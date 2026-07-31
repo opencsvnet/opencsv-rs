@@ -9,14 +9,14 @@
 
 use opencsv_cli::chain::FileAnchorChain;
 use opencsv_cli::hexutil::to_hex;
-use opencsv_cli::ops::{self, COIN_VK, ReceiveReport};
+use opencsv_cli::ops::{self, ReceiveReport, COIN_VK};
 use opencsv_cli::store::{CoinStatus, Wallet};
-use opencsv_core::accept::{MockVerifier, public_input};
+use opencsv_core::accept::{public_input, MockVerifier};
 use opencsv_core::chain::AnchorChain;
 use opencsv_core::consignment::{CoinOpening, Consignment};
 use opencsv_core::{
-    AnchorRecord, AssetGenesis, AssetId, Coin, Digest, OwnerSecret, RejectReason, mint_commit,
-    nullifier_commit,
+    mint_commit, nullifier_commit, AnchorRecord, AssetGenesis, AssetId, Coin, Digest, OwnerSecret,
+    RejectReason,
 };
 
 fn opening(coin: &Coin) -> CoinOpening {
@@ -109,12 +109,10 @@ fn scripted_flow_with_mock_proofs() {
         other => panic!("mint receive failed: {other:?}"),
     }
     assert_eq!(ops::balance(&alice, None), vec![(asset_id, 100)]);
-    assert!(
-        alice
-            .coins()
-            .iter()
-            .all(|c| c.status == CoinStatus::Unspent)
-    );
+    assert!(alice
+        .coins()
+        .iter()
+        .all(|c| c.status == CoinStatus::Unspent));
 
     // Too few confirmations → rejected (proof is fine, depth is not).
     match receive(&mut alice, &chain, &mint_consignment, 100) {
@@ -212,12 +210,7 @@ fn scripted_flow_with_mock_proofs() {
     assert_eq!(alice2.secrets().len(), 1);
     assert!(alice2.issuer_for(&asset_id).is_some());
     assert_eq!(alice2.coins().len(), 2);
-    assert!(
-        alice2
-            .coins()
-            .iter()
-            .all(|c| c.status == CoinStatus::Spent)
-    );
+    assert!(alice2.coins().iter().all(|c| c.status == CoinStatus::Spent));
 
     // The chain file shows both occurrences of the double-spent key.
     let key = nullifier_commit(&nullifiers).to_anchor();

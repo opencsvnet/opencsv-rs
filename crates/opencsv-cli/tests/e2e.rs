@@ -16,9 +16,9 @@
 use std::time::Instant;
 
 use opencsv_cli::chain::FileAnchorChain;
-use opencsv_cli::ops::{self, COIN_VK, ReceiveReport};
+use opencsv_cli::ops::{self, ReceiveReport, COIN_VK};
 use opencsv_cli::store::Wallet;
-use opencsv_core::accept::{ProofVerifier, public_input};
+use opencsv_core::accept::{public_input, ProofVerifier};
 use opencsv_core::chain::AnchorChain;
 use opencsv_core::{AssetId, Owner, RejectReason};
 use opencsv_pcd::CoinProofVerifier;
@@ -51,7 +51,10 @@ fn full_cli_flow_with_real_proofs() {
     let owner_b = ops::keygen(&mut bob).unwrap();
     let owner_c: Owner = ops::keygen(&mut carol).unwrap();
     let asset_id = ops::issuer_init(&mut alice, *b"USD").unwrap();
-    println!("asset {}", opencsv_cli::hexutil::to_hex(asset_id.as_bytes()));
+    println!(
+        "asset {}",
+        opencsv_cli::hexutil::to_hex(asset_id.as_bytes())
+    );
 
     // --- mint 60+40 to alice; alice receives.
     let mint = timed("prove mint (60+40)", || {
@@ -74,7 +77,15 @@ fn full_cli_flow_with_real_proofs() {
     // --- alice sends 70+30 to bob; bob receives.
     let input_ids: Vec<String> = alice.coins().iter().map(|c| c.id()).collect();
     let transfer = timed("prove transfer (70+30)", || {
-        ops::send(&mut alice, &mut chain, &input_ids, owner_b, &[70, 30], false).unwrap()
+        ops::send(
+            &mut alice,
+            &mut chain,
+            &input_ids,
+            owner_b,
+            &[70, 30],
+            false,
+        )
+        .unwrap()
     });
     chain.advance_blocks(6).unwrap();
     let report = timed("verify transfer", || {
@@ -91,12 +102,10 @@ fn full_cli_flow_with_real_proofs() {
     assert_eq!(ops::balance(&alice, None), vec![]);
     assert_eq!(ops::balance(&bob, None), vec![(asset_id, 100)]);
     // The spent inputs are marked spent locally.
-    assert!(
-        alice
-            .coins()
-            .iter()
-            .all(|c| c.status == opencsv_cli::store::CoinStatus::Spent)
-    );
+    assert!(alice
+        .coins()
+        .iter()
+        .all(|c| c.status == opencsv_cli::store::CoinStatus::Spent));
 
     // --- bob redeems the 70 coin; the issuer-side check uses the same
     // CoinProofVerifier adapter over the (openings-less) redeem blob.

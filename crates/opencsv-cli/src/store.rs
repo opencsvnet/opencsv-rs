@@ -21,9 +21,9 @@ use std::path::{Path, PathBuf};
 
 use opencsv_core::chain::AnchorRef;
 use opencsv_core::{AssetGenesis, AssetId, Coin, Owner, OwnerSecret};
-use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
-use crate::error::{Error, io_err};
+use crate::error::{io_err, Error};
 use crate::hexutil::to_hex;
 
 const KEYS_FILE: &str = "keys.bin";
@@ -170,7 +170,9 @@ impl Wallet {
 
     /// The issuer record controlling `asset_id`, if this wallet is the issuer.
     pub fn issuer_for(&self, asset_id: &AssetId) -> Option<&IssuerRecord> {
-        self.issuers.iter().find(|r| r.genesis.asset_id() == *asset_id)
+        self.issuers
+            .iter()
+            .find(|r| r.genesis.asset_id() == *asset_id)
     }
 
     /// The owner secret behind `owner`, if it is one of this wallet's keys.
@@ -186,7 +188,10 @@ impl Wallet {
         } else {
             self.coins.push(stored.clone());
         }
-        write_bincode(&self.dir.join(COINS_DIR).join(format!("{id}.coin")), &stored)
+        write_bincode(
+            &self.dir.join(COINS_DIR).join(format!("{id}.coin")),
+            &stored,
+        )
     }
 
     /// Find the unique coin whose id starts with `prefix`.
@@ -263,11 +268,12 @@ fn decode_bincode<T: DeserializeOwned>(path: &Path, bytes: &[u8]) -> Result<T, E
 }
 
 fn write_bincode<T: Serialize>(path: &Path, value: &T) -> Result<(), Error> {
-    let bytes = bincode::serde::encode_to_vec(value, bincode::config::standard())
-        .map_err(|e| Error::Decode {
+    let bytes = bincode::serde::encode_to_vec(value, bincode::config::standard()).map_err(|e| {
+        Error::Decode {
             path: path.to_path_buf(),
             message: format!("serialization failed: {e}"),
-        })?;
+        }
+    })?;
     write_bytes(path, &bytes)
 }
 

@@ -1,0 +1,22 @@
+[package]
+name = "opencsv-anchor-server"
+description = "Demo anchor server: serves a FileAnchorChain as the JSON snapshot opencsv-ffi consumes, and accepts anchor appends"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+opencsv-core = { path = "../opencsv-core" }
+opencsv-cli = { path = "../opencsv-cli", default-features = false }
+opencsv-ffi = { path = "../../ffi" }
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tiny_http = "0.12"
+
+[[bin]]
+name = "opencsv-anchor-server"
+path = "src/main.rs"
+
+[dev-dependencies]
+tempfile = "3"

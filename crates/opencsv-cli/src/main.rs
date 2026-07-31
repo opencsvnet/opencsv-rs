@@ -11,9 +11,9 @@ use std::process::ExitCode;
 use base64::Engine;
 use clap::{Parser, Subcommand};
 use opencsv_cli::chain::FileAnchorChain;
-use opencsv_cli::error::{Error, io_err};
+use opencsv_cli::error::{io_err, Error};
 use opencsv_cli::hexutil::{digest_from_hex, to_hex};
-use opencsv_cli::ops::{self, DEFAULT_CONFIRMATIONS, Produced, ReceiveReport};
+use opencsv_cli::ops::{self, Produced, ReceiveReport, DEFAULT_CONFIRMATIONS};
 use opencsv_cli::store::Wallet;
 use opencsv_core::{AnchorChain, Owner};
 
@@ -228,7 +228,11 @@ fn run(cli: Cli) -> Result<ExitCode, Error> {
         Commands::Keygen => {
             let mut wallet = wallet;
             let owner = ops::keygen(&mut wallet)?;
-            println!("key {} owner {}", wallet.secrets().len() - 1, to_hex(owner.as_bytes()));
+            println!(
+                "key {} owner {}",
+                wallet.secrets().len() - 1,
+                to_hex(owner.as_bytes())
+            );
         }
         Commands::Keys => {
             for (i, secret) in wallet.secrets().iter().enumerate() {
@@ -238,7 +242,9 @@ fn run(cli: Cli) -> Result<ExitCode, Error> {
         Commands::Issuer(IssuerCmd::Init { currency }) => {
             let code = currency.as_bytes();
             let code: [u8; 3] = code.try_into().map_err(|_| {
-                Error::Parse(format!("currency code must be 3 ASCII letters, got `{currency}`"))
+                Error::Parse(format!(
+                    "currency code must be 3 ASCII letters, got `{currency}`"
+                ))
             })?;
             let mut wallet = wallet;
             let asset_id = ops::issuer_init(&mut wallet, code)?;
@@ -274,7 +280,14 @@ fn run(cli: Cli) -> Result<ExitCode, Error> {
             eprintln!("proving transfer… (this takes a few seconds in release, ~70s in debug)");
             let mut wallet = wallet;
             let mut chain = FileAnchorChain::open(&chain_path)?;
-            let produced = ops::send(&mut wallet, &mut chain, &inputs, to, &amounts, force_respend)?;
+            let produced = ops::send(
+                &mut wallet,
+                &mut chain,
+                &inputs,
+                to,
+                &amounts,
+                force_respend,
+            )?;
             report_produced(&produced, &out, print_blob)?;
         }
         Commands::Receive {
@@ -464,7 +477,10 @@ fn run_signal(
 fn report_produced(produced: &Produced, out: &Path, print_blob: bool) -> Result<(), Error> {
     let blob = produced.consignment.to_bytes();
     let location = produced.anchor.location;
-    let name = format!("consignment-h{}-p{}.bin", location.height, location.position);
+    let name = format!(
+        "consignment-h{}-p{}.bin",
+        location.height, location.position
+    );
     let path = out.join(name);
     std::fs::create_dir_all(out).map_err(io_err(out))?;
     std::fs::write(&path, &blob).map_err(io_err(&path))?;
@@ -474,7 +490,10 @@ fn report_produced(produced: &Produced, out: &Path, print_blob: bool) -> Result<
     );
     println!("consignment {}", path.display());
     if print_blob {
-        println!("{}", base64::engine::general_purpose::STANDARD.encode(&blob));
+        println!(
+            "{}",
+            base64::engine::general_purpose::STANDARD.encode(&blob)
+        );
     }
     Ok(())
 }

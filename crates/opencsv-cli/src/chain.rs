@@ -37,7 +37,7 @@ use opencsv_core::chain::{AnchorChain, AnchorLocation, AnchorRef};
 use opencsv_core::{AnchorRecord, TruncatedDigest};
 use p3_baby_bear::BabyBear;
 
-use crate::error::{Error, io_err};
+use crate::error::{io_err, Error};
 use crate::hexutil::{from_hex, to_hex};
 
 /// First line of every chain file (format version tag).
@@ -110,6 +110,20 @@ impl FileAnchorChain {
         writeln!(f, "tip {}", self.tip_height).map_err(io_err(&self.path))
     }
 
+    /// All anchors with their references, in canonical order — the whole
+    /// chain view, for snapshot export (e.g. `opencsv-anchor-server`).
+    pub fn entries(&self) -> impl Iterator<Item = (AnchorRef, AnchorRecord)> + '_ {
+        self.entries.iter().map(|e| {
+            (
+                AnchorRef {
+                    txid: e.txid,
+                    location: e.location,
+                },
+                e.record,
+            )
+        })
+    }
+
     /// Append a record to the current tip block and persist it. Semantics
     /// (position, txid derivation, first-occurrence index) match
     /// `MockAnchorChain::append`.
@@ -124,8 +138,8 @@ impl FileAnchorChain {
             position,
         };
         let ordinal = self.entries.len() as u32;
-        let txid = *opencsv_core::field::hash_felts("mock-txid", &[&[BabyBear::new(ordinal)]])
-            .as_bytes();
+        let txid =
+            *opencsv_core::field::hash_felts("mock-txid", &[&[BabyBear::new(ordinal)]]).as_bytes();
         let entry = Entry {
             txid,
             location,
@@ -186,9 +200,7 @@ impl FileAnchorChain {
                         height: h.parse().map_err(|_| bad())?,
                         position: p.parse().map_err(|_| bad())?,
                     };
-                    let txid: [u8; 32] = from_hex(txid_hex)?
-                        .try_into()
-                        .map_err(|_| bad())?;
+                    let txid: [u8; 32] = from_hex(txid_hex)?.try_into().map_err(|_| bad())?;
                     let record_bytes: [u8; 64] =
                         from_hex(record_hex)?.try_into().map_err(|_| bad())?;
                     let record = AnchorRecord::from_bytes(&record_bytes)

@@ -15,21 +15,21 @@
 //! - ingest a blob: [`receive`] with the raw bytes — it runs the core
 //!   `accept()` driver and, on success, stores the coins and pins the asset.
 
-use opencsv_core::accept::{AcceptParams, ProofVerifier, accept};
+use opencsv_core::accept::{accept, AcceptParams, ProofVerifier};
 use opencsv_core::chain::{AnchorChain, AnchorLocation};
 use opencsv_core::consignment::{CoinOpening, Consignment};
 use opencsv_core::{
-    AnchorRecord, AssetId, Coin, Digest, Owner, OwnerSecret, RejectReason, mint_commit,
-    nullifier_commit,
+    mint_commit, nullifier_commit, AnchorRecord, AssetId, Coin, Digest, Owner, OwnerSecret,
+    RejectReason,
 };
-use opencsv_core::{Ed25519IssuerSignature, IssuerSignature, mint_signing_message};
-use opencsv_pcd::{NODE_INPUTS, NODE_OUTPUTS, decode_coin_proof, encode_coin_proof};
+use opencsv_core::{mint_signing_message, Ed25519IssuerSignature, IssuerSignature};
+use opencsv_pcd::{decode_coin_proof, encode_coin_proof, NODE_INPUTS, NODE_OUTPUTS};
 use rand::RngExt;
 
 use crate::chain::AnchorWriter;
 use crate::error::Error;
 use crate::hexutil::to_hex;
-use crate::store::{CoinStatus, IssuerRecord, StoredCoin, Wallet, consignment_name};
+use crate::store::{consignment_name, CoinStatus, IssuerRecord, StoredCoin, Wallet};
 
 /// vk tag passed to the accept driver. `opencsv_pcd::CoinProofVerifier`
 /// ignores it (circuit shapes are fixed — see the adapter docs).
@@ -138,7 +138,10 @@ pub fn mint<C: AnchorWriter>(
         anchor_ref: anchor,
         aux: Some(issuer.genesis),
     };
-    Ok(Produced { consignment, anchor })
+    Ok(Produced {
+        consignment,
+        anchor,
+    })
 }
 
 /// Spend exactly [`NODE_INPUTS`] coins into 1–2 outputs owned by `to`
@@ -222,7 +225,10 @@ pub fn send<C: AnchorWriter>(
     for id in &ids {
         wallet.mark_spent(id)?;
     }
-    Ok(Produced { consignment, anchor })
+    Ok(Produced {
+        consignment,
+        anchor,
+    })
 }
 
 /// Burn a coin back to the issuer (paper §4.6). The resulting consignment
@@ -242,7 +248,8 @@ pub fn redeem<C: AnchorWriter>(
         .secret_for(&coin.owner)
         .ok_or_else(|| Error::UnknownOwner(to_hex(coin.owner.as_bytes())))?;
     let predecessor = predecessor_proof(&stored)?;
-    let proof = opencsv_pcd::prove_redeem(&coin.asset_id, &(coin, osk), &predecessor, stored.selector)?;
+    let proof =
+        opencsv_pcd::prove_redeem(&coin.asset_id, &(coin, osk), &predecessor, stored.selector)?;
 
     let record = AnchorRecord::Redeem {
         asset_id: coin.asset_id.to_anchor(),
@@ -257,7 +264,10 @@ pub fn redeem<C: AnchorWriter>(
         aux: None,
     };
     wallet.mark_spent(&stored.id())?;
-    Ok(Produced { consignment, anchor })
+    Ok(Produced {
+        consignment,
+        anchor,
+    })
 }
 
 /// Run the core accept driver over a received consignment blob and, on
@@ -362,8 +372,7 @@ pub fn audit<C: AnchorChain>(
 
 /// Decode the stored creating proof of a coin (the in-circuit predecessor).
 fn predecessor_proof(stored: &StoredCoin) -> Result<opencsv_pcd::CoinProof, Error> {
-    decode_coin_proof(&stored.proof)
-        .ok_or(Error::Internal("stored coin proof does not decode"))
+    decode_coin_proof(&stored.proof).ok_or(Error::Internal("stored coin proof does not decode"))
 }
 
 /// Build 2 output coins from 1–2 amounts (missing second amount pads a

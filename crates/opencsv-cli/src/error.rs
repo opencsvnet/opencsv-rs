@@ -74,7 +74,9 @@ impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Io { path, source } => write!(f, "{}: {source}", path.display()),
-            Self::Decode { path, message } => write!(f, "{}: corrupt data: {message}", path.display()),
+            Self::Decode { path, message } => {
+                write!(f, "{}: corrupt data: {message}", path.display())
+            }
             Self::Hex(m) => write!(f, "invalid hex: {m}"),
             Self::Parse(m) => write!(f, "{m}"),
             Self::NoKeys => write!(f, "wallet has no owner keys (run `opencsv keygen` first)"),
@@ -88,7 +90,10 @@ impl std::fmt::Display for Error {
                 write!(f, "transfers consume exactly {expected} coins, got {got}")
             }
             Self::AmountMismatch { inputs, outputs } => {
-                write!(f, "outputs sum to {outputs} but inputs sum to {inputs} (conservation)")
+                write!(
+                    f,
+                    "outputs sum to {outputs} but inputs sum to {inputs} (conservation)"
+                )
             }
             Self::MixedAssets => write!(f, "all coins in one transaction must share an asset"),
             Self::Proving(e) => write!(f, "proving failed: {e}"),

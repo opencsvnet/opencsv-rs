@@ -37,12 +37,22 @@ fn binary_smoke() {
     assert!(out.contains(&owner_hex), "{out}");
 
     // issuer init prints an asset id; assets lists it.
-    let out = ok(&run(&["--wallet-dir", w, "issuer", "init", "--currency", "USD"]));
+    let out = ok(&run(&[
+        "--wallet-dir",
+        w,
+        "issuer",
+        "init",
+        "--currency",
+        "USD",
+    ]));
     assert!(out.contains("asset "), "{out}");
     let asset_hex = out.trim().rsplit(' ').next().unwrap().to_string();
     assert_eq!(asset_hex.len(), 64);
     let out = ok(&run(&["--wallet-dir", w, "assets"]));
-    assert!(out.contains(&asset_hex) && out.contains("currency USD"), "{out}");
+    assert!(
+        out.contains(&asset_hex) && out.contains("currency USD"),
+        "{out}"
+    );
 
     // Empty wallet: zero balance, empty audit supply.
     let out = ok(&run(&["--wallet-dir", w, "balance"]));
