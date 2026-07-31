@@ -1,7 +1,7 @@
 # opencsv-pcd
 
 Proof-carrying data (PCD) circuits for **OpenCSV** (client-side verified
-stablecoins on Bitcoin, see `paper/opencsv.md` §4), built on the Plonky3
+RWAs on Bitcoin, see `paper/opencsv.md` §4), built on the Plonky3
 circuit/recursion stack.
 
 **Stage 1:** a non-recursive circuit proving knowledge of an opening of an

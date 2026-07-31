@@ -1,7 +1,7 @@
 //! # opencsv-core
 //!
 //! Core types and client-side verification logic for **OpenCSV** —
-//! client-side verified stablecoins anchored to Bitcoin L1 (see
+//! client-side verified RWAs anchored to Bitcoin L1 (see
 //! `paper/opencsv.md`, §4 Construction).
 //!
 //! Implemented here:

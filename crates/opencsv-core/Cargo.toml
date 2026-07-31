@@ -1,6 +1,6 @@
 [package]
 name = "opencsv-core"
-description = "Core types and client-side verification logic for OpenCSV (stablecoins anchored to Bitcoin L1)"
+description = "Core types and client-side verification logic for OpenCSV (RWAs anchored to Bitcoin L1)"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

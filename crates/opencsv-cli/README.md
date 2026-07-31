@@ -1,6 +1,6 @@
 # opencsv-cli
 
-A text wallet client for **OpenCSV** — client-side verified stablecoins
+A text wallet client for **OpenCSV** — client-side verified RWAs
 anchored to Bitcoin L1 with recursive PCD proofs (see `paper/opencsv.md`).
 The binary is a thin shell over this crate's library: all wallet logic lives
 in the lib target so a future Signal transport crate can reuse it and only

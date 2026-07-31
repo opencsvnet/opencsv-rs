@@ -1,6 +1,6 @@
 //! # opencsv-cli
 //!
-//! A text wallet client for **OpenCSV** (client-side verified stablecoins
+//! A text wallet client for **OpenCSV** (client-side verified RWAs
 //! anchored to Bitcoin L1 — see `paper/opencsv.md`). The crate is
 //! deliberately **transport-agnostic**: consignments are opaque binary blobs
 //! ([`opencsv_core::Consignment::to_bytes`]). This crate reads and writes them
