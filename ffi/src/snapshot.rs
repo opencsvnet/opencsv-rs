@@ -9,15 +9,20 @@
 //! {
 //!   "tip_height": 6,
 //!   "entries": [
-//!     { "height": 0, "position": 0, "txid": "<64 hex>", "record": "<128 hex>" }
+//!     { "height": 0, "position": 0, "txid": "<64 hex>", "ctx": "<64 hex>",
+//!       "record": "<128 hex>" }
 //!   ]
 //! }
 //! ```
-
-use std::collections::HashMap;
+//!
+//! `ctx` is the anchor transaction's 32-byte context (see `opencsv-core`'s
+//! anchor docs): records publish bound payloads `H("bind" ∥ raw_nf ∥ ctx)`,
+//! so nullifier occurrences are recognized by scanning the snapshot and
+//! testing the binding against the raw nullifier — something only the
+//! consignment holders can do.
 
 use opencsv_core::chain::{AnchorChain, AnchorLocation, AnchorRef};
-use opencsv_core::{AnchorRecord, TruncatedDigest, ANCHOR_SIZE};
+use opencsv_core::{ANCHOR_SIZE, AnchorRecord, Digest};
 use serde::{Deserialize, Serialize};
 
 use crate::hex::{from_hex_array, to_hex};
@@ -31,6 +36,9 @@ pub struct SnapshotEntry {
     pub position: u32,
     /// Transaction id, 32 bytes hex.
     pub txid: String,
+    /// Transaction context the record's bound payloads commit to, 32 bytes
+    /// hex.
+    pub ctx: String,
     /// The 64-byte anchor record, hex.
     pub record: String,
 }
@@ -48,14 +56,13 @@ struct Entry {
     txid: [u8; 32],
     location: AnchorLocation,
     record: AnchorRecord,
+    ctx: [u8; 32],
 }
 
 /// A read-only anchor chain view decoded from a [`Snapshot`].
 pub struct SnapshotChain {
     tip_height: u64,
     entries: Vec<Entry>,
-    /// First occurrence per nullifier key in canonical order.
-    nullifier_index: HashMap<TruncatedDigest, AnchorLocation>,
 }
 
 impl SnapshotChain {
@@ -71,9 +78,9 @@ impl SnapshotChain {
         let mut entries = Vec::with_capacity(snapshot.entries.len());
         for e in &snapshot.entries {
             let txid = from_hex_array::<32>(&e.txid, "snapshot txid")?;
+            let ctx = from_hex_array::<32>(&e.ctx, "snapshot ctx")?;
             let record_bytes = from_hex_array::<ANCHOR_SIZE>(&e.record, "snapshot record")?;
-            let record = AnchorRecord::from_bytes(&record_bytes)
-                .map_err(|err| format!("snapshot record at {}/{}: {err}", e.height, e.position))?;
+            let record = AnchorRecord::from_bytes(&record_bytes);
             entries.push(Entry {
                 txid,
                 location: AnchorLocation {
@@ -81,19 +88,13 @@ impl SnapshotChain {
                     position: e.position,
                 },
                 record,
+                ctx,
             });
         }
         entries.sort_by_key(|e| e.location);
-        let mut nullifier_index = HashMap::new();
-        for e in &entries {
-            for key in e.record.nullifier_keys() {
-                nullifier_index.entry(key).or_insert(e.location);
-            }
-        }
         Ok(Self {
             tip_height: snapshot.tip_height,
             entries,
-            nullifier_index,
         })
     }
 }
@@ -110,14 +111,21 @@ impl AnchorChain for SnapshotChain {
             .map(|e| e.record)
     }
 
-    fn first_nullifier_occurrence(&self, key: &TruncatedDigest) -> Option<AnchorLocation> {
-        self.nullifier_index.get(key).copied()
-    }
-
-    fn nullifier_occurrences(&self, key: &TruncatedDigest) -> Vec<AnchorLocation> {
+    fn ctx_at(&self, anchor_ref: &AnchorRef) -> Option<[u8; 32]> {
         self.entries
             .iter()
-            .filter(|e| e.record.nullifier_keys().contains(key))
+            .find(|e| e.location == anchor_ref.location && e.txid == anchor_ref.txid)
+            .map(|e| e.ctx)
+    }
+
+    fn first_nullifier_occurrence(&self, raw_nf: &Digest) -> Option<AnchorLocation> {
+        self.nullifier_occurrences(raw_nf).into_iter().next()
+    }
+
+    fn nullifier_occurrences(&self, raw_nf: &Digest) -> Vec<AnchorLocation> {
+        self.entries
+            .iter()
+            .filter(|e| e.record.well_formed(&e.ctx, raw_nf))
             .map(|e| e.location)
             .collect()
     }
@@ -136,11 +144,13 @@ pub fn entry_json(
     location: AnchorLocation,
     txid: &[u8; 32],
     record: &AnchorRecord,
+    ctx: &[u8; 32],
 ) -> SnapshotEntry {
     SnapshotEntry {
         height: location.height,
         position: location.position,
         txid: to_hex(txid),
+        ctx: to_hex(ctx),
         record: to_hex(&record.to_bytes()),
     }
 }

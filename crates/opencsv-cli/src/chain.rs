@@ -9,8 +9,13 @@
 //! - the tip only moves via [`FileAnchorChain::advance_blocks`] — callers
 //!   decide when "blocks" are mined (the CLI has `chain advance`);
 //! - confirmations are `tip − height + 1` ([`AnchorChain::confirmations_at`]);
-//! - first occurrence wins for every nullifier key (paper §4.7 rule 1), with
-//!   the index rebuilt on load by replaying the log;
+//! - each entry carries a 32-byte transaction context `ctx` (a synthetic
+//!   outpoint; in production the funding input's outpoint of the anchor
+//!   transaction), and records publish only bound payloads `H("bind" ∥
+//!   raw_nf ∥ ctx)` — occurrence queries take the raw nullifier and scan the
+//!   log testing the binding, so only consignment holders can recognize
+//!   their nullifiers (paper §4.7 rule 1, amended; see `opencsv-core`'s
+//!   anchor docs);
 //! - transaction IDs are derived from the entry ordinal exactly as
 //!   `MockAnchorChain` does.
 //!
@@ -23,33 +28,41 @@
 //! File format (one record per line, all digests hex):
 //!
 //! ```text
-//! opencsv-chain-v1
+//! opencsv-chain-v3
 //! tip 12
-//! entry 6 0 <txid:64hex> <anchor-record:128hex>
+//! entry 6 0 <txid:64hex> <ctx:64hex> <anchor-record:128hex>
 //! ```
+//!
+//! Version 1 and 2 files are **not** migrated: v1 anchors predate the
+//! context binding, and v2 anchors carry raw nullifier payloads with a
+//! recomputable sidecar binding (the broken anti-grief model) — their
+//! semantics differ from v3's bound payloads. Opening either fails with a
+//! clear error — start a fresh chain file.
 
-use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 
 use opencsv_core::chain::{AnchorChain, AnchorLocation, AnchorRef};
-use opencsv_core::{AnchorRecord, TruncatedDigest};
+use opencsv_core::{AnchorRecord, Digest};
 use p3_baby_bear::BabyBear;
 
 use crate::error::{io_err, Error};
 use crate::hexutil::{from_hex, to_hex};
 
 /// First line of every chain file (format version tag).
-const MAGIC: &str = "opencsv-chain-v1";
+const MAGIC: &str = "opencsv-chain-v3";
 
 /// The write side of the anchor seam: how a new anchor record gets onto the
 /// chain. [`FileAnchorChain`] appends a line to its file; a `bitcoind`
 /// backend would broadcast an OP_RETURN transaction instead. Wallet
 /// operations that anchor (mint/send/redeem) are generic over this trait.
 pub trait AnchorWriter: AnchorChain {
-    /// Publish `record`, returning a reference to its on-chain location.
-    fn append(&mut self, record: AnchorRecord) -> Result<AnchorRef, Error>;
+    /// Publish `record` under transaction context `ctx`, returning a
+    /// reference to its on-chain location. The caller draws `ctx` *before*
+    /// constructing the record (the bound payloads commit to it); see
+    /// [`opencsv_core::anchor`].
+    fn append(&mut self, record: AnchorRecord, ctx: [u8; 32]) -> Result<AnchorRef, Error>;
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -57,6 +70,7 @@ struct Entry {
     txid: [u8; 32],
     location: AnchorLocation,
     record: AnchorRecord,
+    ctx: [u8; 32],
 }
 
 /// An append-only-file [`AnchorChain`] (demo backend; see module docs).
@@ -64,8 +78,6 @@ pub struct FileAnchorChain {
     path: PathBuf,
     tip_height: u64,
     entries: Vec<Entry>,
-    /// First occurrence per nullifier key (never overwritten).
-    nullifier_index: HashMap<TruncatedDigest, AnchorLocation>,
 }
 
 impl FileAnchorChain {
@@ -76,7 +88,6 @@ impl FileAnchorChain {
             path,
             tip_height: 0,
             entries: Vec::new(),
-            nullifier_index: HashMap::new(),
         };
         match File::open(&chain.path) {
             Ok(file) => chain.load(file)?,
@@ -110,9 +121,10 @@ impl FileAnchorChain {
         writeln!(f, "tip {}", self.tip_height).map_err(io_err(&self.path))
     }
 
-    /// All anchors with their references, in canonical order — the whole
-    /// chain view, for snapshot export (e.g. `opencsv-anchor-server`).
-    pub fn entries(&self) -> impl Iterator<Item = (AnchorRef, AnchorRecord)> + '_ {
+    /// All anchors with their references and transaction contexts, in
+    /// canonical order — the whole chain view, for snapshot export (e.g.
+    /// `opencsv-anchor-server`).
+    pub fn entries(&self) -> impl Iterator<Item = (AnchorRef, AnchorRecord, [u8; 32])> + '_ {
         self.entries.iter().map(|e| {
             (
                 AnchorRef {
@@ -120,14 +132,15 @@ impl FileAnchorChain {
                     location: e.location,
                 },
                 e.record,
+                e.ctx,
             )
         })
     }
 
-    /// Append a record to the current tip block and persist it. Semantics
-    /// (position, txid derivation, first-occurrence index) match
-    /// `MockAnchorChain::append`.
-    pub fn append(&mut self, record: AnchorRecord) -> Result<AnchorRef, Error> {
+    /// Append a record under transaction context `ctx` to the current tip
+    /// block and persist it. Semantics (position, txid derivation) match
+    /// [`opencsv_core::MockAnchorChain::append_with_ctx`].
+    pub fn append(&mut self, record: AnchorRecord, ctx: [u8; 32]) -> Result<AnchorRef, Error> {
         let position = self
             .entries
             .iter()
@@ -144,20 +157,19 @@ impl FileAnchorChain {
             txid,
             location,
             record,
+            ctx,
         };
         let mut f = self.open_append()?;
         writeln!(
             f,
-            "entry {} {} {} {}",
+            "entry {} {} {} {} {}",
             location.height,
             location.position,
             to_hex(&txid),
+            to_hex(&ctx),
             to_hex(&record.to_bytes()),
         )
         .map_err(io_err(&self.path))?;
-        for key in record.nullifier_keys() {
-            self.nullifier_index.entry(key).or_insert(location);
-        }
         self.entries.push(entry);
         Ok(AnchorRef { txid, location })
     }
@@ -179,6 +191,13 @@ impl FileAnchorChain {
         // First line: format tag.
         match lines.next() {
             Some((_, Ok(line))) if line.trim() == MAGIC => {}
+            Some((_, Ok(line))) if line.trim().starts_with("opencsv-chain-v") => {
+                return Err(decode(format!(
+                    "chain log is format `{}`, which predates bound nullifier \
+                     payloads and cannot be migrated — start a fresh v3 chain file",
+                    line.trim()
+                )));
+            }
             Some((_, Ok(line))) => return Err(decode(format!("bad magic line `{line}`"))),
             Some((_, Err(e))) => return Err(io_err(&self.path)(e)),
             None => return Err(decode("empty chain file".into())),
@@ -195,23 +214,21 @@ impl FileAnchorChain {
                 ["tip", h] => {
                     self.tip_height = h.parse().map_err(|_| bad())?;
                 }
-                ["entry", h, p, txid_hex, record_hex] => {
+                ["entry", h, p, txid_hex, ctx_hex, record_hex] => {
                     let location = AnchorLocation {
                         height: h.parse().map_err(|_| bad())?,
                         position: p.parse().map_err(|_| bad())?,
                     };
                     let txid: [u8; 32] = from_hex(txid_hex)?.try_into().map_err(|_| bad())?;
+                    let ctx: [u8; 32] = from_hex(ctx_hex)?.try_into().map_err(|_| bad())?;
                     let record_bytes: [u8; 64] =
                         from_hex(record_hex)?.try_into().map_err(|_| bad())?;
-                    let record = AnchorRecord::from_bytes(&record_bytes)
-                        .map_err(|e| decode(format!("line {}: {e}", n + 1)))?;
-                    for key in record.nullifier_keys() {
-                        self.nullifier_index.entry(key).or_insert(location);
-                    }
+                    let record = AnchorRecord::from_bytes(&record_bytes);
                     self.entries.push(Entry {
                         txid,
                         location,
                         record,
+                        ctx,
                     });
                 }
                 _ => return Err(bad()),
@@ -222,8 +239,8 @@ impl FileAnchorChain {
 }
 
 impl AnchorWriter for FileAnchorChain {
-    fn append(&mut self, record: AnchorRecord) -> Result<AnchorRef, Error> {
-        FileAnchorChain::append(self, record)
+    fn append(&mut self, record: AnchorRecord, ctx: [u8; 32]) -> Result<AnchorRef, Error> {
+        FileAnchorChain::append(self, record, ctx)
     }
 }
 
@@ -239,15 +256,25 @@ impl AnchorChain for FileAnchorChain {
             .map(|e| e.record)
     }
 
-    fn first_nullifier_occurrence(&self, key: &TruncatedDigest) -> Option<AnchorLocation> {
-        self.nullifier_index.get(key).copied()
+    fn ctx_at(&self, anchor_ref: &AnchorRef) -> Option<[u8; 32]> {
+        self.entries
+            .iter()
+            .find(|e| e.location == anchor_ref.location && e.txid == anchor_ref.txid)
+            .map(|e| e.ctx)
     }
 
-    fn nullifier_occurrences(&self, key: &TruncatedDigest) -> Vec<AnchorLocation> {
+    fn first_nullifier_occurrence(&self, raw_nf: &Digest) -> Option<AnchorLocation> {
+        self.nullifier_occurrences(raw_nf).into_iter().next()
+    }
+
+    fn nullifier_occurrences(&self, raw_nf: &Digest) -> Vec<AnchorLocation> {
+        // Linear scan over the replayed log, same as MockAnchorChain: an
+        // occurrence is an entry whose record binds `raw_nf` under the
+        // entry's own ctx.
         let mut locations: Vec<_> = self
             .entries
             .iter()
-            .filter(|e| e.record.nullifier_keys().contains(key))
+            .filter(|e| e.record.well_formed(&e.ctx, raw_nf))
             .map(|e| e.location)
             .collect();
         locations.sort();

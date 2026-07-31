@@ -120,7 +120,8 @@ fn full_cli_flow_with_real_proofs() {
     });
     chain.advance_blocks(6).unwrap();
     let record = chain.anchor_at(&redeem.anchor).unwrap();
-    let x = public_input(&record, &[]);
+    let ctx = chain.ctx_at(&redeem.anchor).unwrap();
+    let x = public_input(&record, &ctx, &[]);
     assert!(timed("verify redeem (issuer side)", || {
         CoinProofVerifier.verify(COIN_VK, &x, &redeem.consignment.proof)
     }));

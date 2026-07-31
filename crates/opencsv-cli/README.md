@@ -95,7 +95,9 @@ transfers are 2-input (a missing second amount pads a zero-value output to
 the same recipient; transfer outputs must sum to the inputs). `send` has a
 hidden `--force-respend` that skips the local spent check — it exists to
 demonstrate double-spend *detection* (the second anchor loses to
-first-occurrence and its consignment is rejected with `NullifierConflict`).
+first-occurrence — recognized via the raw nullifiers, whose on-chain
+payloads are context-bound and unlinkable — and its consignment is rejected
+with `NullifierConflict`).
 
 ## Wallet directory layout
 
@@ -115,8 +117,9 @@ All files are bincode (serde data model) unless noted.
   envelope) and the output selector — both are needed to present the coin's
   ancestry as the in-circuit predecessor when spending
   (`opencsv_pcd::decode_coin_proof`).
-- The nullifier index is not stored: it is derived state, rebuilt by
-  replaying `chain.log` on open.
+- Nullifier occurrences are not indexed: they are derived state, recognized
+  by scanning `chain.log` and testing each entry's bound payload against
+  the raw nullifier under the entry's `ctx`.
 - `receive` is idempotent and preserves local spent state: redelivery of a
   consignment for coins you already spent does not resurrect them.
 
@@ -127,10 +130,13 @@ All files are bincode (serde data model) unless noted.
   full statement + the batch-STARK proof, see `opencsv-pcd/src/accept.rs`),
   the anchor ref, and optional genesis `aux`. Treat as opaque.
 - **Chain log** (`chain.log`): text, one record per line —
-  `opencsv-chain-v1` magic, `tip <height>` markers, and
-  `entry <height> <position> <txid-hex> <record-hex>` anchors (the record is
-  the 64-byte anchor of paper §4.4–4.6, hex-encoded). Append-only; corrupt
-  lines fail to load.
+  `opencsv-chain-v3` magic, `tip <height>` markers, and
+  `entry <height> <position> <txid-hex> <ctx-hex> <record-hex>` anchors (the
+  record is the 64-byte anchor of paper §4.4–4.6, hex-encoded; `ctx` is the
+  32-byte transaction context the record's bound nullifier payloads commit
+  to — see `opencsv-core`'s anchor docs). Append-only; corrupt lines fail to
+  load. Version 1/2 logs predate the bound-payload model and are rejected
+  with a clear error rather than migrated — start a fresh chain file.
 
 ## Security caveats
 
@@ -139,8 +145,10 @@ All files are bincode (serde data model) unless noted.
   management is future work.
 - **File-backed demo anchor.** `FileAnchorChain` is not Bitcoin. It matches
   `MockAnchorChain`'s semantics — append to the current tip block, explicit
-  `chain advance`, confirmations `tip − height + 1`, first-occurrence
-  nullifier index — but anyone can write the file, there is no PoW, no
+  `chain advance`, confirmations `tip − height + 1`, a per-anchor random
+  transaction context, and raw-nullifier occurrence recognition via bound
+  payloads (only consignment holders can recognize their nullifiers) — but
+  anyone can write the file, there is no PoW, no
   reorg model, and no file locking. Multi-wallet demos must share one chain
   file via `--chain` (a consignment's `anchor_ref` is meaningless against a
   chain that never saw the anchor).

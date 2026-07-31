@@ -31,8 +31,10 @@ char *opencsv_wallet_status(uint64_t handle);
 char *opencsv_wallet_keygen(uint64_t handle);
 char *opencsv_wallet_init_issuer(uint64_t handle, const char *currency);
 
-/* Prove (phase 1): returns {"pending_id":N,"anchor_record_hex":...,"spends":[...]}.
- * Publish the 64-byte anchor record, then finalize. */
+/* Prove (phase 1): returns {"pending_id":N,"anchor_record_hex":...,
+ * "ctx_hex":...,"spends":[...]}. Publish the 64-byte anchor record together
+ * with the 32-byte transaction context it is bound to (POST /anchor), then
+ * finalize. */
 char *opencsv_prove_mint(uint64_t handle, const char *asset_id_hex,
                          const char *to_owner_hex, const char *amounts_json);
 char *opencsv_prove_transfer(uint64_t handle, const char *coin_ids_json,

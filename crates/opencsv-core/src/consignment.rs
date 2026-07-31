@@ -56,6 +56,12 @@ impl CoinOpening {
 pub struct Consignment {
     /// Openings of the recipient's output coins.
     pub coin_openings: Vec<CoinOpening>,
+    /// Raw nullifiers of the consumed coins (empty for mints; for
+    /// compressed transfers, the full list the anchor's bound commitment
+    /// hashes). These travel **only** off-chain — on-chain records carry
+    /// bound payloads `H("bind" ∥ nf ∥ ctx)` — and let the recipient
+    /// recognize occurrences of its nullifiers (see `crate::chain`).
+    pub nullifiers: Vec<Digest>,
     /// Opaque PCD proof bytes `π` for the transaction.
     pub proof: Vec<u8>,
     /// Where the transaction's anchor sits on the L1.

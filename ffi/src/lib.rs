@@ -14,7 +14,8 @@
 //! - **Anchors** — every chain-dependent call takes an *anchor snapshot*
 //!   JSON (the whole anchor-log view; see [`snapshot`]), so verification is
 //!   fully offline. Producing a transaction is two-phase: `opencsv_prove_*`
-//!   returns a 64-byte anchor record for the host to publish, and
+//!   returns a 64-byte anchor record plus the 32-byte transaction context it
+//!   is bound to for the host to publish together, and
 //!   [`opencsv_consignment_finalize`] builds the consignment blob once the
 //!   host knows where the record anchored.
 //!
@@ -148,6 +149,7 @@ fn proved_json(proved: wallet::Proved) -> serde_json::Value {
     json!({
         "pending_id": proved.pending_id,
         "anchor_record_hex": to_hex(&proved.anchor_record),
+        "ctx_hex": to_hex(&proved.ctx),
         "spends": proved.spends,
     })
 }
@@ -267,8 +269,10 @@ pub unsafe extern "C" fn opencsv_wallet_init_issuer(
 }
 
 /// Prove an issuer mint of `amounts_json` (e.g. `[100]`) to `to_owner_hex`.
-/// Returns `{"pending_id":N,"anchor_record_hex":"<128 hex>","spends":[]}`;
-/// publish the record, then call [`opencsv_consignment_finalize`].
+/// Returns `{"pending_id":N,"anchor_record_hex":"<128 hex>",
+/// "ctx_hex":"<64 hex>","spends":[]}`; publish the record together with its
+/// transaction context (`POST /anchor`), then call
+/// [`opencsv_consignment_finalize`].
 /// Proving takes ~10–60 ms on phone hardware; call from a background queue.
 ///
 /// # Safety

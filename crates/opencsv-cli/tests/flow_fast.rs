@@ -15,8 +15,7 @@ use opencsv_core::accept::{public_input, MockVerifier};
 use opencsv_core::chain::AnchorChain;
 use opencsv_core::consignment::{CoinOpening, Consignment};
 use opencsv_core::{
-    mint_commit, nullifier_commit, AnchorRecord, AssetGenesis, AssetId, Coin, Digest, OwnerSecret,
-    RejectReason,
+    AnchorRecord, AssetGenesis, AssetId, Coin, Digest, OwnerSecret, RejectReason, mint_commit,
 };
 
 fn opening(coin: &Coin) -> CoinOpening {
@@ -37,18 +36,23 @@ fn coin(asset_id: AssetId, value: u64, osk: &OwnerSecret) -> Coin {
     }
 }
 
-/// Build a mock-proved consignment over an anchor record: append, then
-/// `MockVerifier::prove` the reconstructed public input.
+/// Build a mock-proved consignment over an anchor record: append under
+/// `ctx`, then `MockVerifier::prove` the reconstructed public input.
+/// `nullifiers` are the raw nullifiers of the consumed coins (empty for
+/// mints) — they travel only off-chain, in the consignment.
 fn anchor_and_consignment(
     chain: &mut FileAnchorChain,
     record: AnchorRecord,
+    ctx: [u8; 32],
+    nullifiers: Vec<Digest>,
     openings: Vec<CoinOpening>,
     aux: Option<AssetGenesis>,
 ) -> (Consignment, opencsv_core::AnchorRef) {
-    let anchor_ref = chain.append(record).unwrap();
-    let x = public_input(&record, &openings);
+    let anchor_ref = chain.append(record, ctx).unwrap();
+    let x = public_input(&record, &ctx, &openings);
     let consignment = Consignment {
         coin_openings: openings,
+        nullifiers,
         proof: MockVerifier::prove(COIN_VK, &x),
         anchor_ref,
         aux,
@@ -95,6 +99,8 @@ fn scripted_flow_with_mock_proofs() {
             value: 100,
             mint_commit: mint_commit(&asset_id, 100, &nonce).to_anchor(),
         },
+        ops::random_ctx(),
+        vec![],
         coins_a.iter().map(opening).collect(),
         Some(genesis.clone()),
     );
@@ -128,11 +134,12 @@ fn scripted_flow_with_mock_proofs() {
     let osk_b = bob.secret_for(&owner_b).unwrap();
     let coins_b = [coin(asset_id, 70, &osk_b), coin(asset_id, 30, &osk_b)];
     let nullifiers: Vec<Digest> = coins_a.iter().map(|c| c.nullifier(&osk_a)).collect();
+    let transfer_ctx = ops::random_ctx();
     let (transfer_consignment, transfer_ref) = anchor_and_consignment(
         &mut chain,
-        AnchorRecord::XferCompressed {
-            nullifier_commit: nullifier_commit(&nullifiers).to_anchor(),
-        },
+        AnchorRecord::xfer(&nullifiers, &transfer_ctx),
+        transfer_ctx,
+        nullifiers.clone(),
         coins_b.iter().map(opening).collect(),
         Some(genesis.clone()),
     );
@@ -161,12 +168,12 @@ fn scripted_flow_with_mock_proofs() {
         .unwrap()
         .clone();
     let nf_b1 = coin_b1.coin.nullifier(&osk_b);
+    let redeem_ctx = ops::random_ctx();
     let _redeem_ref = chain
-        .append(AnchorRecord::Redeem {
-            asset_id: asset_id.to_anchor(),
-            value: 70,
-            nullifier: nf_b1.to_anchor(),
-        })
+        .append(
+            AnchorRecord::redeem(asset_id.to_anchor(), 70, &nf_b1, &redeem_ctx),
+            redeem_ctx,
+        )
         .unwrap();
     chain.advance_blocks(6).unwrap();
     bob.mark_spent(&coin_b1.id()).unwrap();
@@ -180,11 +187,12 @@ fn scripted_flow_with_mock_proofs() {
     let owner_c = ops::keygen(&mut carol).unwrap();
     let osk_c = carol.secret_for(&owner_c).unwrap();
     let coins_c = [coin(asset_id, 99, &osk_c), coin(asset_id, 1, &osk_c)];
+    let double_ctx = ops::random_ctx();
     let (double_consignment, _) = anchor_and_consignment(
         &mut chain,
-        AnchorRecord::XferCompressed {
-            nullifier_commit: nullifier_commit(&nullifiers).to_anchor(),
-        },
+        AnchorRecord::xfer(&nullifiers, &double_ctx),
+        double_ctx,
+        nullifiers.clone(),
         coins_c.iter().map(opening).collect(),
         Some(genesis),
     );
@@ -212,12 +220,15 @@ fn scripted_flow_with_mock_proofs() {
     assert_eq!(alice2.coins().len(), 2);
     assert!(alice2.coins().iter().all(|c| c.status == CoinStatus::Spent));
 
-    // The chain file shows both occurrences of the double-spent key.
-    let key = nullifier_commit(&nullifiers).to_anchor();
-    assert_eq!(chain.nullifier_occurrences(&key).len(), 2);
+    // Both double-spent nullifiers show two occurrences each — recognized
+    // via the raw nullifiers (the on-chain payloads differ across the two
+    // anchors, being bound to different ctxs).
+    for nf in &nullifiers {
+        assert_eq!(chain.nullifier_occurrences(nf).len(), 2);
+    }
     println!(
-        "fast flow ok: mint 100 → send 70+30 → redeem 70 → supply {} (chain {})",
+        "fast flow ok: mint 100 → send 70+30 → redeem 70 → supply {} (nf {})",
         ops::audit(&chain, &asset_id, None).unwrap(),
-        to_hex(&key.as_bytes()[..4])
+        to_hex(&nullifiers[0].as_bytes()[..4])
     );
 }

@@ -3,12 +3,12 @@
 
 use std::collections::HashSet;
 
-use crate::anchor::AnchorRecord;
+use crate::anchor::{AnchorRecord, binding, nullifier_commit};
 use crate::asset::AssetId;
 use crate::chain::{AnchorChain, AnchorLocation};
 use crate::coin::{Coin, OwnerSecret};
 use crate::consignment::{CoinOpening, Consignment};
-use crate::digest::TruncatedDigest;
+use crate::digest::{Digest, TruncatedDigest};
 
 /// Verification of a transaction validity proof `π` against the predicate's
 /// verification key and public input (paper §4.1: `Π.Verify(vk, x, π)`).
@@ -98,15 +98,21 @@ pub enum RejectReason {
         /// Confirmations required by policy.
         required: u64,
     },
-    /// A nullifier key of this transaction already occurred *earlier* on
+    /// A nullifier of this transaction already occurred *earlier* on
     /// chain — the anchor shown is not the authoritative spend (step 3b,
     /// paper §4.7 rule 1).
     NullifierConflict {
-        /// The conflicting nullifier key.
+        /// The conflicting nullifier (truncated raw nullifier, or the
+        /// nullifier commitment for compressed transfers).
         nullifier: TruncatedDigest,
         /// The first (authoritative) occurrence.
         first: AnchorLocation,
     },
+    /// The anchor record does not bind the consignment's raw nullifiers
+    /// under the anchor's transaction context — e.g. a byte-copied
+    /// (copy-grief) record, whose payloads are bound to the victim's ctx
+    /// (step 3a, amended; see [`crate::anchor`]).
+    IllFormedAnchor,
     /// `Π.Verify(vk, x, π) = 0` (step 2).
     InvalidProof,
     /// None of the openings belongs to any of the recipient's keys (step 4).
@@ -126,6 +132,9 @@ impl std::fmt::Display for RejectReason {
             Self::NullifierConflict { first, .. } => {
                 write!(f, "nullifier already occurred earlier at {first:?}")
             }
+            Self::IllFormedAnchor => {
+                write!(f, "anchor record is not bound to its transaction context (ill-formed)")
+            }
             Self::InvalidProof => write!(f, "transaction proof did not verify"),
             Self::NoOwnedOutput => write!(f, "no opening belongs to the recipient"),
         }
@@ -134,12 +143,15 @@ impl std::fmt::Display for RejectReason {
 
 impl std::error::Error for RejectReason {}
 
-/// Reconstruct the proof public input `x` from the on-chain anchor record and
-/// the consignment's openings (paper §4.8 step 2):
-/// `anchor_bytes(64) ∥ opening_1 ∥ … ∥ opening_n`, each opening encoded as
-/// `asset_id(32) ∥ v(8) ∥ owner(32) ∥ r(32)`.
-pub fn public_input(record: &AnchorRecord, openings: &[CoinOpening]) -> Vec<u8> {
-    let mut x = Vec::with_capacity(64 + 104 * openings.len());
+/// Reconstruct the proof public input `x` from the anchor's transaction
+/// context, the on-chain anchor record, and the consignment's openings
+/// (paper §4.8 step 2): `ctx(32) ∥ anchor_bytes(64) ∥ opening_1 ∥ … ∥
+/// opening_n`, each opening encoded as `asset_id(32) ∥ v(8) ∥ owner(32) ∥
+/// r(32)`. The context is included so the proof verifier can recompute the
+/// bound payloads `H("bind" ∥ nf ∥ ctx)` against the anchor's slots.
+pub fn public_input(record: &AnchorRecord, ctx: &[u8; 32], openings: &[CoinOpening]) -> Vec<u8> {
+    let mut x = Vec::with_capacity(96 + 104 * openings.len());
+    x.extend_from_slice(ctx);
     x.extend_from_slice(&record.to_bytes());
     for opening in openings {
         x.extend_from_slice(&opening.to_public_input_bytes());
@@ -151,7 +163,8 @@ pub fn public_input(record: &AnchorRecord, openings: &[CoinOpening]) -> Vec<u8> 
 ///
 /// Steps: (1) parse/type-check and pin-or-reject genesis aux; (2) proof
 /// check via [`ProofVerifier`]; (3) anchor existence, confirmation depth,
-/// and nullifier first-occurrence; (4) ownership check; (5) credit the
+/// binding of the consignment's raw nullifiers into the anchor record, and
+/// nullifier first-occurrence; (4) ownership check; (5) credit the
 /// recipient's coins.
 pub fn accept<V: ProofVerifier, C: AnchorChain>(
     consignment: &Consignment,
@@ -184,19 +197,24 @@ pub fn accept<V: ProofVerifier, C: AnchorChain>(
     }
 
     // Anchor lookup (step 3a, performed before the proof check because the
-    // public input is reconstructed from the on-chain record).
+    // public input is reconstructed from the on-chain record and its
+    // transaction context).
     let record = chain
         .anchor_at(&consignment.anchor_ref)
         .ok_or(RejectReason::AnchorNotFound)?;
+    let ctx = chain
+        .ctx_at(&consignment.anchor_ref)
+        .ok_or(RejectReason::AnchorNotFound)?;
 
     // Step 2 — proof check.
-    let x = public_input(&record, openings);
+    let x = public_input(&record, &ctx, openings);
     if !verifier.verify(params.vk, &x, &consignment.proof) {
         return Err(RejectReason::InvalidProof);
     }
 
-    // Step 3 — anchor check: confirmation depth, then, for transfers and
-    // redemptions, nullifier first-occurrence (paper §4.7 rules 1–2).
+    // Step 3 — anchor check: confirmation depth (paper §4.7 rule 2), then
+    // the binding and occurrence checks for the consignment's raw
+    // nullifiers (paper §4.7 rule 1, amended; see `crate::anchor`).
     let location = consignment.anchor_ref.location;
     let have = chain.confirmations_at(location.height);
     if have < params.required_confirmations {
@@ -205,13 +223,38 @@ pub fn accept<V: ProofVerifier, C: AnchorChain>(
             required: params.required_confirmations,
         });
     }
-    for key in record.nullifier_keys() {
+
+    // (a) The anchor record must bind exactly the consignment's raw
+    // nullifiers under the anchor's ctx: every `H("bind" ∥ nf ∥ ctx)`
+    // matches a payload slot, and the record carries no unmatched slots
+    // (completeness — a consignment may not smuggle a spend past the
+    // occurrence check by omitting one of the record's nullifiers). A
+    // byte-copy of the record under a different ctx fails here: the copy's
+    // payloads are bound to the victim's ctx, not the copier's.
+    if !record_binds_nullifiers(&record, &ctx, &consignment.nullifiers) {
+        return Err(RejectReason::IllFormedAnchor);
+    }
+
+    // (b) No EARLIER record may bind any of these nullifiers: the first
+    // occurrence of each occurrence key (recognized via the binding, see
+    // `crate::chain`) must be this anchor. Compressed transfers are
+    // recognized under their nullifier commitment, like on-chain.
+    let occurrence_keys: Vec<Digest> = match &record {
+        AnchorRecord::Mint { .. } => vec![],
+        AnchorRecord::Xfer { .. } | AnchorRecord::Redeem { .. } => {
+            consignment.nullifiers.clone()
+        }
+        AnchorRecord::XferCompressed { .. } => {
+            vec![nullifier_commit(&consignment.nullifiers)]
+        }
+    };
+    for key in &occurrence_keys {
         let first = chain
-            .first_nullifier_occurrence(&key)
+            .first_nullifier_occurrence(key)
             .ok_or(RejectReason::AnchorNotFound)?;
         if first != location {
             return Err(RejectReason::NullifierConflict {
-                nullifier: key,
+                nullifier: key.to_anchor(),
                 first,
             });
         }
@@ -233,4 +276,37 @@ pub fn accept<V: ProofVerifier, C: AnchorChain>(
         coins,
         anchor: location,
     })
+}
+
+/// Check (a) of [`accept`]: does `record` bind exactly `raw_nullifiers`
+/// under `ctx`? Mint anchors bind none; XFERC anchors bind the commitment
+/// over the whole raw list (occurrence queries then use the commitment as
+/// the key, see below); XFER/REDEEM bind each nullifier individually.
+fn record_binds_nullifiers(record: &AnchorRecord, ctx: &[u8; 32], raw_nullifiers: &[Digest]) -> bool {
+    let bound = |nf: &Digest| binding(nf, ctx).to_anchor();
+    match record {
+        AnchorRecord::Mint { .. } => raw_nullifiers.is_empty(),
+        AnchorRecord::Redeem { payload, .. } => {
+            raw_nullifiers.len() == 1 && bound(&raw_nullifiers[0]) == *payload
+        }
+        AnchorRecord::XferCompressed {
+            nullifier_commit: slot,
+        } => {
+            !raw_nullifiers.is_empty()
+                && bound(&nullifier_commit(raw_nullifiers)) == *slot
+        }
+        AnchorRecord::Xfer { payloads } => {
+            // Multiset equality: the non-zero payload slots are exactly the
+            // bound nullifiers.
+            let mut slots: Vec<_> = payloads
+                .iter()
+                .copied()
+                .filter(|p| *p != TruncatedDigest([0u8; 24]))
+                .collect();
+            let mut nfs: Vec<_> = raw_nullifiers.iter().map(bound).collect();
+            slots.sort();
+            nfs.sort();
+            !nfs.is_empty() && slots == nfs
+        }
+    }
 }

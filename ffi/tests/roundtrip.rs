@@ -44,9 +44,9 @@ struct TestChain {
 }
 
 impl TestChain {
-    /// Append a record (hex) at the tip, returning the anchor-ref JSON the
-    /// server would respond with.
-    fn append(&mut self, record_hex: &str) -> String {
+    /// Append a record (hex) under transaction context `ctx` (hex) at the
+    /// tip, returning the anchor-ref JSON the server would respond with.
+    fn append(&mut self, record_hex: &str, ctx_hex: &str) -> String {
         let ordinal = self.entries.len() as u32;
         let txid = hash_felts("mock-txid", &[&[BabyBear::new(ordinal)]]);
         let position = self
@@ -59,6 +59,7 @@ impl TestChain {
             height: self.tip_height,
             position,
             txid: txid_hex.clone(),
+            ctx: ctx_hex.to_owned(),
             record: record_hex.to_owned(),
         });
         format!(
@@ -106,7 +107,10 @@ fn mint_to_verify_round_trip() {
     let pending_id = proved["pending_id"].as_u64().expect("pending_id");
 
     let mut chain = TestChain::default();
-    let anchor_ref = chain.append(&str_of(&proved, "anchor_record_hex"));
+    let anchor_ref = chain.append(
+        &str_of(&proved, "anchor_record_hex"),
+        &str_of(&proved, "ctx_hex"),
+    );
 
     let finalized = take(unsafe {
         opencsv_consignment_finalize(issuer, pending_id, cstr(&anchor_ref).as_ptr())

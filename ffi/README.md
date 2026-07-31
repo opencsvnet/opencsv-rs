@@ -12,7 +12,9 @@ consignment blobs through `opencsv_verify_consignment` (milliseconds each)
 and re-marking spends. Chain-dependent calls take an *anchor snapshot* JSON
 (`src/snapshot.rs`) so the phone never talks to a node. Producing a
 transaction is two-phase: `opencsv_prove_*` returns a 64-byte anchor record
-to publish (e.g. to `opencsv-anchor-server`), and
+plus the 32-byte transaction context `ctx` it is bound to (the record's
+nullifier payloads are `H("bind" ∥ raw_nf ∥ ctx)`), to publish together
+(e.g. to `opencsv-anchor-server`), and
 `opencsv_consignment_finalize` builds the consignment blob once the host
 knows where it anchored.
 

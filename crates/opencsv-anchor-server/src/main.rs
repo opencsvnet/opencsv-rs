@@ -5,12 +5,21 @@
 //! without a node:
 //!
 //! - `GET /snapshot` → the whole chain as the snapshot JSON
-//!   `opencsv-ffi` consumes (`{"tip_height":N,"entries":[...]}`);
-//! - `POST /anchor` `{"record":"<128 hex>"}` → appends the 64-byte anchor
-//!   record, returns `{"txid":"<64 hex>","height":N,"position":M}` (the
+//!   `opencsv-ffi` consumes (`{"tip_height":N,"entries":[...]}`), including
+//!   each anchor's transaction context `ctx`;
+//! - `POST /anchor` `{"record":"<128 hex>","ctx":"<64 hex>"}` → appends the
+//!   64-byte anchor record under transaction context `ctx`, returns
+//!   `{"txid":"<64 hex>","height":N,"position":M,"ctx":"<64 hex>"}` (the
 //!   anchor ref for `opencsv_consignment_finalize`), then auto-advances the
 //!   tip by `--auto-advance` blocks (default 6) so demo consignments clear
-//!   the confirmation policy without a separate miner;
+//!   the confirmation policy without a separate miner.
+//!
+//!   The caller draws `ctx` *before* constructing the record — the record's
+//!   payloads are `H("bind" ∥ raw_nf ∥ ctx)` (see `opencsv-core`'s anchor
+//!   docs), and only the caller knows the raw nullifiers, so the server
+//!   cannot (re)bind anything itself. If `ctx` is omitted the server draws
+//!   a fresh random one, which is only meaningful for payload-less MINT
+//!   records.
 //! - `POST /advance` `{"blocks":N}` → advances the tip, returns
 //!   `{"tip_height":N}`.
 //!
@@ -27,8 +36,8 @@ use clap::Parser;
 use opencsv_cli::chain::FileAnchorChain;
 use opencsv_cli::hexutil::{from_hex, to_hex};
 use opencsv_core::chain::AnchorChain;
-use opencsv_core::{AnchorRecord, ANCHOR_SIZE};
-use opencsv_ffi::snapshot::{entry_json, Snapshot};
+use opencsv_core::{ANCHOR_SIZE, AnchorRecord};
+use opencsv_ffi::snapshot::{Snapshot, entry_json};
 use serde::Deserialize;
 use serde_json::json;
 
@@ -98,6 +107,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[derive(Deserialize)]
 struct AnchorBody {
     record: String,
+    /// Transaction context the record's payloads are bound to (hex).
+    /// Optional: if absent, the server draws a fresh random ctx — only
+    /// meaningful for payload-less MINT records (see module docs).
+    ctx: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -119,7 +132,7 @@ fn handle(
                 tip_height: chain.tip_height(),
                 entries: chain
                     .entries()
-                    .map(|(r, record)| entry_json(r.location, &r.txid, &record))
+                    .map(|(r, record, ctx)| entry_json(r.location, &r.txid, &record, &ctx))
                     .collect(),
             };
             match serde_json::to_string(&snapshot) {
@@ -128,11 +141,11 @@ fn handle(
             }
         }
         ("POST", "/anchor") => {
-            let record = match parse_record(body) {
-                Ok(record) => record,
+            let (record, ctx) = match parse_anchor(body) {
+                Ok(parsed) => parsed,
                 Err(e) => return error(400, e),
             };
-            let anchor = match chain.append(record) {
+            let anchor = match chain.append(record, ctx) {
                 Ok(anchor) => anchor,
                 Err(e) => return error(500, format!("append: {e}")),
             };
@@ -147,6 +160,7 @@ fn handle(
                     "txid": to_hex(&anchor.txid),
                     "height": anchor.location.height,
                     "position": anchor.location.position,
+                    "ctx": to_hex(&ctx),
                 })
                 .to_string(),
             )
@@ -165,13 +179,21 @@ fn handle(
     }
 }
 
-fn parse_record(body: &[u8]) -> Result<AnchorRecord, String> {
+fn parse_anchor(body: &[u8]) -> Result<(AnchorRecord, [u8; 32]), String> {
     let parsed: AnchorBody = serde_json::from_slice(body).map_err(|e| format!("body: {e}"))?;
     let bytes: [u8; ANCHOR_SIZE] = from_hex(&parsed.record)
         .map_err(|e| format!("record: {e}"))?
         .try_into()
         .map_err(|_| format!("record: expected {ANCHOR_SIZE} bytes"))?;
-    AnchorRecord::from_bytes(&bytes).map_err(|e| format!("record: {e}"))
+    let record = AnchorRecord::from_bytes(&bytes);
+    let ctx = match &parsed.ctx {
+        Some(hex) => from_hex(hex)
+            .map_err(|e| format!("ctx: {e}"))?
+            .try_into()
+            .map_err(|_| "ctx: expected 32 bytes".to_string())?,
+        None => opencsv_cli::ops::random_ctx(),
+    };
+    Ok((record, ctx))
 }
 
 fn error(status: u16, message: String) -> (u16, String) {
@@ -181,13 +203,36 @@ fn error(status: u16, message: String) -> (u16, String) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use opencsv_core::TruncatedDigest;
+    use opencsv_core::Digest;
+
+    /// Pick a ctx whose bound payload avoids the MINT/REDEEM tag bytes (see
+    /// opencsv-core's anchor docs).
+    fn non_colliding_ctx(raw: &Digest) -> [u8; 32] {
+        for s in 0u8..=255 {
+            let ctx = [s; 32];
+            let p = opencsv_core::binding(raw, &ctx).to_anchor();
+            if p.as_bytes()[0] != 0x01 && p.as_bytes()[0] != 0x04 {
+                return ctx;
+            }
+        }
+        panic!("no non-colliding ctx found");
+    }
+
+    fn raw_nf() -> Digest {
+        Digest::from_bytes([7u8; 32])
+    }
 
     fn record_hex() -> String {
-        let record = AnchorRecord::Xfer {
-            nullifier: TruncatedDigest([7u8; 24]),
-        };
+        let record = AnchorRecord::xfer(&[raw_nf()], &non_colliding_ctx(&raw_nf()));
         to_hex(&record.to_bytes())
+    }
+
+    fn anchor_body() -> String {
+        format!(
+            r#"{{"record":"{}","ctx":"{}"}}"#,
+            record_hex(),
+            to_hex(&non_colliding_ctx(&raw_nf()))
+        )
     }
 
     fn chain() -> (tempfile::TempDir, FileAnchorChain) {
@@ -204,13 +249,16 @@ mod tests {
         assert_eq!(status, 200);
         assert_eq!(body, r#"{"tip_height":0,"entries":[]}"#);
 
-        let post = format!(r#"{{"record":"{}"}}"#, record_hex());
-        let (status, body) = handle(&mut chain, 6, "POST", "/anchor", post.as_bytes());
+        let (status, body) = handle(&mut chain, 6, "POST", "/anchor", anchor_body().as_bytes());
         assert_eq!(status, 200, "{body}");
         let reply: serde_json::Value = serde_json::from_str(&body).expect("json");
         assert_eq!(reply["height"], 0);
         assert_eq!(reply["position"], 0);
         assert_eq!(reply["txid"].as_str().expect("txid").len(), 64);
+        assert_eq!(
+            reply["ctx"].as_str().expect("ctx"),
+            to_hex(&non_colliding_ctx(&raw_nf()))
+        );
 
         // Auto-advance moved the tip past the confirmation policy.
         let (status, body) = handle(&mut chain, 6, "GET", "/snapshot", b"");
@@ -220,6 +268,10 @@ mod tests {
         assert_eq!(
             snapshot["entries"][0]["record"].as_str(),
             Some(record_hex().as_str())
+        );
+        assert_eq!(
+            snapshot["entries"][0]["ctx"].as_str(),
+            Some(to_hex(&non_colliding_ctx(&raw_nf())).as_str())
         );
 
         // The snapshot parses back into the chain view opencsv-ffi uses.
@@ -233,6 +285,22 @@ mod tests {
         let reopened = FileAnchorChain::open(chain.path()).expect("reopen");
         assert_eq!(reopened.tip_height(), 10);
         assert_eq!(reopened.entries().count(), 1);
+    }
+
+    #[test]
+    fn anchor_without_ctx_draws_one() {
+        let (_dir, mut chain) = chain();
+        // A MINT record carries no payload, so a server-drawn ctx is fine.
+        let record = AnchorRecord::Mint {
+            asset_id: Digest::from_bytes([1u8; 32]).to_anchor(),
+            value: 100,
+            mint_commit: Digest::from_bytes([2u8; 32]).to_anchor(),
+        };
+        let post = format!(r#"{{"record":"{}"}}"#, to_hex(&record.to_bytes()));
+        let (status, body) = handle(&mut chain, 0, "POST", "/anchor", post.as_bytes());
+        assert_eq!(status, 200, "{body}");
+        let reply: serde_json::Value = serde_json::from_str(&body).expect("json");
+        assert_eq!(reply["ctx"].as_str().expect("ctx").len(), 64);
     }
 
     #[test]

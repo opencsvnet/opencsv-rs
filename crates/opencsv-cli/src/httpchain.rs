@@ -6,17 +6,23 @@
 //! (e.g. a phone wallet) shares the chain over HTTP, since concurrent
 //! writers on one chain *file* would desync the server's in-memory view.
 //!
+//! Snapshot entries carry each anchor's transaction context `ctx`; the
+//! client draws `ctx` itself before constructing a record (the bound
+//! payloads commit to it — see `opencsv-core`'s anchor docs) and posts it
+//! alongside the record. Nullifier occurrences are recognized client-side
+//! by scanning the snapshot and testing the binding against the raw
+//! nullifier.
+//!
 //! The client is deliberately dependency-free: a blocking HTTP/1.1 exchange
 //! over [`TcpStream`] with `Connection: close`, which the demo server
 //! honors. Not production transport — the demo server stands in for Bitcoin,
 //! and this client stands in for a node RPC.
 
-use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::TcpStream;
 
 use opencsv_core::chain::{AnchorChain, AnchorLocation, AnchorRef};
-use opencsv_core::{AnchorRecord, TruncatedDigest, ANCHOR_SIZE};
+use opencsv_core::{ANCHOR_SIZE, AnchorRecord, Digest};
 use serde::Deserialize;
 
 use crate::chain::AnchorWriter;
@@ -34,6 +40,7 @@ struct EntryJson {
     height: u64,
     position: u32,
     txid: String,
+    ctx: String,
     record: String,
 }
 
@@ -49,8 +56,7 @@ pub struct HttpAnchorChain {
     /// `host:port` of the server.
     authority: String,
     tip_height: u64,
-    entries: Vec<(AnchorRef, AnchorRecord)>,
-    nullifier_index: HashMap<TruncatedDigest, AnchorLocation>,
+    entries: Vec<(AnchorRef, AnchorRecord, [u8; 32])>,
 }
 
 impl HttpAnchorChain {
@@ -71,7 +77,6 @@ impl HttpAnchorChain {
             authority,
             tip_height: 0,
             entries: Vec::new(),
-            nullifier_index: HashMap::new(),
         };
         chain.refresh()?;
         Ok(chain)
@@ -86,11 +91,13 @@ impl HttpAnchorChain {
             let txid: [u8; 32] = from_hex(&e.txid)?
                 .try_into()
                 .map_err(|_| Error::Parse("snapshot txid is not 32 bytes".into()))?;
+            let ctx: [u8; 32] = from_hex(&e.ctx)?
+                .try_into()
+                .map_err(|_| Error::Parse("snapshot ctx is not 32 bytes".into()))?;
             let record_bytes: [u8; ANCHOR_SIZE] = from_hex(&e.record)?
                 .try_into()
                 .map_err(|_| Error::Parse("snapshot record is not 64 bytes".into()))?;
-            let record = AnchorRecord::from_bytes(&record_bytes)
-                .map_err(|err| Error::Parse(format!("snapshot record: {err}")))?;
+            let record = AnchorRecord::from_bytes(&record_bytes);
             let anchor_ref = AnchorRef {
                 txid,
                 location: AnchorLocation {
@@ -98,15 +105,9 @@ impl HttpAnchorChain {
                     position: e.position,
                 },
             };
-            entries.push((anchor_ref, record));
+            entries.push((anchor_ref, record, ctx));
         }
-        entries.sort_by_key(|(r, _)| r.location);
-        self.nullifier_index.clear();
-        for (r, record) in &entries {
-            for key in record.nullifier_keys() {
-                self.nullifier_index.entry(key).or_insert(r.location);
-            }
-        }
+        entries.sort_by_key(|(r, _, _)| r.location);
         self.tip_height = snapshot.tip_height;
         self.entries = entries;
         Ok(())
@@ -150,8 +151,12 @@ impl HttpAnchorChain {
 }
 
 impl AnchorWriter for HttpAnchorChain {
-    fn append(&mut self, record: AnchorRecord) -> Result<AnchorRef, Error> {
-        let body = format!(r#"{{"record":"{}"}}"#, to_hex(&record.to_bytes()));
+    fn append(&mut self, record: AnchorRecord, ctx: [u8; 32]) -> Result<AnchorRef, Error> {
+        let body = format!(
+            r#"{{"record":"{}","ctx":"{}"}}"#,
+            to_hex(&record.to_bytes()),
+            to_hex(&ctx)
+        );
         let reply = self.request("POST", "/anchor", Some(&body))?;
         let reply: AnchorReplyJson = serde_json::from_str(&reply)
             .map_err(|e| Error::Parse(format!("anchor server reply: {e}")))?;
@@ -178,27 +183,37 @@ impl AnchorChain for HttpAnchorChain {
     fn anchor_at(&self, anchor_ref: &AnchorRef) -> Option<AnchorRecord> {
         self.entries
             .iter()
-            .find(|(r, _)| r.location == anchor_ref.location && r.txid == anchor_ref.txid)
-            .map(|(_, record)| *record)
+            .find(|(r, _, _)| r.location == anchor_ref.location && r.txid == anchor_ref.txid)
+            .map(|(_, record, _)| *record)
     }
 
-    fn first_nullifier_occurrence(&self, key: &TruncatedDigest) -> Option<AnchorLocation> {
-        self.nullifier_index.get(key).copied()
-    }
-
-    fn nullifier_occurrences(&self, key: &TruncatedDigest) -> Vec<AnchorLocation> {
+    fn ctx_at(&self, anchor_ref: &AnchorRef) -> Option<[u8; 32]> {
         self.entries
             .iter()
-            .filter(|(_, record)| record.nullifier_keys().contains(key))
-            .map(|(r, _)| r.location)
-            .collect()
+            .find(|(r, _, _)| r.location == anchor_ref.location && r.txid == anchor_ref.txid)
+            .map(|(_, _, ctx)| *ctx)
+    }
+
+    fn first_nullifier_occurrence(&self, raw_nf: &Digest) -> Option<AnchorLocation> {
+        self.nullifier_occurrences(raw_nf).into_iter().next()
+    }
+
+    fn nullifier_occurrences(&self, raw_nf: &Digest) -> Vec<AnchorLocation> {
+        let mut locations: Vec<_> = self
+            .entries
+            .iter()
+            .filter(|(_, record, ctx)| record.well_formed(ctx, raw_nf))
+            .map(|(r, _, _)| r.location)
+            .collect();
+        locations.sort();
+        locations
     }
 
     fn anchors_up_to(&self, height: u64) -> Vec<(AnchorLocation, AnchorRecord)> {
         self.entries
             .iter()
-            .filter(|(r, _)| r.location.height <= height)
-            .map(|(r, record)| (r.location, *record))
+            .filter(|(r, _, _)| r.location.height <= height)
+            .map(|(r, record, _)| (r.location, *record))
             .collect()
     }
 }
@@ -231,10 +246,10 @@ impl ChainBackend {
 }
 
 impl AnchorWriter for ChainBackend {
-    fn append(&mut self, record: AnchorRecord) -> Result<AnchorRef, Error> {
+    fn append(&mut self, record: AnchorRecord, ctx: [u8; 32]) -> Result<AnchorRef, Error> {
         match self {
-            Self::File(c) => c.append(record),
-            Self::Http(c) => c.append(record),
+            Self::File(c) => c.append(record, ctx),
+            Self::Http(c) => c.append(record, ctx),
         }
     }
 }
@@ -254,17 +269,24 @@ impl AnchorChain for ChainBackend {
         }
     }
 
-    fn first_nullifier_occurrence(&self, key: &TruncatedDigest) -> Option<AnchorLocation> {
+    fn ctx_at(&self, anchor_ref: &AnchorRef) -> Option<[u8; 32]> {
         match self {
-            Self::File(c) => c.first_nullifier_occurrence(key),
-            Self::Http(c) => c.first_nullifier_occurrence(key),
+            Self::File(c) => c.ctx_at(anchor_ref),
+            Self::Http(c) => c.ctx_at(anchor_ref),
         }
     }
 
-    fn nullifier_occurrences(&self, key: &TruncatedDigest) -> Vec<AnchorLocation> {
+    fn first_nullifier_occurrence(&self, raw_nf: &Digest) -> Option<AnchorLocation> {
         match self {
-            Self::File(c) => c.nullifier_occurrences(key),
-            Self::Http(c) => c.nullifier_occurrences(key),
+            Self::File(c) => c.first_nullifier_occurrence(raw_nf),
+            Self::Http(c) => c.first_nullifier_occurrence(raw_nf),
+        }
+    }
+
+    fn nullifier_occurrences(&self, raw_nf: &Digest) -> Vec<AnchorLocation> {
+        match self {
+            Self::File(c) => c.nullifier_occurrences(raw_nf),
+            Self::Http(c) => c.nullifier_occurrences(raw_nf),
         }
     }
 

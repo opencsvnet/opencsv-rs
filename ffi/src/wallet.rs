@@ -8,9 +8,12 @@
 //!   [`MemWallet::verify`] (verification is milliseconds; proving is the
 //!   expensive part).
 //! - **No chain writer.** Producing a transaction is two-phase: a `prove_*`
-//!   call returns the 64-byte anchor record for the host to publish, and
-//!   [`MemWallet::finalize`] builds the consignment once the host knows
-//!   where the record anchored. The host never holds key material.
+//!   call returns the 64-byte anchor record **and the 32-byte transaction
+//!   context `ctx` it is bound to** (the record's payloads are
+//!   `H("bind" ∥ raw_nf ∥ ctx)` — see `opencsv-core`'s anchor docs) for the
+//!   host to publish together, and [`MemWallet::finalize`] builds the
+//!   consignment once the host knows where the record anchored. The host
+//!   never holds key material.
 //!
 //! Transfers support change: the first output amount pays the recipient,
 //! an optional second amount returns to this wallet's first owner key.
@@ -21,8 +24,8 @@ use opencsv_core::accept::{accept, AcceptParams};
 use opencsv_core::chain::{AnchorChain, AnchorRef};
 use opencsv_core::consignment::{CoinOpening, Consignment};
 use opencsv_core::{
-    mint_commit, mint_signing_message, nullifier_commit, AnchorRecord, AssetGenesis, AssetId, Coin,
-    Digest, Ed25519IssuerSignature, IssuerSignature, Owner, OwnerSecret,
+    AnchorRecord, AssetGenesis, AssetId, Coin, Digest, Ed25519IssuerSignature, IssuerSignature,
+    Owner, OwnerSecret, mint_commit, mint_signing_message,
 };
 use opencsv_pcd::{decode_coin_proof, encode_coin_proof, NODE_INPUTS, NODE_OUTPUTS};
 use rand::RngExt;
@@ -40,6 +43,31 @@ pub type OpError = String;
 
 fn random_digest() -> Digest {
     Digest::from_bytes(rand::rng().random())
+}
+
+/// A fresh random anchor transaction context (synthetic outpoint), drawn
+/// *before* constructing a nullifier-bearing record: the record's bound
+/// payloads commit to it.
+fn random_ctx() -> [u8; 32] {
+    rand::rng().random()
+}
+
+/// Draw a transaction context and build the XFER record binding
+/// `nullifiers` to it, redrawing if the bound payload's first byte collides
+/// with the MINT/REDEEM tag bytes (such a record would misparse as tagged
+/// for every verifier — see `opencsv-core`'s anchor docs).
+fn fresh_xfer_record(nullifiers: &[Digest]) -> (AnchorRecord, [u8; 32]) {
+    loop {
+        let ctx = random_ctx();
+        let record = AnchorRecord::xfer(nullifiers, &ctx);
+        let parsed = AnchorRecord::from_bytes(&record.to_bytes());
+        if matches!(
+            parsed,
+            AnchorRecord::Xfer { .. } | AnchorRecord::XferCompressed { .. }
+        ) {
+            return (record, ctx);
+        }
+    }
 }
 
 /// An issuer keypair plus the asset genesis it controls.
@@ -76,6 +104,9 @@ impl StoredCoin {
 /// A proved-but-not-yet-anchored transaction awaiting [`MemWallet::finalize`].
 struct Pending {
     openings: Vec<CoinOpening>,
+    /// Raw nullifiers of the consumed coins (empty for mints) — they travel
+    /// only in the consignment, never on-chain.
+    nullifiers: Vec<Digest>,
     proof: Vec<u8>,
     aux: Option<AssetGenesis>,
     /// Coin ids consumed by this transaction, marked spent at finalize.
@@ -180,13 +211,17 @@ pub struct MemWallet {
     next_pending: u64,
 }
 
-/// Result of a `prove_*` call: the anchor record to publish plus the pending
-/// transaction id to [`MemWallet::finalize`] once it anchors.
+/// Result of a `prove_*` call: the anchor record and its transaction
+/// context to publish, plus the pending transaction id to
+/// [`MemWallet::finalize`] once it anchors.
 pub struct Proved {
     /// Pending-transaction id.
     pub pending_id: u64,
     /// The 64-byte anchor record, for the host to publish.
     pub anchor_record: [u8; 64],
+    /// The 32-byte transaction context the record's payloads are bound to;
+    /// the host publishes it alongside the record (`POST /anchor`).
+    pub ctx: [u8; 32],
     /// Coin ids this transaction will consume (empty for mints).
     pub spends: Vec<String>,
 }
@@ -370,11 +405,15 @@ impl MemWallet {
             mint_commit: mint_commit(&asset_id, total, &mint_nonce).to_anchor(),
         };
         Ok(self.push_pending(
-            openings_of(&outputs),
-            encode_coin_proof(&proof),
-            Some(issuer.genesis),
-            Vec::new(),
+            Pending {
+                openings: openings_of(&outputs),
+                nullifiers: Vec::new(),
+                proof: encode_coin_proof(&proof),
+                aux: Some(issuer.genesis),
+                spent_ids: Vec::new(),
+            },
             record,
+            random_ctx(),
         ))
     }
 
@@ -445,16 +484,32 @@ impl MemWallet {
         )
         .map_err(|e| e.to_string())?;
 
-        let record = AnchorRecord::XferCompressed {
-            nullifier_commit: nullifier_commit(&proof.statement.nullifiers).to_anchor(),
-        };
+        // The raw nullifiers travel only in the consignment; the anchor
+        // publishes bound payloads `H("bind" ∥ nf ∥ ctx)`. The 2-in circuit
+        // fits XFER's two payload slots directly.
+        let zero = Digest::from_bytes([0u8; 32]);
+        let nullifiers: Vec<Digest> = proof
+            .statement
+            .nullifiers
+            .iter()
+            .copied()
+            .filter(|nf| *nf != zero)
+            .collect();
+        if nullifiers.is_empty() {
+            return Err("transfer statement has no nullifiers".into());
+        }
+        let (record, ctx) = fresh_xfer_record(&nullifiers);
         let aux = self.find_genesis(&asset_id).cloned();
         Ok(self.push_pending(
-            openings_of(&outputs),
-            encode_coin_proof(&proof),
-            aux,
-            ids,
+            Pending {
+                openings: openings_of(&outputs),
+                nullifiers,
+                proof: encode_coin_proof(&proof),
+                aux,
+                spent_ids: ids,
+            },
             record,
+            ctx,
         ))
     }
 
@@ -474,13 +529,20 @@ impl MemWallet {
             opencsv_pcd::prove_redeem(&coin.asset_id, &(coin, osk), &predecessor, stored.selector)
                 .map_err(|e| e.to_string())?;
 
-        let record = AnchorRecord::Redeem {
-            asset_id: coin.asset_id.to_anchor(),
-            value: coin.value,
-            nullifier: proof.statement.nullifiers[0].to_anchor(),
-        };
-        let ids = vec![stored.id()];
-        Ok(self.push_pending(Vec::new(), encode_coin_proof(&proof), None, ids, record))
+        let ctx = random_ctx();
+        let raw_nf = proof.statement.nullifiers[0];
+        let record = AnchorRecord::redeem(coin.asset_id.to_anchor(), coin.value, &raw_nf, &ctx);
+        Ok(self.push_pending(
+            Pending {
+                openings: Vec::new(),
+                nullifiers: vec![raw_nf],
+                proof: encode_coin_proof(&proof),
+                aux: None,
+                spent_ids: vec![stored.id()],
+            },
+            record,
+            ctx,
+        ))
     }
 
     /// Build the consignment for a proved transaction once the host knows
@@ -497,6 +559,7 @@ impl MemWallet {
             .ok_or_else(|| format!("unknown pending transaction {pending_id}"))?;
         let consignment = Consignment {
             coin_openings: pending.openings,
+            nullifiers: pending.nullifiers,
             proof: pending.proof,
             anchor_ref,
             aux: pending.aux,
@@ -590,29 +653,15 @@ impl MemWallet {
 
     // -- internals ---------------------------------------------------------
 
-    fn push_pending(
-        &mut self,
-        openings: Vec<CoinOpening>,
-        proof: Vec<u8>,
-        aux: Option<AssetGenesis>,
-        spent_ids: Vec<String>,
-        record: AnchorRecord,
-    ) -> Proved {
+    fn push_pending(&mut self, pending: Pending, record: AnchorRecord, ctx: [u8; 32]) -> Proved {
         let pending_id = self.next_pending;
         self.next_pending += 1;
-        let spends = spent_ids.clone();
-        self.pending.insert(
-            pending_id,
-            Pending {
-                openings,
-                proof,
-                aux,
-                spent_ids,
-            },
-        );
+        let spends = pending.spent_ids.clone();
+        self.pending.insert(pending_id, pending);
         Proved {
             pending_id,
             anchor_record: record.to_bytes(),
+            ctx,
             spends,
         }
     }

@@ -19,8 +19,7 @@ use opencsv_core::accept::{accept, AcceptParams, ProofVerifier};
 use opencsv_core::chain::{AnchorChain, AnchorLocation};
 use opencsv_core::consignment::{CoinOpening, Consignment};
 use opencsv_core::{
-    mint_commit, nullifier_commit, AnchorRecord, AssetId, Coin, Digest, Owner, OwnerSecret,
-    RejectReason,
+    AnchorRecord, AssetId, Coin, Digest, Owner, OwnerSecret, RejectReason, mint_commit,
 };
 use opencsv_core::{mint_signing_message, Ed25519IssuerSignature, IssuerSignature};
 use opencsv_pcd::{decode_coin_proof, encode_coin_proof, NODE_INPUTS, NODE_OUTPUTS};
@@ -41,6 +40,30 @@ pub const DEFAULT_CONFIRMATIONS: u64 = 6;
 /// 32 bytes of fresh randomness as a digest.
 pub fn random_digest() -> Digest {
     Digest::from_bytes(rand::rng().random())
+}
+
+/// A fresh random anchor transaction context (synthetic outpoint). Drawn
+/// *before* constructing a nullifier-bearing anchor record: the record's
+/// bound payloads `H("bind" ∥ nf ∥ ctx)` commit to it (see `opencsv-core`'s
+/// anchor docs).
+pub fn random_ctx() -> [u8; 32] {
+    rand::rng().random()
+}
+
+/// Draw a ctx and build the XFER record binding `nullifiers` to it,
+/// redrawing if the bound payload's first byte collides with the MINT/REDEEM
+/// tag bytes (such a record would misparse as tagged for every verifier —
+/// see `opencsv-core`'s anchor docs; ~0.8% of draws, so this loop is
+/// expected to exit on the first iteration).
+fn fresh_xfer_record(nullifiers: &[Digest]) -> (AnchorRecord, [u8; 32]) {
+    loop {
+        let ctx = random_ctx();
+        let record = AnchorRecord::xfer(nullifiers, &ctx);
+        let parsed = AnchorRecord::from_bytes(&record.to_bytes());
+        if matches!(parsed, AnchorRecord::Xfer { .. } | AnchorRecord::XferCompressed { .. }) {
+            return (record, ctx);
+        }
+    }
 }
 
 /// Create a new owner identity, returning its public key (`owner = H(osk)`).
@@ -131,9 +154,10 @@ pub fn mint<C: AnchorWriter>(
         value: total,
         mint_commit: mint_commit(asset_id, total, &mint_nonce).to_anchor(),
     };
-    let anchor = chain.append(record)?;
+    let anchor = chain.append(record, random_ctx())?;
     let consignment = Consignment {
         coin_openings: openings_of(&outputs),
+        nullifiers: vec![],
         proof: encode_coin_proof(&proof),
         anchor_ref: anchor,
         aux: Some(issuer.genesis),
@@ -212,12 +236,26 @@ pub fn send<C: AnchorWriter>(
         [stored[0].selector, stored[1].selector],
     )?;
 
-    let record = AnchorRecord::XferCompressed {
-        nullifier_commit: nullifier_commit(&proof.statement.nullifiers).to_anchor(),
-    };
-    let anchor = chain.append(record)?;
+    // The raw nullifiers travel only in the consignment; the anchor
+    // publishes bound payloads `H("bind" ∥ nf ∥ ctx)` (anti-grief, see
+    // `opencsv-core`'s anchor docs). The 2-in circuit fits XFER's two
+    // payload slots directly.
+    let zero = Digest::from_bytes([0u8; 32]);
+    let nullifiers: Vec<Digest> = proof
+        .statement
+        .nullifiers
+        .iter()
+        .copied()
+        .filter(|nf| *nf != zero)
+        .collect();
+    if nullifiers.is_empty() {
+        return Err(Error::Internal("transfer statement has no nullifiers"));
+    }
+    let (record, ctx) = fresh_xfer_record(&nullifiers);
+    let anchor = chain.append(record, ctx)?;
     let consignment = Consignment {
         coin_openings: openings_of(&outputs),
+        nullifiers,
         proof: encode_coin_proof(&proof),
         anchor_ref: anchor,
         aux: wallet.find_genesis(&asset_id).cloned(),
@@ -251,14 +289,13 @@ pub fn redeem<C: AnchorWriter>(
     let proof =
         opencsv_pcd::prove_redeem(&coin.asset_id, &(coin, osk), &predecessor, stored.selector)?;
 
-    let record = AnchorRecord::Redeem {
-        asset_id: coin.asset_id.to_anchor(),
-        value: coin.value,
-        nullifier: proof.statement.nullifiers[0].to_anchor(),
-    };
-    let anchor = chain.append(record)?;
+    let ctx = random_ctx();
+    let raw_nf = proof.statement.nullifiers[0];
+    let record = AnchorRecord::redeem(coin.asset_id.to_anchor(), coin.value, &raw_nf, &ctx);
+    let anchor = chain.append(record, ctx)?;
     let consignment = Consignment {
         coin_openings: vec![],
+        nullifiers: vec![raw_nf],
         proof: encode_coin_proof(&proof),
         anchor_ref: anchor,
         aux: None,

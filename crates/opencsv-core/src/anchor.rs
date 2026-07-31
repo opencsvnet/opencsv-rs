@@ -1,32 +1,90 @@
-//! On-chain anchor records (paper §4.4–4.7).
+//! On-chain anchor records (paper §4.4–4.7, amended: bound payloads).
 //!
 //! Every anchor serializes to exactly [`ANCHOR_SIZE`] (64) bytes, carried in
 //! an OP_RETURN (or equivalent data-carrier output) of an ordinary Bitcoin
-//! transaction. Byte 0 is a domain tag; digests are carried as 24-byte
-//! [`TruncatedDigest`] prefixes (see [`crate::digest`]); multi-byte integers
-//! are little-endian; all remaining bytes are zero and *must* be zero for the
-//! record to parse.
+//! transaction. Digests are carried as 24-byte [`TruncatedDigest`] prefixes
+//! (see [`crate::digest`]); multi-byte integers are little-endian.
+//!
+//! ## Bound payloads (anti-grief)
+//!
+//! Anchor records are copyable bytes: a mempool spy can copy a record into
+//! their own transaction and get it mined first, and a naive
+//! first-occurrence rule (paper §4.7 rule 1) would then treat the *copy* as
+//! the authoritative spend, freezing the victim's coins. Binding the record
+//! to its transaction context via a *sidecar* hash does not help: any
+//! sidecar `B = H(nf ∥ ctx)` is publicly recomputable from the on-chain
+//! `nf`, so the spy can simply forge a "well-formed" record. Instead, the
+//! on-chain nullifier payload **is** the bound value:
+//!
+//! ```text
+//! P = H("bind" ∥ raw_nf ∥ ctx)
+//! ```
+//!
+//! where `ctx` (32 bytes) identifies the anchor transaction's context — in
+//! production the funding input's outpoint; in the mock/file chains a
+//! synthetic outpoint chosen by the anchoring party before the record is
+//! constructed (see [`crate::chain`]). The **raw nullifier never appears
+//! on-chain**; it travels in the consignment (it is already part of the PCD
+//! statement, which is off-chain). A byte-copied record therefore publishes
+//! a payload bound to the *victim's* `ctx`: it is not an occurrence of the
+//! nullifier under the copier's `ctx`, and a consignment pointing at the
+//! copy fails the accept driver's binding check (see [`crate::accept`]).
+//! And because `ctx` is committed inside `P`, the spy cannot rebind the
+//! payload without knowing `raw_nf` — which only the consignment holders
+//! have. Occurrence recognition is likewise restricted to consignment
+//! holders (see [`crate::chain`]); that privacy is intended.
+//!
+//! ## Camouflage
+//!
+//! Transfer records (XFER/XFERC) are **untagged**: opaque 64-byte strings,
+//! indistinguishable from arbitrary OP_RETURN traffic. MINT and REDEEM keep
+//! their tag bytes because they are intentionally public — the supply audit
+//! (paper §4.9) must recognize them — so tagging them costs no privacy,
+//! while tagging transfers would mark exactly the traffic that wants to be
+//! private.
 //!
 //! Layouts:
 //!
 //! ```text
-//! MINT   [0x01][asset_id:24][V:8][mint_commit:24][pad:7]   (§4.4)
-//! XFER   [0x02][nf:24][pad:39]                             (§4.5, m = 1)
-//! XFERC  [0x03][nf_commit:24][pad:39]                      (§4.5, m > 1)
-//! REDEEM [0x04][asset_id:24][V:8][nf:24][pad:7]            (§4.6)
+//! MINT   [0x01][asset_id:24][V:8][mint_commit:24][pad:7]   (§4.4, unchanged)
+//! XFER   [P_1:24][P_2:24][pad:16]                          (§4.5, m ≤ 2, untagged)
+//! XFERC  [P:24][0:24][pad:16]                              (§4.5, m > 2, untagged)
+//! REDEEM [0x04][asset_id:24][V:8][P:24][pad:7]             (§4.6)
 //! ```
+//!
+//! XFER carries one bound payload per consumed coin (`P_2 = 0` when `m =
+//! 1`); XFERC carries the single bound nullifier commitment `P = H("bind" ∥
+//! nf_commit ∥ ctx)` for `m > 2` inputs, the full nullifier list travelling
+//! in the consignment.
+//!
+//! ## Parsing
+//!
+//! If the first byte is a known tag (MINT/REDEEM) *and* the tagged record's
+//! padding is valid, the record parses as tagged; anything else parses as an
+//! untagged transfer candidate. Parsing never fails: any 64-byte string is
+//! at worst an untagged transfer candidate (arbitrary OP_RETURN traffic must
+//! parse for the camouflage to hold). XFER and XFERC share one layout, so
+//! parsing cannot tell bound nullifiers from a bound commitment (the
+//! consignment resolves which it is); [`AnchorRecord::from_bytes`] yields
+//! [`AnchorRecord::Xfer`] for both and consumers must treat the payload
+//! slots generically.
+//!
+//! One wrinkle: a transfer whose first payload byte collides with the
+//! MINT/REDEEM tags (~0.8%) is byte-wise a valid tagged record and misparses
+//! for *every* verifier. Because the anchoring party chooses `ctx` freely,
+//! it SHOULD simply redraw `ctx` until the bound payload avoids the tag
+//! bytes (the CLI does this); a production deployment should enforce the
+//! same at anchor time.
 
 use crate::asset::AssetId;
 use crate::coin::Nullifier;
 use crate::digest::{Digest, TRUNCATED_DIGEST_BYTES, TruncatedDigest};
-use crate::field::hash_felts;
+use crate::field::{bytes_to_felts, hash_felts};
 
 /// Exact byte length of every serialized anchor record.
 pub const ANCHOR_SIZE: usize = 64;
 
 const TAG_MINT: u8 = 0x01;
-const TAG_XFER: u8 = 0x02;
-const TAG_XFER_COMPRESSED: u8 = 0x03;
 const TAG_REDEEM: u8 = 0x04;
 
 /// `mint_commit = H("mint" ∥ asset_id ∥ V ∥ mint_nonce)` (paper §4.4).
@@ -41,8 +99,8 @@ pub fn mint_commit(asset_id: &AssetId, value: u64, mint_nonce: &Digest) -> Diges
     )
 }
 
-/// `nf_commit = H("xfer" ∥ nf_1 ∥ … ∥ nf_m)` — the hash-compressed anchor
-/// payload for transfers with `m > 1` consumed coins (paper §4.5). The full
+/// `nf_commit = H("xfer" ∥ nf_1 ∥ … ∥ nf_m)` — the hash-compressed nullifier
+/// payload for transfers with `m > 2` consumed coins (paper §4.5). The full
 /// nullifier list travels in the consignment.
 pub fn nullifier_commit(nullifiers: &[Nullifier]) -> Digest {
     let elems: Vec<p3_baby_bear::BabyBear> = nullifiers
@@ -52,7 +110,15 @@ pub fn nullifier_commit(nullifiers: &[Nullifier]) -> Digest {
     hash_felts("xfer", &[&elems])
 }
 
-/// An OpenCSV anchor record (paper §4.4–4.6).
+/// `P = H("bind" ∥ raw ∥ ctx)` — the transaction-context binding of a raw
+/// nullifier (or nullifier commitment) under context `ctx` (see module
+/// docs). Records carry the 24-byte prefix ([`Digest::to_anchor`]) of this
+/// digest as their payload; the raw value never appears on-chain.
+pub fn binding(raw: &Digest, ctx: &[u8; 32]) -> Digest {
+    hash_felts("bind", &[&raw.to_elems(), &bytes_to_felts(ctx)])
+}
+
+/// An OpenCSV anchor record (paper §4.4–4.6, amended: bound payloads).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AnchorRecord {
     /// `MINT ∥ asset_id ∥ V ∥ mint_commit` — transparent mint (§4.4).
@@ -64,49 +130,100 @@ pub enum AnchorRecord {
         /// `H("mint" ∥ asset_id ∥ V ∥ mint_nonce)`, binding the mint nonce.
         mint_commit: TruncatedDigest,
     },
-    /// `XFER ∥ nf` — shielded transfer consuming exactly one coin (§4.5).
+    /// `P_1 ∥ P_2` — shielded transfer consuming `m ≤ 2` coins (§4.5).
+    /// Untagged (camouflage): 64 opaque bytes, see module docs. `P_i =
+    /// H("bind" ∥ nf_i ∥ ctx)`; the second slot is zero when `m = 1`.
     Xfer {
-        /// Nullifier of the consumed coin.
-        nullifier: TruncatedDigest,
+        /// Bound nullifier payloads of the consumed coins, in statement
+        /// order; `payloads[1]` is zero for single-input transfers.
+        payloads: [TruncatedDigest; 2],
     },
-    /// `XFER ∥ H(nf_1 ∥ … ∥ nf_m)` — shielded transfer with `m > 1` inputs,
-    /// hash-compressed to fit the 64-byte budget (§4.5).
+    /// `P ∥ 0` — shielded transfer with `m > 2` inputs, the nullifier list
+    /// hash-compressed to fit the 64-byte budget (§4.5). `P = H("bind" ∥
+    /// nf_commit ∥ ctx)`. Same untagged layout as [`AnchorRecord::Xfer`];
+    /// parsing cannot tell the two apart.
     XferCompressed {
-        /// Commitment to the full nullifier list (carried in the consignment).
+        /// Bound commitment to the full nullifier list (the raw list is
+        /// carried in the consignment).
         nullifier_commit: TruncatedDigest,
     },
-    /// `REDEEM ∥ asset_id ∥ V ∥ nf` — transparent burn back to the issuer (§4.6).
+    /// `REDEEM ∥ asset_id ∥ V ∥ P` — transparent burn back to the issuer
+    /// (§4.6). Tagged (public by design, for the supply audit). `P =
+    /// H("bind" ∥ nf ∥ ctx)`.
     Redeem {
         /// Asset being redeemed.
         asset_id: TruncatedDigest,
         /// Redeemed value `V` (public at burn time).
         value: u64,
-        /// Nullifier of the destroyed coin.
-        nullifier: TruncatedDigest,
+        /// Bound nullifier payload of the destroyed coin.
+        payload: TruncatedDigest,
     },
 }
 
-/// Error returned when parsing a malformed 64-byte anchor record.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum AnchorParseError {
-    /// Byte 0 is not a known anchor tag.
-    UnknownTag(u8),
-    /// Bytes past the record's payload are non-zero.
-    NonZeroPadding,
-}
-
-impl std::fmt::Display for AnchorParseError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::UnknownTag(t) => write!(f, "unknown anchor tag byte 0x{t:02x}"),
-            Self::NonZeroPadding => write!(f, "non-zero anchor padding"),
+impl AnchorRecord {
+    /// An [`AnchorRecord::Xfer`] binding `raw_nullifiers` (1–2 of them) to
+    /// transaction context `ctx`.
+    pub fn xfer(raw_nullifiers: &[Digest], ctx: &[u8; 32]) -> Self {
+        assert!(
+            (1..=2).contains(&raw_nullifiers.len()),
+            "XFER carries 1–2 bound nullifiers"
+        );
+        let bound = |nf: &Digest| binding(nf, ctx).to_anchor();
+        Self::Xfer {
+            payloads: [
+                bound(&raw_nullifiers[0]),
+                raw_nullifiers.get(1).map_or(TruncatedDigest([0u8; 24]), bound),
+            ],
         }
     }
-}
 
-impl std::error::Error for AnchorParseError {}
+    /// An [`AnchorRecord::XferCompressed`] binding the nullifier commitment
+    /// `raw_nf_commit` (see [`nullifier_commit`]) to transaction context
+    /// `ctx`.
+    pub fn xfer_compressed(raw_nf_commit: &Digest, ctx: &[u8; 32]) -> Self {
+        Self::XferCompressed {
+            nullifier_commit: binding(raw_nf_commit, ctx).to_anchor(),
+        }
+    }
 
-impl AnchorRecord {
+    /// An [`AnchorRecord::Redeem`] binding `raw_nf` to transaction context
+    /// `ctx`.
+    pub fn redeem(
+        asset_id: TruncatedDigest,
+        value: u64,
+        raw_nf: &Digest,
+        ctx: &[u8; 32],
+    ) -> Self {
+        Self::Redeem {
+            asset_id,
+            value,
+            payload: binding(raw_nf, ctx).to_anchor(),
+        }
+    }
+
+    /// The on-chain payload slots this record carries (bound values; MINT
+    /// has none, XFERC's second slot is always zero and omitted).
+    pub fn payload_slots(&self) -> Vec<TruncatedDigest> {
+        match self {
+            Self::Mint { .. } => vec![],
+            Self::Xfer { payloads } => payloads.to_vec(),
+            Self::XferCompressed {
+                nullifier_commit, ..
+            } => vec![*nullifier_commit],
+            Self::Redeem { payload, .. } => vec![*payload],
+        }
+    }
+
+    /// Occurrence test / well-formedness relative to a raw nullifier
+    /// supplied by the verifier (module docs): does some payload slot of
+    /// this record equal `H("bind" ∥ raw_nf ∥ ctx)`? Only someone holding
+    /// `raw_nf` (the consignment holders) can evaluate this — by design.
+    /// For XFERC records, pass the raw nullifier *commitment*.
+    pub fn well_formed(&self, ctx: &[u8; 32], raw_nf: &Digest) -> bool {
+        let bound = binding(raw_nf, ctx).to_anchor();
+        self.payload_slots().contains(&bound)
+    }
+
     /// Serialize to exactly 64 bytes.
     pub fn to_bytes(&self) -> [u8; ANCHOR_SIZE] {
         let mut out = [0u8; ANCHOR_SIZE];
@@ -115,90 +232,61 @@ impl AnchorRecord {
                 asset_id,
                 value,
                 mint_commit,
-            }
-            | Self::Redeem {
-                asset_id,
-                value,
-                nullifier: mint_commit,
             } => {
-                out[0] = match self {
-                    Self::Mint { .. } => TAG_MINT,
-                    _ => TAG_REDEEM,
-                };
+                out[0] = TAG_MINT;
                 out[1..25].copy_from_slice(asset_id.as_bytes());
                 out[25..33].copy_from_slice(&value.to_le_bytes());
                 out[33..57].copy_from_slice(mint_commit.as_bytes());
             }
-            Self::Xfer { nullifier } => {
-                out[0] = TAG_XFER;
-                out[1..25].copy_from_slice(nullifier.as_bytes());
+            Self::Redeem {
+                asset_id,
+                value,
+                payload,
+            } => {
+                out[0] = TAG_REDEEM;
+                out[1..25].copy_from_slice(asset_id.as_bytes());
+                out[25..33].copy_from_slice(&value.to_le_bytes());
+                out[33..57].copy_from_slice(payload.as_bytes());
             }
-            Self::XferCompressed { nullifier_commit } => {
-                out[0] = TAG_XFER_COMPRESSED;
-                out[1..25].copy_from_slice(nullifier_commit.as_bytes());
+            Self::Xfer { payloads } => {
+                out[0..24].copy_from_slice(payloads[0].as_bytes());
+                out[24..48].copy_from_slice(payloads[1].as_bytes());
+            }
+            Self::XferCompressed {
+                nullifier_commit, ..
+            } => {
+                out[0..24].copy_from_slice(nullifier_commit.as_bytes());
             }
         }
         out
     }
 
-    /// Parse a 64-byte anchor record, rejecting unknown tags and non-zero
-    /// padding.
-    pub fn from_bytes(bytes: &[u8; ANCHOR_SIZE]) -> Result<Self, AnchorParseError> {
+    /// Parse a 64-byte anchor record (see module docs for the rules). Never
+    /// fails: any 64-byte string is at worst an untagged transfer candidate.
+    pub fn from_bytes(bytes: &[u8; ANCHOR_SIZE]) -> Self {
         let td = |range: std::ops::Range<usize>| {
             let mut b = [0u8; TRUNCATED_DIGEST_BYTES];
             b.copy_from_slice(&bytes[range]);
             TruncatedDigest(b)
         };
-        let check_padding = |from: usize| {
-            if bytes[from..].iter().all(|&b| b == 0) {
-                Ok(())
-            } else {
-                Err(AnchorParseError::NonZeroPadding)
-            }
-        };
+        let padded = |from: usize| bytes[from..].iter().all(|&b| b == 0);
         match bytes[0] {
-            TAG_MINT => {
-                check_padding(57)?;
-                Ok(Self::Mint {
-                    asset_id: td(1..25),
-                    value: u64::from_le_bytes(bytes[25..33].try_into().expect("8 bytes")),
-                    mint_commit: td(33..57),
-                })
-            }
-            TAG_REDEEM => {
-                check_padding(57)?;
-                Ok(Self::Redeem {
-                    asset_id: td(1..25),
-                    value: u64::from_le_bytes(bytes[25..33].try_into().expect("8 bytes")),
-                    nullifier: td(33..57),
-                })
-            }
-            TAG_XFER => {
-                check_padding(25)?;
-                Ok(Self::Xfer {
-                    nullifier: td(1..25),
-                })
-            }
-            TAG_XFER_COMPRESSED => {
-                check_padding(25)?;
-                Ok(Self::XferCompressed {
-                    nullifier_commit: td(1..25),
-                })
-            }
-            tag => Err(AnchorParseError::UnknownTag(tag)),
-        }
-    }
-
-    /// The nullifier keys this record publishes, used for first-occurrence
-    /// indexing (paper §4.7). Mints publish none; a compressed transfer is
-    /// indexed under its nullifier commitment (resolving the individual
-    /// nullifiers requires the off-chain list from the consignment).
-    pub fn nullifier_keys(&self) -> Vec<TruncatedDigest> {
-        match self {
-            Self::Mint { .. } => vec![],
-            Self::Xfer { nullifier } => vec![*nullifier],
-            Self::XferCompressed { nullifier_commit } => vec![*nullifier_commit],
-            Self::Redeem { nullifier, .. } => vec![*nullifier],
+            TAG_MINT if padded(57) => Self::Mint {
+                asset_id: td(1..25),
+                value: u64::from_le_bytes(bytes[25..33].try_into().expect("8 bytes")),
+                mint_commit: td(33..57),
+            },
+            TAG_REDEEM if padded(57) => Self::Redeem {
+                asset_id: td(1..25),
+                value: u64::from_le_bytes(bytes[25..33].try_into().expect("8 bytes")),
+                payload: td(33..57),
+            },
+            // Untagged transfer candidate (camouflage; module docs). XFER
+            // and XFERC share this layout; the canonical parse is `Xfer`.
+            // Trailing bytes are opaque padding and left unchecked.
+            _ => Self::Xfer {
+                payloads: [td(0..24), td(24..48)],
+            },
         }
     }
 }

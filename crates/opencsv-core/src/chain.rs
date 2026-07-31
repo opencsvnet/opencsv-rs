@@ -4,14 +4,30 @@
 //! anchored payloads from `bitcoind` RPC; [`MockAnchorChain`] is an in-memory
 //! append-only ordered log for tests. Ordering is `(block_height, position)`
 //! — block order, then in-block order — and *first occurrence wins* for any
-//! nullifier key (paper §4.7 rule 1).
+//! nullifier (paper §4.7 rule 1).
+//!
+//! ## Transaction context (`ctx`) and occurrence recognition
+//!
+//! Every anchor carries a 32-byte transaction context: in production the
+//! funding input's outpoint of the anchor transaction; here, a synthetic
+//! random outpoint per entry. On-chain records publish only **bound
+//! payloads** `P = H("bind" ∥ raw_nf ∥ ctx)` — never raw nullifiers (see
+//! [`crate::anchor`]). Occurrence queries therefore take the *raw*
+//! nullifier: an occurrence of `raw_nf` is an entry whose record satisfies
+//! [`AnchorRecord::well_formed`] under the entry's own `ctx`. Only the
+//! coin's consignment holders (who know `raw_nf`) can recognize occurrences
+//! — that privacy is intended: chain watchers see unlinkable bound payloads,
+//! and a byte-copied record (bound to the victim's `ctx`) is an occurrence
+//! under nobody's `ctx` but the victim's, so copy-griefing cannot reorder
+//! the victim's spend. A genuine double-spend — two anchors, each binding
+//! the same `raw_nf` under its own `ctx` — is still detected: the first
+//! occurrence wins.
 
-use std::collections::HashMap;
-
+use rand::RngExt;
 use serde::{Deserialize, Serialize};
 
 use crate::anchor::AnchorRecord;
-use crate::digest::TruncatedDigest;
+use crate::digest::Digest;
 use crate::field::{felt, hash_felts};
 
 /// Location of an anchor in the canonical chain order (paper §4.7).
@@ -45,14 +61,22 @@ pub trait AnchorChain {
     /// position").
     fn anchor_at(&self, anchor_ref: &AnchorRef) -> Option<AnchorRecord>;
 
-    /// The first occurrence of a nullifier key in canonical chain order, if
-    /// any (paper §4.7 rule 1). See [`AnchorRecord::nullifier_keys`].
-    fn first_nullifier_occurrence(&self, key: &TruncatedDigest) -> Option<AnchorLocation>;
+    /// The 32-byte transaction context of the anchor at the referenced
+    /// location (in production: the funding input's outpoint of the anchor
+    /// transaction), needed to evaluate [`AnchorRecord::well_formed`].
+    /// Returns `None` under the same conditions as [`AnchorChain::anchor_at`].
+    fn ctx_at(&self, anchor_ref: &AnchorRef) -> Option<[u8; 32]>;
 
-    /// All occurrences of a nullifier key in canonical chain order. More
+    /// The first occurrence of a raw nullifier in canonical chain order, if
+    /// any (paper §4.7 rule 1): an entry whose record binds `raw_nf` under
+    /// the entry's `ctx` (see module docs). For compressed transfers, query
+    /// the raw nullifier *commitment*.
+    fn first_nullifier_occurrence(&self, raw_nf: &Digest) -> Option<AnchorLocation>;
+
+    /// All occurrences of a raw nullifier in canonical chain order. More
     /// than one entry means a (failed, by rule 1) double-spend attempt is
-    /// observable on-chain (paper §4.3, §5.2).
-    fn nullifier_occurrences(&self, key: &TruncatedDigest) -> Vec<AnchorLocation>;
+    /// observable — but only to holders of `raw_nf` (see module docs).
+    fn nullifier_occurrences(&self, raw_nf: &Digest) -> Vec<AnchorLocation>;
 
     /// All anchors at or below `height`, in canonical order. Used by the
     /// supply audit (paper §4.9).
@@ -74,8 +98,6 @@ pub trait AnchorChain {
 pub struct MockAnchorChain {
     tip_height: u64,
     entries: Vec<Entry>,
-    /// First occurrence per nullifier key (never overwritten).
-    nullifier_index: HashMap<TruncatedDigest, AnchorLocation>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -83,6 +105,7 @@ struct Entry {
     txid: [u8; 32],
     location: AnchorLocation,
     record: AnchorRecord,
+    ctx: [u8; 32],
 }
 
 impl MockAnchorChain {
@@ -96,10 +119,31 @@ impl MockAnchorChain {
         self.tip_height = self.tip_height.saturating_add(n);
     }
 
-    /// Append a record to the current tip block, returning a reference to its
-    /// location. The transaction ID is derived deterministically from the
-    /// entry's ordinal in the log.
+    /// A fresh random transaction context (synthetic outpoint). The
+    /// anchoring party draws this *before* constructing a nullifier-bearing
+    /// record, computes the record's bound payload against it, and then
+    /// anchors with [`MockAnchorChain::append_with_ctx`].
+    pub fn fresh_ctx(&self) -> [u8; 32] {
+        rand::rng().random()
+    }
+
+    /// Append a record to the current tip block under a fresh random
+    /// transaction context, returning a reference to its location.
+    ///
+    /// Note: for nullifier-bearing records the context must be known
+    /// *before* the record is constructed (the bound payload commits to
+    /// it), so such records are anchored via [`MockAnchorChain::fresh_ctx`]
+    /// and [`MockAnchorChain::append_with_ctx`]; plain `append` is for
+    /// MINTs (no payload) and for deliberate copy-grief scenarios
+    /// (re-anchoring an existing record under a fresh, foreign `ctx`).
     pub fn append(&mut self, record: AnchorRecord) -> AnchorRef {
+        let ctx = self.fresh_ctx();
+        self.append_with_ctx(record, ctx)
+    }
+
+    /// Append a record under a caller-supplied transaction context (see
+    /// [`MockAnchorChain::append`]).
+    pub fn append_with_ctx(&mut self, record: AnchorRecord, ctx: [u8; 32]) -> AnchorRef {
         let position = self
             .entries
             .iter()
@@ -110,15 +154,12 @@ impl MockAnchorChain {
             position,
         };
         let txid = *hash_felts("mock-txid", &[&[felt(self.entries.len() as u32)]]).as_bytes();
-        let entry = Entry {
+        self.entries.push(Entry {
             txid,
             location,
             record,
-        };
-        for key in record.nullifier_keys() {
-            self.nullifier_index.entry(key).or_insert(location);
-        }
-        self.entries.push(entry);
+            ctx,
+        });
         AnchorRef { txid, location }
     }
 }
@@ -135,15 +176,24 @@ impl AnchorChain for MockAnchorChain {
             .map(|e| e.record)
     }
 
-    fn first_nullifier_occurrence(&self, key: &TruncatedDigest) -> Option<AnchorLocation> {
-        self.nullifier_index.get(key).copied()
+    fn ctx_at(&self, anchor_ref: &AnchorRef) -> Option<[u8; 32]> {
+        self.entries
+            .iter()
+            .find(|e| e.location == anchor_ref.location && e.txid == anchor_ref.txid)
+            .map(|e| e.ctx)
     }
 
-    fn nullifier_occurrences(&self, key: &TruncatedDigest) -> Vec<AnchorLocation> {
+    fn first_nullifier_occurrence(&self, raw_nf: &Digest) -> Option<AnchorLocation> {
+        self.nullifier_occurrences(raw_nf).into_iter().next()
+    }
+
+    fn nullifier_occurrences(&self, raw_nf: &Digest) -> Vec<AnchorLocation> {
+        // Linear scan (fine for a mock): an occurrence is an entry whose
+        // record binds `raw_nf` under the entry's own ctx.
         let mut locations: Vec<_> = self
             .entries
             .iter()
-            .filter(|e| e.record.nullifier_keys().contains(key))
+            .filter(|e| e.record.well_formed(&e.ctx, raw_nf))
             .map(|e| e.location)
             .collect();
         locations.sort();

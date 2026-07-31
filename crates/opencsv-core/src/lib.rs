@@ -34,6 +34,15 @@
 //!    anchors.
 //! 4. **Coin randomness `r` is 32 bytes** (8 field elements), not a single
 //!    field element — 31 bits cannot hide anything.
+//! 5. **Context-bound nullifier payloads, untagged transfers.** Anchor
+//!    records are copyable bytes, so a mempool spy could front-run a copy
+//!    and a naive first-occurrence rule would freeze the victim's coins.
+//!    Nullifier-bearing records therefore publish only *bound payloads*
+//!    `P = H("bind" ∥ raw_nf ∥ ctx)`; the raw nullifier never appears
+//!    on-chain — it travels in the consignment, and occurrence recognition
+//!    is restricted to consignment holders (paper §4.7 rule 1, amended; see
+//!    [`anchor`]). Transfer records additionally drop the tag byte
+//!    (camouflage); MINT/REDEEM stay tagged for the public supply audit.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
@@ -50,7 +59,7 @@ pub mod field;
 pub mod issuer;
 
 pub use accept::{AcceptParams, AcceptedCoins, MockVerifier, ProofVerifier, RejectReason, accept};
-pub use anchor::{ANCHOR_SIZE, AnchorRecord, mint_commit, nullifier_commit};
+pub use anchor::{ANCHOR_SIZE, AnchorRecord, binding, mint_commit, nullifier_commit};
 pub use asset::{AssetGenesis, AssetId};
 pub use audit::{SupplyError, supply};
 pub use chain::{AnchorChain, AnchorLocation, AnchorRef, MockAnchorChain};

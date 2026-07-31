@@ -10,23 +10,33 @@
 //! # How the trait's shape fits recursive proofs
 //!
 //! The trait is `verify(vk, public_input, proof) -> bool`, where
-//! `public_input` is `anchor_bytes(64) ∥ openings` reconstructed by the
-//! accept driver and `proof` is an opaque blob. A recursive coin proof's
-//! statement cannot be fully reconstructed from that public input — anchors
-//! carry only 24-byte truncated digests and openings do not carry nullifiers
-//! or the mint nonce — so the envelope puts the **full statement inside the
-//! proof bytes** (which is sound: [`verify_coin_proof`] checks the statement
-//! against the proof's transcript-bound statement-table public values) and
-//! the adapter additionally checks the statement *projects* onto the public
-//! input:
+//! `public_input` is `ctx(32) ∥ anchor_bytes(64) ∥ openings` reconstructed
+//! by the accept driver and `proof` is an opaque blob. A recursive coin
+//! proof's statement cannot be fully reconstructed from that public input —
+//! anchors carry only 24-byte truncated digests and openings do not carry
+//! nullifiers or the mint nonce — so the envelope puts the **full statement
+//! inside the proof bytes** (which is sound: [`verify_coin_proof`] checks
+//! the statement against the proof's transcript-bound statement-table
+//! public values) and the adapter additionally checks the statement
+//! *projects* onto the public input:
 //!
-//! - the anchor tag matches the proof mode (mint/transfer/redeem);
-//! - the anchor's truncated digests are the 24-byte prefixes of the
-//!   statement's full digests (asset id, mint commit, nullifier or
-//!   nullifier commitment), and the anchor's `V` equals the statement value;
+//! - the anchor's *form* matches the proof mode: transfers (XFER/XFERC) are
+//!   untagged opaque 64-byte records, MINT/REDEEM stay tagged (see
+//!   `opencsv-core`'s anchor docs);
+//! - the anchor's truncated digests match the statement: asset id, mint
+//!   commit and `V` directly, and the nullifier payloads as **bound
+//!   values** — each payload slot must equal `H("bind" ∥ nf ∥ ctx)` for the
+//!   statement's (raw) nullifiers, respectively the nullifier commitment
+//!   for compressed transfers, under the public input's `ctx`;
 //! - the openings' recomputed commitments equal the statement's output
 //!   commitments (mints and transfers), respectively there are no openings
 //!   and no outputs (redeems).
+//!
+//! The transfer payload slots are read straight from the raw anchor bytes:
+//! XFER and XFERC share one untagged layout, and a payload whose first byte
+//! collides with the MINT/REDEEM tags must still verify. The raw nullifier
+//! never appears on-chain; the circuits and statements are unchanged — the
+//! binding lives purely at the anchor layer.
 //!
 //! `vk` is ignored: the circuit shapes are fixed by this crate and each
 //! proof self-describes its common data (the same call-site-discipline
@@ -85,14 +95,14 @@ pub fn decode_coin_proof(bytes: &[u8]) -> Option<CoinProof> {
 }
 
 /// Parse the openings out of the accept driver's public input
-/// (`anchor_bytes(64) ∥ opening_1 ∥ … ∥ opening_n`).
+/// (`ctx(32) ∥ anchor_bytes(64) ∥ opening_1 ∥ … ∥ opening_n`).
 fn parse_openings(x: &[u8]) -> Option<Vec<CoinOpening>> {
-    if x.len() < 64 || !(x.len() - 64).is_multiple_of(OPENING_BYTES) {
+    if x.len() < 96 || !(x.len() - 96).is_multiple_of(OPENING_BYTES) {
         return None;
     }
     let digest = |chunk: &[u8]| Digest::from_bytes(chunk.try_into().expect("32-byte chunk"));
     Some(
-        x[64..]
+        x[96..]
             .chunks_exact(OPENING_BYTES)
             .map(|o| CoinOpening {
                 asset_id: digest(&o[0..32]),
@@ -105,16 +115,19 @@ fn parse_openings(x: &[u8]) -> Option<Vec<CoinOpening>> {
 }
 
 /// Check that the envelope's statement projects onto the accept driver's
-/// public input (module docs): anchor tag/mode agreement, truncated-digest
-/// and value agreement, and openings == output commitments.
+/// public input (module docs): anchor form/mode agreement, digest and value
+/// agreement (nullifier payloads as bound values under the public input's
+/// `ctx`), and openings == output commitments.
 fn statement_matches_public_input(mode: NodeMode, st: &NodeStatement, x: &[u8]) -> bool {
     let Some(openings) = parse_openings(x) else {
         return false;
     };
-    let Ok(record) = AnchorRecord::from_bytes(&x[..64].try_into().expect("64-byte anchor")) else {
-        return false;
-    };
+    let ctx: &[u8; 32] = x[..32].try_into().expect("32-byte ctx");
+    let anchor_bytes: &[u8; 64] = x[32..96].try_into().expect("64-byte anchor");
+    let record = AnchorRecord::from_bytes(anchor_bytes);
     let zero = Digest::from_bytes([0u8; 32]);
+    let zero_td = opencsv_core::digest::TruncatedDigest([0u8; 24]);
+    let bound = |nf: &Digest| opencsv_core::anchor::binding(nf, ctx).to_anchor();
     // Mint/transfer: exactly `NODE_OUTPUTS` openings in the stated asset
     // whose recomputed commitments are the statement's outputs.
     let outputs_match = |openings: &[CoinOpening]| {
@@ -139,35 +152,44 @@ fn statement_matches_public_input(mode: NodeMode, st: &NodeStatement, x: &[u8]) 
                 && st.nullifiers == [zero; crate::NODE_INPUTS]
                 && outputs_match(&openings)
         }
-        (AnchorRecord::XferCompressed { nullifier_commit }, NodeMode::Transfer) => {
-            st.value == 0
-                && st.mint_commit == zero
-                && opencsv_core::anchor::nullifier_commit(&st.nullifiers).to_anchor()
-                    == nullifier_commit
-                && outputs_match(&openings)
-        }
-        (AnchorRecord::Xfer { nullifier }, NodeMode::Transfer) => {
-            st.value == 0
-                && st.mint_commit == zero
-                && st.nullifiers[0].to_anchor() == nullifier
-                && st.nullifiers[1] == zero
-                && outputs_match(&openings)
-        }
         (
             AnchorRecord::Redeem {
                 asset_id,
                 value,
-                nullifier,
+                payload,
             },
             NodeMode::Redeem,
         ) => {
             st.asset_id.to_anchor() == asset_id
                 && st.value == value
                 && st.mint_commit == zero
-                && st.nullifiers[0].to_anchor() == nullifier
+                && bound(&st.nullifiers[0]) == payload
                 && st.nullifiers[1] == zero
                 && st.output_commitments == [zero; NODE_OUTPUTS]
                 && openings.is_empty()
+        }
+        // Transfers are untagged (camouflage): the two 24-byte payload slots
+        // are bytes 0..48 of the raw anchor, whatever the parsed record says
+        // — a payload whose first byte collides with the MINT/REDEEM tags
+        // must still verify. Each slot binds one statement nullifier under
+        // the anchor's ctx (a zero/padding nullifier binds a zero slot); a
+        // compressed transfer instead binds the nullifier commitment into
+        // slot 0 and zeroes slot 1.
+        (_, NodeMode::Transfer) => {
+            let slot = |from: usize| {
+                opencsv_core::digest::TruncatedDigest(
+                    anchor_bytes[from..from + 24].try_into().expect("24-byte slot"),
+                )
+            };
+            let slots = [slot(0), slot(24)];
+            let direct = st
+                .nullifiers
+                .iter()
+                .zip(slots)
+                .all(|(nf, s)| if *nf == zero { s == zero_td } else { bound(nf) == s });
+            let compressed = slots[1] == zero_td
+                && bound(&opencsv_core::anchor::nullifier_commit(&st.nullifiers)) == slots[0];
+            st.value == 0 && st.mint_commit == zero && outputs_match(&openings) && (direct || compressed)
         }
         _ => false,
     }

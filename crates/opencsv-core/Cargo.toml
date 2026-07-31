@@ -11,5 +11,6 @@ p3-field = "0.6.3"
 p3-poseidon2 = "0.6.3"
 p3-symmetric = "0.6.3"
 ed25519-dalek = "3"
+rand = "0.10"
 serde = { version = "1", features = ["derive"] }
 bincode = { version = "2", features = ["serde"] }
