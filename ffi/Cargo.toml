@@ -1,0 +1,18 @@
+[package]
+name = "opencsv-ffi"
+description = "C ABI for embedding the OpenCSV wallet in native apps (iOS-first): prove, verify, balance, audit over an anchor-snapshot view"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+opencsv-core = { path = "../crates/opencsv-core" }
+opencsv-pcd = { path = "../crates/opencsv-pcd" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rand = "0.10"
+base64 = "0.22"
+p3-baby-bear = "0.6.3"
