@@ -1,0 +1,4 @@
+module OpenCsvFFI {
+    header "opencsv.h"
+    export *
+}
