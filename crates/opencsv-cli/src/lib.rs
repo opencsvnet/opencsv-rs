@@ -44,6 +44,7 @@
 pub mod chain;
 pub mod error;
 pub mod hexutil;
+pub mod httpchain;
 pub mod ops;
 pub mod store;
 

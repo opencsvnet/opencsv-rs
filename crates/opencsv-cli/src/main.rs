@@ -10,9 +10,9 @@ use std::process::ExitCode;
 
 use base64::Engine;
 use clap::{Parser, Subcommand};
-use opencsv_cli::chain::FileAnchorChain;
 use opencsv_cli::error::{io_err, Error};
 use opencsv_cli::hexutil::{digest_from_hex, to_hex};
+use opencsv_cli::httpchain::ChainBackend;
 use opencsv_cli::ops::{self, Produced, ReceiveReport, DEFAULT_CONFIRMATIONS};
 use opencsv_cli::store::Wallet;
 use opencsv_core::{AnchorChain, Owner};
@@ -28,6 +28,11 @@ struct Cli {
     /// wallets at the same file to simulate the shared L1 view.
     #[arg(long, global = true)]
     chain: Option<PathBuf>,
+    /// Anchor via a shared opencsv-anchor-server (http://host:port) instead
+    /// of the local chain file — required when other parties (e.g. a phone
+    /// wallet) share the chain over HTTP.
+    #[arg(long, global = true)]
+    anchor_server: Option<String>,
     #[command(subcommand)]
     command: Commands,
 }
@@ -224,6 +229,7 @@ fn run(cli: Cli) -> Result<ExitCode, Error> {
         .chain
         .clone()
         .unwrap_or_else(|| wallet_dir.join("chain.log"));
+    let anchor_server = cli.anchor_server.clone();
     match cli.command {
         Commands::Keygen => {
             let mut wallet = wallet;
@@ -262,7 +268,7 @@ fn run(cli: Cli) -> Result<ExitCode, Error> {
             let amounts = parse_amounts(&amounts)?;
             eprintln!("proving mint… (~1s in release, tens of seconds in debug)");
             let mut wallet = wallet;
-            let mut chain = FileAnchorChain::open(&chain_path)?;
+            let mut chain = ChainBackend::open(&chain_path, anchor_server.as_deref())?;
             let produced = ops::mint(&mut wallet, &mut chain, &asset, to, &amounts)?;
             report_produced(&produced, &out, print_blob)?;
         }
@@ -279,7 +285,7 @@ fn run(cli: Cli) -> Result<ExitCode, Error> {
             let amounts = parse_amounts(&amounts)?;
             eprintln!("proving transfer… (this takes a few seconds in release, ~70s in debug)");
             let mut wallet = wallet;
-            let mut chain = FileAnchorChain::open(&chain_path)?;
+            let mut chain = ChainBackend::open(&chain_path, anchor_server.as_deref())?;
             let produced = ops::send(
                 &mut wallet,
                 &mut chain,
@@ -296,7 +302,7 @@ fn run(cli: Cli) -> Result<ExitCode, Error> {
         } => {
             let blob = std::fs::read(&file).map_err(io_err(&file))?;
             let mut wallet = wallet;
-            let chain = FileAnchorChain::open(&chain_path)?;
+            let chain = ChainBackend::open(&chain_path, anchor_server.as_deref())?;
             eprintln!("verifying proof… (~a second in release, longer in debug)");
             match ops::receive(
                 &mut wallet,
@@ -333,7 +339,7 @@ fn run(cli: Cli) -> Result<ExitCode, Error> {
         } => {
             eprintln!("proving redeem… (~1.5s in release, ~35s in debug)");
             let mut wallet = wallet;
-            let mut chain = FileAnchorChain::open(&chain_path)?;
+            let mut chain = ChainBackend::open(&chain_path, anchor_server.as_deref())?;
             let produced = ops::redeem(&mut wallet, &mut chain, &coin)?;
             report_produced(&produced, &out, print_blob)?;
         }
@@ -374,7 +380,7 @@ fn run(cli: Cli) -> Result<ExitCode, Error> {
         }
         Commands::Audit { asset, height } => {
             let asset = digest_from_hex(&asset)?;
-            let chain = FileAnchorChain::open(&chain_path)?;
+            let chain = ChainBackend::open(&chain_path, anchor_server.as_deref())?;
             let supply = ops::audit(&chain, &asset, height)?;
             println!(
                 "supply {supply} asset {} height {}",
@@ -383,17 +389,23 @@ fn run(cli: Cli) -> Result<ExitCode, Error> {
             );
         }
         Commands::Chain(ChainCmd::Tip) => {
-            let chain = FileAnchorChain::open(&chain_path)?;
+            let chain = ChainBackend::open(&chain_path, anchor_server.as_deref())?;
             println!("tip {}", chain.tip_height());
         }
         Commands::Chain(ChainCmd::Advance { n }) => {
-            let mut chain = FileAnchorChain::open(&chain_path)?;
+            let mut chain = ChainBackend::open(&chain_path, anchor_server.as_deref())?;
             chain.advance_blocks(n)?;
             println!("tip {}", chain.tip_height());
         }
         #[cfg(feature = "signal")]
         Commands::Signal(cmd) => {
-            run_signal(cmd, &wallet_dir, wallet, &chain_path)?;
+            run_signal(
+                cmd,
+                &wallet_dir,
+                wallet,
+                &chain_path,
+                anchor_server.as_deref(),
+            )?;
         }
     }
     Ok(ExitCode::SUCCESS)
@@ -407,6 +419,7 @@ fn run_signal(
     wallet_dir: &Path,
     wallet: Wallet,
     chain_path: &Path,
+    anchor_server: Option<&str>,
 ) -> Result<(), Error> {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -443,13 +456,14 @@ fn run_signal(
             let store_dir = store_dir.unwrap_or_else(|| wallet_dir.join("signal"));
             let mut wallet = wallet;
             let chain_path = chain_path.to_path_buf();
+            let anchor_server = anchor_server.map(str::to_owned);
             runtime.block_on(async move {
                 let mut manager = opencsv_signal::open(&store_dir).await?;
                 let verifier = opencsv_pcd::CoinProofVerifier;
                 opencsv_signal::listen(&mut manager, move |blob| {
-                    // Re-open the chain per message so `chain advance` run
-                    // from another terminal becomes visible.
-                    let chain = match FileAnchorChain::open(&chain_path) {
+                    // Re-open the chain per message so anchors landed since
+                    // (server appends, `chain advance`) become visible.
+                    let chain = match ChainBackend::open(&chain_path, anchor_server.as_deref()) {
                         Ok(chain) => chain,
                         Err(e) => return format!("REJECTED could not open chain: {e}"),
                     };
