@@ -1,7 +1,7 @@
 # opencsv-rs
 
-Rust reference implementation of **OpenCSV** — client-side verified RWAs
-on Bitcoin. The scheme paper and explainer site live in
+Rust reference implementation of **OpenCSV** — client-side verified RWAs,
+stables, and more, on Bitcoin. The scheme paper and explainer site live in
 [opencsvnet/opencsv](https://github.com/opencsvnet/opencsv); the Lean 4
 formalization in [opencsvnet/opencsv-formal](https://github.com/opencsvnet/opencsv-formal).
 
