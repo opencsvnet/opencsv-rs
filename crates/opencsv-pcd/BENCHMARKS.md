@@ -75,3 +75,23 @@ parallelism doesn't pay). Consequences:
 - Optimizations should target single-thread time: cached prover setup,
   inner-proof FRI parameter tuning (smaller in-circuit verifier), PoW
   grinding to trade prover bits for verifier circuit size.
+
+## On-device: iPhone (2026-07-31, release, physical devices)
+
+Measured via `apple/` (see opencsv-rs issue #1 for full JSON and method;
+best of 2 runs per device). Proof sizes byte-identical to the server runs.
+
+| circuit | server (Xeon @ 800 MHz) | iPhone 16e (A18, iOS 26.2.1) | iPhone 17 Pro Max (A19 Pro, iOS 26.5.2) |
+|---|---|---|---|
+| genesis mint | 63.70 ms | **15.9 ms** | 22.4 ms |
+| transfer (2 mint predecessors) | 2.97 s | **566 ms** | 674 ms |
+| 2-hop transfer (2 node predecessors) | 2.96 s | **548 ms** | 668 ms |
+| redeem (1 node predecessor) | 1.47 s | **268 ms** | 337 ms |
+| verify (all) | 3.2–3.6 ms | 2.0–3.3 ms | 2.0–5.3 ms |
+
+**Both phones beat the 64-core server by 3–5× on proving**, consistent with
+the core-scaling finding above (proving is single-thread-bound; phone cores
+have far higher clock + IPC). Recursive transfer proving at ~0.5–1 s is
+viable for interactive mobile UX. Run-to-run spread was up to ~40%
+(thermals/scheduling); the 16e's best edged out the Pro Max's, so treat the
+flagship ranking as noise pending a controlled re-run.
