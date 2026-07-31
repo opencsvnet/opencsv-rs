@@ -2,8 +2,8 @@
 
 Rust reference implementation of **OpenCSV** — client-side verified stablecoins
 on Bitcoin. The scheme paper and explainer site live in
-[opencsv-project/opencsv](https://github.com/opencsv-project/opencsv); the Lean 4
-formalization in [opencsv-project/opencsv-formal](https://github.com/opencsv-project/opencsv-formal).
+[opencsvnet/opencsv](https://github.com/opencsvnet/opencsv); the Lean 4
+formalization in [opencsvnet/opencsv-formal](https://github.com/opencsvnet/opencsv-formal).
 
 ## Crates
 
