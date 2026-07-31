@@ -1,0 +1,14 @@
+[package]
+name = "opencsv-bench-ffi"
+description = "C ABI shim exposing the OpenCSV prover benchmark to the iOS bench app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+crate-type = ["staticlib"]
+
+[dependencies]
+opencsv-core = { path = "../../crates/opencsv-core" }
+opencsv-pcd = { path = "../../crates/opencsv-pcd" }
+postcard = { version = "1", features = ["alloc"] }

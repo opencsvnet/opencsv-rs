@@ -52,3 +52,26 @@ for the consignment encoding).
 - Prover-side setup (`ProverData::from_airs_and_degrees` per circuit shape)
   is rebuilt per proof and included in the prove times above; caching it
   per vk is a known optimization (see README "What's next").
+
+## Core scaling (2026-07-31, same machine, release)
+
+Same bench run pinned with `taskset` to 1, 4, and 8 cores (64-core column
+from the table above for comparison):
+
+| cores | transfer prove | transfer verify | proof size |
+|---|---|---|---|
+| 1 | 2.98 s | 3.53 ms | 56,041 B |
+| 4 | 2.97 s | 3.52 ms | 56,041 B |
+| 8 | 3.71 s | 3.54 ms | 56,041 B |
+| 64 | 2.97 s | 3.56 ms | 56,041 B |
+
+**Proving does not scale with core count for these circuit sizes** — the
+prover is effectively single-threaded here (small traces; per-step
+parallelism doesn't pay). Consequences:
+
+- Single-core speed is the only thing that matters for sender latency.
+  A modern phone core (high clock + NEON) may well beat this 800 MHz-capped
+  server Xeon; see `apple/` for the on-device benchmark harness.
+- Optimizations should target single-thread time: cached prover setup,
+  inner-proof FRI parameter tuning (smaller in-circuit verifier), PoW
+  grinding to trade prover bits for verifier circuit size.

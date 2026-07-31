@@ -5,6 +5,7 @@ members = [
     "crates/opencsv-pcd",
     "crates/opencsv-cli",
     "crates/opencsv-signal",
+    "apple/bench-ffi",
 ]
 
 [workspace.package]
