@@ -22,7 +22,7 @@
 use std::path::PathBuf;
 
 use clap::Parser;
-use opencsv_cli::chain::{AnchorWriter, FileAnchorChain};
+use opencsv_cli::chain::FileAnchorChain;
 use opencsv_cli::hexutil::{from_hex, to_hex};
 use opencsv_core::chain::AnchorChain;
 use opencsv_core::{AnchorRecord, ANCHOR_SIZE};

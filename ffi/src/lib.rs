@@ -361,7 +361,7 @@ pub unsafe extern "C" fn opencsv_consignment_finalize(
 ) -> *mut c_char {
     guarded(|| {
         let anchor_ref = match unsafe { in_str(anchor_ref_json, "anchor_ref_json") }
-            .and_then(|s| parse_anchor_ref(s))
+            .and_then(parse_anchor_ref)
         {
             Ok(r) => r,
             Err(e) => return err(e),
@@ -402,7 +402,7 @@ pub unsafe extern "C" fn opencsv_verify_consignment(
         }
         let blob = unsafe { std::slice::from_raw_parts(blob, blob_len) }.to_vec();
         let chain = match unsafe { in_str(anchor_snapshot_json, "anchor_snapshot_json") }
-            .and_then(|s| SnapshotChain::from_json(s))
+            .and_then(SnapshotChain::from_json)
         {
             Ok(chain) => chain,
             Err(e) => return err(e),
@@ -432,8 +432,7 @@ pub unsafe extern "C" fn opencsv_wallet_mark_spent(
     coin_ids_json: *const c_char,
 ) -> *mut c_char {
     guarded(|| {
-        let ids = match unsafe { in_str(coin_ids_json, "coin_ids_json") }.and_then(|s| parse_ids(s))
-        {
+        let ids = match unsafe { in_str(coin_ids_json, "coin_ids_json") }.and_then(parse_ids) {
             Ok(ids) => ids,
             Err(e) => return err(e),
         };
