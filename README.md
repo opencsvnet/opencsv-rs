@@ -11,15 +11,21 @@ formalization in [opencsvnet/opencsv-formal](https://github.com/opencsvnet/openc
 crates/opencsv-core/    # commitments, nullifiers, anchor records, consignments, accept driver
 crates/opencsv-pcd/     # AIR-native recursive proof engine (Plonky3 + Plonky3-recursion, no zkVM)
 crates/opencsv-cli/     # `opencsv` text wallet: keygen/mint/send/receive/redeem/balance/audit
+crates/opencsv-bitcoin/ # real bitcoind-RPC anchor backend (OP_RETURN anchors, block scanning)
 crates/opencsv-signal/  # Signal transport via presage (linked device, consignments as attachments)
 ```
 
 ## Status
 
-Working prototype, live-tested end to end (2026-07-31): mint → anchor →
-consignment delivered over production Signal → recipient verifies with the real
-recursive proof engine → `VERIFIED 100 USD`. Double-spend attempts are rejected
-by the first-occurrence rule. Numbers:
+Working prototype, live-tested end to end on **real Bitcoin** (2026-08-01):
+the CLI anchors to a real `bitcoind` by default (signet/mainnet/regtest) —
+mint/send/redeem broadcast real `OP_RETURN` anchor transactions, and
+verification scans real blocks. Validated on regtest
+(`scripts/e2e-regtest.sh`): mint → REAL anchor tx → 6 blocks → VERIFIED →
+send → VERIFIED → double-spend attempt → REJECTED by the first-occurrence
+rule, resolved from node data → supply audit from chain data. (Earlier,
+2026-07-31: the same protocol flow live-tested over the demo chain with
+consignment delivery via production Signal.) Numbers:
 
 - constant-size coin proofs (~46–56 KB) and constant verification (~3.6 ms),
   independent of history length — the PCD property, measured

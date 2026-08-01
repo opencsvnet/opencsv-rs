@@ -65,6 +65,9 @@ pub enum Error {
     Supply(SupplyError),
     /// An invariant the wallet maintains was violated.
     Internal(&'static str),
+    /// The bitcoind chain backend failed (RPC, broadcast, scan). Never a
+    /// fallback: real Bitcoin or a hard error.
+    Backend(String),
     /// A transport (e.g. Signal) failed. Prototype-grade: the underlying
     /// error is stringified.
     Transport(String),
@@ -100,6 +103,7 @@ impl std::fmt::Display for Error {
             Self::Consignment(e) => write!(f, "{e}"),
             Self::Supply(e) => write!(f, "supply audit failed: {e}"),
             Self::Internal(m) => write!(f, "internal error: {m}"),
+            Self::Backend(m) => write!(f, "bitcoin backend: {m}"),
             Self::Transport(m) => write!(f, "transport error: {m}"),
         }
     }
@@ -129,6 +133,12 @@ impl From<SupplyError> for Error {
 impl From<opencsv_signal::Error> for Error {
     fn from(e: opencsv_signal::Error) -> Self {
         Self::Transport(e.to_string())
+    }
+}
+
+impl From<opencsv_bitcoin::Error> for Error {
+    fn from(e: opencsv_bitcoin::Error) -> Self {
+        Self::Backend(e.to_string())
     }
 }
 

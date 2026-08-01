@@ -1,0 +1,14 @@
+[package]
+name = "opencsv-bitcoin"
+description = "Real bitcoind-RPC anchor chain backend for OpenCSV (signet/mainnet/regtest)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+opencsv-core = { path = "../opencsv-core" }
+serde_json = { version = "1", features = ["arbitrary_precision"] }
+base64 = "0.22"
+
+[dev-dependencies]
+tempfile = "3"

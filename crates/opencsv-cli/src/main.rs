@@ -10,29 +10,60 @@ use std::process::ExitCode;
 
 use base64::Engine;
 use clap::{Parser, Subcommand};
+use opencsv_cli::backend::{ChainBackend, ChainSpec};
 use opencsv_cli::error::{io_err, Error};
 use opencsv_cli::hexutil::{digest_from_hex, to_hex};
-use opencsv_cli::httpchain::ChainBackend;
 use opencsv_cli::ops::{self, Produced, ReceiveReport, DEFAULT_CONFIRMATIONS};
 use opencsv_cli::store::Wallet;
 use opencsv_core::{AnchorChain, Owner};
 
-/// OpenCSV text wallet (prototype — plaintext keys, file-backed demo chain).
+/// OpenCSV text wallet (prototype — plaintext keys; anchors to real
+/// Bitcoin via `bitcoind` RPC by default).
 #[derive(Parser)]
 #[command(name = "opencsv", version, about, long_about = None)]
 struct Cli {
     /// Wallet directory (default: ~/.opencsv).
     #[arg(long, global = true)]
     wallet_dir: Option<PathBuf>,
-    /// Anchor chain file (default: <wallet-dir>/chain.log). Point several
-    /// wallets at the same file to simulate the shared L1 view.
+    /// Chain backend: `bitcoin` (default — real bitcoind RPC), `demo`
+    /// (simulated file chain at WALLET_DIR/chain.log), `file:<path>`
+    /// (simulated file chain elsewhere), or a bare path (same, for
+    /// backwards compatibility). The demo backends print a warning.
     #[arg(long, global = true)]
-    chain: Option<PathBuf>,
-    /// Anchor via a shared opencsv-anchor-server (http://host:port) instead
-    /// of the local chain file — required when other parties (e.g. a phone
-    /// wallet) share the chain over HTTP.
+    chain: Option<String>,
+    /// Anchor via a shared opencsv-anchor-server (http://host:port) — a
+    /// DEMO backend (prints a warning), for sharing a simulated chain
+    /// with other parties (e.g. a phone wallet) over HTTP.
     #[arg(long, global = true)]
     anchor_server: Option<String>,
+    /// Bitcoin network for the bitcoind backend.
+    #[arg(
+        long,
+        global = true,
+        default_value = "signet",
+        env = "OPENCSV_NETWORK",
+        value_parser = ["signet", "mainnet", "regtest"]
+    )]
+    network: String,
+    /// bitcoind RPC URL (default: 127.0.0.1 with the network's default port).
+    #[arg(long, global = true, env = "OPENCSV_RPC_URL")]
+    rpc_url: Option<String>,
+    /// bitcoind RPC cookie file (default: ~/.bitcoin/NETWORK/.cookie).
+    #[arg(long, global = true, env = "OPENCSV_COOKIE")]
+    cookie: Option<PathBuf>,
+    /// bitcoind RPC auth as `user:password` (takes precedence over
+    /// --cookie).
+    #[arg(long, global = true, env = "OPENCSV_RPC_AUTH")]
+    rpc_auth: Option<String>,
+    /// bitcoind wallet name for the multi-wallet endpoint
+    /// (/wallet/NAME); default: the node's default wallet.
+    #[arg(long, global = true, env = "OPENCSV_RPC_WALLET")]
+    rpc_wallet: Option<String>,
+    /// Height to start scanning for anchors at on first open (default:
+    /// the tip at first open — a fresh wallet has no earlier anchors).
+    /// Changing it rebuilds the local anchor index.
+    #[arg(long, global = true, env = "OPENCSV_SCAN_FROM")]
+    scan_from: Option<u64>,
     #[command(subcommand)]
     command: Commands,
 }
@@ -125,7 +156,7 @@ enum Commands {
         #[arg(long)]
         height: Option<u64>,
     },
-    /// Demo chain control.
+    /// Chain inspection and (demo / regtest) mining.
     #[command(subcommand)]
     Chain(ChainCmd),
     /// Signal transport: link as a secondary device and move consignments
@@ -149,7 +180,9 @@ enum IssuerCmd {
 enum ChainCmd {
     /// Print the chain tip height.
     Tip,
-    /// Advance the tip (simulate mining).
+    /// Advance the tip by mining: simulated on the demo chains; on the
+    /// bitcoind backend, generates real blocks via the wallet on regtest
+    /// (hard error on signet/mainnet — blocks arrive by mining).
     Advance {
         /// Number of blocks.
         #[arg(default_value_t = 1)]
@@ -212,6 +245,67 @@ fn default_wallet_dir() -> PathBuf {
     home.join(".opencsv")
 }
 
+/// Resolve the `--chain`/`--anchor-server` flags into a backend spec. The
+/// default is real Bitcoin; the file chain requires an explicit `demo`,
+/// `file:<path>`, or bare path (backwards compatibility).
+fn chain_spec(cli: &Cli, wallet_dir: &Path) -> Result<ChainSpec, Error> {
+    if let Some(server) = &cli.anchor_server {
+        return Ok(ChainSpec::Http(server.clone()));
+    }
+    match cli.chain.as_deref() {
+        None | Some("bitcoin") => Ok(ChainSpec::Bitcoin(Box::new(bitcoin_config(
+            cli, wallet_dir,
+        )?))),
+        Some("demo") => Ok(ChainSpec::File(wallet_dir.join("chain.log"))),
+        Some(spec) => match spec.strip_prefix("file:") {
+            Some(path) => Ok(ChainSpec::File(PathBuf::from(path))),
+            None => Ok(ChainSpec::File(PathBuf::from(spec))),
+        },
+    }
+}
+
+/// Build the `bitcoind` backend config from the CLI flags (and their
+/// `OPENCSV_*` env fallbacks, resolved by clap).
+fn bitcoin_config(cli: &Cli, wallet_dir: &Path) -> Result<opencsv_bitcoin::Config, Error> {
+    let network = opencsv_bitcoin::Network::parse(&cli.network)?;
+    let rpc_url = cli.rpc_url.clone().unwrap_or_else(|| {
+        format!("http://127.0.0.1:{}", network.default_rpc_port())
+    });
+    let auth = match (&cli.rpc_auth, &cli.cookie) {
+        (Some(user_pass), _) => opencsv_bitcoin::RpcAuth::UserPass(user_pass.clone()),
+        (None, Some(path)) => opencsv_bitcoin::RpcAuth::Cookie(path.clone()),
+        (None, None) => {
+            let home = std::env::home_dir().unwrap_or_else(|| PathBuf::from("."));
+            let dir = home.join(".bitcoin").join(network.datadir_subdir());
+            opencsv_bitcoin::RpcAuth::Cookie(dir.join(".cookie"))
+        }
+    };
+    Ok(opencsv_bitcoin::Config {
+        network,
+        rpc_url,
+        auth,
+        wallet: cli.rpc_wallet.clone(),
+        scan_from: cli.scan_from,
+        index_path: wallet_dir.join(format!("bitcoin-index-{}.log", network.name())),
+    })
+}
+
+/// Whether the command reads or writes the anchor chain (and therefore
+/// deserves the demo-chain warning when a simulated backend is selected).
+fn command_uses_chain(command: &Commands) -> bool {
+    match command {
+        Commands::Mint { .. }
+        | Commands::Send { .. }
+        | Commands::Receive { .. }
+        | Commands::Redeem { .. }
+        | Commands::Audit { .. }
+        | Commands::Chain(_) => true,
+        #[cfg(feature = "signal")]
+        Commands::Signal(SignalCmd::Listen { .. }) => true,
+        _ => false,
+    }
+}
+
 fn main() -> ExitCode {
     // Signal debugging: `RUST_LOG=debug opencsv signal …` surfaces presage /
     // libsignal logs (e.g. the note-to-self transcript path) on stderr.
@@ -236,11 +330,10 @@ fn main() -> ExitCode {
 fn run(cli: Cli) -> Result<ExitCode, Error> {
     let wallet_dir = cli.wallet_dir.clone().unwrap_or_else(default_wallet_dir);
     let wallet = Wallet::open(&wallet_dir)?;
-    let chain_path = cli
-        .chain
-        .clone()
-        .unwrap_or_else(|| wallet_dir.join("chain.log"));
-    let anchor_server = cli.anchor_server.clone();
+    let spec = chain_spec(&cli, &wallet_dir)?;
+    if spec.is_demo() && command_uses_chain(&cli.command) {
+        eprintln!("warning: DEMO CHAIN — not Bitcoin (anchors and confirmations are simulated)");
+    }
     match cli.command {
         Commands::Keygen => {
             let mut wallet = wallet;
@@ -279,9 +372,9 @@ fn run(cli: Cli) -> Result<ExitCode, Error> {
             let amounts = parse_amounts(&amounts)?;
             eprintln!("proving mint… (~1s in release, tens of seconds in debug)");
             let mut wallet = wallet;
-            let mut chain = ChainBackend::open(&chain_path, anchor_server.as_deref())?;
+            let mut chain = ChainBackend::open(&spec)?;
             let produced = ops::mint(&mut wallet, &mut chain, &asset, to, &amounts)?;
-            report_produced(&produced, &out, print_blob)?;
+            report_produced(&produced, &out, print_blob, matches!(spec, ChainSpec::Bitcoin(_)))?;
         }
         Commands::Send {
             inputs,
@@ -296,7 +389,7 @@ fn run(cli: Cli) -> Result<ExitCode, Error> {
             let amounts = parse_amounts(&amounts)?;
             eprintln!("proving transfer… (this takes a few seconds in release, ~70s in debug)");
             let mut wallet = wallet;
-            let mut chain = ChainBackend::open(&chain_path, anchor_server.as_deref())?;
+            let mut chain = ChainBackend::open(&spec)?;
             let produced = ops::send(
                 &mut wallet,
                 &mut chain,
@@ -305,7 +398,7 @@ fn run(cli: Cli) -> Result<ExitCode, Error> {
                 &amounts,
                 force_respend,
             )?;
-            report_produced(&produced, &out, print_blob)?;
+            report_produced(&produced, &out, print_blob, matches!(spec, ChainSpec::Bitcoin(_)))?;
         }
         Commands::Receive {
             file,
@@ -313,7 +406,7 @@ fn run(cli: Cli) -> Result<ExitCode, Error> {
         } => {
             let blob = std::fs::read(&file).map_err(io_err(&file))?;
             let mut wallet = wallet;
-            let chain = ChainBackend::open(&chain_path, anchor_server.as_deref())?;
+            let chain = ChainBackend::open(&spec)?;
             eprintln!("verifying proof… (~a second in release, longer in debug)");
             match ops::receive(
                 &mut wallet,
@@ -350,9 +443,9 @@ fn run(cli: Cli) -> Result<ExitCode, Error> {
         } => {
             eprintln!("proving redeem… (~1.5s in release, ~35s in debug)");
             let mut wallet = wallet;
-            let mut chain = ChainBackend::open(&chain_path, anchor_server.as_deref())?;
+            let mut chain = ChainBackend::open(&spec)?;
             let produced = ops::redeem(&mut wallet, &mut chain, &coin)?;
-            report_produced(&produced, &out, print_blob)?;
+            report_produced(&produced, &out, print_blob, matches!(spec, ChainSpec::Bitcoin(_)))?;
         }
         Commands::Coins => {
             for stored in wallet.coins() {
@@ -391,7 +484,7 @@ fn run(cli: Cli) -> Result<ExitCode, Error> {
         }
         Commands::Audit { asset, height } => {
             let asset = digest_from_hex(&asset)?;
-            let chain = ChainBackend::open(&chain_path, anchor_server.as_deref())?;
+            let chain = ChainBackend::open(&spec)?;
             let supply = ops::audit(&chain, &asset, height)?;
             println!(
                 "supply {supply} asset {} height {}",
@@ -400,23 +493,17 @@ fn run(cli: Cli) -> Result<ExitCode, Error> {
             );
         }
         Commands::Chain(ChainCmd::Tip) => {
-            let chain = ChainBackend::open(&chain_path, anchor_server.as_deref())?;
+            let chain = ChainBackend::open(&spec)?;
             println!("tip {}", chain.tip_height());
         }
         Commands::Chain(ChainCmd::Advance { n }) => {
-            let mut chain = ChainBackend::open(&chain_path, anchor_server.as_deref())?;
+            let mut chain = ChainBackend::open(&spec)?;
             chain.advance_blocks(n)?;
             println!("tip {}", chain.tip_height());
         }
         #[cfg(feature = "signal")]
         Commands::Signal(cmd) => {
-            run_signal(
-                cmd,
-                &wallet_dir,
-                wallet,
-                &chain_path,
-                anchor_server.as_deref(),
-            )?;
+            run_signal(cmd, &wallet_dir, wallet, &spec)?;
         }
     }
     Ok(ExitCode::SUCCESS)
@@ -429,8 +516,7 @@ fn run_signal(
     cmd: SignalCmd,
     wallet_dir: &Path,
     wallet: Wallet,
-    chain_path: &Path,
-    anchor_server: Option<&str>,
+    spec: &ChainSpec,
 ) -> Result<(), Error> {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -487,15 +573,14 @@ fn run_signal(
         } => {
             let store_dir = store_dir.unwrap_or_else(|| wallet_dir.join("signal"));
             let mut wallet = wallet;
-            let chain_path = chain_path.to_path_buf();
-            let anchor_server = anchor_server.map(str::to_owned);
+            let spec = spec.clone();
             runtime.block_on(async move {
                 let mut manager = opencsv_signal::open(&store_dir).await?;
                 let verifier = opencsv_pcd::CoinProofVerifier;
                 opencsv_signal::listen(&mut manager, move |blob| {
                     // Re-open the chain per message so anchors landed since
                     // (server appends, `chain advance`) become visible.
-                    let chain = match ChainBackend::open(&chain_path, anchor_server.as_deref()) {
+                    let chain = match ChainBackend::open(&spec) {
                         Ok(chain) => chain,
                         Err(e) => return format!("REJECTED could not open chain: {e}"),
                     };
@@ -519,8 +604,15 @@ fn run_signal(
 }
 
 /// Write the consignment blob to `<out>/consignment-h<H>-p<P>.bin`, print the
-/// path, and optionally print the blob base64-encoded on stdout.
-fn report_produced(produced: &Produced, out: &Path, print_blob: bool) -> Result<(), Error> {
+/// path, and optionally print the blob base64-encoded on stdout. With the
+/// `bitcoind` backend the anchor was just broadcast: the location is the
+/// mempool placeholder and the txid is what matters.
+fn report_produced(
+    produced: &Produced,
+    out: &Path,
+    print_blob: bool,
+    bitcoin: bool,
+) -> Result<(), Error> {
     let blob = produced.consignment.to_bytes();
     let location = produced.anchor.location;
     let name = format!(
@@ -530,10 +622,17 @@ fn report_produced(produced: &Produced, out: &Path, print_blob: bool) -> Result<
     let path = out.join(name);
     std::fs::create_dir_all(out).map_err(io_err(out))?;
     std::fs::write(&path, &blob).map_err(io_err(&path))?;
-    println!(
-        "anchored at height {} position {}",
-        location.height, location.position
-    );
+    if bitcoin {
+        println!(
+            "anchor broadcast (mempool; mines into a block later) tx {}",
+            opencsv_bitcoin::display_txid(&produced.anchor.txid)
+        );
+    } else {
+        println!(
+            "anchored at height {} position {}",
+            location.height, location.position
+        );
+    }
     println!("consignment {}", path.display());
     if print_blob {
         println!(

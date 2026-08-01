@@ -54,16 +54,40 @@ fn binary_smoke() {
         "{out}"
     );
 
-    // Empty wallet: zero balance, empty audit supply.
+    // Empty wallet: zero balance, empty audit supply. The demo chain must
+    // be requested explicitly — and warns that it is not Bitcoin.
     let out = ok(&run(&["--wallet-dir", w, "balance"]));
     assert_eq!(out.trim(), "0");
-    let out = ok(&run(&["--wallet-dir", w, "audit", "--asset", &asset_hex]));
-    assert!(out.contains("supply 0"), "{out}");
+    let output = run(&["--wallet-dir", w, "--chain", "demo", "audit", "--asset", &asset_hex]);
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert!(String::from_utf8_lossy(&output.stdout).contains("supply 0"));
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("DEMO CHAIN — not Bitcoin"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // The default backend is real bitcoind RPC: an unreachable node is a
+    // hard error, never a fallback to the demo chain.
+    let output = run(&[
+        "--wallet-dir",
+        w,
+        "--rpc-url",
+        "http://127.0.0.1:1", // closed port, deterministically unreachable
+        "chain",
+        "tip",
+    ]);
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("error:"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 
     // Demo chain control: tip advances.
-    let out = ok(&run(&["--wallet-dir", w, "chain", "tip"]));
+    let out = ok(&run(&["--wallet-dir", w, "--chain", "demo", "chain", "tip"]));
     assert_eq!(out.trim(), "tip 0");
-    let out = ok(&run(&["--wallet-dir", w, "chain", "advance", "6"]));
+    let out = ok(&run(&["--wallet-dir", w, "--chain", "demo", "chain", "advance", "6"]));
     assert_eq!(out.trim(), "tip 6");
     // The chain file lives in the wallet dir by default.
     assert!(wallet.join("chain.log").exists());

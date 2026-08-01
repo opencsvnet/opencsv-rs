@@ -46,6 +46,7 @@ use std::path::{Path, PathBuf};
 use opencsv_core::chain::{AnchorChain, AnchorLocation, AnchorRef};
 use opencsv_core::{AnchorRecord, Digest};
 use p3_baby_bear::BabyBear;
+use rand::RngExt;
 
 use crate::error::{io_err, Error};
 use crate::hexutil::{from_hex, to_hex};
@@ -54,15 +55,44 @@ use crate::hexutil::{from_hex, to_hex};
 const MAGIC: &str = "opencsv-chain-v3";
 
 /// The write side of the anchor seam: how a new anchor record gets onto the
-/// chain. [`FileAnchorChain`] appends a line to its file; a `bitcoind`
-/// backend would broadcast an OP_RETURN transaction instead. Wallet
-/// operations that anchor (mint/send/redeem) are generic over this trait.
+/// chain. [`FileAnchorChain`] appends a line to its file; the `bitcoind`
+/// backend broadcasts an `OP_RETURN` transaction instead. Wallet operations
+/// that anchor (mint/send/redeem) are generic over this trait.
 pub trait AnchorWriter: AnchorChain {
     /// Publish `record` under transaction context `ctx`, returning a
     /// reference to its on-chain location. The caller draws `ctx` *before*
     /// constructing the record (the bound payloads commit to it); see
     /// [`opencsv_core::anchor`].
+    ///
+    /// Backends whose `ctx` is not freely choosable (the `bitcoind`
+    /// backend, where `ctx` is the funding input's outpoint) cannot honor
+    /// an arbitrary caller-drawn `ctx`; they return an error here and do
+    /// their real work in [`AnchorWriter::append_bound`].
     fn append(&mut self, record: AnchorRecord, ctx: [u8; 32]) -> Result<AnchorRef, Error>;
+
+    /// Publish a record constructed from the transaction context the
+    /// backend assigns: `build` is called with a candidate `ctx` and
+    /// returns the record whose bound payloads commit to it. This is the
+    /// entry point wallet operations use — the record *must* be built
+    /// against the backend's `ctx`, and only the backend knows it.
+    ///
+    /// The default implementation is for backends that draw `ctx` freely
+    /// (the demo chains): it draws a synthetic ctx, redrawing if an
+    /// untagged record's bound payload collides with the MINT/REDEEM tag
+    /// bytes (see `opencsv-core`'s anchor docs). The `bitcoind` backend
+    /// overrides it with the two-pass funding-input construction.
+    fn append_bound(
+        &mut self,
+        mut build: impl FnMut(&[u8; 32]) -> AnchorRecord,
+    ) -> Result<AnchorRef, Error> {
+        loop {
+            let ctx: [u8; 32] = rand::rng().random();
+            let record = build(&ctx);
+            if record.parses_cleanly() {
+                return self.append(record, ctx);
+            }
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug)]

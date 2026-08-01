@@ -12,10 +12,11 @@ signal = ["dep:opencsv-signal", "dep:tokio", "dep:tracing-subscriber"]
 [dependencies]
 opencsv-core = { path = "../opencsv-core" }
 opencsv-pcd = { path = "../opencsv-pcd" }
+opencsv-bitcoin = { path = "../opencsv-bitcoin" }
 opencsv-signal = { path = "../opencsv-signal", optional = true }
 tokio = { version = "1", features = ["rt"], optional = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = true }
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive", "env"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 bincode = { version = "2", features = ["serde"] }

@@ -205,6 +205,12 @@ pub fn accept<V: ProofVerifier, C: AnchorChain>(
     let ctx = chain
         .ctx_at(&consignment.anchor_ref)
         .ok_or(RejectReason::AnchorNotFound)?;
+    // The canonical location: for backends that anchor into a mempool
+    // (bitcoind), the consignment's claimed location is a placeholder and
+    // the chain resolves the confirmed position by transaction ID.
+    let location = chain
+        .locate(&consignment.anchor_ref)
+        .ok_or(RejectReason::AnchorNotFound)?;
 
     // Step 2 — proof check.
     let x = public_input(&record, &ctx, openings);
@@ -215,7 +221,6 @@ pub fn accept<V: ProofVerifier, C: AnchorChain>(
     // Step 3 — anchor check: confirmation depth (paper §4.7 rule 2), then
     // the binding and occurrence checks for the consignment's raw
     // nullifiers (paper §4.7 rule 1, amended; see `crate::anchor`).
-    let location = consignment.anchor_ref.location;
     let have = chain.confirmations_at(location.height);
     if have < params.required_confirmations {
         return Err(RejectReason::InsufficientConfirmations {

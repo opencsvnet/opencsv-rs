@@ -289,4 +289,23 @@ impl AnchorRecord {
             },
         }
     }
+
+    /// True if the serialization of this record parses back
+    /// ([`AnchorRecord::from_bytes`] of [`AnchorRecord::to_bytes`]) as the
+    /// same record class. Tagged records (MINT/REDEEM) always qualify; an
+    /// untagged transfer qualifies iff its first payload byte avoids the
+    /// MINT/REDEEM tag bytes (see module docs — the anchoring party SHOULD
+    /// redraw `ctx` until this holds). XFER and XFERC count as one class,
+    /// since they share a layout.
+    pub fn parses_cleanly(&self) -> bool {
+        matches!(
+            (self, Self::from_bytes(&self.to_bytes())),
+            (Self::Mint { .. }, Self::Mint { .. })
+                | (Self::Redeem { .. }, Self::Redeem { .. })
+                | (
+                    Self::Xfer { .. } | Self::XferCompressed { .. },
+                    Self::Xfer { .. } | Self::XferCompressed { .. },
+                )
+        )
+    }
 }

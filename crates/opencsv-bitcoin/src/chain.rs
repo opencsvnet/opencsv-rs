@@ -1,0 +1,707 @@
+//! [`AnchorChain`] over real Bitcoin via `bitcoind` RPC, plus the write
+//! side. See the crate docs (`opencsv-bitcoin`) for the two-pass anchor
+//! construction and the scanning/indexing model.
+
+use std::path::PathBuf;
+
+use opencsv_core::chain::{AnchorChain, AnchorLocation, AnchorRef};
+use opencsv_core::{ANCHOR_SIZE, AnchorRecord, Digest};
+use serde_json::{Value, json};
+
+use crate::error::{Error, io_err};
+use crate::rpc::{HttpTransport, RpcAuth, RpcClient, Transport};
+
+/// Location carried in an [`AnchorRef`] for a transaction that is
+/// broadcast but not yet mined. Height 0 / position 0 is unambiguous: the
+/// only real height-0 transaction is the genesis coinbase, which carries
+/// no anchor. A mempool anchor has 0 confirmations
+/// ([`BitcoinAnchorChain::confirmations_at`]) and never counts as a
+/// nullifier occurrence (canonical chain order only exists once mined).
+pub const MEMPOOL_LOCATION: AnchorLocation = AnchorLocation {
+    height: 0,
+    position: 0,
+};
+
+/// A Bitcoin network.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Network {
+    /// mainnet.
+    Mainnet,
+    /// signet.
+    Signet,
+    /// regtest (local testing; `chain advance` mines via the wallet).
+    Regtest,
+}
+
+impl Network {
+    /// Human/config name (`signet`, `mainnet`, `regtest`).
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Mainnet => "mainnet",
+            Self::Signet => "signet",
+            Self::Regtest => "regtest",
+        }
+    }
+
+    /// bitcoind's default RPC port on this network.
+    pub fn default_rpc_port(self) -> u16 {
+        match self {
+            Self::Mainnet => 8332,
+            Self::Signet => 38332,
+            Self::Regtest => 18443,
+        }
+    }
+
+    /// Subdirectory of the default datadir holding this network's cookie
+    /// (`""` for mainnet).
+    pub fn datadir_subdir(self) -> &'static str {
+        match self {
+            Self::Mainnet => "",
+            Self::Signet => "signet",
+            Self::Regtest => "regtest",
+        }
+    }
+
+    /// bitcoind's `getblockchaininfo.chain` value for this network.
+    fn rpc_chain_name(self) -> &'static str {
+        match self {
+            Self::Mainnet => "main",
+            Self::Signet => "signet",
+            Self::Regtest => "regtest",
+        }
+    }
+
+    /// Parse `signet` / `mainnet` / `regtest` (also accepts `main`).
+    pub fn parse(s: &str) -> Result<Self, Error> {
+        match s {
+            "mainnet" | "main" => Ok(Self::Mainnet),
+            "signet" => Ok(Self::Signet),
+            "regtest" => Ok(Self::Regtest),
+            _ => Err(Error::Config(format!(
+                "unknown network `{s}` (expected signet|mainnet|regtest)"
+            ))),
+        }
+    }
+}
+
+/// Everything needed to open a [`BitcoinAnchorChain`].
+#[derive(Clone, Debug)]
+pub struct Config {
+    /// Which network the node must be on (verified against
+    /// `getblockchaininfo` at open; a mismatch is a hard error).
+    pub network: Network,
+    /// `http://host:port` of the node's RPC endpoint.
+    pub rpc_url: String,
+    /// Cookie file or `user:password`.
+    pub auth: RpcAuth,
+    /// Wallet name for bitcoind's multi-wallet endpoint (`/wallet/<name>`);
+    /// `None` uses the default wallet.
+    pub wallet: Option<String>,
+    /// Height to start scanning from on first open (default: the tip at
+    /// first open — a fresh wallet has no earlier anchors). Changing this
+    /// value rebuilds the index. See the crate docs for why this is not
+    /// genesis.
+    pub scan_from: Option<u64>,
+    /// Path of the persistent anchor index (a rebuildable cache).
+    pub index_path: PathBuf,
+}
+
+/// The 32-byte transaction context of a funding-input outpoint: the
+/// internal-order txid with the 4-byte little-endian vout XORed into its
+/// first 4 bytes. An outpoint is 36 bytes and the ctx slot is 32; this
+/// fold is injective in practice (distinct txids differ in the unfolded
+/// bytes; distinct vouts of one txid differ in the fold) and lossless
+/// given the txid.
+pub fn funding_ctx(txid: &[u8; 32], vout: u32) -> [u8; 32] {
+    let mut ctx = *txid;
+    for (i, b) in vout.to_le_bytes().into_iter().enumerate() {
+        ctx[i] ^= b;
+    }
+    ctx
+}
+
+/// Internal-order bytes of a display-order RPC txid/block hash hex string.
+fn hash_from_rpc(hex: &str) -> Result<[u8; 32], Error> {
+    let mut bytes: [u8; 32] = from_hex(hex)?
+        .try_into()
+        .map_err(|v: Vec<u8>| Error::Malformed(format!("hash `{hex}` is {} bytes", v.len())))?;
+    bytes.reverse();
+    Ok(bytes)
+}
+
+/// Display-order hex of internal-order bytes (the inverse of
+/// [`hash_from_rpc`]).
+fn hash_to_rpc(bytes: &[u8; 32]) -> String {
+    let mut bytes = *bytes;
+    bytes.reverse();
+    to_hex(&bytes)
+}
+
+/// Display-order hex of an internal-order txid (block-explorer order).
+pub fn display_txid(txid: &[u8; 32]) -> String {
+    hash_to_rpc(txid)
+}
+
+/// Lowercase hex encoding.
+fn to_hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Decode hex, odd lengths rejected.
+fn from_hex(s: &str) -> Result<Vec<u8>, Error> {
+    let s = s.trim();
+    if !s.len().is_multiple_of(2) {
+        return Err(Error::Malformed(format!("odd-length hex ({})", s.len())));
+    }
+    (0..s.len())
+        .step_by(2)
+        .map(|i| {
+            u8::from_str_radix(&s[i..i + 2], 16)
+                .map_err(|_| Error::Malformed(format!("non-hex byte at offset {i}")))
+        })
+        .collect()
+}
+
+/// Extract a 64-byte `OP_RETURN` payload from a scriptPubKey hex string:
+/// `6a` followed by a single direct/`PUSHDATA1`/`PUSHDATA2` push of
+/// exactly 64 bytes and nothing else.
+fn op_return_payload(script_hex: &str) -> Option<[u8; ANCHOR_SIZE]> {
+    let script = from_hex(script_hex).ok()?;
+    let rest = script.strip_prefix(&[0x6a])?;
+    let data = match rest {
+        [0x40, data @ ..] => data,
+        [0x4c, 0x40, data @ ..] => data,
+        [0x4d, 0x40, 0x00, data @ ..] => data,
+        _ => return None,
+    };
+    data.try_into().ok()
+}
+
+#[derive(Clone, Copy, Debug)]
+struct Entry {
+    txid: [u8; 32],
+    location: AnchorLocation,
+    record: AnchorRecord,
+    ctx: [u8; 32],
+}
+
+/// An [`AnchorChain`] reading real Bitcoin blocks over `bitcoind` RPC and
+/// anchoring by broadcasting `OP_RETURN` transactions (see the crate
+/// docs). Generic over the RPC [`Transport`] so unit tests can script
+/// canned responses; the product path is `BitcoinAnchorChain` (=
+/// `BitcoinAnchorChain<HttpTransport>`).
+pub struct BitcoinAnchorChain<T: Transport = HttpTransport> {
+    client: RpcClient<T>,
+    network: Network,
+    index_path: PathBuf,
+    start_height: u64,
+    tip: u64,
+    /// Last scanned (height, block hash); `None` before the start height.
+    scanned: Option<(u64, [u8; 32])>,
+    /// Confirmed anchors, in canonical order.
+    entries: Vec<Entry>,
+    /// Anchors broadcast by this process and not yet seen mined
+    /// (in-memory only — a fresh process learns them from the scan once
+    /// they confirm).
+    mempool: Vec<Entry>,
+}
+
+impl BitcoinAnchorChain<HttpTransport> {
+    /// Open the backend: build the HTTP transport, probe the node (hard
+    /// error on unreachability, auth failure, or network mismatch), load
+    /// or initialize the index, and scan up to the tip.
+    pub fn open(config: &Config) -> Result<Self, Error> {
+        let transport = HttpTransport::new(&config.rpc_url, config.wallet.as_deref(), &config.auth)?;
+        Self::with_transport(RpcClient::new(transport), config)
+    }
+}
+
+impl<T: Transport> BitcoinAnchorChain<T> {
+    /// Open over an explicit RPC client (the transport-agnostic core of
+    /// [`BitcoinAnchorChain::open`]).
+    pub fn with_transport(client: RpcClient<T>, config: &Config) -> Result<Self, Error> {
+        // Probe: unreachable node, bad auth, and wrong network are hard
+        // errors — never a fallback.
+        let info = client.call("getblockchaininfo", json!([]))?;
+        let actual = info
+            .get("chain")
+            .and_then(Value::as_str)
+            .ok_or_else(|| Error::Malformed("getblockchaininfo: no `chain`".into()))?;
+        if actual != config.network.rpc_chain_name() {
+            return Err(Error::WrongNetwork {
+                expected: config.network,
+                actual: actual.to_string(),
+            });
+        }
+        let tip = info
+            .get("blocks")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| Error::Malformed("getblockchaininfo: no `blocks`".into()))?;
+        let mut chain = Self {
+            client,
+            network: config.network,
+            index_path: config.index_path.clone(),
+            start_height: 0,
+            tip,
+            scanned: None,
+            entries: Vec::new(),
+            mempool: Vec::new(),
+        };
+        chain.load_or_init(config.scan_from)?;
+        chain.refresh()?;
+        Ok(chain)
+    }
+
+    /// The network this backend is connected to.
+    pub fn network(&self) -> Network {
+        self.network
+    }
+
+    /// The height scanning started (or will start) from.
+    pub fn start_height(&self) -> u64 {
+        self.start_height
+    }
+
+    /// The last height scanned into the index (`None` if the start height
+    /// is above the tip).
+    pub fn scanned_height(&self) -> Option<u64> {
+        self.scanned.map(|(h, _)| h)
+    }
+
+    /// Number of confirmed anchors in the index.
+    pub fn entry_count(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Rescan from the last scanned height to the current tip, picking up
+    /// newly mined anchors. On a stale tip hash (reorg) the index is
+    /// truncated back to the start height and rebuilt (crate docs).
+    pub fn refresh(&mut self) -> Result<(), Error> {
+        self.tip = self
+            .client
+            .call("getblockcount", json!([]))?
+            .as_u64()
+            .ok_or_else(|| Error::Malformed("getblockcount: not a number".into()))?;
+        if let Some((h, hash)) = self.scanned {
+            let actual = self.client.call_str("getblockhash", json!([h]))?;
+            if hash_from_rpc(&actual)? != hash {
+                self.scanned = None;
+                self.entries.clear();
+            }
+        }
+        let mut height = self
+            .scanned
+            .map(|(h, _)| h + 1)
+            .unwrap_or(self.start_height);
+        let mut dirty = false;
+        while height <= self.tip {
+            let hash = self.client.call_str("getblockhash", json!([height]))?;
+            let block = self.client.call("getblock", json!([hash, 2]))?;
+            self.scan_block(&block, height)?;
+            self.scanned = Some((height, hash_from_rpc(&hash)?));
+            dirty = true;
+            height += 1;
+        }
+        if !self.mempool.is_empty() {
+            self.mempool
+                .retain(|m| !self.entries.iter().any(|e| e.txid == m.txid));
+        }
+        if dirty {
+            self.persist()?;
+        }
+        Ok(())
+    }
+
+    /// Broadcast a 64-byte anchor record in an `OP_RETURN` output of a
+    /// real Bitcoin transaction (two-pass construction; see the crate
+    /// docs). `build` constructs the record from the transaction context
+    /// — the bound payloads commit to it — and is evaluated once per
+    /// candidate funding input until the record
+    /// [`AnchorRecord::parses_cleanly`]. Returns a reference carrying
+    /// [`MEMPOOL_LOCATION`]; the confirmed location is resolved by txid
+    /// once the transaction mines.
+    pub fn anchor(
+        &mut self,
+        mut build: impl FnMut(&[u8; 32]) -> AnchorRecord,
+    ) -> Result<AnchorRef, Error> {
+        // Pass 1: fund a transaction carrying a dummy 64-byte OP_RETURN,
+        // letting the wallet select inputs and price change + fee.
+        let dummy = to_hex(&[0u8; ANCHOR_SIZE]);
+        let raw1 = self
+            .client
+            .call_str("createrawtransaction", json!([[], [{"data": dummy}]]))?;
+        let funded = self.client.call("fundrawtransaction", json!([raw1, {}]))?;
+        let funded_hex = funded
+            .get("hex")
+            .and_then(Value::as_str)
+            .ok_or_else(|| Error::Malformed("fundrawtransaction: no `hex`".into()))?;
+        let tx = self.client.call("decoderawtransaction", json!([funded_hex]))?;
+        let malformed = |what: &str| Error::Malformed(format!("funded transaction: {what}"));
+        let vin = tx
+            .get("vin")
+            .and_then(Value::as_array)
+            .ok_or_else(|| malformed("no `vin`"))?;
+        let vout = tx
+            .get("vout")
+            .and_then(Value::as_array)
+            .ok_or_else(|| malformed("no `vout`"))?;
+        let mut candidates: Vec<(String, u32)> = Vec::with_capacity(vin.len());
+        for input in vin {
+            let txid = input
+                .get("txid")
+                .and_then(Value::as_str)
+                .ok_or_else(|| malformed("vin entry without `txid`"))?;
+            let n = input
+                .get("vout")
+                .and_then(Value::as_u64)
+                .ok_or_else(|| malformed("vin entry without `vout`"))?;
+            candidates.push((
+                txid.to_string(),
+                u32::try_from(n).map_err(|_| malformed("`vout` overflows u32"))?,
+            ));
+        }
+        if candidates.is_empty() {
+            return Err(Error::NoFundingInputs);
+        }
+        // Choose the funding input: the first whose ctx yields a cleanly
+        // parsing record (the tag-collision redraw, with input order as
+        // the redraw freedom — vin[0] is the ctx input).
+        let mut chosen = None;
+        for (i, (txid, n)) in candidates.iter().enumerate() {
+            let ctx = funding_ctx(&hash_from_rpc(txid)?, *n);
+            let record = build(&ctx);
+            if record.parses_cleanly() {
+                chosen = Some((i, ctx, record));
+                break;
+            }
+        }
+        let (chosen_idx, ctx, record) = chosen.ok_or(Error::TagCollision)?;
+        // Pass 2: identical inputs (chosen first) and identical outputs —
+        // same fee, same change — with the real record bytes in place of
+        // the dummy payload.
+        let mut inputs = Vec::with_capacity(candidates.len());
+        inputs.push(json!({
+            "txid": &candidates[chosen_idx].0,
+            "vout": candidates[chosen_idx].1,
+        }));
+        for (i, (txid, n)) in candidates.iter().enumerate() {
+            if i != chosen_idx {
+                inputs.push(json!({"txid": txid, "vout": n}));
+            }
+        }
+        let record_hex = to_hex(&record.to_bytes());
+        let mut outputs = Vec::with_capacity(vout.len());
+        for output in vout {
+            let script = output
+                .get("scriptPubKey")
+                .ok_or_else(|| malformed("vout entry without `scriptPubKey`"))?;
+            if script.get("type").and_then(Value::as_str) == Some("nulldata") {
+                outputs.push(json!({"data": record_hex}));
+            } else {
+                let address = script
+                    .get("address")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| malformed("vout entry without `address`"))?;
+                // `value` passes through untouched (arbitrary-precision
+                // JSON): the amount is exactly what pass 1 priced.
+                let mut obj = serde_json::Map::new();
+                obj.insert(address.to_string(), output["value"].clone());
+                outputs.push(Value::Object(obj));
+            }
+        }
+        let raw2 = self
+            .client
+            .call_str("createrawtransaction", json!([inputs, outputs]))?;
+        let signed = self
+            .client
+            .call("signrawtransactionwithwallet", json!([raw2]))?;
+        if signed.get("complete").and_then(Value::as_bool) != Some(true) {
+            return Err(Error::SigningFailed(
+                signed
+                    .get("errors")
+                    .map(Value::to_string)
+                    .unwrap_or_else(|| "unknown signing error".into()),
+            ));
+        }
+        let signed_hex = signed
+            .get("hex")
+            .and_then(Value::as_str)
+            .ok_or_else(|| Error::Malformed("signrawtransactionwithwallet: no `hex`".into()))?;
+        let txid_hex = self.client.call_str("sendrawtransaction", json!([signed_hex]))?;
+        let txid = hash_from_rpc(&txid_hex)?;
+        self.mempool.push(Entry {
+            txid,
+            location: MEMPOOL_LOCATION,
+            record,
+            ctx,
+        });
+        Ok(AnchorRef {
+            txid,
+            location: MEMPOOL_LOCATION,
+        })
+    }
+
+    /// Mine `n` blocks to a fresh wallet address (regtest only — backs the
+    /// CLI's `chain advance`; on real networks blocks arrive by mining and
+    /// this is a hard error).
+    pub fn generate_blocks(&mut self, n: u64) -> Result<(), Error> {
+        if self.network != Network::Regtest {
+            return Err(Error::NotRegtest);
+        }
+        let address = self.client.call_str("getnewaddress", json!([]))?;
+        self.client.call("generatetoaddress", json!([n, address]))?;
+        self.refresh()
+    }
+
+    fn scan_block(&mut self, block: &Value, height: u64) -> Result<(), Error> {
+        let txs = block
+            .get("tx")
+            .and_then(Value::as_array)
+            .ok_or_else(|| Error::Malformed("getblock: no `tx` array".into()))?;
+        for (position, tx) in txs.iter().enumerate() {
+            if let Some(entry) = scan_tx(tx, height, position as u32)? {
+                self.entries.push(entry);
+            }
+        }
+        Ok(())
+    }
+
+    fn load_or_init(&mut self, scan_from: Option<u64>) -> Result<(), Error> {
+        match self.load_index()? {
+            Some((start, scanned, entries))
+                if scan_from.is_none() || scan_from == Some(start) =>
+            {
+                self.start_height = start;
+                self.scanned = scanned;
+                self.entries = entries;
+            }
+            Some(_) | None => {
+                // No index, or an explicit --scan-from that differs from
+                // the stored start: (re)build from the requested height.
+                self.start_height = scan_from.unwrap_or(self.tip);
+                self.scanned = None;
+                self.entries.clear();
+            }
+        }
+        Ok(())
+    }
+
+    fn persist(&self) -> Result<(), Error> {
+        if let Some(parent) = self.index_path.parent() {
+            std::fs::create_dir_all(parent).map_err(io_err(parent))?;
+        }
+        let mut out = format!("{MAGIC}\nnetwork {}\nstart {}\n", self.network.name(), self.start_height);
+        if let Some((height, hash)) = self.scanned {
+            out.push_str(&format!("scanned {} {}\n", height, hash_to_rpc(&hash)));
+        }
+        for e in &self.entries {
+            out.push_str(&format!(
+                "entry {} {} {} {} {}\n",
+                e.location.height,
+                e.location.position,
+                hash_to_rpc(&e.txid),
+                to_hex(&e.ctx),
+                to_hex(&e.record.to_bytes()),
+            ));
+        }
+        std::fs::write(&self.index_path, out).map_err(io_err(&self.index_path))
+    }
+
+    /// Load the index file, returning `(start, scanned, entries)`; `None`
+    /// if the file does not exist. A network mismatch is a hard error.
+    fn load_index(&self) -> Result<Option<PersistedIndex>, Error> {
+        let text = match std::fs::read_to_string(&self.index_path) {
+            Ok(text) => text,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(io_err(&self.index_path)(e)),
+        };
+        let decode = |message: String| Error::Decode {
+            path: self.index_path.clone(),
+            message,
+        };
+        let mut start = None;
+        let mut scanned = None;
+        let mut entries = Vec::new();
+        let mut lines = text.lines().enumerate();
+        match lines.next() {
+            Some((_, line)) if line.trim() == MAGIC => {}
+            _ => return Err(decode("bad magic line".into())),
+        }
+        for (n, line) in lines {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            let bad = || decode(format!("line {}: malformed `{line}`", n + 1));
+            let fields: Vec<&str> = line.split_whitespace().collect();
+            match fields.as_slice() {
+                ["network", name] => {
+                    if Network::parse(name).ok() != Some(self.network) {
+                        return Err(decode(format!(
+                            "index is for network `{name}`, not {}",
+                            self.network.name()
+                        )));
+                    }
+                }
+                ["start", h] => start = Some(h.parse().map_err(|_| bad())?),
+                ["scanned", h, hash] => {
+                    scanned = Some((
+                        h.parse().map_err(|_| bad())?,
+                        hash_from_rpc(hash).map_err(|_| bad())?,
+                    ));
+                }
+                ["entry", h, p, txid, ctx, record] => {
+                    let record_bytes: [u8; ANCHOR_SIZE] =
+                        from_hex(record).map_err(|_| bad())?.try_into().map_err(|_| bad())?;
+                    entries.push(Entry {
+                        txid: hash_from_rpc(txid).map_err(|_| bad())?,
+                        location: AnchorLocation {
+                            height: h.parse().map_err(|_| bad())?,
+                            position: p.parse().map_err(|_| bad())?,
+                        },
+                        record: AnchorRecord::from_bytes(&record_bytes),
+                        ctx: from_hex(ctx)
+                            .map_err(|_| bad())?
+                            .try_into()
+                            .map_err(|_| bad())?,
+                    });
+                }
+                _ => return Err(bad()),
+            }
+        }
+        let start = start.ok_or_else(|| decode("missing `start` line".into()))?;
+        Ok(Some((start, scanned, entries)))
+    }
+
+    fn find(&self, anchor_ref: &AnchorRef) -> Option<&Entry> {
+        let matches = |e: &&Entry| {
+            e.txid == anchor_ref.txid
+                && (e.location == anchor_ref.location
+                    || anchor_ref.location == MEMPOOL_LOCATION)
+        };
+        self.entries
+            .iter()
+            .find(matches)
+            .or_else(|| self.mempool.iter().find(matches))
+    }
+}
+
+/// Extract an anchor entry from a decoded transaction (verbosity 2): the
+/// first 64-byte `OP_RETURN` output, with `ctx` from vin\[0\]. Coinbase
+/// transactions and transactions without a 64-byte data output yield
+/// `None`.
+fn scan_tx(tx: &Value, height: u64, position: u32) -> Result<Option<Entry>, Error> {
+    let malformed = || Error::Malformed("scanned transaction has no `txid`".into());
+    let txid_hex = tx.get("txid").and_then(Value::as_str).ok_or_else(malformed)?;
+    let vin0 = tx
+        .get("vin")
+        .and_then(Value::as_array)
+        .and_then(|vin| vin.first());
+    let Some(vin0) = vin0 else {
+        return Ok(None); // vin-less: no funding input
+    };
+    let (Some(prev_txid), Some(prev_vout)) = (
+        vin0.get("txid").and_then(Value::as_str),
+        vin0.get("vout").and_then(Value::as_u64),
+    ) else {
+        return Ok(None); // coinbase: no prevout
+    };
+    let prev_vout = u32::try_from(prev_vout)
+        .map_err(|_| Error::Malformed("scanned vin `vout` overflows u32".into()))?;
+    let ctx = funding_ctx(&hash_from_rpc(prev_txid)?, prev_vout);
+    let Some(vout) = tx.get("vout").and_then(Value::as_array) else {
+        return Ok(None);
+    };
+    for output in vout {
+        let script = output.get("scriptPubKey");
+        if script
+            .and_then(|s| s.get("type"))
+            .and_then(Value::as_str)
+            != Some("nulldata")
+        {
+            continue;
+        }
+        if let Some(payload) = script
+            .and_then(|s| s.get("hex"))
+            .and_then(Value::as_str)
+            .and_then(op_return_payload)
+        {
+            return Ok(Some(Entry {
+                txid: hash_from_rpc(txid_hex)?,
+                location: AnchorLocation { height, position },
+                record: AnchorRecord::from_bytes(&payload),
+                ctx,
+            }));
+        }
+    }
+    Ok(None)
+}
+
+impl<T: Transport> AnchorChain for BitcoinAnchorChain<T> {
+    fn tip_height(&self) -> u64 {
+        // Cached at open/refresh — the trait cannot surface RPC errors.
+        self.tip
+    }
+
+    fn anchor_at(&self, anchor_ref: &AnchorRef) -> Option<AnchorRecord> {
+        self.find(anchor_ref).map(|e| e.record)
+    }
+
+    fn ctx_at(&self, anchor_ref: &AnchorRef) -> Option<[u8; 32]> {
+        self.find(anchor_ref).map(|e| e.ctx)
+    }
+
+    fn locate(&self, anchor_ref: &AnchorRef) -> Option<AnchorLocation> {
+        // Resolve by txid: the consignment's location may be the mempool
+        // placeholder while the confirmed position only exists post-scan.
+        self.find(anchor_ref).map(|e| e.location)
+    }
+
+    fn first_nullifier_occurrence(&self, raw_nf: &Digest) -> Option<AnchorLocation> {
+        self.nullifier_occurrences(raw_nf).into_iter().next()
+    }
+
+    fn nullifier_occurrences(&self, raw_nf: &Digest) -> Vec<AnchorLocation> {
+        // Confirmed anchors only: canonical chain order does not exist for
+        // mempool transactions.
+        let mut locations: Vec<_> = self
+            .entries
+            .iter()
+            .filter(|e| e.record.well_formed(&e.ctx, raw_nf))
+            .map(|e| e.location)
+            .collect();
+        locations.sort();
+        locations
+    }
+
+    fn anchors_up_to(&self, height: u64) -> Vec<(AnchorLocation, AnchorRecord)> {
+        let mut anchors: Vec<_> = self
+            .entries
+            .iter()
+            .filter(|e| e.location.height <= height)
+            .map(|e| (e.location, e.record))
+            .collect();
+        anchors.sort_by_key(|(location, _)| *location);
+        anchors
+    }
+
+    fn confirmations_at(&self, height: u64) -> u64 {
+        // Height 0 is the mempool placeholder: 0 confirmations.
+        if height == 0 || height > self.tip {
+            0
+        } else {
+            self.tip - height + 1
+        }
+    }
+}
+
+/// First line of every index file (format version tag).
+const MAGIC: &str = "opencsv-bitcoin-index-v1";
+
+/// `(start_height, last_scanned(height, block_hash), confirmed entries)`
+/// as persisted in the index file.
+type PersistedIndex = (u64, Option<(u64, [u8; 32])>, Vec<Entry>);
+
+#[cfg(test)]
+#[path = "tests.rs"]
+mod tests;

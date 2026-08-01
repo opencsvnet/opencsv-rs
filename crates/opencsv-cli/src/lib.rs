@@ -14,10 +14,15 @@
 //!   created them, needed later as the in-circuit predecessor), received
 //!   consignment blobs, and issuer keys. **Prototype-grade: secrets are
 //!   stored unencrypted.**
+//! - [`backend`] — the chain-backend selection: **real Bitcoin via
+//!   `bitcoind` RPC (default)** through the `opencsv-bitcoin` crate, or
+//!   the demo backends ([`chain::FileAnchorChain`],
+//!   [`httpchain::HttpAnchorChain`]).
 //! - [`chain`] — [`chain::FileAnchorChain`], a persistent
-//!   [`opencsv_core::AnchorChain`] backed by an append-only text file, plus
-//!   the [`chain::AnchorWriter`] seam (the write side a `bitcoind` backend
-//!   will implement by broadcasting).
+//!   [`opencsv_core::AnchorChain`] backed by an append-only text file (a
+//!   demo backend), plus the [`chain::AnchorWriter`] seam the wallet
+//!   operations anchor through. Records are built against the backend's
+//!   transaction context via [`chain::AnchorWriter::append_bound`].
 //! - [`ops`] — the protocol flows: [`ops::keygen`], [`ops::issuer_init`],
 //!   [`ops::mint`], [`ops::send`], [`ops::receive`], [`ops::redeem`],
 //!   [`ops::balance`], [`ops::audit`]. Proving goes through `opencsv-pcd`'s
@@ -41,6 +46,8 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod backend;
+pub mod bitcoin;
 pub mod chain;
 pub mod error;
 pub mod hexutil;

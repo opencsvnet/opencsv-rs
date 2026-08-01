@@ -7,6 +7,7 @@ members = [
     "crates/opencsv-signal",
     "apple/bench-ffi",
     "crates/opencsv-anchor-server",
+    "crates/opencsv-bitcoin",
     "ffi",
 ]
 

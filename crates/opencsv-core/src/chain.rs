@@ -67,6 +67,19 @@ pub trait AnchorChain {
     /// Returns `None` under the same conditions as [`AnchorChain::anchor_at`].
     fn ctx_at(&self, anchor_ref: &AnchorRef) -> Option<[u8; 32]>;
 
+    /// Resolve an anchor reference to its canonical on-chain location.
+    ///
+    /// For chains where anchors land at a known position (the mock, the
+    /// file demo chain), this is just the claimed location, provided the
+    /// anchor exists there (paper §4.8 step 3a: "the anchor transaction
+    /// exists at the claimed position"). A `bitcoind` backend broadcasts
+    /// into the mempool, where the block height and in-block position are
+    /// unknowable at anchor time, so its references carry a placeholder
+    /// location and it overrides this to resolve by transaction ID.
+    fn locate(&self, anchor_ref: &AnchorRef) -> Option<AnchorLocation> {
+        self.anchor_at(anchor_ref).map(|_| anchor_ref.location)
+    }
+
     /// The first occurrence of a raw nullifier in canonical chain order, if
     /// any (paper §4.7 rule 1): an entry whose record binds `raw_nf` under
     /// the entry's `ctx` (see module docs). For compressed transfers, query

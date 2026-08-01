@@ -42,28 +42,15 @@ pub fn random_digest() -> Digest {
     Digest::from_bytes(rand::rng().random())
 }
 
-/// A fresh random anchor transaction context (synthetic outpoint). Drawn
-/// *before* constructing a nullifier-bearing anchor record: the record's
-/// bound payloads `H("bind" ∥ nf ∥ ctx)` commit to it (see `opencsv-core`'s
-/// anchor docs).
+/// A fresh random anchor transaction context (synthetic outpoint) for the
+/// demo backends, which draw `ctx` freely. Drawn *before* constructing a
+/// nullifier-bearing anchor record: the record's bound payloads
+/// `H("bind" ∥ nf ∥ ctx)` commit to it (see `opencsv-core`'s anchor docs).
+/// Wallet flows do not call this directly — they anchor via
+/// [`AnchorWriter::append_bound`], which lets the backend assign `ctx`
+/// (the `bitcoind` backend derives it from the funding input's outpoint).
 pub fn random_ctx() -> [u8; 32] {
     rand::rng().random()
-}
-
-/// Draw a ctx and build the XFER record binding `nullifiers` to it,
-/// redrawing if the bound payload's first byte collides with the MINT/REDEEM
-/// tag bytes (such a record would misparse as tagged for every verifier —
-/// see `opencsv-core`'s anchor docs; ~0.8% of draws, so this loop is
-/// expected to exit on the first iteration).
-fn fresh_xfer_record(nullifiers: &[Digest]) -> (AnchorRecord, [u8; 32]) {
-    loop {
-        let ctx = random_ctx();
-        let record = AnchorRecord::xfer(nullifiers, &ctx);
-        let parsed = AnchorRecord::from_bytes(&record.to_bytes());
-        if matches!(parsed, AnchorRecord::Xfer { .. } | AnchorRecord::XferCompressed { .. }) {
-            return (record, ctx);
-        }
-    }
 }
 
 /// Create a new owner identity, returning its public key (`owner = H(osk)`).
@@ -154,7 +141,10 @@ pub fn mint<C: AnchorWriter>(
         value: total,
         mint_commit: mint_commit(asset_id, total, &mint_nonce).to_anchor(),
     };
-    let anchor = chain.append(record, random_ctx())?;
+    // MINT carries no bound payload, so the closure ignores the ctx — but
+    // anchoring still goes through the backend's ctx assignment (the
+    // bitcoind backend derives ctx from the funding input's outpoint).
+    let anchor = chain.append_bound(|_| record)?;
     let consignment = Consignment {
         coin_openings: openings_of(&outputs),
         nullifiers: vec![],
@@ -239,7 +229,8 @@ pub fn send<C: AnchorWriter>(
     // The raw nullifiers travel only in the consignment; the anchor
     // publishes bound payloads `H("bind" ∥ nf ∥ ctx)` (anti-grief, see
     // `opencsv-core`'s anchor docs). The 2-in circuit fits XFER's two
-    // payload slots directly.
+    // payload slots directly. The record is built against the backend's
+    // ctx inside `append_bound` (tag-collision redraw included).
     let zero = Digest::from_bytes([0u8; 32]);
     let nullifiers: Vec<Digest> = proof
         .statement
@@ -251,8 +242,7 @@ pub fn send<C: AnchorWriter>(
     if nullifiers.is_empty() {
         return Err(Error::Internal("transfer statement has no nullifiers"));
     }
-    let (record, ctx) = fresh_xfer_record(&nullifiers);
-    let anchor = chain.append(record, ctx)?;
+    let anchor = chain.append_bound(|ctx| AnchorRecord::xfer(&nullifiers, ctx))?;
     let consignment = Consignment {
         coin_openings: openings_of(&outputs),
         nullifiers,
@@ -289,10 +279,10 @@ pub fn redeem<C: AnchorWriter>(
     let proof =
         opencsv_pcd::prove_redeem(&coin.asset_id, &(coin, osk), &predecessor, stored.selector)?;
 
-    let ctx = random_ctx();
     let raw_nf = proof.statement.nullifiers[0];
-    let record = AnchorRecord::redeem(coin.asset_id.to_anchor(), coin.value, &raw_nf, &ctx);
-    let anchor = chain.append(record, ctx)?;
+    let anchor = chain.append_bound(|ctx| {
+        AnchorRecord::redeem(coin.asset_id.to_anchor(), coin.value, &raw_nf, ctx)
+    })?;
     let consignment = Consignment {
         coin_openings: vec![],
         nullifiers: vec![raw_nf],
