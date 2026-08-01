@@ -27,6 +27,12 @@ pub struct Peer {
     pub services: u64,
     /// The peer's claimed best height, from its `version`.
     pub start_height: i32,
+    /// Payload bytes of `cfilter` messages received (bandwidth accounting
+    /// for the scan engine).
+    pub filter_bytes_fetched: u64,
+    /// Payload bytes of `block` messages received (bandwidth accounting
+    /// for the scan engine).
+    pub block_bytes_fetched: u64,
 }
 
 impl Peer {
@@ -46,6 +52,8 @@ impl Peer {
             magic: params.magic,
             services: 0,
             start_height: 0,
+            filter_bytes_fetched: 0,
+            block_bytes_fetched: 0,
         };
         peer.handshake(tip_height)?;
         Ok(peer)
@@ -155,6 +163,7 @@ impl Peer {
         let payload =
             messages::getcfilter_range_payload(crate::gcs::BASIC_FILTER_TYPE, start_height, block_hash);
         let message = self.request("getcfilters", &payload, &["cfilter"])?;
+        self.filter_bytes_fetched += message.payload.len() as u64;
         let parsed = messages::parse_cfilter(&message.payload)?;
         if parsed.block_hash != *block_hash {
             return Err(protocol_err(format!(
@@ -173,6 +182,7 @@ impl Peer {
             let message = self.request("getdata", &payload, &["block", "notfound"])?;
             match message.command.as_str() {
                 "block" => {
+                    self.block_bytes_fetched += message.payload.len() as u64;
                     let block = messages::parse_block_message(&message.payload)?;
                     if block.header.hash() != *block_hash {
                         return Err(protocol_err(format!(

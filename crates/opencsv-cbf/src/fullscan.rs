@@ -37,6 +37,37 @@ use crate::error::Error;
 /// chain rescan.
 pub const MAX_WINDOW_BLOCKS: u64 = 2016;
 
+/// Every anchor candidate in a block (the first 64-byte OP_RETURN
+/// output per non-coinbase transaction, ctx recomputed from the first
+/// input — the same rule as `opencsv-bitcoin`'s scanner).
+pub(crate) fn anchors_in_block(block: &crate::block::Block, height: u64) -> Vec<ScannedAnchor> {
+    let mut entries = Vec::new();
+    for (position, tx) in block.txs.iter().enumerate() {
+        if tx.is_coinbase() {
+            continue;
+        }
+        let Some(funding) = tx.inputs.first() else {
+            continue;
+        };
+        let ctx = funding_ctx(&funding.prev.txid, funding.prev.vout);
+        for output in &tx.outputs {
+            if let Some(payload) = op_return_payload(&output.script_pubkey) {
+                entries.push(ScannedAnchor {
+                    location: AnchorLocation {
+                        height,
+                        position: position as u32,
+                    },
+                    txid: tx.txid(),
+                    record: AnchorRecord::from_bytes(&payload),
+                    ctx,
+                });
+                break;
+            }
+        }
+    }
+    entries
+}
+
 /// One 64-byte OP_RETURN candidate found in a scanned block.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ScannedAnchor {
@@ -101,31 +132,7 @@ impl FullScanChain {
                     crate::hash::hash_to_display(&block_hash)
                 )));
             }
-            for (position, tx) in block.txs.iter().enumerate() {
-                if tx.is_coinbase() {
-                    continue;
-                }
-                let Some(funding) = tx.inputs.first() else {
-                    continue;
-                };
-                let ctx = funding_ctx(&funding.prev.txid, funding.prev.vout);
-                // The first 64-byte OP_RETURN output, matching
-                // opencsv-bitcoin's scanner.
-                for output in &tx.outputs {
-                    if let Some(payload) = op_return_payload(&output.script_pubkey) {
-                        entries.push(ScannedAnchor {
-                            location: AnchorLocation {
-                                height,
-                                position: position as u32,
-                            },
-                            txid: tx.txid(),
-                            record: AnchorRecord::from_bytes(&payload),
-                            ctx,
-                        });
-                        break;
-                    }
-                }
-            }
+            entries.extend(anchors_in_block(&block, height));
         }
         Ok(Self {
             window_start: birth,

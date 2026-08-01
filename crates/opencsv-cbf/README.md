@@ -73,6 +73,41 @@ Early BIP158 drafts did use 1-3, but the deployed spec and every
 shipping implementation use SipHash-2-4; the BIP158 test vectors — and
 live bitcoind filters — only decode with 2-4.)
 
+## The scan engine (ScanIndex): trustless exclusion by default
+
+Anchor transactions carry the protocol-constant marker output
+(`opencsv_bitcoin::MARKER_SPK` = `OP_0 <sha256(OP_TRUE)>`, 546 sats) at
+output index 1, so BIP158 basic filters match anchor-bearing blocks even
+though they exclude the OP_RETURN record itself. `ScanIndex` builds the
+default exclusion path on top of this:
+
+- `scan_sync(client, from_height)` checks every block's verified filter
+  for the marker spk from `from_height` to the tip, SPV-fetches
+  (merkle-verified) the matching blocks, and stores every OP_RETURN
+  candidate with its recomputed funding ctx in a persistent, rebuildable
+  index dir. Bandwidth counters (`filters_bytes`, `blocks_bytes`,
+  `blocks_fetched`) are exposed.
+- `scan_check(raw_nf, birth, spend)` answers occurrence queries
+  **locally** — no network at check time; earliest occurrence wins.
+- The `AnchorChain` impl (tip = synced tip) lets `accept()` run against
+  the scan alone: no RPC to the anchoring node, no indexer.
+
+The regtest test measures the whole exclusion check at **320 filter
+bytes + 1140 block bytes** for an 8-block window (2 anchor blocks).
+
+### The three exclusion postures, and when each applies
+
+| Posture | Trust needed | Cost per check | Use |
+| --- | --- | --- | --- |
+| **ScanIndex** (this crate) | SPV only (PoW headers + verified filters) | filters to tip + anchor blocks only | the default |
+| **FullScanChain** | SPV only | full blocks for the whole window | fallback: pre-marker history, or when filter correctness itself is in doubt |
+| **CrossCheckedChain** (opencsv-core) | 1-of-N honest indexers | one indexer query | when indexers are acceptable anyway (they already run them) |
+
+Marker-copy noise (a third party putting the constant marker in their
+own transaction) and BIP158 false positives both cost one
+merkle-verified block download and nothing else — no record binding the
+queried nullifier is found.
+
 ## FullScanChain: the zero-trust self-scan escape hatch
 
 For high-value receipts, `FullScanChain` removes the indexer from the

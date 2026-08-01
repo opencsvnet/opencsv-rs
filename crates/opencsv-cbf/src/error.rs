@@ -21,6 +21,8 @@ pub enum Error {
     /// Caller supplied an invalid argument (e.g. the mempool sentinel
     /// location).
     InvalidInput(String),
+    /// A persistent cache file failed to decode.
+    Decode(String),
 }
 
 impl fmt::Display for Error {
@@ -33,6 +35,7 @@ impl fmt::Display for Error {
             Self::NoPeers(m) => write!(f, "no usable peers: {m}"),
             Self::DivergentPeers(m) => write!(f, "peers disagree: {m}"),
             Self::InvalidInput(m) => write!(f, "invalid input: {m}"),
+            Self::Decode(m) => write!(f, "cache decode: {m}"),
         }
     }
 }

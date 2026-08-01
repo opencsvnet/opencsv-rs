@@ -70,11 +70,13 @@ pub mod hash;
 pub mod messages;
 pub mod network;
 pub mod peer;
+pub mod scan;
 pub mod siphash;
 pub mod wire;
 
 pub use client::{AnchorVerdict, CbfClient, Config, NotPresentReason};
 pub use fullscan::{FullScanChain, ScannedAnchor, MAX_WINDOW_BLOCKS};
+pub use scan::{ScanCounters, ScanIndex};
 pub use error::Error;
 pub use opencsv_bitcoin::Network;
 pub use opencsv_core::chain::AnchorLocation;

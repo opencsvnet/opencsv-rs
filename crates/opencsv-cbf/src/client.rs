@@ -280,6 +280,18 @@ impl CbfClient {
         )
     }
 
+    /// Network bandwidth consumed so far, as `(filter_bytes,
+    /// block_bytes)` of message payloads. Cache hits do not count; used
+    /// by the scan engine's accounting.
+    pub fn fetched_bytes(&self) -> (u64, u64) {
+        self.peers.iter().fold((0, 0), |(f, b), peer| {
+            (
+                f + peer.filter_bytes_fetched,
+                b + peer.block_bytes_fetched,
+            )
+        })
+    }
+
     /// Fetch a full block from the first peer that has it.
     pub fn fetch_block(&mut self, block_hash: &[u8; 32]) -> Result<Block, Error> {
         let mut last_err = None;
