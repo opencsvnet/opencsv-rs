@@ -59,6 +59,17 @@ struct AnchorReplyJson {
 }
 
 #[derive(Deserialize)]
+struct InfoJson {
+    #[serde(default = "demo_default")]
+    demo: bool,
+}
+
+/// Servers predating `/info` only ever fronted the demo file chain.
+fn demo_default() -> bool {
+    true
+}
+
+#[derive(Deserialize)]
 struct ContextReplyJson {
     ctx: String,
 }
@@ -161,6 +172,17 @@ impl HttpAnchorChain {
         )))
     }
 
+    /// Whether this server simulates anchors (demo file chain) rather than
+    /// publishing them on Bitcoin. Servers without `/info` are demo-era.
+    pub fn is_demo(&self) -> bool {
+        match self.request("GET", "/info", None) {
+            Ok(reply) => serde_json::from_str::<InfoJson>(&reply)
+                .map(|info| info.demo)
+                .unwrap_or(true),
+            Err(_) => true,
+        }
+    }
+
     /// Advance the server's tip by `n` blocks (`POST /advance`).
     pub fn advance_blocks(&mut self, n: u64) -> Result<(), Error> {
         self.request("POST", "/advance", Some(&format!(r#"{{"blocks":{n}}}"#)))?;
@@ -223,7 +245,12 @@ impl AnchorWriter for HttpAnchorChain {
                         .try_into()
                         .map_err(|_| Error::Parse("anchor context is not 32 bytes".into()))?
                 }
-                Err(_) => rand::rng().random(),
+                // Only a missing route means "demo backend, draw your own".
+                // Any other failure (no funds, node down) must surface:
+                // anchoring with a ctx the backend never reserved would be
+                // rejected at broadcast anyway.
+                Err(Error::Parse(message)) if message.contains(" 404 ") => rand::rng().random(),
+                Err(e) => return Err(e),
             };
             let record = build(&ctx);
             if record.parses_cleanly() {

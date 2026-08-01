@@ -29,10 +29,13 @@ pub enum ChainSpec {
 }
 
 impl ChainSpec {
-    /// True for the simulated backends (anything that is not real
-    /// Bitcoin).
+    /// `true` when anchors are simulated rather than published on Bitcoin.
+    ///
+    /// A `--anchor-server` may front *either* a demo file chain or a real
+    /// Bitcoin backend, so it is not classified here: [`ChainBackend`]
+    /// resolves it after the server reports which it is.
     pub fn is_demo(&self) -> bool {
-        !matches!(self, Self::Bitcoin(_))
+        matches!(self, Self::File(_))
     }
 }
 

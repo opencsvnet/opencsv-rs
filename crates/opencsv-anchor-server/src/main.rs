@@ -198,6 +198,7 @@ fn handle(
     body: &[u8],
 ) -> (u16, String) {
     match (method, path) {
+        ("GET", "/info") => (200, json!({ "backend": "file", "demo": true }).to_string()),
         ("GET", "/snapshot") => {
             let snapshot = Snapshot {
                 tip_height: chain.tip_height(),
@@ -331,6 +332,10 @@ fn esplora_handle(
     body: &[u8],
 ) -> (u16, String) {
     match (method, path) {
+        ("GET", "/info") => (
+            200,
+            json!({ "backend": "esplora", "demo": false }).to_string(),
+        ),
         ("GET", "/snapshot") => {
             let state = match state.lock() {
                 Ok(state) => state,

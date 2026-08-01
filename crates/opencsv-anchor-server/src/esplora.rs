@@ -369,6 +369,16 @@ const DUST_SATS: u64 = 546;
 /// Conservative vsize for 1 P2WPKH input, OP_RETURN(64) + change output.
 const ANCHOR_TX_VSIZE: u64 = 210;
 
+/// A funding outpoint held for a client between `reserve_context` and
+/// `broadcast_anchor`.
+struct Reservation {
+    outpoint: (String, u32),
+    made_at: std::time::Instant,
+}
+
+/// How long a reserved funding outpoint is held before it can be reused.
+const RESERVATION_TTL: std::time::Duration = std::time::Duration::from_secs(180);
+
 pub struct AnchorWallet {
     secp: Secp256k1<bitcoin::secp256k1::All>,
     key: PrivateKey,
@@ -378,8 +388,10 @@ pub struct AnchorWallet {
     reserved: Mutex<HashSet<(String, u32)>>,
     /// Funding outpoints handed out by `reserve_context`, keyed by the ctx
     /// they derive: the wallet binds its record to this ctx, so the anchor
-    /// transaction must spend exactly this outpoint.
-    contexts: Mutex<HashMap<[u8; 32], (String, u32)>>,
+    /// transaction must spend exactly this outpoint. Entries carry the
+    /// reservation time and expire — an abandoned handshake (client
+    /// crashed, user cancelled) must not strand the coin forever.
+    contexts: Mutex<HashMap<[u8; 32], Reservation>>,
 }
 
 impl AnchorWallet {
@@ -425,6 +437,20 @@ impl AnchorWallet {
             .reserved
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // Release abandoned handshakes so their coins are spendable again.
+        {
+            let mut contexts = self
+                .contexts
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            contexts.retain(|_, reservation| {
+                let live = reservation.made_at.elapsed() < RESERVATION_TTL;
+                if !live {
+                    reserved.remove(&reservation.outpoint);
+                }
+                live
+            });
+        }
         let utxo = client
             .utxos(&self.address.to_string())?
             .into_iter()
@@ -445,7 +471,13 @@ impl AnchorWallet {
         self.contexts
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .insert(ctx, (utxo.txid, utxo.vout));
+            .insert(
+                ctx,
+                Reservation {
+                    outpoint: (utxo.txid, utxo.vout),
+                    made_at: std::time::Instant::now(),
+                },
+            );
         Ok(ctx)
     }
 
@@ -464,8 +496,11 @@ impl AnchorWallet {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .remove(ctx)
             .ok_or_else(|| {
-                "unknown ctx: reserve one with POST /anchor/context before anchoring".to_string()
-            })?;
+                "unknown or expired ctx: reserve one with POST /anchor/context, \
+                 then anchor within the reservation window"
+                    .to_string()
+            })?
+            .outpoint;
         let utxo = client
             .utxos(&self.address.to_string())?
             .into_iter()

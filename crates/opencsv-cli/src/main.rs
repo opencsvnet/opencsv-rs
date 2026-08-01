@@ -328,11 +328,22 @@ fn main() -> ExitCode {
     }
 }
 
+/// Whether the selected backend simulates anchors. An `--anchor-server`
+/// may front a demo file chain *or* real Bitcoin, so ask it.
+fn backend_is_demo(spec: &ChainSpec) -> bool {
+    match spec {
+        ChainSpec::Http(url) => opencsv_cli::httpchain::HttpAnchorChain::open(url)
+            .map(|chain| chain.is_demo())
+            .unwrap_or(true),
+        spec => spec.is_demo(),
+    }
+}
+
 fn run(cli: Cli) -> Result<ExitCode, Error> {
     let wallet_dir = cli.wallet_dir.clone().unwrap_or_else(default_wallet_dir);
     let wallet = Wallet::open(&wallet_dir)?;
     let spec = chain_spec(&cli, &wallet_dir)?;
-    if spec.is_demo() && command_uses_chain(&cli.command) {
+    if command_uses_chain(&cli.command) && backend_is_demo(&spec) {
         eprintln!("warning: DEMO CHAIN — not Bitcoin (anchors and confirmations are simulated)");
     }
     match cli.command {
