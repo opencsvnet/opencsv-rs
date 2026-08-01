@@ -58,8 +58,20 @@ fn binary_smoke() {
     // be requested explicitly — and warns that it is not Bitcoin.
     let out = ok(&run(&["--wallet-dir", w, "balance"]));
     assert_eq!(out.trim(), "0");
-    let output = run(&["--wallet-dir", w, "--chain", "demo", "audit", "--asset", &asset_hex]);
-    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    let output = run(&[
+        "--wallet-dir",
+        w,
+        "--chain",
+        "demo",
+        "audit",
+        "--asset",
+        &asset_hex,
+    ]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     assert!(String::from_utf8_lossy(&output.stdout).contains("supply 0"));
     assert!(
         String::from_utf8_lossy(&output.stderr).contains("DEMO CHAIN — not Bitcoin"),
@@ -85,9 +97,24 @@ fn binary_smoke() {
     );
 
     // Demo chain control: tip advances.
-    let out = ok(&run(&["--wallet-dir", w, "--chain", "demo", "chain", "tip"]));
+    let out = ok(&run(&[
+        "--wallet-dir",
+        w,
+        "--chain",
+        "demo",
+        "chain",
+        "tip",
+    ]));
     assert_eq!(out.trim(), "tip 0");
-    let out = ok(&run(&["--wallet-dir", w, "--chain", "demo", "chain", "advance", "6"]));
+    let out = ok(&run(&[
+        "--wallet-dir",
+        w,
+        "--chain",
+        "demo",
+        "chain",
+        "advance",
+        "6",
+    ]));
     assert_eq!(out.trim(), "tip 6");
     // The chain file lives in the wallet dir by default.
     assert!(wallet.join("chain.log").exists());

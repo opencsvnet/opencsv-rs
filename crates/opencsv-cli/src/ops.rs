@@ -19,7 +19,7 @@ use opencsv_core::accept::{accept, AcceptParams, ProofVerifier};
 use opencsv_core::chain::{AnchorChain, AnchorLocation};
 use opencsv_core::consignment::{CoinOpening, Consignment};
 use opencsv_core::{
-    AnchorRecord, AssetId, Coin, Digest, Owner, OwnerSecret, RejectReason, mint_commit,
+    mint_commit, AnchorRecord, AssetId, Coin, Digest, Owner, OwnerSecret, RejectReason,
 };
 use opencsv_core::{mint_signing_message, Ed25519IssuerSignature, IssuerSignature};
 use opencsv_pcd::{decode_coin_proof, encode_coin_proof, NODE_INPUTS, NODE_OUTPUTS};

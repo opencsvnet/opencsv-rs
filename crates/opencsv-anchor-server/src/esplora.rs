@@ -91,17 +91,14 @@ struct EsploraTx {
     vout: Vec<EsploraVout>,
 }
 
-/// The transaction context of an anchor: `ctx = SHA256(txid ∥ vout_le)` of
-/// the transaction's **funding input** (paper §4.5 / `opencsv-core`'s anchor
-/// docs — "in production the funding input's outpoint"). Deriving it from
-/// chain data means the 32 bytes need no room in the 64-byte OP_RETURN and
-/// any scanner recomputes it independently, so a snapshot server cannot lie
-/// about the context a record is bound to.
+/// The transaction context of an anchor: the funding input's outpoint,
+/// folded by [`opencsv_bitcoin::funding_ctx`] — the *same* derivation the
+/// `bitcoind` backend uses, so the two real-chain backends agree on what a
+/// record binds to. Deriving `ctx` from chain data means the 32 bytes need
+/// no room in the 64-byte OP_RETURN and any scanner recomputes it
+/// independently, so a snapshot server cannot lie about it.
 pub fn ctx_from_outpoint(txid: &Txid, vout: u32) -> [u8; 32] {
-    use bitcoin::hashes::sha256;
-    let mut preimage = txid.to_byte_array().to_vec();
-    preimage.extend_from_slice(&vout.to_le_bytes());
-    <sha256::Hash as Hash>::hash(&preimage).to_byte_array()
+    opencsv_bitcoin::funding_ctx(&txid.to_byte_array(), vout)
 }
 
 #[derive(Deserialize)]

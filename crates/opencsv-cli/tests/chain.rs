@@ -168,6 +168,9 @@ fn old_log_versions_are_rejected_with_a_clear_message() {
             Err(e) => e.to_string(),
         };
         assert!(err.contains(magic), "unexpected error: {err}");
-        assert!(err.contains("cannot be migrated"), "unexpected error: {err}");
+        assert!(
+            err.contains("cannot be migrated"),
+            "unexpected error: {err}"
+        );
     }
 }

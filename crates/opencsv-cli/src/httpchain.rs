@@ -22,12 +22,17 @@ use std::io::{Read, Write};
 use std::net::TcpStream;
 
 use opencsv_core::chain::{AnchorChain, AnchorLocation, AnchorRef};
-use opencsv_core::{ANCHOR_SIZE, AnchorRecord, Digest};
+use opencsv_core::{AnchorRecord, Digest, ANCHOR_SIZE};
+use rand::RngExt;
 use serde::Deserialize;
 
 use crate::chain::AnchorWriter;
 use crate::error::Error;
 use crate::hexutil::{from_hex, to_hex};
+
+/// Bound on tag-collision redraws (each costs a UTXO reservation on
+/// real-chain backends).
+const MAX_CTX_DRAWS: usize = 16;
 
 #[derive(Deserialize)]
 struct SnapshotJson {
@@ -51,6 +56,11 @@ struct AnchorReplyJson {
     // on real chains, where the anchor is pending until mined.
     height: Option<u64>,
     position: Option<u32>,
+}
+
+#[derive(Deserialize)]
+struct ContextReplyJson {
+    ctx: String,
 }
 
 #[derive(Deserialize)]
@@ -189,6 +199,42 @@ impl HttpAnchorChain {
 }
 
 impl AnchorWriter for HttpAnchorChain {
+    /// Anchor through the server, letting it choose the transaction
+    /// context.
+    ///
+    /// Real-chain backends derive `ctx` from the anchor transaction's
+    /// funding outpoint, so the wallet cannot pick it: `POST
+    /// /anchor/context` reserves that outpoint and reports its `ctx`, the
+    /// record is built against it here, and `POST /anchor` spends exactly
+    /// that outpoint. Demo-file backends have no such route (404) — fall
+    /// back to locally drawn contexts, which is what they store. Either
+    /// way an untagged record whose bound payload collides with the
+    /// MINT/REDEEM tag bytes is redrawn (see `opencsv-core`'s anchor docs).
+    fn append_bound(
+        &mut self,
+        mut build: impl FnMut(&[u8; 32]) -> AnchorRecord,
+    ) -> Result<AnchorRef, Error> {
+        for _ in 0..MAX_CTX_DRAWS {
+            let ctx = match self.request("POST", "/anchor/context", Some("{}")) {
+                Ok(reply) => {
+                    let reply: ContextReplyJson = serde_json::from_str(&reply)
+                        .map_err(|e| Error::Parse(format!("anchor context reply: {e}")))?;
+                    from_hex(&reply.ctx)?
+                        .try_into()
+                        .map_err(|_| Error::Parse("anchor context is not 32 bytes".into()))?
+                }
+                Err(_) => rand::rng().random(),
+            };
+            let record = build(&ctx);
+            if record.parses_cleanly() {
+                return self.append(record, ctx);
+            }
+        }
+        Err(Error::Parse(
+            "could not draw a non-colliding transaction context".into(),
+        ))
+    }
+
     fn append(&mut self, record: AnchorRecord, ctx: [u8; 32]) -> Result<AnchorRef, Error> {
         let body = format!(
             r#"{{"record":"{}","ctx":"{}"}}"#,

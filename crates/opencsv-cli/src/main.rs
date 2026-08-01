@@ -268,9 +268,10 @@ fn chain_spec(cli: &Cli, wallet_dir: &Path) -> Result<ChainSpec, Error> {
 /// `OPENCSV_*` env fallbacks, resolved by clap).
 fn bitcoin_config(cli: &Cli, wallet_dir: &Path) -> Result<opencsv_bitcoin::Config, Error> {
     let network = opencsv_bitcoin::Network::parse(&cli.network)?;
-    let rpc_url = cli.rpc_url.clone().unwrap_or_else(|| {
-        format!("http://127.0.0.1:{}", network.default_rpc_port())
-    });
+    let rpc_url = cli
+        .rpc_url
+        .clone()
+        .unwrap_or_else(|| format!("http://127.0.0.1:{}", network.default_rpc_port()));
     let auth = match (&cli.rpc_auth, &cli.cookie) {
         (Some(user_pass), _) => opencsv_bitcoin::RpcAuth::UserPass(user_pass.clone()),
         (None, Some(path)) => opencsv_bitcoin::RpcAuth::Cookie(path.clone()),
@@ -374,7 +375,12 @@ fn run(cli: Cli) -> Result<ExitCode, Error> {
             let mut wallet = wallet;
             let mut chain = ChainBackend::open(&spec)?;
             let produced = ops::mint(&mut wallet, &mut chain, &asset, to, &amounts)?;
-            report_produced(&produced, &out, print_blob, matches!(spec, ChainSpec::Bitcoin(_)))?;
+            report_produced(
+                &produced,
+                &out,
+                print_blob,
+                matches!(spec, ChainSpec::Bitcoin(_)),
+            )?;
         }
         Commands::Send {
             inputs,
@@ -398,7 +404,12 @@ fn run(cli: Cli) -> Result<ExitCode, Error> {
                 &amounts,
                 force_respend,
             )?;
-            report_produced(&produced, &out, print_blob, matches!(spec, ChainSpec::Bitcoin(_)))?;
+            report_produced(
+                &produced,
+                &out,
+                print_blob,
+                matches!(spec, ChainSpec::Bitcoin(_)),
+            )?;
         }
         Commands::Receive {
             file,
@@ -445,7 +456,12 @@ fn run(cli: Cli) -> Result<ExitCode, Error> {
             let mut wallet = wallet;
             let mut chain = ChainBackend::open(&spec)?;
             let produced = ops::redeem(&mut wallet, &mut chain, &coin)?;
-            report_produced(&produced, &out, print_blob, matches!(spec, ChainSpec::Bitcoin(_)))?;
+            report_produced(
+                &produced,
+                &out,
+                print_blob,
+                matches!(spec, ChainSpec::Bitcoin(_)),
+            )?;
         }
         Commands::Coins => {
             for stored in wallet.coins() {

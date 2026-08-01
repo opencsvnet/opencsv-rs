@@ -15,7 +15,7 @@ use opencsv_core::accept::{public_input, MockVerifier};
 use opencsv_core::chain::AnchorChain;
 use opencsv_core::consignment::{CoinOpening, Consignment};
 use opencsv_core::{
-    AnchorRecord, AssetGenesis, AssetId, Coin, Digest, OwnerSecret, RejectReason, mint_commit,
+    mint_commit, AnchorRecord, AssetGenesis, AssetId, Coin, Digest, OwnerSecret, RejectReason,
 };
 
 fn opening(coin: &Coin) -> CoinOpening {
