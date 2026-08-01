@@ -85,6 +85,19 @@ char *opencsv_cbf_verify_anchor(const char *config_json);
  * "tips":[...]}. */
 char *opencsv_cross_check(uint64_t handle, const char *request_json);
 
+/* Self-scan-first exclusion (opencsv-cbf ScanIndex; the default posture):
+ * sync walks BIP158 filters for the protocol marker output and SPV-fetches
+ * matching blocks into a persistent occurrence index; check/verify are then
+ * fully local. Sync config = {"network","peers":["host:port"],"cache_dir",
+ * "timeout_ms","from_height","required_confirmations"}; the sync registers
+ * the config for check/verify. Returns {"tip_height","filters_bytes",
+ * "blocks_bytes","anchors"}. Check request = {"raw_nf_hex","birth","spend"};
+ * returns {"occurrence":{...}|null}. Verify runs accept over a consignment
+ * (hex) against the index (read-only). */
+char *opencsv_scan_sync(const char *config_json);
+char *opencsv_scan_check(uint64_t handle, const char *request_json);
+char *opencsv_scan_verify(uint64_t handle, const char *consignment_hex);
+
 /* State queries and spend-state replay. */
 char *opencsv_wallet_mark_spent(uint64_t handle, const char *coin_ids_json);
 char *opencsv_balance(uint64_t handle);

@@ -32,7 +32,12 @@ Beyond the wallet core, three host-facing verification surfaces:
   (`bitcoind` RPC indexer / `http` anchor-server / inline `snapshot`)
   and run the accept driver over a received consignment; tip
   disagreement between backends is a hard error
-  (`{"kind":"tip_disagreement"}`), never a silent pick.
+  (`{"kind":"tip_disagreement"}`), never a silent pick;
+- `opencsv_scan_sync` / `opencsv_scan_check` / `opencsv_scan_verify` —
+  the self-scan-first default: `opencsv-cbf`'s `ScanIndex` walks BIP158
+  filters for the protocol marker output and SPV-fetches matching
+  blocks into a persistent occurrence index; occurrence checks and
+  `accept()` then run fully local (read-only).
 
 ## Build
 

@@ -33,6 +33,7 @@
 mod hex;
 pub mod cbf;
 pub mod crosscheck;
+pub mod scan;
 pub mod snapshot;
 pub mod wallet;
 
@@ -633,6 +634,72 @@ pub unsafe extern "C" fn opencsv_cross_check(
             })),
             Err(crosscheck::CrossCheckFailure::Other(message)) => err(message),
         }
+    })
+}
+
+/// Sync the self-scan-first occurrence index (see [`scan`]): connect to
+/// the P2P network, walk BIP158 filters for the protocol marker output,
+/// SPV-fetch matching blocks, and register the scan configuration for
+/// [`opencsv_scan_check`] / [`opencsv_scan_verify`]. Returns
+/// `{"tip_height":N,"filters_bytes":N,"blocks_bytes":N,"anchors":N}`.
+///
+/// # Safety
+/// `config_json` must be a valid NUL-terminated C string.
+#[no_mangle]
+pub unsafe extern "C" fn opencsv_scan_sync(config_json: *const c_char) -> *mut c_char {
+    guarded(|| {
+        match unsafe { in_str(config_json, "config_json") }.and_then(scan::sync_json) {
+            Ok(value) => out(value),
+            Err(e) => err(e),
+        }
+    })
+}
+
+/// Local-only earliest-occurrence check against the scan index built by
+/// [`opencsv_scan_sync`] (no network). `request_json` is
+/// `{"raw_nf_hex":"<64 hex>","birth":N,"spend":N}`; returns
+/// `{"occurrence":{"height":N,"position":M,"ctx_hex":"<64 hex>"}}` or
+/// `{"occurrence":null}`.
+///
+/// # Safety
+/// `request_json` must be a valid NUL-terminated C string.
+#[no_mangle]
+pub unsafe extern "C" fn opencsv_scan_check(handle: u64, request_json: *const c_char) -> *mut c_char {
+    guarded(|| {
+        let request_json = match unsafe { in_str(request_json, "request_json") } {
+            Ok(s) => s.to_owned(),
+            Err(e) => return err(e),
+        };
+        with_wallet(handle, |_w| scan::check_json(&request_json))
+    })
+}
+
+/// Run the accept driver over a consignment (hex) against the scan
+/// index built by [`opencsv_scan_sync`] (read-only, no network; credit
+/// via [`opencsv_verify_consignment`]). Returns
+/// `{"status":"verified",...,"confirmations":N,"tip_height":N}` or
+/// `{"status":"rejected","reason":"...",...}`.
+///
+/// # Safety
+/// `consignment_hex` must be a valid NUL-terminated C string.
+#[no_mangle]
+pub unsafe extern "C" fn opencsv_scan_verify(
+    handle: u64,
+    consignment_hex: *const c_char,
+) -> *mut c_char {
+    guarded(|| {
+        let consignment_hex = match unsafe { in_str(consignment_hex, "consignment_hex") } {
+            Ok(s) => s.to_owned(),
+            Err(e) => return err(e),
+        };
+        with_wallet(handle, |w| {
+            scan::verify_json(
+                &consignment_hex,
+                &w.owner_secrets(),
+                &w.known_asset_ids(),
+                &opencsv_pcd::CoinProofVerifier,
+            )
+        })
     })
 }
 
