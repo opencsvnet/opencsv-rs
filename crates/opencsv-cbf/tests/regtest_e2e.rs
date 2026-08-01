@@ -131,6 +131,26 @@ fn regtest_end_to_end() {
     assert!(client.filter_matches(location.height, &miner_script).unwrap());
     assert!(!client.filter_matches(location.height, &anchor_script(&record.to_bytes())).unwrap());
 
+    // Protocol-fixed anchor transaction layout: output 0 is the
+    // 64-byte OP_RETURN record, output 1 is the constant marker output
+    // (546 sats to OP_0 <sha256(OP_TRUE)>), which makes the block
+    // discoverable by BIP158 filter scans.
+    let anchor_tx = &block.txs[location.position as usize];
+    assert_eq!(anchor_tx.outputs[0].script_pubkey, anchor_script(&record.to_bytes()));
+    assert_eq!(
+        anchor_tx.outputs[1].script_pubkey.as_slice(),
+        opencsv_bitcoin::MARKER_SPK.as_slice(),
+        "marker scriptPubKey at output 1"
+    );
+    assert_eq!(anchor_tx.outputs[1].value, opencsv_bitcoin::MARKER_DUST_SATS);
+    // ...and therefore the marker spk matches this block's filter.
+    assert!(
+        client
+            .filter_matches(location.height, &opencsv_bitcoin::MARKER_SPK)
+            .unwrap(),
+        "the marker output must be filter-matchable"
+    );
+
     // --- wrong-payload absence verdict -------------------------------------
     let wrong_nf = Digest::from_bytes([9u8; 32]);
     let wrong_record = AnchorRecord::xfer(&[wrong_nf], &ctx_expected);

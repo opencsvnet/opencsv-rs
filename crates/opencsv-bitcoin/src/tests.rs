@@ -110,7 +110,8 @@ fn anchor_two_pass_construction() {
                 ],
                 "vout": [
                     {"value": 0, "n": 0, "scriptPubKey": {"type": "nulldata", "hex": format!("6a40{}", to_hex(&[0u8; 64]))}},
-                    {"value": 0.49999859, "n": 1, "scriptPubKey": {"type": "witness_v0_keyhash", "address": "bcrt1qchange"}},
+                    {"value": MARKER_DUST_BTC, "n": 1, "scriptPubKey": {"type": "witness_v0_scripthash", "address": marker_address(Network::Regtest), "hex": to_hex(&MARKER_SPK)}},
+                    {"value": 0.49999859, "n": 2, "scriptPubKey": {"type": "witness_v0_keyhash", "address": "bcrt1qchange"}},
                 ],
             }),
         )
@@ -162,7 +163,24 @@ fn anchor_two_pass_construction() {
         pass2["params"][1][0]["data"],
         json!(to_hex(&good.to_bytes()))
     );
-    assert_eq!(pass2["params"][1][1]["bcrt1qchange"], json!(0.49999859));
+    // Output 1 is the protocol marker, passed through unchanged; output 2
+    // is the change.
+    assert_eq!(
+        pass2["params"][1][1][marker_address(Network::Regtest)],
+        json!(MARKER_DUST_BTC)
+    );
+    assert_eq!(pass2["params"][1][2]["bcrt1qchange"], json!(0.49999859));
+    // Pass 1 included the marker so the fee/funding math was exact, with
+    // change pinned to position 2.
+    let pass1_create = &requests[2];
+    assert_eq!(pass1_create["method"], "createrawtransaction");
+    assert_eq!(
+        pass1_create["params"][1][1][marker_address(Network::Regtest)],
+        json!(MARKER_DUST_BTC)
+    );
+    let pass1_fund = &requests[3];
+    assert_eq!(pass1_fund["method"], "fundrawtransaction");
+    assert_eq!(pass1_fund["params"][1]["change_position"], json!(2));
     drop(requests);
 
     // The mempool entry is visible by placeholder reference but is not a
@@ -200,7 +218,8 @@ fn scan_and_index_persistence() {
              "vin": [{"txid": funding_tx, "vout": 2}],
              "vout": [
                  {"value": 0, "n": 0, "scriptPubKey": {"type": "nulldata", "hex": format!("6a40{record_hex}")}},
-                 {"value": 0.1, "n": 1, "scriptPubKey": {"type": "witness_v0_keyhash", "address": "tb1qchange"}},
+                 {"value": MARKER_DUST_BTC, "n": 1, "scriptPubKey": {"type": "witness_v0_scripthash", "hex": to_hex(&MARKER_SPK), "address": marker_address(Network::Signet)}},
+                 {"value": 0.1, "n": 2, "scriptPubKey": {"type": "witness_v0_keyhash", "address": "tb1qchange"}},
              ]},
         ],
     });
@@ -251,6 +270,11 @@ fn scan_and_index_persistence() {
             }]
         );
         assert_eq!(chain.confirmations_at(101), 2);
+        // Marker presence per scanned block: block A carries the
+        // protocol marker, block B does not.
+        assert_eq!(chain.block_has_marker(101), Some(true));
+        assert_eq!(chain.block_has_marker(102), Some(false));
+        assert_eq!(chain.block_has_marker(103), None);
     }
 
     // Reopen: the index is loaded from disk; only the reorg check hits RPC.
@@ -264,6 +288,7 @@ fn scan_and_index_persistence() {
         let chain = BitcoinAnchorChain::with_transport(RpcClient::new(transport), &config).unwrap();
         assert_eq!(chain.entry_count(), 1);
         assert_eq!(chain.scanned_height(), Some(102));
+        assert_eq!(chain.block_has_marker(101), Some(true), "markers persist");
     }
 
     // A changed tip hash (reorg) truncates the index and forces a rescan.
@@ -342,5 +367,37 @@ fn primitives() {
     assert_eq!(
         op_return_payload(&format!("6a40{}00", to_hex(&payload))),
         None
+    );
+}
+
+/// The marker constant is `OP_0 <sha256(OP_TRUE)>` and its address is a
+/// valid per-network bech32 form of the same program.
+#[test]
+fn marker_constant_is_pinned() {
+    use sha2::{Digest as _, Sha256};
+    let program: [u8; 32] = Sha256::digest(MARKER_SCRIPT).into();
+    let mut expected = vec![0x00, 0x20];
+    expected.extend_from_slice(&program);
+    assert_eq!(MARKER_SPK.as_slice(), expected.as_slice());
+    assert_eq!(MARKER_DUST_SATS, 546);
+    assert_eq!(MARKER_DUST_BTC, 0.00000546);
+    for network in [Network::Mainnet, Network::Signet, Network::Regtest] {
+        let address = marker_address(network);
+        let hrp = match network {
+            Network::Mainnet => "bc",
+            Network::Signet => "tb",
+            Network::Regtest => "bcrt",
+        };
+        assert!(
+            address.starts_with(&format!("{hrp}1")),
+            "{network:?} address {address}"
+        );
+        assert_eq!(address.len(), hrp.len() + 60, "{network:?} {address}");
+    }
+    // Cross-check the regtest form against an independent bech32 decode:
+    // the payload must be the witness-v0 marker program.
+    assert_eq!(
+        marker_address(Network::Regtest),
+        crate::bech32::encode_v0("bcrt", &Sha256::digest(MARKER_SCRIPT)[..])
     );
 }

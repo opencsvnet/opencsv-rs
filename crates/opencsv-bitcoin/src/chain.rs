@@ -130,6 +130,41 @@ pub fn funding_ctx(txid: &[u8; 32], vout: u32) -> [u8; 32] {
     hasher.finalize().into()
 }
 
+/// The protocol-constant marker output's script: `OP_TRUE` (quantum-clean,
+/// no EC).
+pub const MARKER_SCRIPT: [u8; 1] = [0x51];
+
+/// The marker output's scriptPubKey: `OP_0 <sha256(OP_TRUE)>` (a P2WSH to
+/// [`MARKER_SCRIPT`], anyone-can-spend). Anchor transactions carry one at
+/// output index 1 so BIP158 basic filters — which exclude OP_RETURN but
+/// include ordinary scriptPubKeys — can find anchor-bearing blocks. The
+/// marker carries **zero authority**: copying it into one's own
+/// transaction is self-funded noise that only makes the copier's block
+/// marginally more interesting to anchor scanners.
+pub const MARKER_SPK: [u8; 34] = [
+    0x00, 0x20, 0x4a, 0xe8, 0x15, 0x72, 0xf0, 0x6e, 0x1b, 0x88, 0xfd, 0x5c, 0xed, 0x7a, 0x1a, 0x00,
+    0x09, 0x45, 0x43, 0x2e, 0x83, 0xe1, 0x55, 0x1e, 0x6f, 0x72, 0x1e, 0xe9, 0xc0, 0x0b, 0x8c, 0xc3,
+    0x32, 0x60,
+];
+
+/// The marker output's value in satoshis (above the P2WSH dust limit of
+/// 294, matching the conventional 546-sat dust constant).
+pub const MARKER_DUST_SATS: u64 = 546;
+
+/// The marker output's value in BTC (for `createrawtransaction` amounts).
+pub const MARKER_DUST_BTC: f64 = 0.00000546;
+
+/// The bech32 address of the marker scriptPubKey on `network` (needed
+/// because `createrawtransaction` takes address-keyed outputs).
+pub fn marker_address(network: Network) -> String {
+    let hrp = match network {
+        Network::Mainnet => "bc",
+        Network::Signet => "tb",
+        Network::Regtest => "bcrt",
+    };
+    crate::bech32::encode_v0(hrp, &MARKER_SPK[2..])
+}
+
 /// Internal-order bytes of a display-order RPC txid/block hash hex string.
 fn hash_from_rpc(hex: &str) -> Result<[u8; 32], Error> {
     let mut bytes: [u8; 32] = from_hex(hex)?
@@ -214,6 +249,10 @@ pub struct BitcoinAnchorChain<T: Transport = HttpTransport> {
     /// (in-memory only — a fresh process learns them from the scan once
     /// they confirm).
     mempool: Vec<Entry>,
+    /// Per-scanned-block marker presence: does the block contain the
+    /// protocol-constant [`MARKER_SPK`] output (i.e. is it discoverable
+    /// by a BIP158 filter scan)?
+    markers: std::collections::BTreeMap<u64, bool>,
 }
 
 impl BitcoinAnchorChain<HttpTransport> {
@@ -257,6 +296,7 @@ impl<T: Transport> BitcoinAnchorChain<T> {
             scanned: None,
             entries: Vec::new(),
             mempool: Vec::new(),
+            markers: std::collections::BTreeMap::new(),
         };
         chain.load_or_init(config.scan_from)?;
         chain.refresh()?;
@@ -298,6 +338,7 @@ impl<T: Transport> BitcoinAnchorChain<T> {
             if hash_from_rpc(&actual)? != hash {
                 self.scanned = None;
                 self.entries.clear();
+                self.markers.clear();
             }
         }
         let mut height = self
@@ -331,17 +372,31 @@ impl<T: Transport> BitcoinAnchorChain<T> {
     /// [`AnchorRecord::parses_cleanly`]. Returns a reference carrying
     /// [`MEMPOOL_LOCATION`]; the confirmed location is resolved by txid
     /// once the transaction mines.
+    ///
+    /// The anchor transaction's output layout is protocol-fixed: output
+    /// 0 is the OP_RETURN record, output 1 is the constant
+    /// [`MARKER_SPK`] output ([`MARKER_DUST_SATS`] sats) that makes the
+    /// block discoverable by BIP158 filter scans, outputs 2.. are change
+    /// (`fundrawtransaction` places change at position 2). The marker is
+    /// included in the pass-1 dummy transaction so the funding and fee
+    /// math is exact.
     pub fn anchor(
         &mut self,
         mut build: impl FnMut(&[u8; 32]) -> AnchorRecord,
     ) -> Result<AnchorRef, Error> {
-        // Pass 1: fund a transaction carrying a dummy 64-byte OP_RETURN,
-        // letting the wallet select inputs and price change + fee.
+        // Pass 1: fund a transaction carrying a dummy 64-byte OP_RETURN
+        // and the marker output, letting the wallet select inputs and
+        // price change + fee. Change is pinned to position 2 so the
+        // output layout is the protocol's (record@0, marker@1, change@2).
         let dummy = to_hex(&[0u8; ANCHOR_SIZE]);
-        let raw1 = self
+        let marker = marker_address(self.network);
+        let raw1 = self.client.call_str(
+            "createrawtransaction",
+            json!([[], [{"data": dummy}, {marker: MARKER_DUST_BTC}]]),
+        )?;
+        let funded = self
             .client
-            .call_str("createrawtransaction", json!([[], [{"data": dummy}]]))?;
-        let funded = self.client.call("fundrawtransaction", json!([raw1, {}]))?;
+            .call("fundrawtransaction", json!([raw1, {"change_position": 2}]))?;
         let funded_hex = funded
             .get("hex")
             .and_then(Value::as_str)
@@ -473,20 +528,46 @@ impl<T: Transport> BitcoinAnchorChain<T> {
             .get("tx")
             .and_then(Value::as_array)
             .ok_or_else(|| Error::Malformed("getblock: no `tx` array".into()))?;
+        let marker_hex = to_hex(&MARKER_SPK);
+        let mut has_marker = false;
         for (position, tx) in txs.iter().enumerate() {
+            if !has_marker {
+                has_marker = tx
+                    .get("vout")
+                    .and_then(Value::as_array)
+                    .is_some_and(|vout| {
+                        vout.iter().any(|o| {
+                            o.get("scriptPubKey")
+                                .and_then(|s| s.get("hex"))
+                                .and_then(Value::as_str)
+                                == Some(marker_hex.as_str())
+                        })
+                    });
+            }
             if let Some(entry) = scan_tx(tx, height, position as u32)? {
                 self.entries.push(entry);
             }
         }
+        self.markers.insert(height, has_marker);
         Ok(())
+    }
+
+    /// Whether the block at `height` carries the protocol-constant
+    /// marker output ([`MARKER_SPK`]); `None` for blocks not (yet)
+    /// scanned.
+    pub fn block_has_marker(&self, height: u64) -> Option<bool> {
+        self.markers.get(&height).copied()
     }
 
     fn load_or_init(&mut self, scan_from: Option<u64>) -> Result<(), Error> {
         match self.load_index()? {
-            Some((start, scanned, entries)) if scan_from.is_none() || scan_from == Some(start) => {
+            Some((start, scanned, entries, markers))
+                if scan_from.is_none() || scan_from == Some(start) =>
+            {
                 self.start_height = start;
                 self.scanned = scanned;
                 self.entries = entries;
+                self.markers = markers;
             }
             Some(_) | None => {
                 // No index, or an explicit --scan-from that differs from
@@ -494,6 +575,7 @@ impl<T: Transport> BitcoinAnchorChain<T> {
                 self.start_height = scan_from.unwrap_or(self.tip);
                 self.scanned = None;
                 self.entries.clear();
+                self.markers.clear();
             }
         }
         Ok(())
@@ -510,6 +592,13 @@ impl<T: Transport> BitcoinAnchorChain<T> {
         );
         if let Some((height, hash)) = self.scanned {
             out.push_str(&format!("scanned {} {}\n", height, hash_to_rpc(&hash)));
+        }
+        for (height, has_marker) in &self.markers {
+            out.push_str(&format!(
+                "marker {} {}\n",
+                height,
+                u8::from(*has_marker)
+            ));
         }
         for e in &self.entries {
             out.push_str(&format!(
@@ -539,8 +628,12 @@ impl<T: Transport> BitcoinAnchorChain<T> {
         let mut start = None;
         let mut scanned = None;
         let mut entries = Vec::new();
+        let mut markers = std::collections::BTreeMap::new();
         let mut lines = text.lines().enumerate();
         match lines.next() {
+            // A v1 cache predates the marker lines: rebuild (the index
+            // is a cache — this is an upgrade, not corruption).
+            Some((_, line)) if line.trim() == MAGIC_V1 => return Ok(None),
             Some((_, line)) if line.trim() == MAGIC => {}
             _ => return Err(decode("bad magic line".into())),
         }
@@ -561,6 +654,15 @@ impl<T: Transport> BitcoinAnchorChain<T> {
                     }
                 }
                 ["start", h] => start = Some(h.parse().map_err(|_| bad())?),
+                ["marker", h, f] => {
+                    let height = h.parse().map_err(|_| bad())?;
+                    let has_marker = match *f {
+                        "0" => false,
+                        "1" => true,
+                        _ => return Err(bad()),
+                    };
+                    markers.insert(height, has_marker);
+                }
                 ["scanned", h, hash] => {
                     scanned = Some((
                         h.parse().map_err(|_| bad())?,
@@ -589,7 +691,7 @@ impl<T: Transport> BitcoinAnchorChain<T> {
             }
         }
         let start = start.ok_or_else(|| decode("missing `start` line".into()))?;
-        Ok(Some((start, scanned, entries)))
+        Ok(Some((start, scanned, entries, markers)))
     }
 
     fn find(&self, anchor_ref: &AnchorRef) -> Option<&Entry> {
@@ -712,12 +814,20 @@ impl<T: Transport> AnchorChain for BitcoinAnchorChain<T> {
     }
 }
 
-/// First line of every index file (format version tag).
-const MAGIC: &str = "opencsv-bitcoin-index-v1";
+/// First line of every index file (format version tag; v2 adds the
+/// per-block `marker` lines).
+const MAGIC: &str = "opencsv-bitcoin-index-v2";
+/// The pre-marker format's magic: rebuilt silently (rebuildable cache).
+const MAGIC_V1: &str = "opencsv-bitcoin-index-v1";
 
-/// `(start_height, last_scanned(height, block_hash), confirmed entries)`
-/// as persisted in the index file.
-type PersistedIndex = (u64, Option<(u64, [u8; 32])>, Vec<Entry>);
+/// `(start_height, last_scanned(height, block_hash), confirmed entries,
+/// per-block marker flags)` as persisted in the index file.
+type PersistedIndex = (
+    u64,
+    Option<(u64, [u8; 32])>,
+    Vec<Entry>,
+    std::collections::BTreeMap<u64, bool>,
+);
 
 #[cfg(test)]
 #[path = "tests.rs"]

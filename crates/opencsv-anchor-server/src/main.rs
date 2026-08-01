@@ -332,10 +332,22 @@ fn esplora_handle(
     body: &[u8],
 ) -> (u16, String) {
     match (method, path) {
-        ("GET", "/info") => (
-            200,
-            json!({ "backend": "esplora", "demo": false }).to_string(),
-        ),
+        ("GET", "/info") => {
+            let marked = state
+                .lock()
+                .map(|state| {
+                    state
+                        .markers
+                        .keys()
+                        .filter(|&&height| state.block_has_marker(height) == Some(true))
+                        .count()
+                })
+                .unwrap_or(0);
+            (
+                200,
+                json!({ "backend": "esplora", "demo": false, "marked_blocks": marked }).to_string(),
+            )
+        }
         ("GET", "/snapshot") => {
             let state = match state.lock() {
                 Ok(state) => state,

@@ -125,7 +125,7 @@ pub fn run_cross_check<V: ProofVerifier>(
     let blob = base64::engine::general_purpose::STANDARD
         .decode(&request.consignment_base64)
         .map_err(|e| other(format!("consignment base64: {e}")))?;
-    let consignment = Consignment::from_bytes(&blob).map_err(|e| other(e))?;
+    let consignment = Consignment::from_bytes(&blob).map_err(other)?;
     let accepted = accept(
         &consignment,
         &chain,

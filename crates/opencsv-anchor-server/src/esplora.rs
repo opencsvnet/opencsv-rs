@@ -218,6 +218,10 @@ pub struct ScanState {
     pub entries: Vec<(AnchorRef, AnchorRecord, [u8; 32])>,
     pub tip_height: u64,
     scanned_to: u64,
+    /// Per-scanned-block presence of the protocol-constant marker output
+    /// (`opencsv_bitcoin::MARKER_SPK`): is the block discoverable by a
+    /// BIP158 filter scan?
+    pub markers: std::collections::BTreeMap<u64, bool>,
     /// Block hash of `scanned_to` — the anchor for reorg detection: if the
     /// chain later reports a different hash at that height, everything
     /// scanned is suspect and the index is rebuilt.
@@ -232,6 +236,7 @@ impl ScanState {
             entries: Vec::new(),
             tip_height: 0,
             scanned_to: birth_height.saturating_sub(1),
+            markers: std::collections::BTreeMap::new(),
             scanned_hash: None,
             birth_height,
             cache_path,
@@ -255,6 +260,15 @@ impl ScanState {
                 ["scanned", h, hash] => {
                     state.scanned_to = h.parse().map_err(|e| format!("cache: {e}"))?;
                     state.scanned_hash = Some((*hash).to_string());
+                }
+                ["marker", h, f] => {
+                    let height = h.parse().map_err(|e| format!("cache: {e}"))?;
+                    let has_marker = match *f {
+                        "0" => false,
+                        "1" => true,
+                        _ => return Err(format!("cache: malformed marker `{f}`")),
+                    };
+                    state.markers.insert(height, has_marker);
                 }
                 ["entry", h, p, txid_hex, record_hex, ctx_hex] => {
                     let txid: [u8; 32] = from_hex(txid_hex)
@@ -293,10 +307,17 @@ impl ScanState {
     /// invalidates the index.
     fn reset(&mut self) -> Result<(), String> {
         self.entries.clear();
+        self.markers.clear();
         self.scanned_to = self.birth_height.saturating_sub(1);
         self.scanned_hash = None;
         std::fs::write(&self.cache_path, format!("{CACHE_MAGIC}\n"))
             .map_err(|e| format!("cache: {e}"))
+    }
+
+    /// Whether the block at `height` carries the protocol-constant
+    /// marker output; `None` for blocks not (yet) scanned.
+    pub fn block_has_marker(&self, height: u64) -> Option<bool> {
+        self.markers.get(&height).copied()
     }
 
     fn append_cache_line(&self, line: &str) -> Result<(), String> {
@@ -334,6 +355,8 @@ pub fn scan_new_blocks(client: &EsploraClient, state: &mut ScanState) -> Result<
     while state.scanned_to < tip {
         let height = state.scanned_to + 1;
         let hash = client.block_hash_at(height)?;
+        let marker_hex = to_hex(&opencsv_bitcoin::MARKER_SPK);
+        let mut has_marker = false;
         let mut index = 0usize;
         loop {
             let txs = client.block_txs(&hash, index)?;
@@ -342,6 +365,12 @@ pub fn scan_new_blocks(client: &EsploraClient, state: &mut ScanState) -> Result<
             }
             let page_len = txs.len();
             for (offset, tx) in txs.into_iter().enumerate() {
+                if !has_marker {
+                    has_marker = tx
+                        .vout
+                        .iter()
+                        .any(|vout| vout.scriptpubkey == marker_hex);
+                }
                 let position = (index + offset) as u32;
                 for vout in &tx.vout {
                     if vout.scriptpubkey_type != "op_return" {
@@ -386,6 +415,8 @@ pub fn scan_new_blocks(client: &EsploraClient, state: &mut ScanState) -> Result<
             }
             index += page_len;
         }
+        state.markers.insert(height, has_marker);
+        state.append_cache_line(&format!("marker {height} {}", u8::from(has_marker)))?;
         state.scanned_to = height;
         state.scanned_hash = Some(hash.clone());
         state.append_cache_line(&format!("scanned {height} {hash}"))?;
@@ -641,6 +672,22 @@ mod tests {
         let reloaded = ScanState::load(cache, 100).expect("reload");
         assert!(reloaded.entries.is_empty());
         assert_eq!(reloaded.scanned_to, 99);
+    }
+
+    /// Per-block marker flags round-trip through the cache.
+    #[test]
+    fn marker_lines_round_trip() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cache = dir.path().join("cache.log");
+        std::fs::write(
+            &cache,
+            format!("{CACHE_MAGIC}\nmarker 101 1\nmarker 102 0\nscanned 102\n"),
+        )
+        .expect("write");
+        let state = ScanState::load(cache, 100).expect("load");
+        assert_eq!(state.block_has_marker(101), Some(true));
+        assert_eq!(state.block_has_marker(102), Some(false));
+        assert_eq!(state.block_has_marker(103), None);
     }
 
     /// Cache lines from before reorg tracking (no block hash) still load;
