@@ -10,12 +10,12 @@
 //! set `OPENCSV_BITCOIND` to override the default
 //! `~/bitcoin-core/bin/bitcoind` path.
 
-use std::net::TcpListener;
-use std::path::PathBuf;
-use std::process::{Child, Command, Stdio};
-use std::time::{Duration, Instant};
+mod common;
 
-use opencsv_bitcoin::rpc::{HttpTransport, RpcAuth, RpcClient};
+use std::time::Duration;
+
+use common::{bitcoind_path, Node};
+use opencsv_bitcoin::rpc::RpcAuth;
 use opencsv_bitcoin::{BitcoinAnchorChain, Config as BtcConfig, Network};
 use opencsv_cbf::block::anchor_script;
 use opencsv_cbf::hash::{hash_to_display, to_hex};
@@ -23,93 +23,6 @@ use opencsv_cbf::{AnchorVerdict, CbfClient, Config, NotPresentReason};
 use opencsv_core::chain::{AnchorChain, AnchorLocation};
 use opencsv_core::{AnchorRecord, Digest};
 use serde_json::json;
-
-fn bitcoind_path() -> Option<PathBuf> {
-    if let Ok(path) = std::env::var("OPENCSV_BITCOIND") {
-        return Some(PathBuf::from(path));
-    }
-    let path = PathBuf::from(std::env::var("HOME").ok()?).join("bitcoin-core/bin/bitcoind");
-    path.exists().then_some(path)
-}
-
-fn free_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
-}
-
-/// A running regtest node; stopped on drop.
-struct Node {
-    child: Child,
-    rpc_url: String,
-    cookie: PathBuf,
-    p2p_port: u16,
-    debug_log: PathBuf,
-}
-
-impl Node {
-    fn start(bitcoind: &PathBuf, datadir: PathBuf) -> Self {
-        std::fs::create_dir_all(&datadir).unwrap();
-        let rpc_port = free_port();
-        let p2p_port = free_port();
-        let child = Command::new(bitcoind)
-            .args([
-                "-regtest",
-                &format!("-datadir={}", datadir.display()),
-                "-server",
-                &format!("-rpcport={rpc_port}"),
-                &format!("-bind=127.0.0.1:{p2p_port}"),
-                "-blockfilterindex=1",
-                "-peerblockfilters=1",
-                "-fallbackfee=0.00001",
-                "-listenonion=0",
-                "-dnsseed=0",
-                "-fixedseeds=0",
-            ])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("spawn bitcoind");
-        Self {
-            child,
-            rpc_url: format!("http://127.0.0.1:{rpc_port}"),
-            cookie: datadir.join("regtest/.cookie"),
-            p2p_port,
-            debug_log: datadir.join("regtest/debug.log"),
-        }
-    }
-
-    fn rpc(&self, wallet: Option<&str>) -> RpcClient<HttpTransport> {
-        let transport =
-            HttpTransport::new(&self.rpc_url, wallet, &RpcAuth::Cookie(self.cookie.clone()))
-                .unwrap();
-        RpcClient::new(transport)
-    }
-}
-
-impl Drop for Node {
-    fn drop(&mut self) {
-        if self.cookie.exists() {
-            let _ = self.rpc(None).call("stop", json!([]));
-        }
-        let deadline = Instant::now() + Duration::from_secs(30);
-        loop {
-            match self.child.try_wait() {
-                Ok(Some(_)) => return,
-                Ok(None) if Instant::now() < deadline => {
-                    std::thread::sleep(Duration::from_millis(200))
-                }
-                _ => {
-                    let _ = self.child.kill();
-                    let _ = self.child.wait();
-                    return;
-                }
-            }
-        }
-    }
-}
 
 #[test]
 fn regtest_end_to_end() {
@@ -120,30 +33,8 @@ fn regtest_end_to_end() {
     let tmp = tempfile::tempdir().unwrap();
     let node = Node::start(&bitcoind, tmp.path().join("node"));
 
-    // Wait for the RPC interface.
-    let deadline = Instant::now() + Duration::from_secs(60);
-    loop {
-        if node.cookie.exists() && node.rpc(None).call("getblockcount", json!([])).is_ok() {
-            break;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "bitcoind RPC did not come up; see {}",
-            node.debug_log.display()
-        );
-        std::thread::sleep(Duration::from_millis(200));
-    }
-
-    // Wallet + 101 spendable blocks.
-    node.rpc(None).call("createwallet", json!(["test"])).unwrap();
-    let wallet = node.rpc(Some("test"));
-    let address = wallet
-        .call("getnewaddress", json!([]))
-        .unwrap()
-        .as_str()
-        .unwrap()
-        .to_string();
-    wallet.call("generatetoaddress", json!([101, address])).unwrap();
+    // Wallet + 101 spendable blocks (Node::start waits for RPC).
+    node.create_wallet_and_mine(101);
 
     // Anchor a real record through the opencsv-bitcoin backend (real
     // two-pass OP_RETURN transaction, signed and broadcast by the node).
@@ -169,22 +60,7 @@ fn regtest_end_to_end() {
     assert!(location.height > 101 && location.height <= tip);
 
     // Wait for the compact-filter index to catch up.
-    let deadline = Instant::now() + Duration::from_secs(60);
-    loop {
-        let info = node.rpc(None).call("getindexinfo", json!([])).unwrap();
-        let synced = info["basic block filter index"]["synced"]
-            .as_bool()
-            .or_else(|| info["blockfilterindex"]["synced"].as_bool());
-        if synced == Some(true) {
-            break;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "blockfilterindex did not sync; see {}",
-            node.debug_log.display()
-        );
-        std::thread::sleep(Duration::from_millis(200));
-    }
+    node.wait_for_filter_index();
 
     // The CBF client: two peer entries (same node twice) so the
     // multi-peer tip / filter-header comparison path is exercised.

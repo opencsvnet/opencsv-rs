@@ -64,6 +64,7 @@ pub mod block;
 pub mod chain;
 pub mod client;
 pub mod error;
+pub mod fullscan;
 pub mod gcs;
 pub mod hash;
 pub mod messages;
@@ -73,6 +74,7 @@ pub mod siphash;
 pub mod wire;
 
 pub use client::{AnchorVerdict, CbfClient, Config, NotPresentReason};
+pub use fullscan::{FullScanChain, ScannedAnchor, MAX_WINDOW_BLOCKS};
 pub use error::Error;
 pub use opencsv_bitcoin::Network;
 pub use opencsv_core::chain::AnchorLocation;

@@ -73,6 +73,31 @@ Early BIP158 drafts did use 1-3, but the deployed spec and every
 shipping implementation use SipHash-2-4; the BIP158 test vectors — and
 live bitcoind filters — only decode with 2-4.)
 
+## FullScanChain: the zero-trust self-scan escape hatch
+
+For high-value receipts, `FullScanChain` removes the indexer from the
+exclusion check entirely: it downloads **every full block** in a bounded
+window `[birth_height, spend_height]` over P2P — each merkle-verified
+against the PoW-checked header chain, so the scan inherits
+`verify_anchor`'s trustlessness — parses every 64-byte OP_RETURN
+candidate, recomputes each candidate's `ctx` from its first input, and
+tests `well_formed(ctx, raw_nf)` locally.
+
+```text
+FullScanChain::first_occurrence_in_window(client, raw_nf, birth, spend)
+    -> Result<Option<(AnchorLocation, ctx)>>
+```
+
+It also implements `AnchorChain` constrained to the window, so `accept()`
+can run against it directly — with two caveats that follow from the
+window semantics: occurrences before `birth` are invisible (start the
+window at the coin's birth height), and `tip_height()` is the window
+*end*, so confirmation depth is measured from there (scan up to the
+live tip for receipts). Windows are capped at `MAX_WINDOW_BLOCKS`
+(2016) blocks; the regtest integration test mines a genuine double-spend
+(same raw nullifier anchored twice, each under its own ctx) and checks
+the scan reports the first occurrence and only that one.
+
 ## What it cannot prove: occurrence exclusion
 
 Compact filters cannot support OpenCSV **occurrence-exclusion scans**
