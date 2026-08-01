@@ -47,8 +47,17 @@ struct EntryJson {
 #[derive(Deserialize)]
 struct AnchorReplyJson {
     txid: String,
-    height: u64,
-    position: u32,
+    // Present when the backend anchors immediately (file backend); absent
+    // on real chains, where the anchor is pending until mined.
+    height: Option<u64>,
+    position: Option<u32>,
+}
+
+#[derive(Deserialize)]
+struct AnchorStatusJson {
+    confirmed: bool,
+    height: Option<u64>,
+    position: Option<u32>,
 }
 
 /// A chain view fetched from (and anchored via) `opencsv-anchor-server`.
@@ -113,6 +122,35 @@ impl HttpAnchorChain {
         Ok(())
     }
 
+    /// Poll `GET /anchor/<txid>` until the anchor is mined. Real blocks can
+    /// take from seconds (mutinynet) to tens of minutes (mainnet).
+    fn wait_for_confirmation(&self, txid: &str) -> Result<(u64, u32), Error> {
+        const POLL_SECS: u64 = 10;
+        const MAX_POLLS: u64 = 12 * 60; // two hours
+        eprintln!("anchor {txid} broadcast; waiting for confirmation…");
+        for polls in 1..=MAX_POLLS {
+            std::thread::sleep(std::time::Duration::from_secs(POLL_SECS));
+            let status = self.request("GET", &format!("/anchor/{txid}"), None)?;
+            let status: AnchorStatusJson = serde_json::from_str(&status)
+                .map_err(|e| Error::Parse(format!("anchor status: {e}")))?;
+            if let (true, Some(height), Some(position)) =
+                (status.confirmed, status.height, status.position)
+            {
+                eprintln!("anchor confirmed at height {height} position {position}");
+                return Ok((height, position));
+            }
+            if polls.is_multiple_of(30) {
+                eprintln!(
+                    "still waiting for anchor {txid} ({} min)…",
+                    polls * POLL_SECS / 60
+                );
+            }
+        }
+        Err(Error::Parse(format!(
+            "anchor {txid} not confirmed after two hours; retry later"
+        )))
+    }
+
     /// Advance the server's tip by `n` blocks (`POST /advance`).
     pub fn advance_blocks(&mut self, n: u64) -> Result<(), Error> {
         self.request("POST", "/advance", Some(&format!(r#"{{"blocks":{n}}}"#)))?;
@@ -163,14 +201,18 @@ impl AnchorWriter for HttpAnchorChain {
         let txid: [u8; 32] = from_hex(&reply.txid)?
             .try_into()
             .map_err(|_| Error::Parse("anchor server txid is not 32 bytes".into()))?;
-        // Pick up the appended entry and any auto-advanced tip.
+
+        let (height, position) = match (reply.height, reply.position) {
+            // File backend: anchored immediately.
+            (Some(height), Some(position)) => (height, position),
+            // Real chain: poll until the anchor transaction is mined.
+            _ => self.wait_for_confirmation(&reply.txid)?,
+        };
+        // Pick up the appended entry and any advanced tip.
         self.refresh()?;
         Ok(AnchorRef {
             txid,
-            location: AnchorLocation {
-                height: reply.height,
-                position: reply.position,
-            },
+            location: AnchorLocation { height, position },
         })
     }
 }

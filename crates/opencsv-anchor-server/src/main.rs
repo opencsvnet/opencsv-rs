@@ -29,6 +29,8 @@
 //! must not wedge the server) with the chain behind a mutex, so writes stay
 //! serialized — `FileAnchorChain` has no file locking of its own.
 
+mod esplora;
+
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -36,17 +38,30 @@ use clap::Parser;
 use opencsv_cli::chain::FileAnchorChain;
 use opencsv_cli::hexutil::{from_hex, to_hex};
 use opencsv_core::chain::AnchorChain;
-use opencsv_core::{ANCHOR_SIZE, AnchorRecord};
-use opencsv_ffi::snapshot::{Snapshot, entry_json};
+use opencsv_core::{AnchorRecord, ANCHOR_SIZE};
+use opencsv_ffi::snapshot::{entry_json, Snapshot};
 use serde::Deserialize;
 use serde_json::json;
 
+use crate::esplora::{scan_new_blocks, AnchorWallet, EsploraClient, KnownNetwork, ScanState};
+
 /// Demo anchor server for OpenCSV wallets.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+enum Backend {
+    /// Demo chain in a local append-only file.
+    File,
+    /// Real Bitcoin via an esplora API.
+    Esplora,
+}
+
 #[derive(Parser)]
 struct Args {
-    /// Chain file to serve (created if missing).
-    #[arg(long)]
-    chain: PathBuf,
+    /// Chain backend.
+    #[arg(long, value_enum, default_value_t = Backend::File)]
+    backend: Backend,
+    /// Chain file for the file backend (created if missing).
+    #[arg(long, required_if_eq("backend", "file"))]
+    chain: Option<PathBuf>,
     /// Listen address.
     #[arg(long, default_value = "127.0.0.1:8787")]
     listen: String,
@@ -54,26 +69,62 @@ struct Args {
     /// demo default clears the receiver's 6-confirmation policy).
     #[arg(long, default_value_t = 6)]
     auto_advance: u64,
+    /// Esplora backend: which network (sets the well-known endpoint).
+    #[arg(long, value_enum, required_if_eq("backend", "esplora"))]
+    network: Option<KnownNetwork>,
+    /// Esplora backend: custom endpoint overriding the network default
+    /// (e.g. your own electrs/esplora instance).
+    #[arg(long)]
+    esplora_url: Option<String>,
+    /// Esplora backend: file holding the anchoring key (WIF). Without it
+    /// the server is read-only (no anchoring).
+    #[arg(long)]
+    wif_file: Option<PathBuf>,
+    /// Esplora backend: first block height to scan for anchors.
+    #[arg(long, default_value_t = 0)]
+    birth_height: u64,
+    /// Esplora backend: scan cache file (default:
+    /// esplora-cache-<network>.log in the working directory).
+    #[arg(long)]
+    cache: Option<PathBuf>,
+    /// Esplora backend: seconds between scans for new blocks.
+    #[arg(long, default_value_t = 20)]
+    poll_secs: u64,
+    /// Generate a fresh anchoring key for --network, print its WIF and
+    /// address, and exit.
+    #[arg(long)]
+    generate_key: bool,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
-    let chain = FileAnchorChain::open(&args.chain)?;
-    let server = tiny_http::Server::http(&args.listen)
-        .map_err(|e| format!("listen on {}: {e}", args.listen))?;
-    eprintln!(
-        "opencsv-anchor-server: serving {} on http://{} (tip {}, {} anchors, auto-advance {})",
-        args.chain.display(),
-        args.listen,
-        chain.tip_height(),
-        chain.entries().count(),
-        args.auto_advance,
-    );
 
-    let chain = Arc::new(Mutex::new(chain));
+    if args.generate_key {
+        let network = args.network.ok_or("--generate-key requires --network")?;
+        let (wif, address) = AnchorWallet::generate(network.bitcoin_network());
+        println!("network: {network:?}");
+        println!("wif:     {wif}");
+        println!("address: {address}");
+        println!("(save the WIF to a file, pass --wif-file, and fund the address)");
+        return Ok(());
+    }
+
+    match args.backend {
+        Backend::File => run_file_backend(&args),
+        Backend::Esplora => run_esplora_backend(&args),
+    }
+}
+
+/// Serve requests on their own threads (a stalled client must not wedge
+/// the server).
+fn serve<F>(listen: &str, route: F) -> Result<(), Box<dyn std::error::Error>>
+where
+    F: Fn(&str, &str, &[u8]) -> (u16, String) + Send + Sync + 'static,
+{
+    let server = tiny_http::Server::http(listen).map_err(|e| format!("listen on {listen}: {e}"))?;
+    let route = Arc::new(route);
     for mut request in server.incoming_requests() {
-        let chain = Arc::clone(&chain);
-        let auto_advance = args.auto_advance;
+        let route = Arc::clone(&route);
         std::thread::spawn(move || {
             let mut body = Vec::new();
             if let Err(e) = request.as_reader().read_to_end(&mut body) {
@@ -82,13 +133,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             let method = request.method().as_str().to_owned();
             let path = request.url().to_owned();
-            let (status, reply) = {
-                let mut chain = match chain.lock() {
-                    Ok(chain) => chain,
-                    Err(poisoned) => poisoned.into_inner(),
-                };
-                handle(&mut chain, auto_advance, &method, &path, &body)
-            };
+            let (status, reply) = route(&method, &path, &body);
             eprintln!("{method} {path} -> {status}");
             let response = tiny_http::Response::from_string(reply)
                 .with_status_code(status)
@@ -102,6 +147,32 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// File backend (demo chain).
+// ---------------------------------------------------------------------------
+
+fn run_file_backend(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
+    let chain_path = args.chain.clone().expect("required for the file backend");
+    let chain = FileAnchorChain::open(&chain_path)?;
+    eprintln!(
+        "opencsv-anchor-server[file]: serving {} on http://{} (tip {}, {} anchors, auto-advance {})",
+        chain_path.display(),
+        args.listen,
+        chain.tip_height(),
+        chain.entries().count(),
+        args.auto_advance,
+    );
+    let chain = Arc::new(Mutex::new(chain));
+    let auto_advance = args.auto_advance;
+    serve(&args.listen.clone(), move |method, path, body| {
+        let mut chain = match chain.lock() {
+            Ok(chain) => chain,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        handle(&mut chain, auto_advance, method, path, body)
+    })
 }
 
 #[derive(Deserialize)]
@@ -175,6 +246,171 @@ fn handle(
             }
             (200, json!({ "tip_height": chain.tip_height() }).to_string())
         }
+        _ => error(404, format!("no route {method} {path}")),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Esplora backend (real Bitcoin).
+// ---------------------------------------------------------------------------
+
+/// `ctx` on a real chain is derived from the anchor transaction's funding
+/// outpoint, so any scanner recomputes it from chain data alone — no extra
+/// on-chain bytes, and a snapshot server cannot lie about it. The wallet
+/// must know `ctx` *before* building the record, so anchoring is a
+/// handshake: `POST /anchor/context` reserves a funding UTXO and returns
+/// its `ctx`; `POST /anchor` then broadcasts a transaction spending exactly
+/// that UTXO.
+fn run_esplora_backend(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
+    let network = args.network.expect("required for the esplora backend");
+    let esplora_url = args
+        .esplora_url
+        .clone()
+        .unwrap_or_else(|| network.default_esplora_url().to_string());
+    let cache_path = args.cache.clone().unwrap_or_else(|| {
+        PathBuf::from(format!(
+            "esplora-cache-{}.log",
+            format!("{network:?}").to_lowercase()
+        ))
+    });
+    let wallet = match &args.wif_file {
+        Some(path) => {
+            let wif = std::fs::read_to_string(path)?;
+            let wallet = AnchorWallet::from_wif(&wif, network.bitcoin_network())?;
+            eprintln!("anchoring key funded address: {}", wallet.address);
+            Some(Arc::new(wallet))
+        }
+        None => {
+            eprintln!("no --wif-file: read-only (anchoring disabled)");
+            None
+        }
+    };
+
+    let client = Arc::new(EsploraClient::new(&esplora_url));
+    let mut state = ScanState::load(cache_path, args.birth_height)?;
+    eprintln!(
+        "opencsv-anchor-server[esplora {network:?}]: {esplora_url}, scanning from height {}…",
+        args.birth_height,
+    );
+    scan_new_blocks(&client, &mut state)?;
+    eprintln!(
+        "serving on http://{} (tip {}, {} anchors)",
+        args.listen,
+        state.tip_height,
+        state.entries.len(),
+    );
+    let state = Arc::new(Mutex::new(state));
+
+    {
+        let client = Arc::clone(&client);
+        let state = Arc::clone(&state);
+        let poll_secs = args.poll_secs.max(5);
+        std::thread::spawn(move || loop {
+            std::thread::sleep(std::time::Duration::from_secs(poll_secs));
+            let mut state = match state.lock() {
+                Ok(state) => state,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            if let Err(e) = scan_new_blocks(&client, &mut state) {
+                eprintln!("scan: {e}");
+            }
+        });
+    }
+
+    serve(&args.listen.clone(), move |method, path, body| {
+        esplora_handle(&client, &state, wallet.as_deref(), method, path, body)
+    })
+}
+
+fn esplora_handle(
+    client: &EsploraClient,
+    state: &Mutex<ScanState>,
+    wallet: Option<&AnchorWallet>,
+    method: &str,
+    path: &str,
+    body: &[u8],
+) -> (u16, String) {
+    match (method, path) {
+        ("GET", "/snapshot") => {
+            let state = match state.lock() {
+                Ok(state) => state,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            let snapshot = Snapshot {
+                tip_height: state.tip_height,
+                entries: state
+                    .entries
+                    .iter()
+                    .map(|(r, record, ctx)| entry_json(r.location, &r.txid, record, ctx))
+                    .collect(),
+            };
+            match serde_json::to_string(&snapshot) {
+                Ok(json) => (200, json),
+                Err(e) => error(500, format!("encode snapshot: {e}")),
+            }
+        }
+        ("POST", "/anchor/context") => {
+            let Some(wallet) = wallet else {
+                return error(400, "this server has no anchoring key (read-only)".into());
+            };
+            match wallet.reserve_context(client) {
+                Ok(ctx) => (200, json!({ "ctx": to_hex(&ctx) }).to_string()),
+                Err(e) => error(500, format!("reserve: {e}")),
+            }
+        }
+        ("POST", "/anchor") => {
+            let Some(wallet) = wallet else {
+                return error(400, "this server has no anchoring key (read-only)".into());
+            };
+            let (record, ctx) = match parse_anchor(body) {
+                Ok(parsed) => parsed,
+                Err(e) => return error(400, e),
+            };
+            match wallet.broadcast_anchor(client, &record, &ctx) {
+                Ok(txid) => (
+                    200,
+                    json!({ "txid": txid.to_string(), "ctx": to_hex(&ctx), "status": "pending" })
+                        .to_string(),
+                ),
+                Err(e) => error(500, format!("broadcast: {e}")),
+            }
+        }
+        ("GET", path) if path.starts_with("/anchor/") => {
+            let txid = &path["/anchor/".len()..];
+            if txid.len() != 64 || from_hex(txid).is_err() {
+                return error(400, "bad txid".into());
+            }
+            let status = match client.tx_status(txid) {
+                Ok(status) => status,
+                Err(e) => return error(502, format!("esplora: {e}")),
+            };
+            let (Some(height), Some(block_hash), true) =
+                (status.block_height, status.block_hash, status.confirmed)
+            else {
+                return (200, json!({ "confirmed": false, "txid": txid }).to_string());
+            };
+            let position = match client.block_txids(&block_hash) {
+                Ok(txids) => txids.iter().position(|t| t == txid),
+                Err(e) => return error(502, format!("esplora: {e}")),
+            };
+            let Some(position) = position else {
+                return error(502, "confirmed tx missing from its block".into());
+            };
+            (
+                200,
+                json!({
+                    "confirmed": true,
+                    "txid": txid,
+                    "height": height,
+                    "position": position as u32,
+                })
+                .to_string(),
+            )
+        }
+        ("POST", "/advance") => error(
+            400,
+            "advance is not supported on the esplora backend".into(),
+        ),
         _ => error(404, format!("no route {method} {path}")),
     }
 }
