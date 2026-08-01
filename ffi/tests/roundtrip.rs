@@ -198,6 +198,49 @@ fn mint_to_verify_round_trip() {
     }
 }
 
+/// Real chains supply the transaction context after proving: prove once,
+/// rebind to the reserved ctx, then anchor and finalize.
+#[test]
+fn rebind_pending_to_a_supplied_context() {
+    let issuer_secrets = take(opencsv_wallet_create());
+    let opened = take(unsafe { opencsv_wallet_open(cstr(&issuer_secrets.to_string()).as_ptr()) });
+    let issuer = opened["handle"].as_u64().expect("handle");
+    let asset_id = str_of(
+        &take(unsafe { opencsv_wallet_init_issuer(issuer, cstr("USD").as_ptr()) }),
+        "asset_id",
+    );
+    let receiver = take(unsafe {
+        opencsv_wallet_open(cstr(&take(opencsv_wallet_create()).to_string()).as_ptr())
+    });
+    let receiver_owner = receiver["owners"][0].as_str().expect("owner").to_owned();
+
+    let proved = take(unsafe {
+        opencsv_prove_mint(
+            issuer,
+            cstr(&asset_id).as_ptr(),
+            cstr(&receiver_owner).as_ptr(),
+            cstr("[100]").as_ptr(),
+        )
+    });
+    let pending_id = proved["pending_id"].as_u64().expect("pending_id");
+
+    // Rebinding to a caller-supplied ctx yields a publishable record.
+    let ctx = "ab".repeat(32);
+    let rebound = take(unsafe { opencsv_pending_rebind(issuer, pending_id, cstr(&ctx).as_ptr()) });
+    let record_hex = str_of(&rebound, "anchor_record_hex");
+    assert_eq!(record_hex.len(), 128);
+    // A MINT publishes no bound payload, so its record is ctx-independent.
+    assert_eq!(record_hex, str_of(&proved, "anchor_record_hex"));
+
+    // Malformed contexts and unknown pending ids are errors, not panics.
+    let bad = take(unsafe { opencsv_pending_rebind(issuer, pending_id, cstr("zz").as_ptr()) });
+    assert!(bad["error"].as_str().is_some(), "{bad}");
+    let bad = take(unsafe { opencsv_pending_rebind(issuer, 9999, cstr(&ctx).as_ptr()) });
+    assert!(bad["error"].as_str().is_some(), "{bad}");
+
+    take(opencsv_wallet_close(issuer));
+}
+
 #[test]
 fn rejects_garbage_and_unknown_handles() {
     let opened = take(unsafe {

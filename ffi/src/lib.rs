@@ -350,6 +350,37 @@ pub unsafe extern "C" fn opencsv_prove_redeem(handle: u64, coin_id: *const c_cha
     })
 }
 
+/// Rebuild a pending transaction's anchor record under a caller-supplied
+/// transaction context, without re-proving.
+///
+/// Real chains derive `ctx` from the anchor transaction's funding outpoint,
+/// which the anchoring service reserves after the proof exists: prove once,
+/// reserve a context, rebind here, publish, finalize. Returns
+/// `{"anchor_record_hex":"<128 hex>"}`, or an error if this context would
+/// make the record misparse — reserve another and call again.
+///
+/// # Safety
+/// `ctx_hex` must be a valid NUL-terminated C string.
+#[no_mangle]
+pub unsafe extern "C" fn opencsv_pending_rebind(
+    handle: u64,
+    pending_id: u64,
+    ctx_hex: *const c_char,
+) -> *mut c_char {
+    guarded(|| {
+        let ctx = match unsafe { in_str(ctx_hex, "ctx_hex") }
+            .and_then(|s| from_hex_array::<32>(s, "ctx"))
+        {
+            Ok(ctx) => ctx,
+            Err(e) => return err(e),
+        };
+        with_wallet(handle, |w| {
+            let record = w.rebind_pending(pending_id, ctx)?;
+            Ok(json!({ "anchor_record_hex": to_hex(&record) }))
+        })
+    })
+}
+
 /// Build the consignment blob for a proved transaction.
 /// `anchor_ref_json` is `{"txid":"<64 hex>","height":N,"position":M}` — where
 /// the published record actually anchored. Marks consumed coins spent.

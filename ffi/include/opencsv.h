@@ -41,6 +41,13 @@ char *opencsv_prove_transfer(uint64_t handle, const char *coin_ids_json,
                              const char *to_owner_hex, const char *amounts_json);
 char *opencsv_prove_redeem(uint64_t handle, const char *coin_id);
 
+/* Rebind (real chains): rebuild a pending transaction's anchor record under
+ * a context reserved by the anchoring service, without re-proving. Returns
+ * {"anchor_record_hex":...}, or an error if the context would make the
+ * record misparse (reserve another and retry). */
+char *opencsv_pending_rebind(uint64_t handle, uint64_t pending_id,
+                             const char *ctx_hex);
+
 /* Finalize (phase 2): anchor_ref_json = {"txid":"<64hex>","height":N,"position":M}.
  * Returns {"consignment_base64":"...","spends":[...]}. */
 char *opencsv_consignment_finalize(uint64_t handle, uint64_t pending_id,

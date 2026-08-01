@@ -60,13 +60,23 @@ fn fresh_xfer_record(nullifiers: &[Digest]) -> (AnchorRecord, [u8; 32]) {
     loop {
         let ctx = random_ctx();
         let record = AnchorRecord::xfer(nullifiers, &ctx);
-        let parsed = AnchorRecord::from_bytes(&record.to_bytes());
-        if matches!(
-            parsed,
-            AnchorRecord::Xfer { .. } | AnchorRecord::XferCompressed { .. }
-        ) {
+        if record_parses_cleanly(&record) {
             return (record, ctx);
         }
+    }
+}
+
+/// Whether a record round-trips to the same variant — an untagged transfer
+/// whose bound payload starts with a MINT/REDEEM tag byte would misparse
+/// for every verifier.
+fn record_parses_cleanly(record: &AnchorRecord) -> bool {
+    match record {
+        AnchorRecord::Xfer { .. } | AnchorRecord::XferCompressed { .. } => matches!(
+            AnchorRecord::from_bytes(&record.to_bytes()),
+            AnchorRecord::Xfer { .. } | AnchorRecord::XferCompressed { .. }
+        ),
+        // MINT/REDEEM are tagged: they always parse back as themselves.
+        _ => true,
     }
 }
 
@@ -101,8 +111,46 @@ impl StoredCoin {
     }
 }
 
+/// Everything needed to rebuild a pending transaction's anchor record
+/// under a different transaction context.
+///
+/// Real chains derive `ctx` from the anchor transaction's funding outpoint,
+/// so the host cannot know it until the anchoring service reserves one —
+/// but proving is expensive and `ctx` does not enter the proof. Keeping the
+/// record's *shape* lets the host rebind cheaply (see
+/// [`MemWallet::rebind_pending`]).
+enum RecordShape {
+    /// MINT publishes no bound payload, so its record is ctx-independent.
+    Fixed(AnchorRecord),
+    /// XFER binds one payload per consumed coin.
+    Xfer { nullifiers: Vec<Digest> },
+    /// REDEEM binds the burnt coin's nullifier.
+    Redeem {
+        asset_id: opencsv_core::TruncatedDigest,
+        value: u64,
+        raw_nf: Digest,
+    },
+}
+
+impl RecordShape {
+    /// The anchor record for this transaction under `ctx`.
+    fn build(&self, ctx: &[u8; 32]) -> AnchorRecord {
+        match self {
+            Self::Fixed(record) => *record,
+            Self::Xfer { nullifiers } => AnchorRecord::xfer(nullifiers, ctx),
+            Self::Redeem {
+                asset_id,
+                value,
+                raw_nf,
+            } => AnchorRecord::redeem(*asset_id, *value, raw_nf, ctx),
+        }
+    }
+}
+
 /// A proved-but-not-yet-anchored transaction awaiting [`MemWallet::finalize`].
 struct Pending {
+    /// How to (re)build the anchor record for a given `ctx`.
+    shape: RecordShape,
     openings: Vec<CoinOpening>,
     /// Raw nullifiers of the consumed coins (empty for mints) — they travel
     /// only in the consignment, never on-chain.
@@ -406,6 +454,7 @@ impl MemWallet {
         };
         Ok(self.push_pending(
             Pending {
+                shape: RecordShape::Fixed(record),
                 openings: openings_of(&outputs),
                 nullifiers: Vec::new(),
                 proof: encode_coin_proof(&proof),
@@ -502,6 +551,9 @@ impl MemWallet {
         let aux = self.find_genesis(&asset_id).cloned();
         Ok(self.push_pending(
             Pending {
+                shape: RecordShape::Xfer {
+                    nullifiers: nullifiers.clone(),
+                },
                 openings: openings_of(&outputs),
                 nullifiers,
                 proof: encode_coin_proof(&proof),
@@ -534,6 +586,11 @@ impl MemWallet {
         let record = AnchorRecord::redeem(coin.asset_id.to_anchor(), coin.value, &raw_nf, &ctx);
         Ok(self.push_pending(
             Pending {
+                shape: RecordShape::Redeem {
+                    asset_id: coin.asset_id.to_anchor(),
+                    value: coin.value,
+                    raw_nf,
+                },
                 openings: Vec::new(),
                 nullifiers: vec![raw_nf],
                 proof: encode_coin_proof(&proof),
@@ -543,6 +600,29 @@ impl MemWallet {
             record,
             ctx,
         ))
+    }
+
+    /// Rebuild a pending transaction's anchor record under `ctx`, without
+    /// re-proving.
+    ///
+    /// Real chains derive `ctx` from the anchor transaction's funding
+    /// outpoint, which the anchoring service reserves *after* the proof
+    /// exists — so the host proves once, reserves a context, and rebinds
+    /// here. Fails if the resulting untagged record would misparse as a
+    /// tagged one (see `opencsv-core`'s anchor docs); the host reserves a
+    /// different context and calls again.
+    pub fn rebind_pending(&mut self, pending_id: u64, ctx: [u8; 32]) -> Result<[u8; 64], OpError> {
+        let pending = self
+            .pending
+            .get(&pending_id)
+            .ok_or_else(|| format!("unknown pending transaction {pending_id}"))?;
+        let record = pending.shape.build(&ctx);
+        if !record_parses_cleanly(&record) {
+            return Err(
+                "this context would make the record misparse; reserve another and retry".into(),
+            );
+        }
+        Ok(record.to_bytes())
     }
 
     /// Build the consignment for a proved transaction once the host knows
