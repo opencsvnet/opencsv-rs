@@ -16,10 +16,12 @@
 //!
 //! Point every party of a demo at the same server (`opencsv-cli` wallets use
 //! `--chain` on the same file only when co-located; remote parties use this
-//! server). Single-threaded on purpose: `FileAnchorChain` has no file
-//! locking, and demo traffic is a handful of requests.
+//! server). Requests are handled on their own threads (a stalled client
+//! must not wedge the server) with the chain behind a mutex, so writes stay
+//! serialized — `FileAnchorChain` has no file locking of its own.
 
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 
 use clap::Parser;
 use opencsv_cli::chain::FileAnchorChain;
@@ -47,7 +49,7 @@ struct Args {
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
-    let mut chain = FileAnchorChain::open(&args.chain)?;
+    let chain = FileAnchorChain::open(&args.chain)?;
     let server = tiny_http::Server::http(&args.listen)
         .map_err(|e| format!("listen on {}: {e}", args.listen))?;
     eprintln!(
@@ -59,25 +61,36 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         args.auto_advance,
     );
 
+    let chain = Arc::new(Mutex::new(chain));
     for mut request in server.incoming_requests() {
-        let mut body = Vec::new();
-        if let Err(e) = request.as_reader().read_to_end(&mut body) {
-            eprintln!("read body: {e}");
-            continue;
-        }
-        let method = request.method().as_str().to_owned();
-        let path = request.url().to_owned();
-        let (status, reply) = handle(&mut chain, args.auto_advance, &method, &path, &body);
-        eprintln!("{method} {path} -> {status}");
-        let response = tiny_http::Response::from_string(reply)
-            .with_status_code(status)
-            .with_header(
-                tiny_http::Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..])
-                    .expect("static header"),
-            );
-        if let Err(e) = request.respond(response) {
-            eprintln!("respond: {e}");
-        }
+        let chain = Arc::clone(&chain);
+        let auto_advance = args.auto_advance;
+        std::thread::spawn(move || {
+            let mut body = Vec::new();
+            if let Err(e) = request.as_reader().read_to_end(&mut body) {
+                eprintln!("read body: {e}");
+                return;
+            }
+            let method = request.method().as_str().to_owned();
+            let path = request.url().to_owned();
+            let (status, reply) = {
+                let mut chain = match chain.lock() {
+                    Ok(chain) => chain,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
+                handle(&mut chain, auto_advance, &method, &path, &body)
+            };
+            eprintln!("{method} {path} -> {status}");
+            let response = tiny_http::Response::from_string(reply)
+                .with_status_code(status)
+                .with_header(
+                    tiny_http::Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..])
+                        .expect("static header"),
+                );
+            if let Err(e) = request.respond(response) {
+                eprintln!("respond: {e}");
+            }
+        });
     }
     Ok(())
 }
