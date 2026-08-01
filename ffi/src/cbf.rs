@@ -82,10 +82,13 @@ pub fn sync_json(config_json: &str) -> Result<Value, String> {
 
 /// Verify a claimed anchor (module docs). Verdicts:
 /// `{"status":"confirmed","ctx_hex","block_hash_hex","confirmations",
-/// "filter_matched","tip_height"}`,
+/// "filter_diagnostic","tip_height"}`,
 /// `{"status":"not_present","reason":"above_tip"|"position_out_of_range"|
 /// "txid_mismatch"|"record_not_in_tx",...}`,
 /// `{"status":"insufficient_confirmations","have":N,"required":N,...}`.
+/// NOTE: `filter_diagnostic` is a BIP158 filter-match hint ONLY — basic filters
+/// exclude OP_RETURN, so it plays no part in the verdict and must never be
+/// read as evidence. The verdict rests solely on the SPV/merkle path.
 pub fn verify_anchor_json(config_json: &str) -> Result<Value, String> {
     let config: CbfConfigJson =
         serde_json::from_str(config_json).map_err(|e| format!("cbf config JSON: {e}"))?;
@@ -117,7 +120,7 @@ pub fn verify_anchor_json(config_json: &str) -> Result<Value, String> {
             "ctx_hex": to_hex(&ctx),
             "block_hash_hex": to_hex(&block_hash),
             "confirmations": confirmations,
-            "filter_matched": filter_matched,
+            "filter_diagnostic": filter_matched,
         }),
         AnchorVerdict::NotPresent(reason) => {
             let (reason, detail) = match reason {
