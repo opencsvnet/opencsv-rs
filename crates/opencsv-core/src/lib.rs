@@ -54,6 +54,7 @@ pub mod audit;
 pub mod chain;
 pub mod coin;
 pub mod consignment;
+pub mod crosscheck;
 pub mod digest;
 pub mod field;
 pub mod issuer;
@@ -63,6 +64,7 @@ pub use anchor::{binding, mint_commit, nullifier_commit, AnchorRecord, ANCHOR_SI
 pub use asset::{AssetGenesis, AssetId};
 pub use audit::{supply, SupplyError};
 pub use chain::{AnchorChain, AnchorLocation, AnchorRef, MockAnchorChain};
+pub use crosscheck::{CrossCheckError, CrossCheckedChain};
 pub use coin::{Coin, Commitment, Nullifier, Owner, OwnerSecret};
 pub use consignment::{CoinOpening, Consignment};
 pub use digest::{Digest, TruncatedDigest};
