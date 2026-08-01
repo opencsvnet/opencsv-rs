@@ -184,6 +184,17 @@ enum SignalCmd {
         #[arg(long)]
         store_dir: Option<PathBuf>,
     },
+    /// Announce this wallet's receiving key in a chat so the peer's
+    /// wallet can prefill it ("OpenCSV address: <hex>").
+    Announce {
+        /// Recipient: `self` (Note to Self), an ACI uuid, or an E.164
+        /// phone number (resolved via the synced contacts).
+        #[arg(long)]
+        to: String,
+        /// Signal store directory (default: <wallet-dir>/signal).
+        #[arg(long)]
+        store_dir: Option<PathBuf>,
+    },
     /// Listen for incoming consignments and verify them into the wallet.
     /// Runs until Ctrl-C.
     Listen {
@@ -445,9 +456,30 @@ fn run_signal(
                 let mut manager = opencsv_signal::open(&store_dir).await?;
                 eprintln!("syncing pending Signal messages before sending…");
                 opencsv_signal::sync_once(&mut manager).await?;
-                opencsv_signal::send_consignment(&mut manager, &recipient, &blob).await
+                let sender = wallet
+                    .secrets()
+                    .first()
+                    .map(|k| to_hex(k.owner().as_bytes()));
+                opencsv_signal::send_consignment(&mut manager, &recipient, &blob, sender.as_deref())
+                    .await
             })?;
             println!("sent {} ({} bytes) to {to}", file.display(), blob.len());
+        }
+        SignalCmd::Announce { to, store_dir } => {
+            let store_dir = store_dir.unwrap_or_else(|| wallet_dir.join("signal"));
+            let owner = wallet
+                .secrets()
+                .first()
+                .map(|k| to_hex(k.owner().as_bytes()))
+                .ok_or(Error::NoKeys)?;
+            let recipient = opencsv_signal::parse_recipient(&to)?;
+            let body = opencsv_signal::address_announcement(&owner);
+            runtime.block_on(async {
+                let mut manager = opencsv_signal::open(&store_dir).await?;
+                opencsv_signal::sync_once(&mut manager).await?;
+                opencsv_signal::send_text(&mut manager, &recipient, &body).await
+            })?;
+            println!("announced {owner} to {to}");
         }
         SignalCmd::Listen {
             confirmations,

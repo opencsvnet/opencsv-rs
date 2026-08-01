@@ -31,21 +31,24 @@ use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use futures::channel::oneshot;
-use futures::{StreamExt, future, pin_mut};
-use presage::Manager;
+use futures::{future, pin_mut, StreamExt};
 use presage::libsignal_service::configuration::SignalServers;
 use presage::libsignal_service::content::{Content, ContentBody, DataMessage};
 use presage::libsignal_service::protocol::ServiceId;
 use presage::libsignal_service::sender::AttachmentSpec;
 use presage::manager::Registered;
 use presage::model::messages::Received;
-use presage::proto::SyncMessage;
 use presage::proto::sync_message::Sent;
+use presage::proto::SyncMessage;
 use presage::store::ContentsStore;
+use presage::Manager;
 use presage_store_sqlite::{OnNewIdentity, SqliteStore};
 
 pub use error::Error;
-pub use msg::{CONSIGNMENT_BODY, CONSIGNMENT_CONTENT_TYPE, CONSIGNMENT_FILENAME, Recipient};
+pub use msg::{
+    address_announcement, parse_address, Recipient, ADDRESS_MARKER, CONSIGNMENT_BODY,
+    CONSIGNMENT_CONTENT_TYPE, CONSIGNMENT_FILENAME,
+};
 pub use msg::{is_consignment_attachment, parse_recipient};
 
 /// A registered Signal client backed by the sqlite store.
@@ -195,6 +198,7 @@ pub async fn send_consignment(
     manager: &mut SignalManager,
     recipient: &Recipient,
     blob: &[u8],
+    sender_address: Option<&str>,
 ) -> Result<(), Error> {
     let service_id = resolve_recipient(manager, recipient).await?;
 
@@ -219,9 +223,38 @@ pub async fn send_consignment(
         .expect("one upload was requested")
         .map_err(|e| Error::Attachment(format!("upload rejected: {e:?}")))?;
 
+    let mut body = format!("{CONSIGNMENT_BODY} ({} bytes)", blob.len());
+    if let Some(address) = sender_address {
+        // Carry the sender's receiving key so the recipient's wallet can
+        // prefill the reply-to address from the chat itself.
+        body.push('\n');
+        body.push_str(&msg::address_announcement(address));
+    }
     let message = DataMessage {
-        body: Some(format!("{CONSIGNMENT_BODY} ({} bytes)", blob.len())),
+        body: Some(body),
         attachments: vec![pointer],
+        ..Default::default()
+    };
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock before the epoch")
+        .as_millis() as u64;
+    manager
+        .send_message(service_id, message, timestamp)
+        .await
+        .map_err(|e| Error::Signal(format!("send failed: {e}")))?;
+    Ok(())
+}
+
+/// Send a plain text message (used for address announcements).
+pub async fn send_text(
+    manager: &mut SignalManager,
+    recipient: &Recipient,
+    body: &str,
+) -> Result<(), Error> {
+    let service_id = resolve_recipient(manager, recipient).await?;
+    let message = DataMessage {
+        body: Some(body.to_string()),
         ..Default::default()
     };
     let timestamp = SystemTime::now()
@@ -338,17 +371,21 @@ where
         // from another terminal) echoes back as a sync "sent" transcript —
         // this is how Note-to-Self consignments arrive.
         ContentBody::SynchronizeMessage(SyncMessage {
-            sent: Some(Sent {
-                message: Some(data_message),
-                ..
-            }),
+            sent:
+                Some(Sent {
+                    message: Some(data_message),
+                    ..
+                }),
             ..
         }) => vec![data_message],
         _ => vec![],
     };
 
     if data_messages.is_empty() {
-        println!("from {sender}: not an OpenCSV consignment ({})", body_kind(content));
+        println!(
+            "from {sender}: not an OpenCSV consignment ({})",
+            body_kind(content)
+        );
         return;
     }
 

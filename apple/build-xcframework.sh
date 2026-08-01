@@ -13,16 +13,25 @@ out_dir="${1:-$repo_root/apple}"
 lib=libopencsv_ffi.a
 headers="$repo_root/ffi/include"
 
-for target in aarch64-apple-ios aarch64-apple-ios-sim; do
+for target in aarch64-apple-ios aarch64-apple-ios-sim x86_64-apple-ios; do
     echo ">> cargo build --release --target $target -p opencsv-ffi"
     cargo build --release --target "$target" -p opencsv-ffi \
         --manifest-path "$repo_root/Cargo.toml"
 done
 
+# Universal simulator slice (arm64 + x86_64), as Xcode's generic simulator
+# destination builds both architectures.
+sim_universal="$repo_root/target/ios-sim-universal"
+mkdir -p "$sim_universal"
+lipo -create \
+    "$repo_root/target/aarch64-apple-ios-sim/release/$lib" \
+    "$repo_root/target/x86_64-apple-ios/release/$lib" \
+    -output "$sim_universal/$lib"
+
 rm -rf "$out_dir/OpenCsv.xcframework"
 xcodebuild -create-xcframework \
     -library "$repo_root/target/aarch64-apple-ios/release/$lib" -headers "$headers" \
-    -library "$repo_root/target/aarch64-apple-ios-sim/release/$lib" -headers "$headers" \
+    -library "$sim_universal/$lib" -headers "$headers" \
     -output "$out_dir/OpenCsv.xcframework"
 
 echo ">> $out_dir/OpenCsv.xcframework"

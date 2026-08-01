@@ -6,8 +6,8 @@
 
 use std::str::FromStr;
 
-use presage::libsignal_service::prelude::Uuid;
 use presage::libsignal_service::prelude::phonenumber::PhoneNumber;
+use presage::libsignal_service::prelude::Uuid;
 
 use crate::Error;
 
@@ -19,6 +19,30 @@ pub const CONSIGNMENT_BODY: &str = "OpenCSV consignment";
 
 /// Content type a consignment attachment is uploaded with.
 pub const CONSIGNMENT_CONTENT_TYPE: &str = "application/octet-stream";
+
+/// Marker line announcing a wallet's receiving key inside a message body,
+/// so wallets can prefill recipient keys from the chat itself. Carried as
+/// an extra line of consignment bodies and by explicit announcements.
+pub const ADDRESS_MARKER: &str = "OpenCSV address: ";
+
+/// Format an address announcement line for `owner` (64 hex chars).
+pub fn address_announcement(owner_hex: &str) -> String {
+    format!("{ADDRESS_MARKER}{owner_hex}")
+}
+
+/// Extract an announced owner key from a message body, if any line carries
+/// the [`ADDRESS_MARKER`] followed by 64 hex characters.
+pub fn parse_address(body: &str) -> Option<String> {
+    for line in body.lines() {
+        if let Some(rest) = line.strip_prefix(ADDRESS_MARKER) {
+            let key = rest.trim();
+            if key.len() == 64 && key.chars().all(|c| c.is_ascii_hexdigit()) {
+                return Some(key.to_ascii_lowercase());
+            }
+        }
+    }
+    None
+}
 
 /// Who a consignment is sent to.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -65,8 +89,8 @@ pub fn is_consignment_attachment(
         return true;
     }
     let marked = body.is_some_and(|b| b.starts_with(CONSIGNMENT_BODY));
-    let opaque =
-        content_type.is_none_or(|c| c.is_empty() || c.eq_ignore_ascii_case(CONSIGNMENT_CONTENT_TYPE));
+    let opaque = content_type
+        .is_none_or(|c| c.is_empty() || c.eq_ignore_ascii_case(CONSIGNMENT_CONTENT_TYPE));
     marked && opaque
 }
 
@@ -134,7 +158,27 @@ mod tests {
             Some("OpenCSV consignment (2 coins)")
         ));
         // Missing content type still matches a marked message.
-        assert!(is_consignment_attachment(None, None, Some(CONSIGNMENT_BODY)));
+        assert!(is_consignment_attachment(
+            None,
+            None,
+            Some(CONSIGNMENT_BODY)
+        ));
+    }
+
+    #[test]
+    fn address_round_trip() {
+        let key = "ab".repeat(32);
+        let body = format!(
+            "OpenCSV consignment (100 bytes)\n{}",
+            address_announcement(&key)
+        );
+        assert_eq!(parse_address(&body), Some(key.clone()));
+        assert_eq!(
+            parse_address(&address_announcement(&key.to_uppercase())),
+            Some(key)
+        );
+        assert_eq!(parse_address("OpenCSV address: zz"), None);
+        assert_eq!(parse_address("hello"), None);
     }
 
     #[test]
