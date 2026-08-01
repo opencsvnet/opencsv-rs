@@ -178,6 +178,115 @@ pub struct GenesisJson {
     pub nonce: u64,
 }
 
+/// Serde form of a [`RecordShape`] (pending export).
+#[derive(Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "lowercase")]
+enum ShapeJson {
+    /// MINT: a fixed, ctx-independent record (128 hex).
+    Fixed { record_hex: String },
+    /// XFER: the consumed coins' raw nullifiers (hex).
+    Xfer { nullifiers: Vec<String> },
+    /// REDEEM: asset id (hex), value, and the burnt coin's raw nullifier.
+    Redeem {
+        asset_id: String,
+        value: u64,
+        raw_nf: String,
+    },
+}
+
+/// Serde form of a [`CoinOpening`] (pending export).
+#[derive(Serialize, Deserialize)]
+struct OpeningJson {
+    asset_id: String,
+    value: u64,
+    owner: String,
+    randomness: String,
+}
+
+/// The exportable form of a pending (proved, not yet finalized)
+/// transaction: **everything [`MemWallet::finalize`] and
+/// [`MemWallet::rebind_pending`] need**, including the coin openings with
+/// their fresh randomness that proving drew and cannot re-derive. The
+/// host persists it across the broadcast→finalize window so a crash no
+/// longer loses the consignment. Treat it as sensitive: openings reveal
+/// values and owners.
+#[derive(Serialize, Deserialize)]
+pub struct PendingExport {
+    /// Format version, currently 1.
+    pub version: u32,
+    shape: ShapeJson,
+    openings: Vec<OpeningJson>,
+    nullifiers: Vec<String>,
+    proof_base64: String,
+    aux: Option<GenesisJson>,
+    spent_ids: Vec<String>,
+}
+
+fn shape_to_json(shape: &RecordShape) -> ShapeJson {
+    match shape {
+        RecordShape::Fixed(record) => ShapeJson::Fixed {
+            record_hex: to_hex(&record.to_bytes()),
+        },
+        RecordShape::Xfer { nullifiers } => ShapeJson::Xfer {
+            nullifiers: nullifiers.iter().map(|nf| to_hex(nf.as_bytes())).collect(),
+        },
+        RecordShape::Redeem {
+            asset_id,
+            value,
+            raw_nf,
+        } => ShapeJson::Redeem {
+            asset_id: to_hex(asset_id.as_bytes()),
+            value: *value,
+            raw_nf: to_hex(raw_nf.as_bytes()),
+        },
+    }
+}
+
+fn shape_from_json(shape: &ShapeJson) -> Result<RecordShape, OpError> {
+    match shape {
+        ShapeJson::Fixed { record_hex } => {
+            let bytes = from_hex_array::<64>(record_hex, "anchor record")?;
+            Ok(RecordShape::Fixed(AnchorRecord::from_bytes(&bytes)))
+        }
+        ShapeJson::Xfer { nullifiers } => Ok(RecordShape::Xfer {
+            nullifiers: nullifiers
+                .iter()
+                .map(|nf| from_hex_array::<32>(nf, "nullifier").map(Digest::from_bytes))
+                .collect::<Result<_, _>>()?,
+        }),
+        ShapeJson::Redeem {
+            asset_id,
+            value,
+            raw_nf,
+        } => Ok(RecordShape::Redeem {
+            asset_id: Digest::from_bytes(from_hex_array::<32>(asset_id, "asset id")?).to_anchor(),
+            value: *value,
+            raw_nf: Digest::from_bytes(from_hex_array::<32>(raw_nf, "raw nullifier")?),
+        }),
+    }
+}
+
+fn opening_to_json(opening: &CoinOpening) -> OpeningJson {
+    OpeningJson {
+        asset_id: to_hex(opening.asset_id.as_bytes()),
+        value: opening.value,
+        owner: to_hex(opening.owner.as_bytes()),
+        randomness: to_hex(opening.randomness.as_bytes()),
+    }
+}
+
+fn opening_from_json(opening: &OpeningJson) -> Result<CoinOpening, OpError> {
+    Ok(CoinOpening {
+        asset_id: Digest::from_bytes(from_hex_array::<32>(&opening.asset_id, "asset id")?),
+        value: opening.value,
+        owner: Digest::from_bytes(from_hex_array::<32>(&opening.owner, "owner")?),
+        randomness: Digest::from_bytes(from_hex_array::<32>(
+            &opening.randomness,
+            "randomness",
+        )?),
+    })
+}
+
 #[derive(Serialize, Deserialize)]
 struct IssuerJson {
     isk: String,
@@ -650,6 +759,80 @@ impl MemWallet {
             }
         }
         Ok((consignment.to_bytes(), pending.spent_ids))
+    }
+
+    /// Export a pending transaction as a JSON string capturing everything
+    /// [`MemWallet::finalize`] and [`MemWallet::rebind_pending`] need
+    /// (see [`PendingExport`]): the record shape (for rebinding), the
+    /// coin openings with their fresh randomness, the raw nullifiers, the
+    /// proof, the aux genesis, and the spend list. The pending entry is
+    /// kept — export does not consume it.
+    pub fn export_pending(&self, pending_id: u64) -> Result<String, OpError> {
+        use base64::Engine as _;
+        let pending = self
+            .pending
+            .get(&pending_id)
+            .ok_or_else(|| format!("unknown pending transaction {pending_id}"))?;
+        let export = PendingExport {
+            version: 1,
+            shape: shape_to_json(&pending.shape),
+            openings: pending.openings.iter().map(opening_to_json).collect(),
+            nullifiers: pending
+                .nullifiers
+                .iter()
+                .map(|nf| to_hex(nf.as_bytes()))
+                .collect(),
+            proof_base64: base64::engine::general_purpose::STANDARD.encode(&pending.proof),
+            aux: pending.aux.as_ref().map(genesis_to_json),
+            spent_ids: pending.spent_ids.clone(),
+        };
+        serde_json::to_string(&export).map_err(|e| e.to_string())
+    }
+
+    /// Import a previously exported pending transaction, returning its
+    /// (newly assigned) pending id. The export captures no wallet secrets,
+    /// so an export can move a pending transaction between processes
+    /// opening the same wallet secrets.
+    pub fn import_pending(&mut self, pending_json: &str) -> Result<u64, OpError> {
+        use base64::Engine as _;
+        let export: PendingExport =
+            serde_json::from_str(pending_json).map_err(|e| format!("pending export JSON: {e}"))?;
+        if export.version != 1 {
+            return Err(format!("unsupported pending export version {}", export.version));
+        }
+        let pending = Pending {
+            shape: shape_from_json(&export.shape)?,
+            openings: export
+                .openings
+                .iter()
+                .map(opening_from_json)
+                .collect::<Result<_, _>>()?,
+            nullifiers: export
+                .nullifiers
+                .iter()
+                .map(|nf| from_hex_array::<32>(nf, "nullifier").map(Digest::from_bytes))
+                .collect::<Result<_, _>>()?,
+            proof: base64::engine::general_purpose::STANDARD
+                .decode(&export.proof_base64)
+                .map_err(|e| format!("proof base64: {e}"))?,
+            aux: export.aux.as_ref().map(genesis_from_json).transpose()?,
+            spent_ids: export.spent_ids,
+        };
+        let pending_id = self.next_pending;
+        self.next_pending += 1;
+        self.pending.insert(pending_id, pending);
+        Ok(pending_id)
+    }
+
+    /// The wallet's owner secrets, for accept-side verification params
+    /// (the cross-check driver; see `crate::crosscheck`).
+    pub fn owner_secrets(&self) -> Vec<OwnerSecret> {
+        self.keys.clone()
+    }
+
+    /// Asset ids of all pinned geneses.
+    pub fn known_asset_ids(&self) -> Vec<opencsv_core::AssetId> {
+        self.assets.iter().map(AssetGenesis::asset_id).collect()
     }
 
     /// Run the accept driver over a received consignment blob against an

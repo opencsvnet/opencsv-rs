@@ -31,6 +31,8 @@
 #![warn(missing_docs)]
 
 mod hex;
+pub mod cbf;
+pub mod crosscheck;
 pub mod snapshot;
 pub mod wallet;
 
@@ -511,6 +513,125 @@ pub unsafe extern "C" fn opencsv_audit(
         match result {
             Ok(supply) => out(json!({ "supply": supply })),
             Err(e) => err(e),
+        }
+    })
+}
+
+/// Export a pending (proved, not yet finalized) transaction as a JSON
+/// string the host can persist across the broadcast→finalize window —
+/// closing the crash-loses-consignment gap: the openings carry fresh
+/// randomness proving drew and cannot re-derive, so everything
+/// [`opencsv_consignment_finalize`] and [`opencsv_pending_rebind`] need
+/// is in the export. Returns `{"pending_json":"{...}"}` — persist the
+/// inner string as-is; treat it as sensitive (it reveals coin values
+/// and owners).
+#[no_mangle]
+pub extern "C" fn opencsv_pending_export(handle: u64, pending_id: u64) -> *mut c_char {
+    guarded(|| {
+        with_wallet(handle, |w| {
+            let export = w.export_pending(pending_id)?;
+            Ok(json!({ "pending_json": export }))
+        })
+    })
+}
+
+/// Import a pending transaction exported by [`opencsv_pending_export`]
+/// (possibly in an earlier process lifetime of the same wallet secrets).
+/// Returns `{"pending_id":M}` — a fresh id; the export's original id is
+/// not preserved.
+///
+/// # Safety
+/// `pending_json` must be a valid NUL-terminated C string.
+#[no_mangle]
+pub unsafe extern "C" fn opencsv_pending_import(
+    handle: u64,
+    pending_json: *const c_char,
+) -> *mut c_char {
+    guarded(|| {
+        let pending_json = match unsafe { in_str(pending_json, "pending_json") } {
+            Ok(s) => s.to_owned(),
+            Err(e) => return err(e),
+        };
+        with_wallet(handle, |w| {
+            w.import_pending(&pending_json)
+                .map(|pending_id| json!({ "pending_id": pending_id }))
+        })
+    })
+}
+
+/// Verify a claimed anchor trustlessly over the BIP157/158 P2P protocol
+/// (see [`cbf`] for the config JSON). Returns the verdict JSON:
+/// `{"status":"confirmed",...}` / `{"status":"not_present",...}` /
+/// `{"status":"insufficient_confirmations",...}`.
+///
+/// # Safety
+/// `config_json` must be a valid NUL-terminated C string.
+#[no_mangle]
+pub unsafe extern "C" fn opencsv_cbf_verify_anchor(config_json: *const c_char) -> *mut c_char {
+    guarded(|| {
+        match unsafe { in_str(config_json, "config_json") }.and_then(cbf::verify_anchor_json) {
+            Ok(value) => out(value),
+            Err(e) => err(e),
+        }
+    })
+}
+
+/// Sync the header/filter chains from all configured peers and report
+/// the verified tip: `{"tip_height":N}` (see [`cbf`] for the config
+/// JSON; the `anchor` member is not needed).
+///
+/// # Safety
+/// `config_json` must be a valid NUL-terminated C string.
+#[no_mangle]
+pub unsafe extern "C" fn opencsv_cbf_sync(config_json: *const c_char) -> *mut c_char {
+    guarded(|| {
+        match unsafe { in_str(config_json, "config_json") }.and_then(cbf::sync_json) {
+            Ok(value) => out(value),
+            Err(e) => err(e),
+        }
+    })
+}
+
+/// Run the accept driver over a received consignment against an N-of-M
+/// [`CrossCheckedChain`](opencsv_core::CrossCheckedChain) built from a
+/// JSON list of backend specs (see [`crosscheck`]: bitcoind-rpc / http
+/// anchor-server / inline snapshot). Read-only: coins are reported, not
+/// credited. Returns `{"status":"verified",...}` /
+/// `{"status":"rejected",...}`; tip disagreement between backends
+/// returns `{"error":"...","kind":"tip_disagreement","tips":[...]}`.
+///
+/// # Safety
+/// `request_json` must be a valid NUL-terminated C string.
+#[no_mangle]
+pub unsafe extern "C" fn opencsv_cross_check(
+    handle: u64,
+    request_json: *const c_char,
+) -> *mut c_char {
+    guarded(|| {
+        let request_json = match unsafe { in_str(request_json, "request_json") } {
+            Ok(s) => s.to_owned(),
+            Err(e) => return err(e),
+        };
+        let mut registry = match WALLETS.lock() {
+            Ok(registry) => registry,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let Some(wallet) = registry.wallets.get_mut(&handle) else {
+            return err(format!("unknown wallet handle {handle}"));
+        };
+        match crosscheck::run_cross_check(
+            &request_json,
+            &wallet.owner_secrets(),
+            &wallet.known_asset_ids(),
+            &opencsv_pcd::CoinProofVerifier,
+        ) {
+            Ok(value) => out(value),
+            Err(crosscheck::CrossCheckFailure::TipDisagreement(tips)) => out(json!({
+                "error": format!("anchor backends disagree on tip height: {tips:?}"),
+                "kind": "tip_disagreement",
+                "tips": tips,
+            })),
+            Err(crosscheck::CrossCheckFailure::Other(message)) => err(message),
         }
     })
 }

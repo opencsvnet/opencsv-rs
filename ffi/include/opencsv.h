@@ -48,6 +48,14 @@ char *opencsv_prove_redeem(uint64_t handle, const char *coin_id);
 char *opencsv_pending_rebind(uint64_t handle, uint64_t pending_id,
                              const char *ctx_hex);
 
+/* Pending-transaction persistence across the broadcast->finalize window
+ * (the crash-loses-consignment gap: openings carry fresh randomness that
+ * cannot be re-derived). Export returns {"pending_json":"{...}"} — persist
+ * the inner string as-is (sensitive: reveals coin values/owners). Import
+ * returns {"pending_id":M} with a fresh id. */
+char *opencsv_pending_export(uint64_t handle, uint64_t pending_id);
+char *opencsv_pending_import(uint64_t handle, const char *pending_json);
+
 /* Finalize (phase 2): anchor_ref_json = {"txid":"<64hex>","height":N,"position":M}.
  * Returns {"consignment_base64":"...","spends":[...]}. */
 char *opencsv_consignment_finalize(uint64_t handle, uint64_t pending_id,
@@ -58,6 +66,24 @@ char *opencsv_verify_consignment(uint64_t handle, const uint8_t *blob,
                                  size_t blob_len,
                                  const char *anchor_snapshot_json,
                                  uint64_t required_confirmations);
+
+/* Trustless anchor point verification over BIP157/158 P2P (opencsv-cbf).
+ * config_json = {"network":"signet","peers":["host:port"],"cache_dir":"...",
+ * "timeout_ms":30000,"anchor":{"record_hex":"<128hex>","txid_hex":"<64hex>",
+ * "height":N,"position":M,"required_confirmations":N}} (anchor member only
+ * for verify). Returns {"tip_height":N} or the verdict JSON
+ * ({"status":"confirmed"|"not_present"|"insufficient_confirmations",...}). */
+char *opencsv_cbf_sync(const char *config_json);
+char *opencsv_cbf_verify_anchor(const char *config_json);
+
+/* N-of-M cross-checked accept (paper 4.7.1): build a CrossCheckedChain from
+ * request_json = {"backends":[{"type":"bitcoind",...}|{"type":"http","url":...}|
+ * {"type":"snapshot","snapshot":{...}}],"consignment_base64":"...",
+ * "required_confirmations":N} and run accept over it (read-only; credit via
+ * opencsv_verify_consignment). Returns {"status":"verified"|"rejected",...};
+ * backend tip disagreement returns {"error":...,"kind":"tip_disagreement",
+ * "tips":[...]}. */
+char *opencsv_cross_check(uint64_t handle, const char *request_json);
 
 /* State queries and spend-state replay. */
 char *opencsv_wallet_mark_spent(uint64_t handle, const char *coin_ids_json);
