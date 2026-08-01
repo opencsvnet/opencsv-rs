@@ -9,8 +9,10 @@
 //! until the transaction is mined (a real chain assigns `(height, position)`
 //! only at confirmation).
 //!
-//! Prototype caveats: reorgs are not tracked (the scan cursor only moves
-//! forward), and one anchor output per transaction is indexed.
+//! A reorg is detected by re-checking the hash of the last scanned block
+//! before each scan: if the chain no longer agrees, the index is dropped
+//! and rebuilt from the birth height (mirroring the `bitcoind` backend).
+//! One anchor output per transaction is indexed.
 
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
@@ -216,6 +218,11 @@ pub struct ScanState {
     pub entries: Vec<(AnchorRef, AnchorRecord, [u8; 32])>,
     pub tip_height: u64,
     scanned_to: u64,
+    /// Block hash of `scanned_to` — the anchor for reorg detection: if the
+    /// chain later reports a different hash at that height, everything
+    /// scanned is suspect and the index is rebuilt.
+    scanned_hash: Option<String>,
+    birth_height: u64,
     cache_path: PathBuf,
 }
 
@@ -225,6 +232,8 @@ impl ScanState {
             entries: Vec::new(),
             tip_height: 0,
             scanned_to: birth_height.saturating_sub(1),
+            scanned_hash: None,
+            birth_height,
             cache_path,
         };
         let content = match std::fs::read_to_string(&state.cache_path) {
@@ -241,6 +250,11 @@ impl ScanState {
             match fields.as_slice() {
                 ["scanned", h] => {
                     state.scanned_to = h.parse().map_err(|e| format!("cache: {e}"))?;
+                    state.scanned_hash = None;
+                }
+                ["scanned", h, hash] => {
+                    state.scanned_to = h.parse().map_err(|e| format!("cache: {e}"))?;
+                    state.scanned_hash = Some((*hash).to_string());
                 }
                 ["entry", h, p, txid_hex, record_hex, ctx_hex] => {
                     let txid: [u8; 32] = from_hex(txid_hex)
@@ -275,6 +289,16 @@ impl ScanState {
         Ok(state)
     }
 
+    /// Drop everything scanned and rewrite the cache — used when a reorg
+    /// invalidates the index.
+    fn reset(&mut self) -> Result<(), String> {
+        self.entries.clear();
+        self.scanned_to = self.birth_height.saturating_sub(1);
+        self.scanned_hash = None;
+        std::fs::write(&self.cache_path, format!("{CACHE_MAGIC}\n"))
+            .map_err(|e| format!("cache: {e}"))
+    }
+
     fn append_cache_line(&self, line: &str) -> Result<(), String> {
         let mut file = std::fs::OpenOptions::new()
             .create(true)
@@ -293,6 +317,19 @@ impl ScanState {
 pub fn scan_new_blocks(client: &EsploraClient, state: &mut ScanState) -> Result<usize, String> {
     let tip = client.tip_height()?;
     state.tip_height = tip;
+
+    // Reorg check: does the chain still have the block we last scanned?
+    if let Some(known) = state.scanned_hash.clone() {
+        let actual = client.block_hash_at(state.scanned_to)?;
+        if actual != known {
+            eprintln!(
+                "reorg detected at height {} ({known} → {actual}); rebuilding index",
+                state.scanned_to,
+            );
+            state.reset()?;
+        }
+    }
+
     let mut found = 0;
     while state.scanned_to < tip {
         let height = state.scanned_to + 1;
@@ -350,7 +387,8 @@ pub fn scan_new_blocks(client: &EsploraClient, state: &mut ScanState) -> Result<
             index += page_len;
         }
         state.scanned_to = height;
-        state.append_cache_line(&format!("scanned {height}"))?;
+        state.scanned_hash = Some(hash.clone());
+        state.append_cache_line(&format!("scanned {height} {hash}"))?;
         if height.is_multiple_of(100) || state.scanned_to == tip {
             eprintln!(
                 "scanned to height {height} ({} anchors)",
@@ -557,5 +595,63 @@ impl AnchorWallet {
 
         let txid = client.broadcast(&bitcoin::consensus::encode::serialize_hex(&tx))?;
         txid.parse().map_err(|e| format!("broadcast txid: {e}"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A reorg invalidates the scanned index: on a changed block hash at
+    /// the last scanned height, everything is dropped and rebuilt from the
+    /// birth height (mirroring the `bitcoind` backend).
+    #[test]
+    fn reorg_resets_the_index() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cache = dir.path().join("cache.log");
+        let mut state = ScanState::load(cache.clone(), 100).expect("load");
+
+        // Pretend a scan reached height 105 and indexed one anchor.
+        let record = AnchorRecord::Xfer {
+            payloads: [
+                opencsv_core::TruncatedDigest([7u8; 24]),
+                opencsv_core::TruncatedDigest([0u8; 24]),
+            ],
+        };
+        state.entries.push((
+            AnchorRef {
+                txid: [1u8; 32],
+                location: AnchorLocation {
+                    height: 105,
+                    position: 0,
+                },
+            },
+            record,
+            [2u8; 32],
+        ));
+        state.scanned_to = 105;
+        state.scanned_hash = Some("aaaa".into());
+
+        state.reset().expect("reset");
+        assert!(state.entries.is_empty(), "index survived the reorg");
+        assert_eq!(state.scanned_to, 99, "cursor did not rewind to birth");
+        assert!(state.scanned_hash.is_none());
+
+        // The rewritten cache reloads as an empty index at the birth height.
+        let reloaded = ScanState::load(cache, 100).expect("reload");
+        assert!(reloaded.entries.is_empty());
+        assert_eq!(reloaded.scanned_to, 99);
+    }
+
+    /// Cache lines from before reorg tracking (no block hash) still load;
+    /// they simply carry no reorg anchor until the next scan writes one.
+    #[test]
+    fn legacy_cache_lines_load() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cache = dir.path().join("cache.log");
+        std::fs::write(&cache, format!("{CACHE_MAGIC}\nscanned 250\n")).expect("write");
+        let state = ScanState::load(cache, 100).expect("load");
+        assert_eq!(state.scanned_to, 250);
+        assert!(state.scanned_hash.is_none());
     }
 }
