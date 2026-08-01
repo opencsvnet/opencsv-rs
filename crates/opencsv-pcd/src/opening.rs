@@ -35,11 +35,11 @@
 //! pattern in the upstream recursion crate (`recursion/src/pcs/mmcs.rs`).
 
 use opencsv_core::{Coin, Digest};
-use p3_baby_bear::{BabyBear, default_babybear_poseidon2_16};
+use p3_baby_bear::{default_babybear_poseidon2_16, BabyBear};
 use p3_circuit::ops::{generate_poseidon2_trace, generate_recompose_trace};
 use p3_circuit::{Circuit, CircuitBuilder, CircuitBuilderError, CircuitError};
 use p3_circuit_prover::batch_stark_prover::{BatchStarkProof, BatchStarkProverError};
-use p3_circuit_prover::config::{BabyBearConfig, baby_bear};
+use p3_circuit_prover::config::{baby_bear, BabyBearConfig};
 use p3_poseidon2_circuit_air::BabyBearD4Width16;
 
 use crate::hash::{connect_digest, hash_felts_limbs};

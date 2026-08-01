@@ -8,7 +8,7 @@ mismatch is a hard error at open.
 - **Write path** — two-pass anchoring: `createrawtransaction` +
   `fundrawtransaction` with a dummy 64-byte `OP_RETURN` learns the funding
   inputs; the record is built against the funding input's outpoint ctx
-  (`txid ⊕ vout` folded to 32 bytes — the tag-collision redraw picks the
+  (`SHA-256(txid_internal ∥ vout_le)`, canonical across backends — the tag-collision redraw picks the
   vin\[0\] input); the tx is rebuilt with identical inputs/outputs and the
   real record bytes, signed (`signrawtransactionwithwallet`), and
   broadcast (`sendrawtransaction`). The returned `AnchorRef` carries the

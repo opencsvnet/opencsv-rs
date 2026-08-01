@@ -82,9 +82,9 @@ mod node;
 mod opening;
 mod prove;
 mod recursion_config;
-mod statement;
 #[cfg(test)]
 mod spike;
+mod statement;
 mod transfer;
 mod value;
 
@@ -96,26 +96,26 @@ use p3_field::extension::BinomialExtensionField;
 /// degrees `D ∈ {2, 4, 5}` — see `README.md`).
 pub type EF = BinomialExtensionField<BabyBear, 4>;
 
-pub use accept::{CoinProofVerifier, decode_coin_proof, encode_coin_proof};
-pub use hash::{OSK_ELEMS, osk_felts};
+pub use accept::{decode_coin_proof, encode_coin_proof, CoinProofVerifier};
+pub use hash::{osk_felts, OSK_ELEMS};
 pub use mint::{
-    MINT_OUTPUTS, MINT_PRIVATE_ELEMS, MINT_PUBLIC_ELEMS, MintError, MintProof, MintStatement,
-    prove_mint, prove_mint_raw, verify_mint,
-};
-pub use node::{
-    CoinProof, NODE_INPUTS, NODE_OUTPUTS, NODE_PRIVATE_ELEMS, NodeError, NodeMode, NodeStatement,
-    REDEEM_PRIVATE_ELEMS, RedeemProof, STATEMENT_ELEMS, coin_fri_params, prove_genesis_mint,
-    prove_redeem, verify_coin_proof, verify_redeem,
+    prove_mint, prove_mint_raw, verify_mint, MintError, MintProof, MintStatement, MINT_OUTPUTS,
+    MINT_PRIVATE_ELEMS, MINT_PUBLIC_ELEMS,
 };
 pub use node::prove_transfer as prove_coin_transfer;
+pub use node::{
+    coin_fri_params, prove_genesis_mint, prove_redeem, verify_coin_proof, verify_redeem, CoinProof,
+    NodeError, NodeMode, NodeStatement, RedeemProof, NODE_INPUTS, NODE_OUTPUTS, NODE_PRIVATE_ELEMS,
+    REDEEM_PRIVATE_ELEMS, STATEMENT_ELEMS,
+};
 pub use opening::{
-    CoinWitness, OpeningError, OpeningProof, PRIVATE_ELEMS, PUBLIC_ELEMS, prove_opening,
-    prove_opening_raw, verify_opening,
+    prove_opening, prove_opening_raw, verify_opening, CoinWitness, OpeningError, OpeningProof,
+    PRIVATE_ELEMS, PUBLIC_ELEMS,
 };
 pub use transfer::{
+    prove_transfer, verify_transfer, TransferError, TransferProof, TransferStatement,
     TRANSFER_INPUTS, TRANSFER_OUTPUTS, TRANSFER_PRIVATE_ELEMS, TRANSFER_PUBLIC_ELEMS,
-    TransferError, TransferProof, TransferStatement, prove_transfer, verify_transfer,
 };
-pub use value::{VALUE_LIMBS, u64_to_felts};
+pub use value::{u64_to_felts, VALUE_LIMBS};
 
 pub use opencsv_core::field::DIGEST_ELEMS;

@@ -4,12 +4,12 @@
 
 use p3_baby_bear::BabyBear;
 use p3_batch_stark::ProverData;
+use p3_circuit::ops::Poseidon2Config;
 use p3_circuit::Circuit;
 use p3_circuit::CircuitError;
-use p3_circuit::ops::Poseidon2Config;
 use p3_circuit_prover::batch_stark_prover::{poseidon2_air_builders, recompose_air_builders};
-use p3_circuit_prover::common::{NpoPreprocessor, get_airs_and_degrees_with_prep};
-use p3_circuit_prover::config::{BabyBearConfig, baby_bear};
+use p3_circuit_prover::common::{get_airs_and_degrees_with_prep, NpoPreprocessor};
+use p3_circuit_prover::config::{baby_bear, BabyBearConfig};
 use p3_circuit_prover::{
     BatchStarkProver, CircuitProverData, ConstraintProfile, Poseidon2Preprocessor,
     RecomposePreprocessor, TablePacking,

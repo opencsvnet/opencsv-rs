@@ -36,10 +36,11 @@
 //!    position only exist once the transaction mines; the read path
 //!    resolves them by txid (see `opencsv-core`'s `AnchorChain::locate`).
 //!
-//! The transaction context is `ctx = txid ⊕ vout` — the 32-byte
-//! internal-order funding txid with the 4-byte little-endian vout XORed
+//! The transaction context is `ctx = SHA-256(txid ∥ vout)` over the
+//! 32-byte internal-order funding txid and the 4-byte little-endian vout
 //! into its first 4 bytes (a 36-byte outpoint does not fit the 32-byte
-//! ctx slot; this fold is lossless given the txid). See [`funding_ctx`].
+//! ctx slot). The derivation is canonical across backends —
+//! `SHA-256(txid_internal ∥ vout_le)`; see [`funding_ctx`].
 //!
 //! ## Read path (scanning)
 //!
@@ -72,6 +73,6 @@ pub mod chain;
 pub mod error;
 pub mod rpc;
 
-pub use chain::{BitcoinAnchorChain, Config, MEMPOOL_LOCATION, Network, display_txid, funding_ctx};
+pub use chain::{display_txid, funding_ctx, BitcoinAnchorChain, Config, Network, MEMPOOL_LOCATION};
 pub use error::Error;
 pub use rpc::{HttpTransport, RpcAuth, RpcClient, Transport};

@@ -92,9 +92,9 @@ struct EsploraTx {
 }
 
 /// The transaction context of an anchor: the funding input's outpoint,
-/// folded by [`opencsv_bitcoin::funding_ctx`] — the *same* derivation the
-/// `bitcoind` backend uses, so the two real-chain backends agree on what a
-/// record binds to. Deriving `ctx` from chain data means the 32 bytes need
+/// hashed by [`opencsv_bitcoin::funding_ctx`] — the canonical derivation
+/// (`SHA-256(txid_internal ∥ vout_le)`), so every backend agrees on what a
+/// record binds to (opencsv-rs#2). Deriving `ctx` from chain data means the 32 bytes need
 /// no room in the 64-byte OP_RETURN and any scanner recomputes it
 /// independently, so a snapshot server cannot lie about it.
 pub fn ctx_from_outpoint(txid: &Txid, vout: u32) -> [u8; 32] {

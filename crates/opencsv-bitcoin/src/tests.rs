@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 use opencsv_core::chain::AnchorChain;
 use opencsv_core::digest::TruncatedDigest;
 use opencsv_core::{AnchorRecord, Digest};
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 
 use super::*;
 
@@ -122,8 +122,7 @@ fn anchor_two_pass_construction() {
         )
         .reply("sendrawtransaction", json!(tx_c));
     let config = test_config(tmp.path().join("index.log"), Network::Regtest, Some(101));
-    let mut chain =
-        BitcoinAnchorChain::with_transport(RpcClient::new(transport), &config).unwrap();
+    let mut chain = BitcoinAnchorChain::with_transport(RpcClient::new(transport), &config).unwrap();
 
     // The record builder collides with the MINT tag for the first
     // candidate ctx (input A) and parses cleanly for the second (input B).
@@ -284,21 +283,35 @@ fn scan_and_index_persistence() {
             .reply("getblock", block_b);
         let config = test_config(index_path.clone(), Network::Signet, None);
         let chain = BitcoinAnchorChain::with_transport(RpcClient::new(transport), &config).unwrap();
-        assert_eq!(chain.entry_count(), 0, "the anchor was on the orphaned fork");
+        assert_eq!(
+            chain.entry_count(),
+            0,
+            "the anchor was on the orphaned fork"
+        );
     }
 }
 
-/// Small pure-function checks: outpoint fold, hash byte order, OP_RETURN
+/// Small pure-function checks: ctx derivation, hash byte order, OP_RETURN
 /// payload shapes.
 #[test]
 fn primitives() {
-    // The vout folds into the first four bytes only.
+    // ctx = SHA-256(txid_internal ∥ vout_le): distinct outpoints give
+    // distinct contexts, and the derivation is a hash of the whole
+    // outpoint (not a fold of part of it).
     let txid = [0x11; 32];
     let ctx0 = funding_ctx(&txid, 0);
-    assert_eq!(ctx0, txid);
     let ctx5 = funding_ctx(&txid, 5);
-    assert_eq!(ctx5[0], 0x11 ^ 5);
-    assert_eq!(ctx5[1..], txid[1..]);
+    assert_ne!(ctx0, txid);
+    assert_ne!(ctx0, ctx5);
+    assert_ne!(funding_ctx(&[0x12; 32], 0), ctx0);
+
+    // Canonical test vector — the protocol constant every backend and
+    // third-party indexer must reproduce (opencsv-rs#2). Recompute with:
+    //   python3 -c "import hashlib;print(hashlib.sha256(bytes.fromhex('11'*32)+(5).to_bytes(4,'little')).hexdigest())"
+    assert_eq!(
+        to_hex(&ctx5),
+        "d48f515144348f4b5df84301bc9c842217aa95a09a37beec2bdd243d74c401d8",
+    );
 
     // RPC display order is reversed internal order.
     let internal = hash_from_rpc(&display_hash(0x77)).unwrap();
@@ -318,7 +331,16 @@ fn primitives() {
     let push2 = format!("6a4d4000{}", to_hex(&payload));
     assert_eq!(op_return_payload(&push2), Some(payload));
     // Wrong length, no OP_RETURN, trailing garbage: rejected.
-    assert_eq!(op_return_payload(&format!("6a20{}", to_hex(&[9u8; 32]))), None);
-    assert_eq!(op_return_payload(&format!("5140{}", to_hex(&payload))), None);
-    assert_eq!(op_return_payload(&format!("6a40{}00", to_hex(&payload))), None);
+    assert_eq!(
+        op_return_payload(&format!("6a20{}", to_hex(&[9u8; 32]))),
+        None
+    );
+    assert_eq!(
+        op_return_payload(&format!("5140{}", to_hex(&payload))),
+        None
+    );
+    assert_eq!(
+        op_return_payload(&format!("6a40{}00", to_hex(&payload))),
+        None
+    );
 }

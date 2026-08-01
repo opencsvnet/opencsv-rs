@@ -7,7 +7,7 @@
 use std::time::Instant;
 
 use opencsv_core::{Coin, Digest, OwnerSecret};
-use opencsv_pcd::{TransferError, TransferStatement, prove_transfer, verify_transfer};
+use opencsv_pcd::{prove_transfer, verify_transfer, TransferError, TransferStatement};
 
 /// Test asset id (arbitrary but fixed).
 fn asset_id() -> Digest {
@@ -39,8 +39,7 @@ fn prove_and_verify_transfer() {
     let outputs = [coin(u64::MAX, 0x66, 0x77), coin(0, 0x88, 0x99)];
 
     let t = Instant::now();
-    let transfer =
-        prove_transfer(&asset_id(), &inputs, &outputs).expect("proving should succeed");
+    let transfer = prove_transfer(&asset_id(), &inputs, &outputs).expect("proving should succeed");
     let prove_time = t.elapsed();
     println!("prove_transfer: {prove_time:?}");
 
@@ -66,7 +65,10 @@ fn prove_and_verify_transfer() {
 /// on the carry constraints).
 #[test]
 fn unbalanced_transfer_fails() {
-    let inputs = [(coin(10, 0x22, 0x33), osk(0x22)), (coin(20, 0x44, 0x55), osk(0x44))];
+    let inputs = [
+        (coin(10, 0x22, 0x33), osk(0x22)),
+        (coin(20, 0x44, 0x55), osk(0x44)),
+    ];
     // 10 + 20 = 30 in, but only 29 out.
     let outputs = [coin(15, 0x66, 0x77), coin(14, 0x88, 0x99)];
 
@@ -101,10 +103,12 @@ fn wrong_osk_fails() {
 /// data.
 #[test]
 fn tampered_statement_fails_verification() {
-    let inputs = [(coin(7, 0x22, 0x33), osk(0x22)), (coin(8, 0x44, 0x55), osk(0x44))];
+    let inputs = [
+        (coin(7, 0x22, 0x33), osk(0x22)),
+        (coin(8, 0x44, 0x55), osk(0x44)),
+    ];
     let outputs = [coin(9, 0x66, 0x77), coin(6, 0x88, 0x99)];
-    let transfer =
-        prove_transfer(&asset_id(), &inputs, &outputs).expect("proving should succeed");
+    let transfer = prove_transfer(&asset_id(), &inputs, &outputs).expect("proving should succeed");
 
     let mut tampered: TransferStatement = transfer.statement.clone();
     tampered.nullifiers[0] = Digest::from_bytes([0xee; 32]);

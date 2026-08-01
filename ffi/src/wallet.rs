@@ -24,8 +24,8 @@ use opencsv_core::accept::{accept, AcceptParams};
 use opencsv_core::chain::{AnchorChain, AnchorRef};
 use opencsv_core::consignment::{CoinOpening, Consignment};
 use opencsv_core::{
-    AnchorRecord, AssetGenesis, AssetId, Coin, Digest, Ed25519IssuerSignature, IssuerSignature,
-    Owner, OwnerSecret, mint_commit, mint_signing_message,
+    mint_commit, mint_signing_message, AnchorRecord, AssetGenesis, AssetId, Coin, Digest,
+    Ed25519IssuerSignature, IssuerSignature, Owner, OwnerSecret,
 };
 use opencsv_pcd::{decode_coin_proof, encode_coin_proof, NODE_INPUTS, NODE_OUTPUTS};
 use rand::RngExt;

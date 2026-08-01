@@ -8,8 +8,8 @@ use std::time::Instant;
 
 use opencsv_core::{Coin, Digest, OwnerSecret};
 use opencsv_pcd::{
-    CoinProof, NodeError, NodeMode, NodeStatement, prove_coin_transfer, prove_genesis_mint,
-    verify_coin_proof,
+    prove_coin_transfer, prove_genesis_mint, verify_coin_proof, CoinProof, NodeError, NodeMode,
+    NodeStatement,
 };
 
 /// Test asset id (arbitrary but fixed).
@@ -143,8 +143,7 @@ fn wrong_predecessor_fails() {
     let outputs = [coin(70, 0x66, 0x77), coin(30, 0x88, 0x99)];
 
     // Off-circuit pre-check: the mint's outputs do not include `stranger`.
-    let err = match prove_coin_transfer(&asset_id(), &inputs, &outputs, [&mint, &mint], [0, 1])
-    {
+    let err = match prove_coin_transfer(&asset_id(), &inputs, &outputs, [&mint, &mint], [0, 1]) {
         Ok(_) => panic!("spending a coin the predecessor never created must fail"),
         Err(e) => e,
     };

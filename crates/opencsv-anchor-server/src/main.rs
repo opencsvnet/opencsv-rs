@@ -544,6 +544,34 @@ mod tests {
         assert_eq!(reply["ctx"].as_str().expect("ctx").len(), 64);
     }
 
+    /// Cross-backend conformance (opencsv-rs#2): the esplora backend must
+    /// derive `ctx` identically to the `bitcoind` backend, or a record
+    /// anchored through one is not occurrence-recognizable through the
+    /// other. Both must equal the canonical `SHA-256(txid_internal ∥
+    /// vout_le)`.
+    #[test]
+    fn ctx_derivation_matches_bitcoind_backend() {
+        use bitcoin::hashes::Hash as _;
+
+        // Internal-order txid bytes; Txid::from_byte_array takes internal
+        // order, matching what opencsv-bitcoin passes funding_ctx.
+        let raw = [0x11u8; 32];
+        let txid = bitcoin::Txid::from_byte_array(raw);
+        for vout in [0u32, 1, 5, 0xffff_ffff] {
+            assert_eq!(
+                crate::esplora::ctx_from_outpoint(&txid, vout),
+                opencsv_bitcoin::funding_ctx(&raw, vout),
+                "esplora and bitcoind ctx disagree at vout {vout}",
+            );
+        }
+
+        // The canonical vector, pinned in both crates.
+        assert_eq!(
+            to_hex(&crate::esplora::ctx_from_outpoint(&txid, 5)),
+            "d48f515144348f4b5df84301bc9c842217aa95a09a37beec2bdd243d74c401d8",
+        );
+    }
+
     #[test]
     fn rejects_bad_input() {
         let (_dir, mut chain) = chain();

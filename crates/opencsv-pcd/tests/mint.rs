@@ -5,8 +5,8 @@
 
 use std::time::Instant;
 
-use opencsv_core::{Coin, Digest, OwnerSecret, mint_commit};
-use opencsv_pcd::{MintError, MintStatement, prove_mint, prove_mint_raw, verify_mint};
+use opencsv_core::{mint_commit, Coin, Digest, OwnerSecret};
+use opencsv_pcd::{prove_mint, prove_mint_raw, verify_mint, MintError, MintStatement};
 
 /// Test asset id (arbitrary but fixed).
 fn asset_id() -> Digest {
@@ -29,9 +29,12 @@ fn mint_nonce() -> Digest {
 
 /// Raw proving entry point computing the honest `mint_commit` for
 /// `(asset_id, value, mint_nonce)`.
-fn prove_raw(asset_id: &Digest, value: u64, nonce: &Digest, outputs: &[Coin; 2]) ->
-    Result<opencsv_pcd::MintProof, MintError>
-{
+fn prove_raw(
+    asset_id: &Digest,
+    value: u64,
+    nonce: &Digest,
+    outputs: &[Coin; 2],
+) -> Result<opencsv_pcd::MintProof, MintError> {
     let mc = mint_commit(asset_id, value, nonce);
     prove_mint_raw(asset_id, value, &mc, nonce, outputs)
 }

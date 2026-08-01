@@ -28,7 +28,7 @@
 //! - [`Digest`] → 8 field elements: little-endian `u32` limbs reduced mod p
 //!   (digests produced by this crate are always canonical, i.e. < p).
 
-use p3_baby_bear::{BabyBear, Poseidon2BabyBear, default_babybear_poseidon2_16};
+use p3_baby_bear::{default_babybear_poseidon2_16, BabyBear, Poseidon2BabyBear};
 use p3_field::PrimeField32;
 use p3_symmetric::{CryptographicHasher, PaddingFreeSponge};
 use std::sync::OnceLock;

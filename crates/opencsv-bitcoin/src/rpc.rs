@@ -17,7 +17,7 @@ use std::time::Duration;
 use base64::Engine;
 use serde_json::Value;
 
-use crate::error::{Error, io_err};
+use crate::error::{io_err, Error};
 
 /// How the JSON-RPC request body gets to bitcoind and the reply body back.
 pub trait Transport {
@@ -127,9 +127,7 @@ impl Transport for HttpTransport {
         if looks_like_json_rpc_error {
             return Ok(reply_body.to_string());
         }
-        Err(Error::Http(format!(
-            "{status_line}; body {reply_body}"
-        )))
+        Err(Error::Http(format!("{status_line}; body {reply_body}")))
     }
 }
 

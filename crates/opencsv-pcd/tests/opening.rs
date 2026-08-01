@@ -5,7 +5,7 @@
 use std::time::Instant;
 
 use opencsv_core::{Coin, Digest, OwnerSecret};
-use opencsv_pcd::{CoinWitness, OpeningError, prove_opening, prove_opening_raw, verify_opening};
+use opencsv_pcd::{prove_opening, prove_opening_raw, verify_opening, CoinWitness, OpeningError};
 
 /// A coin with plausible but arbitrary contents (`value` distinguishes
 /// coins in tests).

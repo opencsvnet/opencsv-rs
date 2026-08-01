@@ -26,18 +26,18 @@
 //! cargo test -p opencsv-pcd --test acceptance -- --ignored --nocapture
 //! ```
 
-use opencsv_core::accept::{AcceptParams, ProofVerifier, accept, public_input};
-use opencsv_core::anchor::{AnchorRecord, mint_commit};
+use opencsv_core::accept::{accept, public_input, AcceptParams, ProofVerifier};
+use opencsv_core::anchor::{mint_commit, AnchorRecord};
 use opencsv_core::asset::AssetGenesis;
 use opencsv_core::audit::supply;
 use opencsv_core::chain::{AnchorChain, MockAnchorChain};
 use opencsv_core::coin::{Coin, OwnerSecret};
 use opencsv_core::consignment::{CoinOpening, Consignment};
 use opencsv_core::digest::Digest;
-use opencsv_core::issuer::{Ed25519IssuerSignature, IssuerSignature, mint_signing_message};
+use opencsv_core::issuer::{mint_signing_message, Ed25519IssuerSignature, IssuerSignature};
 use opencsv_core::RejectReason;
 use opencsv_pcd::{
-    CoinProofVerifier, encode_coin_proof, prove_coin_transfer, prove_genesis_mint, prove_redeem,
+    encode_coin_proof, prove_coin_transfer, prove_genesis_mint, prove_redeem, CoinProofVerifier,
 };
 
 /// vk tag carried in `AcceptParams` (ignored by `CoinProofVerifier` — the
@@ -90,18 +90,16 @@ fn full_protocol_flow_with_real_proofs() {
 
     // Off-circuit issuer authorization (paper §4.4 item 1; the signature
     // stays off-circuit in this prototype — see README deviations).
-    let sig = Ed25519IssuerSignature::sign(
-        &isk,
-        &mint_signing_message(&asset_id, 100, &mint_nonce),
-    );
+    let sig =
+        Ed25519IssuerSignature::sign(&isk, &mint_signing_message(&asset_id, 100, &mint_nonce));
     assert!(Ed25519IssuerSignature::verify(
         &ipk,
         &mint_signing_message(&asset_id, 100, &mint_nonce),
         &sig
     ));
 
-    let mint = prove_genesis_mint(&asset_id, &mint_nonce, &[coin_a1, coin_a2])
-        .expect("mint proving");
+    let mint =
+        prove_genesis_mint(&asset_id, &mint_nonce, &[coin_a1, coin_a2]).expect("mint proving");
     let mint_ref = chain.append(AnchorRecord::Mint {
         asset_id: asset_id.to_anchor(),
         value: 100,
@@ -266,8 +264,7 @@ fn full_protocol_flow_with_real_proofs() {
     .expect("the authoritative spend remains acceptable");
 
     // --- 5. B redeems coin_b1 (70 units) back to the issuer.
-    let redeem =
-        prove_redeem(&asset_id, &(coin_b1, osk_b), &transfer, 0).expect("redeem proving");
+    let redeem = prove_redeem(&asset_id, &(coin_b1, osk_b), &transfer, 0).expect("redeem proving");
     let redeem_ctx = chain.fresh_ctx();
     let redeem_ref = chain.append_with_ctx(
         AnchorRecord::redeem(

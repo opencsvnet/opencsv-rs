@@ -5,10 +5,10 @@
 use std::path::PathBuf;
 
 use opencsv_core::chain::{AnchorChain, AnchorLocation, AnchorRef};
-use opencsv_core::{ANCHOR_SIZE, AnchorRecord, Digest};
-use serde_json::{Value, json};
+use opencsv_core::{AnchorRecord, Digest, ANCHOR_SIZE};
+use serde_json::{json, Value};
 
-use crate::error::{Error, io_err};
+use crate::error::{io_err, Error};
 use crate::rpc::{HttpTransport, RpcAuth, RpcClient, Transport};
 
 /// Location carried in an [`AnchorRef`] for a transaction that is
@@ -106,18 +106,28 @@ pub struct Config {
     pub index_path: PathBuf,
 }
 
-/// The 32-byte transaction context of a funding-input outpoint: the
-/// internal-order txid with the 4-byte little-endian vout XORed into its
-/// first 4 bytes. An outpoint is 36 bytes and the ctx slot is 32; this
-/// fold is injective in practice (distinct txids differ in the unfolded
-/// bytes; distinct vouts of one txid differ in the fold) and lossless
-/// given the txid.
+/// The 32-byte transaction context of a funding-input outpoint:
+///
+/// ```text
+/// ctx = SHA-256( txid_internal_order (32 bytes) ∥ vout (4 bytes, LE) )
+/// ```
+///
+/// **This is protocol-canonical**: `ctx` is what an anchor record's bound
+/// payloads commit to, so every backend and every third-party indexer must
+/// compute it identically or they stop recognizing each other's anchors
+/// (see opencsv-rs#2). SHA-256 over the explicit 36-byte outpoint is
+/// self-describing, available in every language, and free of truncation or
+/// byte-order subtleties beyond the one fixed here: the txid is in
+/// **internal byte order** (the reverse of block-explorer display order —
+/// use [`hash_from_rpc`] on RPC/REST hex), and `vout` is little-endian.
+///
+/// Any new backend MUST call this function rather than reimplement it.
 pub fn funding_ctx(txid: &[u8; 32], vout: u32) -> [u8; 32] {
-    let mut ctx = *txid;
-    for (i, b) in vout.to_le_bytes().into_iter().enumerate() {
-        ctx[i] ^= b;
-    }
-    ctx
+    use sha2::{Digest as _, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(txid);
+    hasher.update(vout.to_le_bytes());
+    hasher.finalize().into()
 }
 
 /// Internal-order bytes of a display-order RPC txid/block hash hex string.
@@ -211,7 +221,8 @@ impl BitcoinAnchorChain<HttpTransport> {
     /// error on unreachability, auth failure, or network mismatch), load
     /// or initialize the index, and scan up to the tip.
     pub fn open(config: &Config) -> Result<Self, Error> {
-        let transport = HttpTransport::new(&config.rpc_url, config.wallet.as_deref(), &config.auth)?;
+        let transport =
+            HttpTransport::new(&config.rpc_url, config.wallet.as_deref(), &config.auth)?;
         Self::with_transport(RpcClient::new(transport), config)
     }
 }
@@ -335,7 +346,9 @@ impl<T: Transport> BitcoinAnchorChain<T> {
             .get("hex")
             .and_then(Value::as_str)
             .ok_or_else(|| Error::Malformed("fundrawtransaction: no `hex`".into()))?;
-        let tx = self.client.call("decoderawtransaction", json!([funded_hex]))?;
+        let tx = self
+            .client
+            .call("decoderawtransaction", json!([funded_hex]))?;
         let malformed = |what: &str| Error::Malformed(format!("funded transaction: {what}"));
         let vin = tx
             .get("vin")
@@ -427,7 +440,9 @@ impl<T: Transport> BitcoinAnchorChain<T> {
             .get("hex")
             .and_then(Value::as_str)
             .ok_or_else(|| Error::Malformed("signrawtransactionwithwallet: no `hex`".into()))?;
-        let txid_hex = self.client.call_str("sendrawtransaction", json!([signed_hex]))?;
+        let txid_hex = self
+            .client
+            .call_str("sendrawtransaction", json!([signed_hex]))?;
         let txid = hash_from_rpc(&txid_hex)?;
         self.mempool.push(Entry {
             txid,
@@ -468,9 +483,7 @@ impl<T: Transport> BitcoinAnchorChain<T> {
 
     fn load_or_init(&mut self, scan_from: Option<u64>) -> Result<(), Error> {
         match self.load_index()? {
-            Some((start, scanned, entries))
-                if scan_from.is_none() || scan_from == Some(start) =>
-            {
+            Some((start, scanned, entries)) if scan_from.is_none() || scan_from == Some(start) => {
                 self.start_height = start;
                 self.scanned = scanned;
                 self.entries = entries;
@@ -490,7 +503,11 @@ impl<T: Transport> BitcoinAnchorChain<T> {
         if let Some(parent) = self.index_path.parent() {
             std::fs::create_dir_all(parent).map_err(io_err(parent))?;
         }
-        let mut out = format!("{MAGIC}\nnetwork {}\nstart {}\n", self.network.name(), self.start_height);
+        let mut out = format!(
+            "{MAGIC}\nnetwork {}\nstart {}\n",
+            self.network.name(),
+            self.start_height
+        );
         if let Some((height, hash)) = self.scanned {
             out.push_str(&format!("scanned {} {}\n", height, hash_to_rpc(&hash)));
         }
@@ -551,8 +568,10 @@ impl<T: Transport> BitcoinAnchorChain<T> {
                     ));
                 }
                 ["entry", h, p, txid, ctx, record] => {
-                    let record_bytes: [u8; ANCHOR_SIZE] =
-                        from_hex(record).map_err(|_| bad())?.try_into().map_err(|_| bad())?;
+                    let record_bytes: [u8; ANCHOR_SIZE] = from_hex(record)
+                        .map_err(|_| bad())?
+                        .try_into()
+                        .map_err(|_| bad())?;
                     entries.push(Entry {
                         txid: hash_from_rpc(txid).map_err(|_| bad())?,
                         location: AnchorLocation {
@@ -576,8 +595,7 @@ impl<T: Transport> BitcoinAnchorChain<T> {
     fn find(&self, anchor_ref: &AnchorRef) -> Option<&Entry> {
         let matches = |e: &&Entry| {
             e.txid == anchor_ref.txid
-                && (e.location == anchor_ref.location
-                    || anchor_ref.location == MEMPOOL_LOCATION)
+                && (e.location == anchor_ref.location || anchor_ref.location == MEMPOOL_LOCATION)
         };
         self.entries
             .iter()
@@ -592,7 +610,10 @@ impl<T: Transport> BitcoinAnchorChain<T> {
 /// `None`.
 fn scan_tx(tx: &Value, height: u64, position: u32) -> Result<Option<Entry>, Error> {
     let malformed = || Error::Malformed("scanned transaction has no `txid`".into());
-    let txid_hex = tx.get("txid").and_then(Value::as_str).ok_or_else(malformed)?;
+    let txid_hex = tx
+        .get("txid")
+        .and_then(Value::as_str)
+        .ok_or_else(malformed)?;
     let vin0 = tx
         .get("vin")
         .and_then(Value::as_array)
@@ -614,11 +635,7 @@ fn scan_tx(tx: &Value, height: u64, position: u32) -> Result<Option<Entry>, Erro
     };
     for output in vout {
         let script = output.get("scriptPubKey");
-        if script
-            .and_then(|s| s.get("type"))
-            .and_then(Value::as_str)
-            != Some("nulldata")
-        {
+        if script.and_then(|s| s.get("type")).and_then(Value::as_str) != Some("nulldata") {
             continue;
         }
         if let Some(payload) = script

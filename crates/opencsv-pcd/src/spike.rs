@@ -19,9 +19,9 @@ use p3_recursion::verifier::verify_p3_batch_proof_circuit;
 use p3_recursion::FriRecursionConfig;
 
 use crate::recursion_config::{
-    CoinFriParams, CoinRecursionConfig, new_prover, node_table_provers, setup_circuit,
+    new_prover, node_table_provers, setup_circuit, CoinFriParams, CoinRecursionConfig,
 };
-use crate::statement::{StatementCircuitPlugin, StatementProver, statement_op_type};
+use crate::statement::{statement_op_type, StatementCircuitPlugin, StatementProver};
 use crate::EF;
 
 const N: usize = 2;
@@ -122,8 +122,9 @@ fn spike_in_circuit_verification() {
         .prepare_circuit_for_verification(&mut builder)
         .expect("prepare");
     let lookup_gadget = p3_lookup::logup::LogUpGadget::new();
-    let table_provers: Vec<Box<dyn p3_circuit_prover::batch_stark_prover::TableProver<CoinRecursionConfig>>> =
-        vec![Box::new(StatementProver::<4, N>::new())];
+    let table_provers: Vec<
+        Box<dyn p3_circuit_prover::batch_stark_prover::TableProver<CoinRecursionConfig>>,
+    > = vec![Box::new(StatementProver::<4, N>::new())];
     let (verifier_inputs, op_ids) = verify_p3_batch_proof_circuit::<
         CoinRecursionConfig,
         <CoinRecursionConfig as FriRecursionConfig>::Commitment,
@@ -183,14 +184,14 @@ fn spike_in_circuit_verification() {
     );
 
     let mut runner1 = s1.circuit.runner();
-    runner1.set_public_inputs(&public_inputs).expect("set public");
-    runner1.set_private_inputs(&private_inputs).expect("set private");
-    CoinRecursionConfig::set_fri_private_data(
-        &mut runner1,
-        &op_ids,
-        &proof0.proof.opening_proof,
-    )
-    .expect("fri private data");
+    runner1
+        .set_public_inputs(&public_inputs)
+        .expect("set public");
+    runner1
+        .set_private_inputs(&private_inputs)
+        .expect("set private");
+    CoinRecursionConfig::set_fri_private_data(&mut runner1, &op_ids, &proof0.proof.opening_proof)
+        .expect("fri private data");
     let traces1 = runner1.run().expect("witness gen l1");
     eprintln!("spike2 parent witness gen: {:?}", t2.elapsed());
 
@@ -206,14 +207,18 @@ fn spike_in_circuit_verification() {
     verifier1
         .verify_all_tables::<EF>(&proof1)
         .expect("verify l1");
-    eprintln!("spike2 parent verify: {:?} (total {:?})", t4.elapsed(), t0.elapsed());
+    eprintln!(
+        "spike2 parent verify: {:?} (total {:?})",
+        t4.elapsed(),
+        t0.elapsed()
+    );
 }
 
+#[allow(unused_imports)]
+use node_table_provers as _node_table_provers_unused;
 /// Silence unused-import warnings for helpers used only by later stages.
 #[allow(unused_imports)]
 use p3_circuit_prover::batch_stark_prover::TableProver as _TableProverUnused;
-#[allow(unused_imports)]
-use node_table_provers as _node_table_provers_unused;
 #[allow(unused_imports)]
 use ConstraintProfile as _CpUnused;
 #[allow(unused_imports)]

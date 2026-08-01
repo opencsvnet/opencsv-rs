@@ -3,7 +3,7 @@
 
 use std::collections::HashSet;
 
-use crate::anchor::{AnchorRecord, binding, nullifier_commit};
+use crate::anchor::{binding, nullifier_commit, AnchorRecord};
 use crate::asset::AssetId;
 use crate::chain::{AnchorChain, AnchorLocation};
 use crate::coin::{Coin, OwnerSecret};
@@ -133,7 +133,10 @@ impl std::fmt::Display for RejectReason {
                 write!(f, "nullifier already occurred earlier at {first:?}")
             }
             Self::IllFormedAnchor => {
-                write!(f, "anchor record is not bound to its transaction context (ill-formed)")
+                write!(
+                    f,
+                    "anchor record is not bound to its transaction context (ill-formed)"
+                )
             }
             Self::InvalidProof => write!(f, "transaction proof did not verify"),
             Self::NoOwnedOutput => write!(f, "no opening belongs to the recipient"),
@@ -246,9 +249,7 @@ pub fn accept<V: ProofVerifier, C: AnchorChain>(
     // recognized under their nullifier commitment, like on-chain.
     let occurrence_keys: Vec<Digest> = match &record {
         AnchorRecord::Mint { .. } => vec![],
-        AnchorRecord::Xfer { .. } | AnchorRecord::Redeem { .. } => {
-            consignment.nullifiers.clone()
-        }
+        AnchorRecord::Xfer { .. } | AnchorRecord::Redeem { .. } => consignment.nullifiers.clone(),
         AnchorRecord::XferCompressed { .. } => {
             vec![nullifier_commit(&consignment.nullifiers)]
         }
@@ -287,7 +288,11 @@ pub fn accept<V: ProofVerifier, C: AnchorChain>(
 /// under `ctx`? Mint anchors bind none; XFERC anchors bind the commitment
 /// over the whole raw list (occurrence queries then use the commitment as
 /// the key, see below); XFER/REDEEM bind each nullifier individually.
-fn record_binds_nullifiers(record: &AnchorRecord, ctx: &[u8; 32], raw_nullifiers: &[Digest]) -> bool {
+fn record_binds_nullifiers(
+    record: &AnchorRecord,
+    ctx: &[u8; 32],
+    raw_nullifiers: &[Digest],
+) -> bool {
     let bound = |nf: &Digest| binding(nf, ctx).to_anchor();
     match record {
         AnchorRecord::Mint { .. } => raw_nullifiers.is_empty(),
@@ -296,10 +301,7 @@ fn record_binds_nullifiers(record: &AnchorRecord, ctx: &[u8; 32], raw_nullifiers
         }
         AnchorRecord::XferCompressed {
             nullifier_commit: slot,
-        } => {
-            !raw_nullifiers.is_empty()
-                && bound(&nullifier_commit(raw_nullifiers)) == *slot
-        }
+        } => !raw_nullifiers.is_empty() && bound(&nullifier_commit(raw_nullifiers)) == *slot,
         AnchorRecord::Xfer { payloads } => {
             // Multiset equality: the non-zero payload slots are exactly the
             // bound nullifiers.

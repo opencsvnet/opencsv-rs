@@ -78,7 +78,7 @@
 
 use crate::asset::AssetId;
 use crate::coin::Nullifier;
-use crate::digest::{Digest, TRUNCATED_DIGEST_BYTES, TruncatedDigest};
+use crate::digest::{Digest, TruncatedDigest, TRUNCATED_DIGEST_BYTES};
 use crate::field::{bytes_to_felts, hash_felts};
 
 /// Exact byte length of every serialized anchor record.
@@ -103,10 +103,8 @@ pub fn mint_commit(asset_id: &AssetId, value: u64, mint_nonce: &Digest) -> Diges
 /// payload for transfers with `m > 2` consumed coins (paper §4.5). The full
 /// nullifier list travels in the consignment.
 pub fn nullifier_commit(nullifiers: &[Nullifier]) -> Digest {
-    let elems: Vec<p3_baby_bear::BabyBear> = nullifiers
-        .iter()
-        .flat_map(|nf| nf.to_elems())
-        .collect();
+    let elems: Vec<p3_baby_bear::BabyBear> =
+        nullifiers.iter().flat_map(|nf| nf.to_elems()).collect();
     hash_felts("xfer", &[&elems])
 }
 
@@ -172,7 +170,9 @@ impl AnchorRecord {
         Self::Xfer {
             payloads: [
                 bound(&raw_nullifiers[0]),
-                raw_nullifiers.get(1).map_or(TruncatedDigest([0u8; 24]), bound),
+                raw_nullifiers
+                    .get(1)
+                    .map_or(TruncatedDigest([0u8; 24]), bound),
             ],
         }
     }
@@ -188,12 +188,7 @@ impl AnchorRecord {
 
     /// An [`AnchorRecord::Redeem`] binding `raw_nf` to transaction context
     /// `ctx`.
-    pub fn redeem(
-        asset_id: TruncatedDigest,
-        value: u64,
-        raw_nf: &Digest,
-        ctx: &[u8; 32],
-    ) -> Self {
+    pub fn redeem(asset_id: TruncatedDigest, value: u64, raw_nf: &Digest, ctx: &[u8; 32]) -> Self {
         Self::Redeem {
             asset_id,
             value,

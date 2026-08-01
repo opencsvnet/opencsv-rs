@@ -22,7 +22,7 @@
 //! consignment holders can do.
 
 use opencsv_core::chain::{AnchorChain, AnchorLocation, AnchorRef};
-use opencsv_core::{ANCHOR_SIZE, AnchorRecord, Digest};
+use opencsv_core::{AnchorRecord, Digest, ANCHOR_SIZE};
 use serde::{Deserialize, Serialize};
 
 use crate::hex::{from_hex_array, to_hex};

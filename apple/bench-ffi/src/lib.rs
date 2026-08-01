@@ -11,8 +11,8 @@ use std::time::Instant;
 
 use opencsv_core::{Coin, Digest, OwnerSecret};
 use opencsv_pcd::{
-    CoinProof, prove_coin_transfer, prove_genesis_mint, prove_redeem, verify_coin_proof,
-    verify_redeem,
+    prove_coin_transfer, prove_genesis_mint, prove_redeem, verify_coin_proof, verify_redeem,
+    CoinProof,
 };
 
 fn asset_id() -> Digest {
@@ -94,8 +94,8 @@ fn run() -> Result<String, String> {
 
     // Redeem (1 in-circuit verification of a node predecessor).
     let t = Instant::now();
-    let redeem = prove_redeem(&asset_id(), &(outputs2[0], osk(0x11)), &t2, 0)
-        .map_err(|e| e.to_string())?;
+    let redeem =
+        prove_redeem(&asset_id(), &(outputs2[0], osk(0x11)), &t2, 0).map_err(|e| e.to_string())?;
     let redeem_prove = t.elapsed();
     let t = Instant::now();
     verify_redeem(&redeem.statement, &redeem).map_err(|e| e.to_string())?;

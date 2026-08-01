@@ -107,7 +107,11 @@ fn owner_derivation_matches_hash_of_secret() {
 #[test]
 fn issuer_signature_round_trip() {
     let (sk, pk) = Ed25519IssuerSignature::keypair_from_seed(byte_seed(1));
-    let msg = mint_signing_message(&genesis().asset_id(), 100, &Digest::from_bytes(byte_seed(6)));
+    let msg = mint_signing_message(
+        &genesis().asset_id(),
+        100,
+        &Digest::from_bytes(byte_seed(6)),
+    );
     let sig = Ed25519IssuerSignature::sign(&sk, &msg);
     assert!(Ed25519IssuerSignature::verify(&pk, &msg, &sig));
 
@@ -175,7 +179,10 @@ fn anchor_records_are_64_bytes_and_round_trip() {
     assert_eq!(
         AnchorRecord::from_bytes(&bytes),
         AnchorRecord::Xfer {
-            payloads: [anchor::binding(&d(13), &ctx).to_anchor(), TruncatedDigest([0u8; 24])],
+            payloads: [
+                anchor::binding(&d(13), &ctx).to_anchor(),
+                TruncatedDigest([0u8; 24])
+            ],
         }
     );
 }
@@ -254,8 +261,14 @@ fn binding_binds_payload_to_raw_nf_and_ctx() {
     assert!(!mint.well_formed(&ctx_a, &d(3)));
 
     // The binding commits to both halves of its input.
-    assert_ne!(anchor::binding(&d(3), &ctx_a), anchor::binding(&d(8), &ctx_a));
-    assert_ne!(anchor::binding(&d(3), &ctx_a), anchor::binding(&d(3), &ctx_b));
+    assert_ne!(
+        anchor::binding(&d(3), &ctx_a),
+        anchor::binding(&d(8), &ctx_a)
+    );
+    assert_ne!(
+        anchor::binding(&d(3), &ctx_a),
+        anchor::binding(&d(3), &ctx_b)
+    );
 }
 
 // --- Mock chain (§4.7) --------------------------------------------------------
@@ -496,7 +509,12 @@ fn accept_rejects_bad_proof() {
     consignment.proof[n - 1] ^= 1; // corrupt the mock checksum
 
     assert_eq!(
-        accept(&consignment, &chain, &MockVerifier, &params(&[secret(3)], &[])),
+        accept(
+            &consignment,
+            &chain,
+            &MockVerifier,
+            &params(&[secret(3)], &[])
+        ),
         Err(RejectReason::InvalidProof)
     );
 }
@@ -513,7 +531,12 @@ fn accept_rejects_unknown_anchor() {
     consignment.anchor_ref.location.position = 99;
 
     assert_eq!(
-        accept(&consignment, &chain, &MockVerifier, &params(&[secret(3)], &[])),
+        accept(
+            &consignment,
+            &chain,
+            &MockVerifier,
+            &params(&[secret(3)], &[])
+        ),
         Err(RejectReason::AnchorNotFound)
     );
 }
@@ -529,7 +552,12 @@ fn accept_rejects_insufficient_confirmations() {
     chain.advance_blocks(3); // only 4 confirmations
 
     assert_eq!(
-        accept(&consignment, &chain, &MockVerifier, &params(&[secret(3)], &[])),
+        accept(
+            &consignment,
+            &chain,
+            &MockVerifier,
+            &params(&[secret(3)], &[])
+        ),
         Err(RejectReason::InsufficientConfirmations {
             have: 4,
             required: 6
@@ -604,7 +632,10 @@ fn accept_survives_copy_grief() {
     chain.advance_blocks(6);
 
     // The copy is not an occurrence of the raw nullifier…
-    assert_eq!(chain.first_nullifier_occurrence(&nf), Some(victim_ref.location));
+    assert_eq!(
+        chain.first_nullifier_occurrence(&nf),
+        Some(victim_ref.location)
+    );
     assert_eq!(chain.nullifier_occurrences(&nf), vec![victim_ref.location]);
     // …and the legitimate consignment still verifies.
     let openings = vec![opening_for(asset_id, 60, 3, 4)];
@@ -642,7 +673,12 @@ fn accept_rejects_unknown_asset_without_genesis_aux() {
     chain.advance_blocks(5);
 
     assert_eq!(
-        accept(&consignment, &chain, &MockVerifier, &params(&[secret(3)], &[])),
+        accept(
+            &consignment,
+            &chain,
+            &MockVerifier,
+            &params(&[secret(3)], &[])
+        ),
         Err(RejectReason::UnknownAsset)
     );
 
@@ -669,7 +705,12 @@ fn accept_rejects_mismatched_genesis_aux() {
     chain.advance_blocks(5);
 
     assert_eq!(
-        accept(&consignment, &chain, &MockVerifier, &params(&[secret(3)], &[])),
+        accept(
+            &consignment,
+            &chain,
+            &MockVerifier,
+            &params(&[secret(3)], &[])
+        ),
         Err(RejectReason::GenesisMismatch)
     );
 }
@@ -685,7 +726,12 @@ fn accept_rejects_when_nothing_is_owned() {
     chain.advance_blocks(5);
 
     assert_eq!(
-        accept(&consignment, &chain, &MockVerifier, &params(&[secret(9)], &[])),
+        accept(
+            &consignment,
+            &chain,
+            &MockVerifier,
+            &params(&[secret(9)], &[])
+        ),
         Err(RejectReason::NoOwnedOutput)
     );
 }
@@ -785,5 +831,8 @@ fn supply_audit_flags_overspent_asset() {
         AnchorRecord::redeem(asset_id.to_anchor(), 1, &d(15), &ctx),
         ctx,
     );
-    assert_eq!(supply(&chain, &asset_id, 0), Err(SupplyError::NegativeSupply));
+    assert_eq!(
+        supply(&chain, &asset_id, 0),
+        Err(SupplyError::NegativeSupply)
+    );
 }

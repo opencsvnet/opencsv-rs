@@ -17,7 +17,7 @@
 
 use std::sync::Arc;
 
-use p3_baby_bear::{BabyBear, Poseidon2BabyBear, default_babybear_poseidon2_16};
+use p3_baby_bear::{default_babybear_poseidon2_16, BabyBear, Poseidon2BabyBear};
 use p3_challenger::DuplexChallenger;
 use p3_circuit::{CircuitRunner, NonPrimitiveOpId};
 use p3_circuit_prover::config::StarkField;
@@ -28,8 +28,7 @@ use p3_fri::{FriParameters, TwoAdicFriPcs};
 use p3_lookup::logup::LogUpGadget;
 use p3_merkle_tree::MerkleTreeMmcs;
 use p3_recursion::pcs::{
-    InputProofTargets, MerkleCapTargets, RecExtensionValMmcs, RecValMmcs,
-    set_fri_mmcs_private_data,
+    set_fri_mmcs_private_data, InputProofTargets, MerkleCapTargets, RecExtensionValMmcs, RecValMmcs,
 };
 use p3_recursion::traits::{RecursiveAir, RecursivePcs};
 use p3_recursion::{FriRecursionConfig, FriVerifierParams, Poseidon2Config, RecursionInput};
@@ -175,12 +174,12 @@ impl StarkGenericConfig for CoinRecursionConfig {
 impl FriRecursionConfig for CoinRecursionConfig
 where
     MyPcs: RecursivePcs<
-            CoinRecursionConfig,
-            InputProofTargets<BabyBear, EF, RecInputMmcs>,
-            InnerFri,
-            MerkleCapTargets<BabyBear, MERKLE_DIGEST_ELEMS>,
-            <MyPcs as Pcs<EF, Challenger>>::Domain,
-        >,
+        CoinRecursionConfig,
+        InputProofTargets<BabyBear, EF, RecInputMmcs>,
+        InnerFri,
+        MerkleCapTargets<BabyBear, MERKLE_DIGEST_ELEMS>,
+        <MyPcs as Pcs<EF, Challenger>>::Domain,
+    >,
 {
     type Commitment = MerkleCapTargets<BabyBear, MERKLE_DIGEST_ELEMS>;
     type InputProof = InputProofTargets<BabyBear, EF, RecInputMmcs>;
@@ -241,7 +240,10 @@ where
             MyCompress,
             MERKLE_DIGEST_ELEMS,
         >(
-            runner, op_ids, opening_proof, Poseidon2Config::BABY_BEAR_D4_W16
+            runner,
+            op_ids,
+            opening_proof,
+            Poseidon2Config::BABY_BEAR_D4_W16,
         )
     }
 }
@@ -265,13 +267,13 @@ const _: fn() = || {
 
 use p3_batch_stark::ProverData;
 use p3_circuit::Circuit;
-use p3_circuit_prover::batch_stark_prover::{TableProver, poseidon2_air_builders};
-use p3_circuit_prover::common::{NpoPreprocessor, get_airs_and_degrees_with_prep};
+use p3_circuit_prover::batch_stark_prover::recompose_air_builders;
+use p3_circuit_prover::batch_stark_prover::{poseidon2_air_builders, TableProver};
+use p3_circuit_prover::common::{get_airs_and_degrees_with_prep, NpoPreprocessor};
 use p3_circuit_prover::{
     BatchStarkProver, CircuitProverData, ConstraintProfile, Poseidon2Preprocessor,
     RecomposePreprocessor, TablePacking,
 };
-use p3_circuit_prover::batch_stark_prover::recompose_air_builders;
 
 use crate::statement::{StatementAirBuilder, StatementPreprocessor, StatementProver};
 
@@ -343,8 +345,8 @@ pub(crate) fn new_prover<const N: usize>(
 /// The non-primitive table provers of a recursive node proof, in proof order
 /// (must match the registration order in [`new_prover`]); used to reconstruct
 /// the table AIRs for in-circuit verification.
-pub(crate) fn node_table_provers<const N: usize>(
-) -> Vec<Box<dyn TableProver<CoinRecursionConfig>>> {
+pub(crate) fn node_table_provers<const N: usize>() -> Vec<Box<dyn TableProver<CoinRecursionConfig>>>
+{
     vec![
         Box::new(p3_circuit_prover::Poseidon2Prover::new(
             Poseidon2Config::BABY_BEAR_D4_W16,

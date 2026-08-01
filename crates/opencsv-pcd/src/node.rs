@@ -72,7 +72,7 @@
 //! root check in [`verify_coin_proof`] compares the proof's statement-table
 //! public values and natively verifies the proof.
 
-use opencsv_core::{AssetId, Coin, Commitment, Digest, Nullifier, OwnerSecret, mint_commit};
+use opencsv_core::{mint_commit, AssetId, Coin, Commitment, Digest, Nullifier, OwnerSecret};
 use p3_baby_bear::BabyBear;
 use p3_circuit::{Circuit, CircuitBuilder, CircuitBuilderError, CircuitError, ExprId};
 use p3_circuit_prover::batch_stark_prover::{
@@ -81,16 +81,16 @@ use p3_circuit_prover::batch_stark_prover::{
 use p3_field::PrimeCharacteristicRing;
 use p3_lookup::logup::LogUpGadget;
 use p3_recursion::public_inputs::BatchStarkVerifierInputsBuilder;
-use p3_recursion::verifier::{VerificationError, verify_p3_batch_proof_circuit};
+use p3_recursion::verifier::{verify_p3_batch_proof_circuit, VerificationError};
 use p3_recursion::{FriRecursionConfig, Poseidon2Config};
 use serde::{Deserialize, Serialize};
 
 use crate::hash::{coin_commitment_base, connect_digest, hash_felts_base, hash_felts_limbs};
 use crate::recursion_config::{
-    CoinFriParams, CoinRecursionConfig, RecSetup, new_prover, node_table_provers, setup_circuit,
+    new_prover, node_table_provers, setup_circuit, CoinFriParams, CoinRecursionConfig, RecSetup,
 };
-use crate::statement::{StatementCircuitPlugin, statement_op_type};
-use crate::value::{VALUE_LIMBS, enforce_sum_eq, range_check_value, u64_to_felts};
+use crate::statement::{statement_op_type, StatementCircuitPlugin};
+use crate::value::{enforce_sum_eq, range_check_value, u64_to_felts, VALUE_LIMBS};
 use crate::{DIGEST_ELEMS, EF};
 
 /// Number of node inputs (consumed coins).
@@ -293,10 +293,7 @@ impl From<BatchStarkProverError> for NodeError {
 // ============================================================================
 
 /// Allocate the statement op over `stmt` (exactly [`STATEMENT_ELEMS`] exprs).
-fn push_statement_op(
-    builder: &mut CircuitBuilder<EF>,
-    stmt: Vec<ExprId>,
-) -> Result<(), NodeError> {
+fn push_statement_op(builder: &mut CircuitBuilder<EF>, stmt: Vec<ExprId>) -> Result<(), NodeError> {
     assert_eq!(stmt.len(), STATEMENT_ELEMS);
     // Ensure every statement element has a WitnessChecks creator: hint
     // outputs (hash decompose coefficients) whose only use would be the
@@ -521,8 +518,7 @@ fn build_node_circuit(
         let (v, owner, r) = witness.outputs[j];
         *out_value = v.try_into().expect("v has 3 limbs");
         range_check_value(&mut builder, out_value)?;
-        out_commitments[j] =
-            coin_commitment_base(&mut builder, witness.asset_id, v, owner, r)?;
+        out_commitments[j] = coin_commitment_base(&mut builder, witness.asset_id, v, owner, r)?;
     }
 
     // Conservation: Σ v_in = Σ v_out, exact u64 arithmetic.
@@ -629,7 +625,12 @@ fn chain_predecessor(
     // present. Recomposing `[t, 0, 0, 0]` reads `t` through the
     // (bus-safe) recompose table and yields an ordinary NPO output.
     let relay = |builder: &mut CircuitBuilder<EF>, t: ExprId| {
-        builder.recompose_base_coeffs_to_ext::<BabyBear>(&[t, ExprId::ZERO, ExprId::ZERO, ExprId::ZERO])
+        builder.recompose_base_coeffs_to_ext::<BabyBear>(&[
+            t,
+            ExprId::ZERO,
+            ExprId::ZERO,
+            ExprId::ZERO,
+        ])
     };
 
     // (a) predecessor asset == this circuit's asset (coefficient 0 per
@@ -756,9 +757,7 @@ pub fn prove_genesis_mint(
     }
     let mut value = 0u64;
     for c in outputs {
-        value = value
-            .checked_add(c.value)
-            .ok_or(NodeError::AssetMismatch)?;
+        value = value.checked_add(c.value).ok_or(NodeError::AssetMismatch)?;
     }
     let mc = mint_commit(asset_id, value, mint_nonce);
 

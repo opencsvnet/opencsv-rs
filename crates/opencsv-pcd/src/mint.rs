@@ -22,17 +22,17 @@
 //! statement); they are carried in [`MintProof`] for the consignment and
 //! will be chained to successor proofs at the recursion stage (stage 3).
 
-use opencsv_core::{AssetId, Coin, Commitment, Digest, mint_commit};
-use p3_baby_bear::{BabyBear, default_babybear_poseidon2_16};
+use opencsv_core::{mint_commit, AssetId, Coin, Commitment, Digest};
+use p3_baby_bear::{default_babybear_poseidon2_16, BabyBear};
 use p3_circuit::ops::{generate_poseidon2_trace, generate_recompose_trace};
 use p3_circuit::{Circuit, CircuitBuilder, CircuitBuilderError, CircuitError, ExprId};
 use p3_circuit_prover::batch_stark_prover::{BatchStarkProof, BatchStarkProverError};
-use p3_circuit_prover::config::{BabyBearConfig, baby_bear};
+use p3_circuit_prover::config::{baby_bear, BabyBearConfig};
 use p3_poseidon2_circuit_air::BabyBearD4Width16;
 
 use crate::hash::{coin_commitment_limbs, connect_digest, hash_felts_limbs};
-use crate::prove::{Setup, new_prover, setup};
-use crate::value::{VALUE_LIMBS, enforce_sum_eq, range_check_value, u64_to_felts};
+use crate::prove::{new_prover, setup, Setup};
+use crate::value::{enforce_sum_eq, range_check_value, u64_to_felts, VALUE_LIMBS};
 use crate::{DIGEST_ELEMS, EF};
 
 /// Number of mint outputs this circuit supports.
@@ -142,7 +142,10 @@ fn witness_layout(private: &[ExprId]) -> WitnessLayout<'_> {
             &private[s + VALUE_LIMBS + DIGEST_ELEMS..s + OUT_ELEMS],
         )
     });
-    WitnessLayout { mint_nonce, outputs }
+    WitnessLayout {
+        mint_nonce,
+        outputs,
+    }
 }
 
 /// Build the mint circuit (see module docs for the constraints).
@@ -185,7 +188,11 @@ fn build_circuit() -> Result<Circuit<EF>, MintError> {
     }
 
     // (d) mint_commit = H("mint" ∥ asset_id ∥ V ∥ mint_nonce).
-    let mc = hash_felts_limbs(&mut builder, "mint", &[asset_id, value_total, witness.mint_nonce])?;
+    let mc = hash_felts_limbs(
+        &mut builder,
+        "mint",
+        &[asset_id, value_total, witness.mint_nonce],
+    )?;
     connect_digest(&mut builder, mc, mint_commit)?;
 
     Ok(builder.build()?)
@@ -234,7 +241,6 @@ pub fn prove_mint_raw(
     mint_nonce: &Digest,
     outputs: &[Coin; MINT_OUTPUTS],
 ) -> Result<MintProof, MintError> {
-
     let mut public_values = Vec::with_capacity(MINT_PUBLIC_ELEMS);
     public_values.extend(asset_id.to_elems().iter().map(|&x| EF::from(x)));
     public_values.extend(u64_to_felts(value).iter().map(|&x| EF::from(x)));

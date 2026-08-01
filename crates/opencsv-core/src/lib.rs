@@ -58,12 +58,12 @@ pub mod digest;
 pub mod field;
 pub mod issuer;
 
-pub use accept::{AcceptParams, AcceptedCoins, MockVerifier, ProofVerifier, RejectReason, accept};
-pub use anchor::{ANCHOR_SIZE, AnchorRecord, binding, mint_commit, nullifier_commit};
+pub use accept::{accept, AcceptParams, AcceptedCoins, MockVerifier, ProofVerifier, RejectReason};
+pub use anchor::{binding, mint_commit, nullifier_commit, AnchorRecord, ANCHOR_SIZE};
 pub use asset::{AssetGenesis, AssetId};
-pub use audit::{SupplyError, supply};
+pub use audit::{supply, SupplyError};
 pub use chain::{AnchorChain, AnchorLocation, AnchorRef, MockAnchorChain};
 pub use coin::{Coin, Commitment, Nullifier, Owner, OwnerSecret};
 pub use consignment::{CoinOpening, Consignment};
 pub use digest::{Digest, TruncatedDigest};
-pub use issuer::{Ed25519IssuerSignature, IssuerSignature, mint_signing_message};
+pub use issuer::{mint_signing_message, Ed25519IssuerSignature, IssuerSignature};

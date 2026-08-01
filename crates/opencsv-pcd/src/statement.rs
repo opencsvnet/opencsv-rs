@@ -81,9 +81,7 @@ use p3_circuit::ops::{
     PreprocessedWriter,
 };
 use p3_circuit::tables::{NonPrimitiveTrace, TraceGeneratorFn, Traces};
-use p3_circuit::{
-    CircuitBuilderError, CircuitError, ExprId, PreprocessedColumns, WitnessId,
-};
+use p3_circuit::{CircuitBuilderError, CircuitError, ExprId, PreprocessedColumns, WitnessId};
 use p3_circuit_prover::batch_stark_prover::{
     BatchTableInstance, NonPrimitiveTableEntry, TableProver,
 };
@@ -274,7 +272,6 @@ impl<F: Clone + Send + Sync + 'static, CF> NonPrimitiveTrace<CF> for StatementTr
     }
 }
 
-
 /// Trace generator for the statement NPO (registered with the circuit).
 pub fn generate_statement_trace<E, const N: usize>(
     op_states: &p3_circuit::ops::OpStateMap,
@@ -385,11 +382,7 @@ where
         let main_local = main.current_slice();
         let prep = builder.preprocessed().clone();
         let prep_local = prep.current_slice();
-        let pvs: Vec<AB::Expr> = builder
-            .public_values()
-            .iter()
-            .map(|&v| v.into())
-            .collect();
+        let pvs: Vec<AB::Expr> = builder.public_values().iter().map(|&v| v.into()).collect();
 
         for e in 0..N {
             let idx: AB::Expr = prep_local[2 * e].into();
@@ -415,8 +408,8 @@ where
     }
 }
 
-impl<SC, const D: usize, const N: usize>
-    p3_circuit_prover::batch_stark_prover::BatchAir<SC> for StatementAir<Val<SC>, D, N>
+impl<SC, const D: usize, const N: usize> p3_circuit_prover::batch_stark_prover::BatchAir<SC>
+    for StatementAir<Val<SC>, D, N>
 where
     SC: StarkGenericConfig + Send + Sync,
     Val<SC>: StarkField,
@@ -532,8 +525,7 @@ impl<const D: usize, const N: usize> StatementProver<D, N> {
         }
 
         let air = StatementAir::<Val<SC>, D, N>::new(prep, min_height);
-        let matrix =
-            StatementAir::<Val<SC>, D, N>::trace_to_matrix(&t.values, min_height);
+        let matrix = StatementAir::<Val<SC>, D, N>::trace_to_matrix(&t.values, min_height);
 
         Some(BatchTableInstance {
             op_type: statement_op_type(),

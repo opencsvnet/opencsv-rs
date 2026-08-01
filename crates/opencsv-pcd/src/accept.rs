@@ -48,7 +48,7 @@ use opencsv_core::consignment::CoinOpening;
 use opencsv_core::digest::Digest;
 use serde::{Deserialize, Serialize};
 
-use crate::node::{NODE_OUTPUTS, verify_coin_proof};
+use crate::node::{verify_coin_proof, NODE_OUTPUTS};
 use crate::{CoinProof, NodeMode, NodeStatement};
 
 /// Byte length of one opening inside the accept driver's public input
@@ -178,18 +178,25 @@ fn statement_matches_public_input(mode: NodeMode, st: &NodeStatement, x: &[u8]) 
         (_, NodeMode::Transfer) => {
             let slot = |from: usize| {
                 opencsv_core::digest::TruncatedDigest(
-                    anchor_bytes[from..from + 24].try_into().expect("24-byte slot"),
+                    anchor_bytes[from..from + 24]
+                        .try_into()
+                        .expect("24-byte slot"),
                 )
             };
             let slots = [slot(0), slot(24)];
-            let direct = st
-                .nullifiers
-                .iter()
-                .zip(slots)
-                .all(|(nf, s)| if *nf == zero { s == zero_td } else { bound(nf) == s });
+            let direct = st.nullifiers.iter().zip(slots).all(|(nf, s)| {
+                if *nf == zero {
+                    s == zero_td
+                } else {
+                    bound(nf) == s
+                }
+            });
             let compressed = slots[1] == zero_td
                 && bound(&opencsv_core::anchor::nullifier_commit(&st.nullifiers)) == slots[0];
-            st.value == 0 && st.mint_commit == zero && outputs_match(&openings) && (direct || compressed)
+            st.value == 0
+                && st.mint_commit == zero
+                && outputs_match(&openings)
+                && (direct || compressed)
         }
         _ => false,
     }

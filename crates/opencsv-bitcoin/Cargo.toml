@@ -9,6 +9,9 @@ license.workspace = true
 opencsv-core = { path = "../opencsv-core" }
 serde_json = { version = "1", features = ["arbitrary_precision"] }
 base64 = "0.22"
+# The canonical ctx derivation is SHA-256 so any indexer, in any language,
+# recomputes it (see `funding_ctx`).
+sha2 = "0.10"
 
 [dev-dependencies]
 tempfile = "3"

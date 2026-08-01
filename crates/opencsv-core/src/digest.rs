@@ -13,7 +13,7 @@
 use p3_baby_bear::BabyBear;
 use serde::{Deserialize, Serialize};
 
-use crate::field::{DIGEST_ELEMS, elems_to_canonical_u32s, felt};
+use crate::field::{elems_to_canonical_u32s, felt, DIGEST_ELEMS};
 
 /// Byte length of a full [`Digest`].
 pub const DIGEST_BYTES: usize = 32;
@@ -50,7 +50,10 @@ impl Digest {
 
     pub(crate) fn from_elems(elems: &[BabyBear; DIGEST_ELEMS]) -> Self {
         let mut bytes = [0u8; DIGEST_BYTES];
-        for (chunk, x) in bytes.chunks_exact_mut(4).zip(elems_to_canonical_u32s(elems)) {
+        for (chunk, x) in bytes
+            .chunks_exact_mut(4)
+            .zip(elems_to_canonical_u32s(elems))
+        {
             chunk.copy_from_slice(&x.to_le_bytes());
         }
         Self(bytes)

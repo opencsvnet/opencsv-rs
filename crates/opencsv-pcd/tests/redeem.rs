@@ -8,8 +8,8 @@ use std::time::Instant;
 
 use opencsv_core::{Coin, Digest, OwnerSecret};
 use opencsv_pcd::{
-    CoinProof, NodeError, NodeMode, prove_coin_transfer, prove_genesis_mint, prove_redeem,
-    verify_redeem,
+    prove_coin_transfer, prove_genesis_mint, prove_redeem, verify_redeem, CoinProof, NodeError,
+    NodeMode,
 };
 
 /// Test asset id (arbitrary but fixed).
@@ -53,7 +53,8 @@ fn mint_to_redeem_round_trip() {
     let (mint, coins) = genesis();
 
     let t = Instant::now();
-    let redeem = prove_redeem(&asset_id(), &(coins[0], osk(0x22)), &mint, 0).expect("redeem proving");
+    let redeem =
+        prove_redeem(&asset_id(), &(coins[0], osk(0x22)), &mint, 0).expect("redeem proving");
     let prove_time = t.elapsed();
     println!("prove_redeem (mint predecessor): {prove_time:?}");
     println!("redeem proof size: {} bytes", proof_size(&redeem));
