@@ -8,6 +8,7 @@ members = [
     "apple/bench-ffi",
     "crates/opencsv-anchor-server",
     "crates/opencsv-bitcoin",
+    "crates/opencsv-cbf",
     "ffi",
 ]
 

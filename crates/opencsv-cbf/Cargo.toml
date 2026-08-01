@@ -1,0 +1,15 @@
+[package]
+name = "opencsv-cbf"
+description = "BIP157/158 compact-block-filter light client: trustless point verification of OpenCSV anchors"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+opencsv-core = { path = "../opencsv-core" }
+opencsv-bitcoin = { path = "../opencsv-bitcoin" }
+sha2 = "0.10"
+
+[dev-dependencies]
+serde_json = { version = "1", features = ["arbitrary_precision"] }
+tempfile = "3"
