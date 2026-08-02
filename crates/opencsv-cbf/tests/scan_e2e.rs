@@ -42,10 +42,7 @@ fn scan_engine_finds_and_excludes() {
     let mut anchor_chain = BitcoinAnchorChain::open(&btc_config).unwrap();
 
     // The legitimate spend of `raw_nf` (marker-carrying anchor), mined.
-    let raw_nf = Digest::from_bytes([21u8; 32]);
-    let ref1 = anchor_chain
-        .anchor(|ctx| AnchorRecord::xfer(&[raw_nf], ctx))
-        .unwrap();
+    let (raw_nf, ref1) = common::anchor_xfer_retry(&mut anchor_chain, 21);
     anchor_chain.generate_blocks(6).unwrap();
     let loc1 = anchor_chain.locate(&ref1).expect("anchor mined");
     let ctx1 = anchor_chain.ctx_at(&ref1).unwrap();
@@ -126,9 +123,7 @@ fn scan_engine_finds_and_excludes() {
     assert_eq!(counters.blocks_fetched, 1, "{counters:?}");
 
     // --- (c) a real double-spend: the scan finds exactly the first ---------
-    let ref2 = anchor_chain
-        .anchor(|ctx| AnchorRecord::xfer(&[raw_nf], ctx))
-        .unwrap();
+    let ref2 = common::anchor_xfer_same_retry(&mut anchor_chain, raw_nf);
     anchor_chain.generate_blocks(2).unwrap();
     let loc2 = anchor_chain.locate(&ref2).expect("double-spend mined");
     let tip = anchor_chain.tip_height();

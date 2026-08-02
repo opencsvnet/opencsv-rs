@@ -255,6 +255,42 @@ fn registered_required_confirmations() -> u64 {
         .unwrap_or(0)
 }
 
+/// Export the registered scan index as an **anchor-snapshot JSON** in
+/// exactly the shape `opencsv_verify_consignment` consumes (see
+/// [`crate::snapshot`]): `{"tip_height":N,"entries":[{height,position,
+/// txid,ctx,record}]}`, `tip_height` being the scan's synced tip at call
+/// time (so confirmation counting in the crediting verify agrees with
+/// the scan's own view). This is the serverless crediting path: the
+/// index SPV-fetched full blocks, so every entry's record, txid, ctx,
+/// and location is PoW-verified already. Local-only — no network.
+///
+/// Batch anchors contribute one snapshot entry per *transaction*
+/// (deduplicated by `(location, txid)`): the snapshot contract models
+/// on-chain records, and batch payloads ride the witness envelope,
+/// which the snapshot consumer's occurrence rules intentionally do not
+/// see (consistent with the accept driver).
+pub fn export_snapshot_json() -> Result<Value, String> {
+    let index = registered_index()?;
+    let mut seen = std::collections::BTreeSet::new();
+    let mut entries = Vec::new();
+    for e in index.occurrences() {
+        if seen.insert((e.location, e.txid)) {
+            entries.push(json!({
+                "height": e.location.height,
+                "position": e.location.position,
+                "txid": to_hex(&e.txid),
+                "ctx": to_hex(&e.ctx),
+                "record": to_hex(&e.record.to_bytes()),
+            }));
+        }
+    }
+    entries.sort_by_key(|e| (e["height"].as_u64(), e["position"].as_u64()));
+    Ok(json!({
+        "tip_height": index.synced_tip(),
+        "entries": entries,
+    }))
+}
+
 /// The occurrence-check request:
 /// `{"raw_nf_hex":"<64 hex>","birth":N,"spend":N}`.
 #[derive(Deserialize)]

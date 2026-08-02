@@ -41,14 +41,9 @@ fn fullscan_finds_first_occurrence_of_double_spend() {
 
     // The legitimate spend of `raw_nf`, mined, then a double-spend of
     // the SAME raw nullifier (bound to its own ctx), mined later.
-    let raw_nf = Digest::from_bytes([11u8; 32]);
-    let ref1 = anchor_chain
-        .anchor(|ctx| AnchorRecord::xfer(&[raw_nf], ctx))
-        .unwrap();
+    let (raw_nf, ref1) = common::anchor_xfer_retry(&mut anchor_chain, 11);
     anchor_chain.generate_blocks(2).unwrap();
-    let ref2 = anchor_chain
-        .anchor(|ctx| AnchorRecord::xfer(&[raw_nf], ctx))
-        .unwrap();
+    let ref2 = common::anchor_xfer_same_retry(&mut anchor_chain, raw_nf);
     anchor_chain.generate_blocks(2).unwrap();
     let loc1 = anchor_chain.locate(&ref1).expect("first anchor mined");
     let loc2 = anchor_chain.locate(&ref2).expect("double-spend mined");

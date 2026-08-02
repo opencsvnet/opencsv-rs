@@ -37,7 +37,13 @@ Beyond the wallet core, three host-facing verification surfaces:
   the self-scan-first default: `opencsv-cbf`'s `ScanIndex` walks BIP158
   filters for the protocol marker output and SPV-fetches matching
   blocks into a persistent occurrence index; occurrence checks and
-  `accept()` then run fully local (read-only).
+  `accept()` then run fully local (read-only);
+- `opencsv_scan_export_snapshot` — exports the registered scan index as
+  an anchor-snapshot JSON (the exact shape `opencsv_verify_consignment`
+  consumes), so consignments are credited serverlessly: every entry was
+  SPV-fetched and PoW-verified by the scan. `tip_height` is the synced
+  tip at call time; with no registered scan it returns
+  `{"error":"no scan registered; call opencsv_scan_sync first"}`.
 
 ## Build
 

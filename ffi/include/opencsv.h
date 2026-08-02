@@ -112,6 +112,15 @@ char *opencsv_cbf_open(const char *config_json);
 char *opencsv_cbf_close(uint64_t client_id);
 char *opencsv_scan_sync_with(uint64_t client_id);
 
+/* Export the registered scan index as an anchor-snapshot JSON — the exact
+ * shape opencsv_verify_consignment consumes ({"tip_height":N,"entries":
+ * [{"height","position","txid","ctx","record"}]}). The serverless crediting
+ * path: every entry was SPV-fetched and PoW-verified by the scan.
+ * Local-only; tip_height is the synced tip at call time. Returns
+ * {"error":"no scan registered; call opencsv_scan_sync first"} when no sync
+ * has registered an index. */
+char *opencsv_scan_export_snapshot(void);
+
 /* Free any string returned by this library. */
 void opencsv_string_free(char *s);
 

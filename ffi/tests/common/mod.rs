@@ -31,6 +31,48 @@ fn free_port() -> u16 {
         .port()
 }
 
+
+/// Anchor an XFER record binding a fresh raw nullifier, retrying with
+/// successive seeds when the bound payload's first byte collides with
+/// the MINT/REDEEM/BATCH tag bytes for every candidate funding ctx
+/// (`Error::TagCollision` — the two-pass anchor's only redraw freedom
+/// is input order, so unlucky seeds fail ~1% of the time on regtest).
+pub fn anchor_xfer_retry(
+    chain: &mut opencsv_bitcoin::BitcoinAnchorChain,
+    seed: u8,
+) -> (opencsv_core::Digest, opencsv_core::chain::AnchorRef) {
+    for attempt in seed..=255 {
+        let raw_nf = opencsv_core::Digest::from_bytes([attempt; 32]);
+        match chain.anchor(|ctx| opencsv_core::AnchorRecord::xfer(&[raw_nf], ctx)) {
+            Ok(anchor_ref) => return (raw_nf, anchor_ref),
+            Err(opencsv_bitcoin::error::Error::TagCollision) => continue,
+            Err(e) => panic!("anchor failed: {e}"),
+        }
+    }
+    panic!("tag collision for all 256 seeds");
+}
+
+
+/// Anchor an XFER record binding `raw_nf` (a fixed nullifier, e.g. a
+/// deliberate double-spend), mining a block between `TagCollision`
+/// retries so `fundrawtransaction` draws different funding inputs (the
+/// tag-collision redraw freedom is input order).
+pub fn anchor_xfer_same_retry(
+    chain: &mut opencsv_bitcoin::BitcoinAnchorChain,
+    raw_nf: opencsv_core::Digest,
+) -> opencsv_core::chain::AnchorRef {
+    for _ in 0..8 {
+        match chain.anchor(|ctx| opencsv_core::AnchorRecord::xfer(&[raw_nf], ctx)) {
+            Ok(anchor_ref) => return anchor_ref,
+            Err(opencsv_bitcoin::error::Error::TagCollision) => {
+                chain.generate_blocks(1).expect("mine for fresh inputs")
+            }
+            Err(e) => panic!("anchor failed: {e}"),
+        }
+    }
+    panic!("tag collision persists for this raw_nf");
+}
+
 /// A running regtest node; stopped on drop.
 pub struct Node {
     child: Child,

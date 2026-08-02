@@ -737,6 +737,20 @@ pub extern "C" fn opencsv_scan_sync_with(client_id: u64) -> *mut c_char {
     })
 }
 
+/// Export the registered scan index as an anchor-snapshot JSON (the
+/// exact shape [`opencsv_verify_consignment`] consumes) — the
+/// serverless crediting path: everything in it was SPV-fetched and
+/// PoW-verified by the scan. Local-only; `tip_height` is the synced
+/// tip at call time. Returns `{"error":"no scan registered; call
+/// opencsv_scan_sync first"}` when no sync has registered an index.
+#[no_mangle]
+pub extern "C" fn opencsv_scan_export_snapshot() -> *mut c_char {
+    guarded(|| match scan::export_snapshot_json() {
+        Ok(value) => out(value),
+        Err(e) => err(e),
+    })
+}
+
 /// Free a string returned by any function in this library.
 ///
 /// # Safety

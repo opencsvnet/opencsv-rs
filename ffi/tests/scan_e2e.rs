@@ -93,10 +93,7 @@ fn scan_sync_check_verify_via_c_abi() {
 
     // An XFER anchor binding a known raw nullifier (for scan_check and
     // the double-spend scenario).
-    let raw_nf = Digest::from_bytes([31u8; 32]);
-    let ref1 = anchor_chain
-        .anchor(|ctx| AnchorRecord::xfer(&[raw_nf], ctx))
-        .unwrap();
+    let (raw_nf, ref1) = common::anchor_xfer_retry(&mut anchor_chain, 31);
     anchor_chain.generate_blocks(6).unwrap();
     let mint_location = anchor_chain.locate(&mint_ref).expect("mint mined");
     let loc1 = anchor_chain.locate(&ref1).expect("xfer mined");
@@ -177,9 +174,7 @@ fn scan_sync_check_verify_via_c_abi() {
     assert!(none["occurrence"].is_null(), "{none}");
 
     // --- a real double-spend: NullifierConflict ------------------------------
-    let ref2 = anchor_chain
-        .anchor(|ctx| AnchorRecord::xfer(&[raw_nf], ctx))
-        .unwrap();
+    let ref2 = common::anchor_xfer_same_retry(&mut anchor_chain, raw_nf);
     anchor_chain.generate_blocks(6).unwrap();
     let loc2 = anchor_chain.locate(&ref2).expect("double-spend mined");
     let ctx2 = anchor_chain.ctx_at(&ref2).unwrap();
