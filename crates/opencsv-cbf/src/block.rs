@@ -89,7 +89,7 @@ pub struct TxOut {
     pub script_pubkey: Vec<u8>,
 }
 
-/// A parsed transaction (witness data consumed but not retained).
+/// A parsed transaction.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Transaction {
     /// Transaction version.
@@ -100,6 +100,11 @@ pub struct Transaction {
     pub outputs: Vec<TxOut>,
     /// Lock time.
     pub lock_time: u32,
+    /// Witness stacks, one per input (empty for non-segwit
+    /// transactions). The txid never commits to these; they are kept
+    /// because batch anchors carry their payload envelope in the
+    /// funding input's witness.
+    pub witnesses: Vec<Vec<Vec<u8>>>,
 }
 
 impl Transaction {
@@ -147,12 +152,18 @@ impl Transaction {
                 script_pubkey: cursor.read_varbytes()?.to_vec(),
             });
         }
+        let mut witnesses = Vec::new();
         if segwit {
             for _ in 0..input_count {
                 let item_count = cursor.read_varint()?;
-                for _ in 0..item_count {
-                    cursor.read_varbytes()?;
+                if item_count > 1000 {
+                    return Err(Error::Protocol("absurd witness item count".into()));
                 }
+                let mut stack = Vec::with_capacity(item_count as usize);
+                for _ in 0..item_count {
+                    stack.push(cursor.read_varbytes()?.to_vec());
+                }
+                witnesses.push(stack);
             }
         }
         let lock_time = cursor.read_u32()?;
@@ -161,6 +172,7 @@ impl Transaction {
             inputs,
             outputs,
             lock_time,
+            witnesses,
         })
     }
 
@@ -402,6 +414,8 @@ mod tests {
         assert!(cursor.is_empty());
         assert_eq!(tx.inputs[0].prev.txid, [9u8; 32]);
         assert_eq!(tx.outputs.len(), 1);
+        assert_eq!(tx.witnesses.len(), 1);
+        assert_eq!(tx.witnesses[0], vec![vec![0xaa, 0xbb]]);
         // The txid commits to the legacy serialization only (no marker,
         // flag, or witness bytes).
         let mut legacy = vec![2, 0, 0, 0, 1];

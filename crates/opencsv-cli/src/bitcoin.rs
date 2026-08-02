@@ -6,7 +6,7 @@
 
 use opencsv_bitcoin::{BitcoinAnchorChain, Config};
 use opencsv_core::chain::{AnchorChain, AnchorLocation, AnchorRef};
-use opencsv_core::{AnchorRecord, Digest};
+use opencsv_core::{AnchorRecord, Digest, TruncatedDigest};
 
 use crate::chain::AnchorWriter;
 use crate::error::Error;
@@ -31,6 +31,18 @@ impl BitcoinBackend {
     pub fn generate_blocks(&mut self, n: u64) -> Result<(), Error> {
         self.inner.generate_blocks(n)?;
         Ok(())
+    }
+
+    /// The batch funding ctx for `count` payloads (see
+    /// [`opencsv_bitcoin::BitcoinAnchorChain::marker_utxo_ctx`]).
+    pub fn marker_utxo_ctx(&mut self, count: u8) -> Result<[u8; 32], Error> {
+        Ok(self.inner.marker_utxo_ctx(count)?)
+    }
+
+    /// Broadcast a batch anchor (see
+    /// [`opencsv_bitcoin::BitcoinAnchorChain::anchor_batch`]).
+    pub fn anchor_batch(&mut self, payloads: &[TruncatedDigest]) -> Result<AnchorRef, Error> {
+        Ok(self.inner.anchor_batch(payloads)?)
     }
 }
 

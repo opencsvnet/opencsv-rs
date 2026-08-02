@@ -248,7 +248,11 @@ pub fn accept<V: ProofVerifier, C: AnchorChain>(
     // `crate::chain`) must be this anchor. Compressed transfers are
     // recognized under their nullifier commitment, like on-chain.
     let occurrence_keys: Vec<Digest> = match &record {
-        AnchorRecord::Mint { .. } => vec![],
+        // Batch headers carry no on-chain payload slots: their
+        // occurrences live in the witness envelope (see `crate::batch`),
+        // which the consignment format does not yet name — a consignment
+        // pointing at a batch header has no occurrence keys to check.
+        AnchorRecord::Mint { .. } | AnchorRecord::BatchHeader { .. } => vec![],
         AnchorRecord::Xfer { .. } | AnchorRecord::Redeem { .. } => consignment.nullifiers.clone(),
         AnchorRecord::XferCompressed { .. } => {
             vec![nullifier_commit(&consignment.nullifiers)]
@@ -295,7 +299,8 @@ fn record_binds_nullifiers(
 ) -> bool {
     let bound = |nf: &Digest| binding(nf, ctx).to_anchor();
     match record {
-        AnchorRecord::Mint { .. } => raw_nullifiers.is_empty(),
+        // Batch headers bind no nullifiers on-chain (witness envelope).
+        AnchorRecord::Mint { .. } | AnchorRecord::BatchHeader { .. } => raw_nullifiers.is_empty(),
         AnchorRecord::Redeem { payload, .. } => {
             raw_nullifiers.len() == 1 && bound(&raw_nullifiers[0]) == *payload
         }

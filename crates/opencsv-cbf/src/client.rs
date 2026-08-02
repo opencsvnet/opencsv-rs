@@ -212,6 +212,13 @@ impl CbfClient {
         self.chain.tip_height().expect("genesis synced")
     }
 
+    /// Total `version` handshakes performed across all peers of this
+    /// client (observability for the persistent-client API: reusing a
+    /// client must not re-handshake).
+    pub fn handshake_count(&self) -> u64 {
+        self.peers.iter().map(|p| p.versions_sent).sum()
+    }
+
     /// Internal-order hash of the block at `height`.
     pub fn block_hash(&self, height: u64) -> Option<[u8; 32]> {
         self.chain.hash_at(height)

@@ -33,6 +33,10 @@ pub struct Peer {
     /// Payload bytes of `block` messages received (bandwidth accounting
     /// for the scan engine).
     pub block_bytes_fetched: u64,
+    /// Number of `version` messages sent on this connection (handshake
+    /// counting for the persistent-client API: a reused client must not
+    /// re-handshake).
+    pub versions_sent: u64,
 }
 
 impl Peer {
@@ -54,6 +58,7 @@ impl Peer {
             start_height: 0,
             filter_bytes_fetched: 0,
             block_bytes_fetched: 0,
+            versions_sent: 0,
         };
         peer.handshake(tip_height)?;
         Ok(peer)
@@ -68,6 +73,7 @@ impl Peer {
         let services = NODE_WITNESS | NODE_COMPACT_FILTERS;
         let payload = messages::version_payload(services, tip_height as i32);
         messages::write_message(&mut self.stream, self.magic, "version", &payload)?;
+        self.versions_sent += 1;
         let mut got_version = false;
         let mut got_verack = false;
         while !(got_version && got_verack) {

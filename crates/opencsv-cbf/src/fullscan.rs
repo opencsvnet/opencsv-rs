@@ -26,7 +26,7 @@
 
 use opencsv_bitcoin::funding_ctx;
 use opencsv_core::chain::{AnchorChain, AnchorLocation, AnchorRef};
-use opencsv_core::{AnchorRecord, Digest};
+use opencsv_core::{AnchorRecord, Digest, TruncatedDigest};
 
 use crate::block::op_return_payload;
 use crate::client::CbfClient;
@@ -39,7 +39,10 @@ pub const MAX_WINDOW_BLOCKS: u64 = 2016;
 
 /// Every anchor candidate in a block (the first 64-byte OP_RETURN
 /// output per non-coinbase transaction, ctx recomputed from the first
-/// input — the same rule as `opencsv-bitcoin`'s scanner).
+/// input — the same rule as `opencsv-bitcoin`'s scanner). A batch
+/// header at output 0 additionally expands the transaction's witness
+/// envelope into one candidate per payload (see `opencsv-core`'s
+/// `batch` module).
 pub(crate) fn anchors_in_block(block: &crate::block::Block, height: u64) -> Vec<ScannedAnchor> {
     let mut entries = Vec::new();
     for (position, tx) in block.txs.iter().enumerate() {
@@ -52,15 +55,55 @@ pub(crate) fn anchors_in_block(block: &crate::block::Block, height: u64) -> Vec<
         let ctx = funding_ctx(&funding.prev.txid, funding.prev.vout);
         for output in &tx.outputs {
             if let Some(payload) = op_return_payload(&output.script_pubkey) {
-                entries.push(ScannedAnchor {
-                    location: AnchorLocation {
-                        height,
-                        position: position as u32,
-                    },
-                    txid: tx.txid(),
-                    record: AnchorRecord::from_bytes(&payload),
-                    ctx,
-                });
+                let record = AnchorRecord::from_bytes(&payload);
+                let location = AnchorLocation {
+                    height,
+                    position: position as u32,
+                };
+                let txid = tx.txid();
+                if let AnchorRecord::BatchHeader { .. } = record {
+                    // The envelope is the funding input's witness minus
+                    // the final witness-script item.
+                    let envelope = tx
+                        .witnesses
+                        .first()
+                        .and_then(|w| w.split_last())
+                        .and_then(|(_, items)| opencsv_core::batch::envelope_decode(items));
+                    match envelope {
+                        Some(envelope) => {
+                            for (index, _) in envelope.iter().enumerate() {
+                                entries.push(ScannedAnchor {
+                                    location,
+                                    txid,
+                                    record,
+                                    ctx,
+                                    batch: Some(BatchCandidate {
+                                        index: index as u32,
+                                        envelope: envelope.clone(),
+                                    }),
+                                });
+                            }
+                        }
+                        // A batch header without a decodable envelope:
+                        // index the header for presence queries only —
+                        // nothing in it can bind.
+                        None => entries.push(ScannedAnchor {
+                            location,
+                            txid,
+                            record,
+                            ctx,
+                            batch: None,
+                        }),
+                    }
+                } else {
+                    entries.push(ScannedAnchor {
+                        location,
+                        txid,
+                        record,
+                        ctx,
+                        batch: None,
+                    });
+                }
                 break;
             }
         }
@@ -68,8 +111,18 @@ pub(crate) fn anchors_in_block(block: &crate::block::Block, height: u64) -> Vec<
     entries
 }
 
+/// A batch candidate's envelope data: this payload's envelope index
+/// and the full payload envelope it was decoded from.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BatchCandidate {
+    /// This candidate's index in the witness envelope.
+    pub index: u32,
+    /// The full decoded payload envelope of the batch.
+    pub envelope: Vec<TruncatedDigest>,
+}
+
 /// One 64-byte OP_RETURN candidate found in a scanned block.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ScannedAnchor {
     /// Where the carrying transaction sits in the chain.
     pub location: AnchorLocation,
@@ -81,6 +134,28 @@ pub struct ScannedAnchor {
     /// The transaction context, recomputed from the transaction's first
     /// input.
     pub ctx: [u8; 32],
+    /// Batch envelope data when `record` is a batch header.
+    pub batch: Option<BatchCandidate>,
+}
+
+impl ScannedAnchor {
+    /// Occurrence test: does this candidate bind `raw_nf`? Solo records
+    /// use the on-chain payload slots; batch candidates use the
+    /// envelope occurrence semantics (payload equality AND the
+    /// envelope validating against the header's `batch_commit`).
+    pub fn binds(&self, raw_nf: &Digest) -> bool {
+        match &self.batch {
+            None => self.record.well_formed(&self.ctx, raw_nf),
+            Some(batch) => {
+                opencsv_core::batch::envelope_occurrence(
+                    &self.record,
+                    &batch.envelope,
+                    &self.ctx,
+                    raw_nf,
+                ) == Some(batch.index)
+            }
+        }
+    }
 }
 
 /// The result of self-scanning a block window (module docs).
@@ -154,7 +229,7 @@ impl FullScanChain {
         Ok(scan
             .entries
             .iter()
-            .filter(|e| e.record.well_formed(&e.ctx, raw_nf))
+            .filter(|e| e.binds(raw_nf))
             .map(|e| (e.location, e.ctx))
             .min_by_key(|(location, _)| *location))
     }
@@ -211,7 +286,7 @@ impl AnchorChain for FullScanChain {
     fn first_nullifier_occurrence(&self, raw_nf: &Digest) -> Option<AnchorLocation> {
         self.entries
             .iter()
-            .filter(|e| e.record.well_formed(&e.ctx, raw_nf))
+            .filter(|e| e.binds(raw_nf))
             .map(|e| e.location)
             .min()
     }
@@ -220,7 +295,7 @@ impl AnchorChain for FullScanChain {
         let mut locations: Vec<_> = self
             .entries
             .iter()
-            .filter(|e| e.record.well_formed(&e.ctx, raw_nf))
+            .filter(|e| e.binds(raw_nf))
             .map(|e| e.location)
             .collect();
         locations.sort();

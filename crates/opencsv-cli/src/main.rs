@@ -12,7 +12,7 @@ use base64::Engine;
 use clap::{Parser, Subcommand};
 use opencsv_cli::backend::{ChainBackend, ChainSpec};
 use opencsv_cli::error::{io_err, Error};
-use opencsv_cli::hexutil::{digest_from_hex, to_hex};
+use opencsv_cli::hexutil::{digest_from_hex, from_hex, to_hex};
 use opencsv_cli::ops::{self, Produced, ReceiveReport, DEFAULT_CONFIRMATIONS};
 use opencsv_cli::store::Wallet;
 use opencsv_core::{AnchorChain, Owner};
@@ -156,6 +156,10 @@ enum Commands {
         #[arg(long)]
         height: Option<u64>,
     },
+    /// Batch anchoring: combine N transfer records in one anchor
+    /// transaction (bitcoind backend only).
+    #[command(subcommand)]
+    Batch(BatchCmd),
     /// Chain inspection and (demo / regtest) mining.
     #[command(subcommand)]
     Chain(ChainCmd),
@@ -164,6 +168,25 @@ enum Commands {
     #[cfg(feature = "signal")]
     #[command(subcommand)]
     Signal(SignalCmd),
+}
+
+#[derive(Subcommand)]
+enum BatchCmd {
+    /// Print the batch funding ctx for a payload count (creating the
+    /// funding UTXO if absent). Senders bind their payloads against it:
+    /// `P = H("bind" ∥ raw_nf ∥ ctx)`.
+    Ctx {
+        /// Number of payloads the batch will carry.
+        #[arg(long)]
+        count: u8,
+    },
+    /// Broadcast a batch anchor carrying pre-bound payloads (comma-
+    /// separated 24-byte hex strings, bound against `batch ctx`).
+    Anchor {
+        /// Comma-separated payload hex strings (48 hex chars each).
+        #[arg(long)]
+        payloads: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -300,6 +323,7 @@ fn command_uses_chain(command: &Commands) -> bool {
         | Commands::Receive { .. }
         | Commands::Redeem { .. }
         | Commands::Audit { .. }
+        | Commands::Batch(_)
         | Commands::Chain(_) => true,
         #[cfg(feature = "signal")]
         Commands::Signal(SignalCmd::Listen { .. }) => true,
@@ -519,6 +543,22 @@ fn run(cli: Cli) -> Result<ExitCode, Error> {
                 height.unwrap_or_else(|| chain.tip_height()),
             );
         }
+        Commands::Batch(BatchCmd::Ctx { count }) => {
+            let mut chain = ChainBackend::open(&spec)?;
+            let ctx = chain.batch_ctx(count)?;
+            println!("ctx {} count {count}", to_hex(&ctx));
+        }
+        Commands::Batch(BatchCmd::Anchor { payloads }) => {
+            let payloads = parse_payloads(&payloads)?;
+            let mut chain = ChainBackend::open(&spec)?;
+            let anchor_ref = chain.anchor_batch(&payloads)?;
+            println!(
+                "batch tx {} payloads {}",
+                opencsv_bitcoin::display_txid(&anchor_ref.txid),
+                payloads.len()
+            );
+            eprintln!("anchor is in the mempool; it becomes verifiable once mined");
+        }
         Commands::Chain(ChainCmd::Tip) => {
             let chain = ChainBackend::open(&spec)?;
             println!("tip {}", chain.tip_height());
@@ -676,6 +716,25 @@ fn parse_recipient(wallet: &Wallet, to: &str) -> Result<Owner, Error> {
         return Ok(secret.owner());
     }
     digest_from_hex(to)
+}
+
+/// Comma-separated 24-byte payload hex strings → TruncatedDigests.
+fn parse_payloads(s: &str) -> Result<Vec<opencsv_core::TruncatedDigest>, Error> {
+    s.split(',')
+        .map(|part| {
+            let bytes = from_hex(part.trim())
+                .map_err(|e| Error::Parse(format!("payload `{part}`: {e}")))?;
+            let bytes: [u8; 24] = bytes
+                .try_into()
+                .map_err(|v: Vec<u8>| {
+                    Error::Parse(format!(
+                        "payload `{part}` is {} bytes, expected 24",
+                        v.len()
+                    ))
+                })?;
+            Ok(opencsv_core::TruncatedDigest(bytes))
+        })
+        .collect()
 }
 
 fn parse_amounts(s: &str) -> Result<Vec<u64>, Error> {

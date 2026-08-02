@@ -69,11 +69,13 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod batch;
 pub mod bech32;
 pub mod chain;
 pub mod error;
 pub mod rpc;
 
+pub use batch::BATCH_FUNDING_SATS;
 pub use chain::{
     display_txid, funding_ctx, marker_address, BitcoinAnchorChain, Config, Network,
     MARKER_DUST_BTC, MARKER_DUST_SATS, MARKER_SCRIPT, MARKER_SPK, MEMPOOL_LOCATION,

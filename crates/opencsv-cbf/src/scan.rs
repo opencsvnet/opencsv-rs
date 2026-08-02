@@ -118,20 +118,42 @@ impl ScanIndex {
                 }
                 ["from", h] => self.from_height = h.parse().map_err(|_| bad())?,
                 ["tip", h] => self.synced_tip = h.parse().map_err(|_| bad())?,
-                ["occurrence", h, p, txid, ctx, record] => {
+                ["occurrence", h, p, txid, ctx, record, rest @ ..] => {
+                    let txid = {
+                        let mut bytes: [u8; 32] = from_hex(txid)
+                            .map_err(|_| bad())?
+                            .try_into()
+                            .map_err(|_| bad())?;
+                        bytes.reverse();
+                        bytes
+                    };
+                    let batch = match rest {
+                        [] => None,
+                        ["batch", index, envelope] => {
+                            let envelope_bytes = from_hex(envelope).map_err(|_| bad())?;
+                            if envelope_bytes.len() % 24 != 0 {
+                                return Err(bad());
+                            }
+                            Some(crate::fullscan::BatchCandidate {
+                                index: index.parse().map_err(|_| bad())?,
+                                envelope: envelope_bytes
+                                    .chunks_exact(24)
+                                    .map(|chunk| {
+                                        opencsv_core::TruncatedDigest(
+                                            chunk.try_into().expect("24-byte chunk"),
+                                        )
+                                    })
+                                    .collect(),
+                            })
+                        }
+                        _ => return Err(bad()),
+                    };
                     self.occurrences.push(ScannedAnchor {
                         location: AnchorLocation {
                             height: h.parse().map_err(|_| bad())?,
                             position: p.parse().map_err(|_| bad())?,
                         },
-                        txid: {
-                            let mut bytes: [u8; 32] = from_hex(txid)
-                                .map_err(|_| bad())?
-                                .try_into()
-                                .map_err(|_| bad())?;
-                            bytes.reverse();
-                            bytes
-                        },
+                        txid,
                         record: AnchorRecord::from_bytes(
                             &from_hex(record)
                                 .map_err(|_| bad())?
@@ -139,6 +161,7 @@ impl ScanIndex {
                                 .map_err(|_| bad())?,
                         ),
                         ctx: from_hex(ctx).map_err(|_| bad())?.try_into().map_err(|_| bad())?,
+                        batch,
                     });
                 }
                 _ => {}
@@ -156,14 +179,24 @@ impl ScanIndex {
             self.synced_tip
         );
         for e in &self.occurrences {
-            out.push_str(&format!(
-                "occurrence {} {} {} {} {}\n",
+            let mut line = format!(
+                "occurrence {} {} {} {} {}",
                 e.location.height,
                 e.location.position,
                 hash_to_display(&e.txid),
                 to_hex(&e.ctx),
                 to_hex(&e.record.to_bytes()),
-            ));
+            );
+            if let Some(batch) = &e.batch {
+                let envelope: Vec<u8> = batch
+                    .envelope
+                    .iter()
+                    .flat_map(|p| *p.as_bytes())
+                    .collect();
+                line.push_str(&format!(" batch {} {}", batch.index, to_hex(&envelope)));
+            }
+            out.push_str(&line);
+            out.push('\n');
         }
         std::fs::write(self.path(), out)?;
         Ok(())
@@ -224,7 +257,7 @@ impl ScanIndex {
             .filter(|e| {
                 e.location.height >= birth
                     && e.location.height <= spend
-                    && e.record.well_formed(&e.ctx, raw_nf)
+                    && e.binds(raw_nf)
             })
             .map(|e| (e.location, e.ctx))
             .min_by_key(|(location, _)| *location)
@@ -283,7 +316,7 @@ impl AnchorChain for ScanIndex {
     fn first_nullifier_occurrence(&self, raw_nf: &Digest) -> Option<AnchorLocation> {
         self.occurrences
             .iter()
-            .filter(|e| e.record.well_formed(&e.ctx, raw_nf))
+            .filter(|e| e.binds(raw_nf))
             .map(|e| e.location)
             .min()
     }
@@ -292,7 +325,7 @@ impl AnchorChain for ScanIndex {
         let mut locations: Vec<_> = self
             .occurrences
             .iter()
-            .filter(|e| e.record.well_formed(&e.ctx, raw_nf))
+            .filter(|e| e.binds(raw_nf))
             .map(|e| e.location)
             .collect();
         locations.sort();

@@ -166,7 +166,7 @@ pub fn marker_address(network: Network) -> String {
 }
 
 /// Internal-order bytes of a display-order RPC txid/block hash hex string.
-fn hash_from_rpc(hex: &str) -> Result<[u8; 32], Error> {
+pub(crate) fn hash_from_rpc(hex: &str) -> Result<[u8; 32], Error> {
     let mut bytes: [u8; 32] = from_hex(hex)?
         .try_into()
         .map_err(|v: Vec<u8>| Error::Malformed(format!("hash `{hex}` is {} bytes", v.len())))?;
@@ -188,7 +188,7 @@ pub fn display_txid(txid: &[u8; 32]) -> String {
 }
 
 /// Lowercase hex encoding.
-fn to_hex(bytes: &[u8]) -> String {
+pub(crate) fn to_hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
@@ -253,6 +253,11 @@ pub struct BitcoinAnchorChain<T: Transport = HttpTransport> {
     /// protocol-constant [`MARKER_SPK`] output (i.e. is it discoverable
     /// by a BIP158 filter scan)?
     markers: std::collections::BTreeMap<u64, bool>,
+    /// The batch-funding outpoints tracked by this backend, keyed by
+    /// payload count (see `batch.rs`): anyone-can-spend, so the wallet
+    /// does not report them in `listunspent` — they are tracked here
+    /// and verified against the node's UTXO set with `gettxout`.
+    funding_utxos: std::collections::BTreeMap<u8, ([u8; 32], u32)>,
 }
 
 impl BitcoinAnchorChain<HttpTransport> {
@@ -297,6 +302,7 @@ impl<T: Transport> BitcoinAnchorChain<T> {
             entries: Vec::new(),
             mempool: Vec::new(),
             markers: std::collections::BTreeMap::new(),
+            funding_utxos: std::collections::BTreeMap::new(),
         };
         chain.load_or_init(config.scan_from)?;
         chain.refresh()?;
@@ -306,6 +312,39 @@ impl<T: Transport> BitcoinAnchorChain<T> {
     /// The network this backend is connected to.
     pub fn network(&self) -> Network {
         self.network
+    }
+
+    /// The RPC client (crate-internal: the batch flow needs raw calls).
+    pub(crate) fn client(&self) -> &RpcClient<T> {
+        &self.client
+    }
+
+    /// Record a broadcast anchor in the in-memory mempool view
+    /// (crate-internal: the batch flow shares the resolution contract).
+    pub(crate) fn note_mempool(&mut self, txid: [u8; 32], record: AnchorRecord, ctx: [u8; 32]) {
+        self.mempool.push(Entry {
+            txid,
+            location: MEMPOOL_LOCATION,
+            record,
+            ctx,
+        });
+    }
+
+    /// The tracked batch-funding outpoint for `payload_count`
+    /// (crate-internal).
+    pub(crate) fn funding_utxo(&self, payload_count: u8) -> Option<([u8; 32], u32)> {
+        self.funding_utxos.get(&payload_count).copied()
+    }
+
+    /// Track/replace the batch-funding outpoint for `payload_count`
+    /// and persist it (crate-internal).
+    pub(crate) fn set_funding_utxo(
+        &mut self,
+        payload_count: u8,
+        outpoint: ([u8; 32], u32),
+    ) -> Result<(), Error> {
+        self.funding_utxos.insert(payload_count, outpoint);
+        self.persist()
     }
 
     /// The height scanning started (or will start) from.
@@ -561,13 +600,14 @@ impl<T: Transport> BitcoinAnchorChain<T> {
 
     fn load_or_init(&mut self, scan_from: Option<u64>) -> Result<(), Error> {
         match self.load_index()? {
-            Some((start, scanned, entries, markers))
+            Some((start, scanned, entries, markers, funding_utxos))
                 if scan_from.is_none() || scan_from == Some(start) =>
             {
                 self.start_height = start;
                 self.scanned = scanned;
                 self.entries = entries;
                 self.markers = markers;
+                self.funding_utxos = funding_utxos;
             }
             Some(_) | None => {
                 // No index, or an explicit --scan-from that differs from
@@ -600,6 +640,14 @@ impl<T: Transport> BitcoinAnchorChain<T> {
                 u8::from(*has_marker)
             ));
         }
+        for (count, (txid, vout)) in &self.funding_utxos {
+            out.push_str(&format!(
+                "fundingutxo {} {} {}\n",
+                count,
+                hash_to_rpc(txid),
+                vout
+            ));
+        }
         for e in &self.entries {
             out.push_str(&format!(
                 "entry {} {} {} {} {}\n",
@@ -629,6 +677,7 @@ impl<T: Transport> BitcoinAnchorChain<T> {
         let mut scanned = None;
         let mut entries = Vec::new();
         let mut markers = std::collections::BTreeMap::new();
+        let mut funding_utxos = std::collections::BTreeMap::new();
         let mut lines = text.lines().enumerate();
         match lines.next() {
             // A v1 cache predates the marker lines: rebuild (the index
@@ -654,6 +703,15 @@ impl<T: Transport> BitcoinAnchorChain<T> {
                     }
                 }
                 ["start", h] => start = Some(h.parse().map_err(|_| bad())?),
+                ["fundingutxo", count, txid, vout] => {
+                    funding_utxos.insert(
+                        count.parse().map_err(|_| bad())?,
+                        (
+                            hash_from_rpc(txid).map_err(|_| bad())?,
+                            vout.parse().map_err(|_| bad())?,
+                        ),
+                    );
+                }
                 ["marker", h, f] => {
                     let height = h.parse().map_err(|_| bad())?;
                     let has_marker = match *f {
@@ -691,7 +749,7 @@ impl<T: Transport> BitcoinAnchorChain<T> {
             }
         }
         let start = start.ok_or_else(|| decode("missing `start` line".into()))?;
-        Ok(Some((start, scanned, entries, markers)))
+        Ok(Some((start, scanned, entries, markers, funding_utxos)))
     }
 
     fn find(&self, anchor_ref: &AnchorRef) -> Option<&Entry> {
@@ -827,6 +885,7 @@ type PersistedIndex = (
     Option<(u64, [u8; 32])>,
     Vec<Entry>,
     std::collections::BTreeMap<u64, bool>,
+    std::collections::BTreeMap<u8, ([u8; 32], u32)>,
 );
 
 #[cfg(test)]

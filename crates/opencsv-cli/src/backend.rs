@@ -10,7 +10,7 @@
 use std::path::PathBuf;
 
 use opencsv_core::chain::{AnchorChain, AnchorLocation, AnchorRef};
-use opencsv_core::{AnchorRecord, Digest};
+use opencsv_core::{AnchorRecord, Digest, TruncatedDigest};
 
 use crate::bitcoin::BitcoinBackend;
 use crate::chain::{AnchorWriter, FileAnchorChain};
@@ -41,8 +41,8 @@ impl ChainSpec {
 
 /// An opened chain backend.
 pub enum ChainBackend {
-    /// Real Bitcoin ([`BitcoinBackend`]).
-    Bitcoin(BitcoinBackend),
+    /// Real Bitcoin ([`BitcoinBackend`]; boxed — the backend is large).
+    Bitcoin(Box<BitcoinBackend>),
     /// Append-only local file ([`FileAnchorChain`], demo).
     File(FileAnchorChain),
     /// Remote demo server ([`HttpAnchorChain`]).
@@ -53,7 +53,7 @@ impl ChainBackend {
     /// Open the backend named by `spec`.
     pub fn open(spec: &ChainSpec) -> Result<Self, Error> {
         match spec {
-            ChainSpec::Bitcoin(config) => Ok(Self::Bitcoin(BitcoinBackend::open(config)?)),
+            ChainSpec::Bitcoin(config) => Ok(Self::Bitcoin(Box::new(BitcoinBackend::open(config)?))),
             ChainSpec::File(path) => Ok(Self::File(FileAnchorChain::open(path)?)),
             ChainSpec::Http(url) => Ok(Self::Http(HttpAnchorChain::open(url)?)),
         }
@@ -67,6 +67,28 @@ impl ChainBackend {
             Self::Bitcoin(c) => c.generate_blocks(n),
             Self::File(c) => c.advance_blocks(n),
             Self::Http(c) => c.advance_blocks(n),
+        }
+    }
+
+    /// The batch funding ctx for `count` payloads (bitcoind backend
+    /// only — batching rides the real marker/funding construction).
+    pub fn batch_ctx(&mut self, count: u8) -> Result<[u8; 32], Error> {
+        match self {
+            Self::Bitcoin(c) => c.marker_utxo_ctx(count),
+            _ => Err(Error::Backend(
+                "batch anchoring is only supported on the bitcoind backend".into(),
+            )),
+        }
+    }
+
+    /// Broadcast a batch anchor of pre-bound payloads (bitcoind backend
+    /// only).
+    pub fn anchor_batch(&mut self, payloads: &[TruncatedDigest]) -> Result<AnchorRef, Error> {
+        match self {
+            Self::Bitcoin(c) => c.anchor_batch(payloads),
+            _ => Err(Error::Backend(
+                "batch anchoring is only supported on the bitcoind backend".into(),
+            )),
         }
     }
 }
