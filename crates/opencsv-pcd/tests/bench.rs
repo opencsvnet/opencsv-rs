@@ -11,14 +11,25 @@
 
 use std::time::Instant;
 
-use opencsv_core::{Coin, Digest, OwnerSecret};
+use opencsv_core::{AssetGenesis, Coin, Digest, OwnerSecret, PoseidonIssuerAuthorization};
 use opencsv_pcd::{
     prove_coin_transfer, prove_genesis_mint, prove_redeem, verify_coin_proof, verify_redeem,
     CoinProof,
 };
 
+const ISSUER_SECRET: [u8; 32] = [0x42; 32];
+
+fn asset_genesis() -> AssetGenesis {
+    AssetGenesis {
+        issuer_pk: PoseidonIssuerAuthorization::public_key(&ISSUER_SECRET),
+        currency_code: *b"USD",
+        terms_hash: Digest::from_bytes([0x74; 32]),
+        nonce: 1,
+    }
+}
+
 fn asset_id() -> Digest {
-    Digest::from_bytes([0x11; 32])
+    asset_genesis().asset_id()
 }
 
 fn osk(tag: u8) -> OwnerSecret {
@@ -69,7 +80,8 @@ fn coin_proof_benchmarks() {
     let coins = [coin(60, 0x22, 0x33), coin(40, 0x44, 0x55)];
     let nonce = Digest::from_bytes([0xaa; 32]);
     let t = Instant::now();
-    let mint = prove_genesis_mint(&asset_id(), &nonce, &coins).expect("mint proving");
+    let mint =
+        prove_genesis_mint(&asset_genesis(), &ISSUER_SECRET, &nonce, &coins).expect("mint proving");
     let prove = t.elapsed();
     let t = Instant::now();
     verify_coin_proof(&mint.statement, &mint).expect("mint verification");

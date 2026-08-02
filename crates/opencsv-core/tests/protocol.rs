@@ -10,7 +10,7 @@ fn byte_seed(seed: u8) -> [u8; 32] {
 }
 
 fn genesis() -> AssetGenesis {
-    let (_, pk) = Ed25519IssuerSignature::keypair_from_seed(byte_seed(1));
+    let (_, pk) = PoseidonIssuerAuthorization::keypair_from_seed(byte_seed(1));
     AssetGenesis {
         issuer_pk: pk,
         currency_code: *b"USD",
@@ -105,7 +105,15 @@ fn owner_derivation_matches_hash_of_secret() {
 }
 
 #[test]
-fn issuer_signature_round_trip() {
+fn poseidon_issuer_commitment_controls_genesis() {
+    let (sk, pk) = PoseidonIssuerAuthorization::keypair_from_seed(byte_seed(1));
+    assert!(PoseidonIssuerAuthorization::controls(&sk, &pk));
+    assert!(!PoseidonIssuerAuthorization::controls(&byte_seed(9), &pk));
+}
+
+#[test]
+#[allow(deprecated)]
+fn legacy_issuer_signature_round_trip_for_export_compatibility() {
     let (sk, pk) = Ed25519IssuerSignature::keypair_from_seed(byte_seed(1));
     let msg = mint_signing_message(
         &genesis().asset_id(),

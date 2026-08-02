@@ -35,9 +35,11 @@ const CONSIGNMENTS_DIR: &str = "consignments";
 /// An issuer keypair plus the asset genesis it controls.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct IssuerRecord {
-    /// Ed25519 issuer secret key (prototype stand-in — see `opencsv-core`).
+    /// Poseidon-committed issuer seed. Legacy records may contain an Ed25519
+    /// secret and are read/export-only because their genesis key will not
+    /// match the version-2 derivation.
     pub isk: [u8; 32],
-    /// The asset genesis whose `issuer_pk` matches `isk`.
+    /// The asset genesis whose Poseidon issuer commitment matches `isk`.
     pub genesis: AssetGenesis,
 }
 

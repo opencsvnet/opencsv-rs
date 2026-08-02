@@ -4,9 +4,8 @@
 //!
 //! Flow:
 //!
-//! 1. Issuer keygen (`Ed25519IssuerSignature`) and asset genesis; the mint
-//!    authorization signature is checked off-circuit (stage-2 deviation,
-//!    see `README.md`).
+//! 1. Poseidon issuer key commitment and asset genesis; the mint proof
+//!    proves issuer control inside the AIR.
 //! 2. Genesis mint (2 coins to user A) → MINT anchor on `MockAnchorChain`
 //!    → consignment to A → `accept()` with the real `CoinProofVerifier`.
 //! 3. A → B transfer (2-in/2-out, two in-circuit predecessor verifications)
@@ -34,7 +33,7 @@ use opencsv_core::chain::{AnchorChain, MockAnchorChain};
 use opencsv_core::coin::{Coin, OwnerSecret};
 use opencsv_core::consignment::{CoinOpening, Consignment};
 use opencsv_core::digest::Digest;
-use opencsv_core::issuer::{mint_signing_message, Ed25519IssuerSignature, IssuerSignature};
+use opencsv_core::issuer::PoseidonIssuerAuthorization;
 use opencsv_core::RejectReason;
 use opencsv_pcd::{
     encode_coin_proof, prove_coin_transfer, prove_genesis_mint, prove_redeem, CoinProofVerifier,
@@ -42,7 +41,7 @@ use opencsv_pcd::{
 
 /// vk tag carried in `AcceptParams` (ignored by `CoinProofVerifier` — the
 /// circuit shapes are fixed; see the adapter docs).
-const VK: &[u8] = b"opencsv-pcd-coin-v1";
+const VK: &[u8] = b"opencsv-pcd-coin-v2";
 
 fn osk(tag: u8) -> OwnerSecret {
     OwnerSecret::from_bytes([tag; 32])
@@ -61,7 +60,7 @@ fn opening(coin: &Coin) -> CoinOpening {
 #[ignore = "acceptance test: four full recursive proofs (~4 min in debug)"]
 fn full_protocol_flow_with_real_proofs() {
     // --- 1. Issuer keygen and asset genesis (paper §4.2).
-    let (isk, ipk) = Ed25519IssuerSignature::keypair_from_seed([0x42; 32]);
+    let (isk, ipk) = PoseidonIssuerAuthorization::keypair_from_seed([0x42; 32]);
     let genesis = AssetGenesis {
         issuer_pk: ipk,
         currency_code: *b"USD",
@@ -88,18 +87,8 @@ fn full_protocol_flow_with_real_proofs() {
     };
     let mint_nonce = Digest::from_bytes([0xaa; 32]);
 
-    // Off-circuit issuer authorization (paper §4.4 item 1; the signature
-    // stays off-circuit in this prototype — see README deviations).
-    let sig =
-        Ed25519IssuerSignature::sign(&isk, &mint_signing_message(&asset_id, 100, &mint_nonce));
-    assert!(Ed25519IssuerSignature::verify(
-        &ipk,
-        &mint_signing_message(&asset_id, 100, &mint_nonce),
-        &sig
-    ));
-
-    let mint =
-        prove_genesis_mint(&asset_id, &mint_nonce, &[coin_a1, coin_a2]).expect("mint proving");
+    let mint = prove_genesis_mint(&genesis, &isk, &mint_nonce, &[coin_a1, coin_a2])
+        .expect("issuer-authorized mint proving");
     let mint_ref = chain.append(AnchorRecord::Mint {
         asset_id: asset_id.to_anchor(),
         value: 100,

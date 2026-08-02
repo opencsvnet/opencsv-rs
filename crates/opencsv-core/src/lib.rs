@@ -8,8 +8,8 @@
 //!
 //! - [`asset`] — asset genesis and `asset_id = H("OpenCSV-asset" ∥ G)` (§4.2);
 //! - [`coin`] — coins, commitments, nullifiers, owner keys (§4.3);
-//! - [`issuer`] — the issuer-signature trait `Σ`, with an Ed25519 prototype
-//!   stand-in (§4.1, §4.4);
+//! - [`issuer`] — Poseidon-native issuer authorization proved inside mint
+//!   PCD, plus read-only legacy Ed25519 helpers (§4.1, §4.4);
 //! - [`anchor`] — 64-byte MINT / XFER / REDEEM anchor records (§4.4–4.6);
 //! - [`chain`] — the [`chain::AnchorChain`] abstraction over Bitcoin plus an
 //!   in-memory mock, with first-occurrence nullifier semantics (§4.7);
@@ -23,10 +23,11 @@
 //! 1. **Poseidon2, not Poseidon.** The paper says "Poseidon over 𝔽"; we use
 //!    Poseidon2 over BabyBear via Plonky3 (`p3-poseidon2`, width 16, rate 8)
 //!    — the field-dedicated hash Plonky3 actually ships.
-//! 2. **Ed25519 issuer signatures.** The paper requires an AIR-friendly `Σ`;
-//!    Ed25519 is a prototype stand-in behind the
-//!    [`issuer::IssuerSignature`] trait and must be replaced before in-circuit
-//!    mint verification.
+//! 2. **Issuer authorization is a PCD signature of knowledge.** New mints
+//!    prove knowledge of a Poseidon2-committed issuer seed in the same circuit
+//!    that binds the mint statement. This is not an independently verifiable
+//!    standalone signature; the versioned PCD proof is the authorization
+//!    artifact. Legacy Ed25519 records are not accepted for new mints.
 //! 3. **32-byte digests, 24-byte anchor prefixes.** The paper both fixes the
 //!    anchor at 64 bytes and calls nullifiers "64 pseudorandom bytes"; these
 //!    cannot both hold with the MINT/REDEEM layouts of §4.4/§4.6. We hash to
@@ -70,4 +71,8 @@ pub use crosscheck::{CrossCheckError, CrossCheckedChain};
 pub use coin::{Coin, Commitment, Nullifier, Owner, OwnerSecret};
 pub use consignment::{CoinOpening, Consignment};
 pub use digest::{Digest, TruncatedDigest};
-pub use issuer::{mint_signing_message, Ed25519IssuerSignature, IssuerSignature};
+#[allow(deprecated)]
+pub use issuer::{
+    mint_signing_message, Ed25519IssuerSignature, IssuerSignature, PoseidonIssuerAuthorization,
+    POSEIDON_ISSUER_KEY_DOMAIN,
+};

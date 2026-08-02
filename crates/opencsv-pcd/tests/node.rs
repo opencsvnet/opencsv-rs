@@ -6,15 +6,26 @@
 
 use std::time::Instant;
 
-use opencsv_core::{Coin, Digest, OwnerSecret};
+use opencsv_core::{AssetGenesis, Coin, Digest, OwnerSecret, PoseidonIssuerAuthorization};
 use opencsv_pcd::{
-    prove_coin_transfer, prove_genesis_mint, verify_coin_proof, CoinProof, NodeError, NodeMode,
-    NodeStatement,
+    prove_coin_transfer, prove_genesis_mint, prove_genesis_mint_raw, verify_coin_proof, CoinProof,
+    NodeError, NodeMode, NodeStatement, COIN_PROOF_VERSION,
 };
 
-/// Test asset id (arbitrary but fixed).
+const ISSUER_SECRET: [u8; 32] = [0x42; 32];
+
+fn asset_genesis() -> AssetGenesis {
+    AssetGenesis {
+        issuer_pk: PoseidonIssuerAuthorization::public_key(&ISSUER_SECRET),
+        currency_code: *b"USD",
+        terms_hash: Digest::from_bytes([0x74; 32]),
+        nonce: 1,
+    }
+}
+
+/// Test asset id derived from an issuer-controlled genesis.
 fn asset_id() -> Digest {
-    Digest::from_bytes([0x11; 32])
+    asset_genesis().asset_id()
 }
 
 fn osk(tag: u8) -> OwnerSecret {
@@ -41,7 +52,8 @@ fn proof_size(proof: &CoinProof) -> usize {
 fn genesis() -> (CoinProof, [Coin; 2]) {
     let coins = [coin(60, 0x22, 0x33), coin(40, 0x44, 0x55)];
     let nonce = Digest::from_bytes([0xaa; 32]);
-    let proof = prove_genesis_mint(&asset_id(), &nonce, &coins).expect("mint proving");
+    let proof =
+        prove_genesis_mint(&asset_genesis(), &ISSUER_SECRET, &nonce, &coins).expect("mint proving");
     (proof, coins)
 }
 
@@ -51,7 +63,8 @@ fn genesis_mint_verifies() {
     let t = Instant::now();
     let coins = [coin(u64::MAX, 0x22, 0x33), coin(0, 0x44, 0x55)];
     let nonce = Digest::from_bytes([0xaa; 32]);
-    let proof = prove_genesis_mint(&asset_id(), &nonce, &coins).expect("mint proving");
+    let proof =
+        prove_genesis_mint(&asset_genesis(), &ISSUER_SECRET, &nonce, &coins).expect("mint proving");
     println!("prove_genesis_mint: {:?}", t.elapsed());
     println!("mint proof size: {} bytes", proof_size(&proof));
 
@@ -154,6 +167,7 @@ fn wrong_predecessor_fails() {
     // pre-check passes; the statement table in the proof still binds the real
     // outputs, so the chaining constraint conflicts at witness generation.
     let mut tampered_mint = CoinProof {
+        version: mint.version,
         mode: mint.mode,
         statement: mint.statement.clone(),
         proof: mint.proof,
@@ -201,6 +215,7 @@ fn tampered_public_data_fails() {
         output_commitments: mint.statement.output_commitments,
     };
     let proof_as_transfer = CoinProof {
+        version: mint.version,
         mode: NodeMode::Transfer,
         statement: transfer_mode.clone(),
         proof: mint.proof,
@@ -215,4 +230,60 @@ fn tampered_public_data_fails() {
     let mint = genesis().0;
     verify_coin_proof(&mint.statement, &mint).expect("honest mint verifies");
     let _ = coins;
+}
+
+/// The recursive mint AIR rejects an issuer forgery even when the native
+/// consistency check is bypassed, and version-1 lineages fail closed.
+#[test]
+fn issuer_forgery_and_legacy_lineage_fail() {
+    let coins = [coin(60, 0x22, 0x33), coin(40, 0x44, 0x55)];
+    let nonce = Digest::from_bytes([0xaa; 32]);
+    let wrong_secret = [0x43; 32];
+
+    let err = match prove_genesis_mint(&asset_genesis(), &wrong_secret, &nonce, &coins) {
+        Ok(_) => panic!("checked proving must reject a foreign issuer seed"),
+        Err(error) => error,
+    };
+    assert!(matches!(err, NodeError::IssuerKeyMismatch));
+
+    let err = match prove_genesis_mint_raw(
+        &asset_id(),
+        &asset_genesis(),
+        &wrong_secret,
+        &nonce,
+        &coins,
+    ) {
+        Ok(_) => panic!("the recursive mint circuit must reject an issuer forgery"),
+        Err(error) => error,
+    };
+    assert!(matches!(err, NodeError::Circuit(_)));
+
+    // Simulate an old 52-element statement relabeled with the current outer
+    // version: the transcript-bound statement shape still rejects it.
+    let (mut relabeled, _) = genesis();
+    let statement_entry = relabeled
+        .proof
+        .non_primitives
+        .iter_mut()
+        .find(|entry| entry.public_values.len() == 4 * opencsv_pcd::STATEMENT_ELEMS)
+        .expect("coin proof has a statement table");
+    statement_entry.public_values.drain(0..4);
+    let err = verify_coin_proof(&relabeled.statement, &relabeled)
+        .expect_err("an old statement shape cannot be relabeled as version 2");
+    assert!(matches!(err, NodeError::StatementMismatch));
+
+    let (mint, _) = genesis();
+    let legacy = CoinProof {
+        version: 1,
+        mode: mint.mode,
+        statement: mint.statement.clone(),
+        proof: mint.proof,
+    };
+    let err = verify_coin_proof(&legacy.statement, &legacy)
+        .expect_err("legacy unauthenticated proofs must not verify");
+    assert!(matches!(
+        err,
+        NodeError::UnsupportedProofVersion { actual: 1 }
+    ));
+    assert_eq!(COIN_PROOF_VERSION, 2);
 }

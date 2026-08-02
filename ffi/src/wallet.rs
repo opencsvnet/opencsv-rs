@@ -24,8 +24,8 @@ use opencsv_core::accept::{accept, AcceptParams};
 use opencsv_core::chain::{AnchorChain, AnchorRef};
 use opencsv_core::consignment::{CoinOpening, Consignment};
 use opencsv_core::{
-    mint_commit, mint_signing_message, AnchorRecord, AssetGenesis, AssetId, Coin, Digest,
-    Ed25519IssuerSignature, IssuerSignature, Owner, OwnerSecret,
+    mint_commit, AnchorRecord, AssetGenesis, AssetId, Coin, Digest, Owner, OwnerSecret,
+    PoseidonIssuerAuthorization,
 };
 use opencsv_pcd::{decode_coin_proof, encode_coin_proof, NODE_INPUTS, NODE_OUTPUTS};
 use rand::RngExt;
@@ -36,7 +36,7 @@ use crate::snapshot::SnapshotChain;
 
 /// vk tag passed to the accept driver (`opencsv_pcd::CoinProofVerifier`
 /// ignores it; kept identical to `opencsv-cli`'s for consistency).
-pub const COIN_VK: &[u8] = b"opencsv-pcd-coin-v1";
+pub const COIN_VK: &[u8] = b"opencsv-pcd-coin-v2";
 
 /// One operation's failure, as a display string for the JSON boundary.
 pub type OpError = String;
@@ -488,7 +488,7 @@ impl MemWallet {
             .try_into()
             .map_err(|_| format!("currency code `{currency}` is not 3 bytes"))?;
         let seed: [u8; 32] = rand::rng().random();
-        let (isk, ipk) = Ed25519IssuerSignature::keypair_from_seed(seed);
+        let (isk, ipk) = PoseidonIssuerAuthorization::keypair_from_seed(seed);
         let genesis = AssetGenesis {
             issuer_pk: ipk,
             currency_code: code,
@@ -526,8 +526,8 @@ impl MemWallet {
         out
     }
 
-    /// Issuer-signed mint of `amounts` (1–2 outputs) to `to` (paper §4.4).
-    /// This wallet must hold the issuer key for `asset_id`.
+    /// Issuer-authorized mint of `amounts` (1–2 outputs) to `to` (paper
+    /// §4.4). This wallet must hold the issuer seed committed by `asset_id`.
     pub fn prove_mint(
         &mut self,
         asset_id_hex: &str,
@@ -546,16 +546,9 @@ impl MemWallet {
         let total = checked_total(amounts)?;
         let mint_nonce = random_digest();
 
-        // Off-circuit issuer authorization (paper §4.4 item 1; the signature
-        // is not yet carried in the consignment — see opencsv-pcd's caveats).
-        let message = mint_signing_message(&asset_id, total, &mint_nonce);
-        let sig = Ed25519IssuerSignature::sign(&issuer.isk, &message);
-        if !Ed25519IssuerSignature::verify(&issuer.genesis.issuer_pk, &message, &sig) {
-            return Err("issuer self-check failed".into());
-        }
-
-        let proof = opencsv_pcd::prove_genesis_mint(&asset_id, &mint_nonce, &outputs)
-            .map_err(|e| e.to_string())?;
+        let proof =
+            opencsv_pcd::prove_genesis_mint(&issuer.genesis, &issuer.isk, &mint_nonce, &outputs)
+                .map_err(|e| e.to_string())?;
         let record = AnchorRecord::Mint {
             asset_id: asset_id.to_anchor(),
             value: total,

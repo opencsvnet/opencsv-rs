@@ -22,10 +22,11 @@
 //!
 //! Still **non-recursive** (recursion is stage 3):
 //!
-//! - Mint ([`prove_mint`] / [`verify_mint`]): output commitments recompute,
-//!   values in range, `Σ v_i = V`, and
-//!   `mint_commit = H("mint" ∥ asset_id ∥ V ∥ mint_nonce)`. The issuer
-//!   signature stays off-circuit (see the `mint` module docs).
+//! - Mint ([`prove_mint`] / [`verify_mint`]): proves knowledge of the issuer
+//!   seed committed by the asset genesis, derives the asset id in-circuit,
+//!   recomputes output commitments, range-checks values, enforces
+//!   `Σ v_i = V`, and binds
+//!   `mint_commit = H("mint" ∥ asset_id ∥ V ∥ mint_nonce)`.
 //! - Transfer ([`prove_transfer`] / [`verify_transfer`]): 2 inputs / 2
 //!   outputs, **single asset** — input commitments recompute, ownership
 //!   (`owner_i = H(osk_i)`), nullifiers (`nf_i = H("null" ∥ osk_i ∥ C_i)`),
@@ -77,6 +78,7 @@
 
 mod accept;
 mod hash;
+mod issuer;
 mod mint;
 mod node;
 mod opening;
@@ -105,9 +107,9 @@ pub use mint::{
 };
 pub use node::prove_transfer as prove_coin_transfer;
 pub use node::{
-    coin_fri_params, prove_genesis_mint, prove_redeem, verify_coin_proof, verify_redeem, CoinProof,
-    NodeError, NodeMode, NodeStatement, RedeemProof, NODE_INPUTS, NODE_OUTPUTS, NODE_PRIVATE_ELEMS,
-    REDEEM_PRIVATE_ELEMS, STATEMENT_ELEMS,
+    coin_fri_params, prove_genesis_mint, prove_genesis_mint_raw, prove_redeem, verify_coin_proof,
+    verify_redeem, CoinProof, NodeError, NodeMode, NodeStatement, RedeemProof, COIN_PROOF_VERSION,
+    NODE_INPUTS, NODE_OUTPUTS, NODE_PRIVATE_ELEMS, REDEEM_PRIVATE_ELEMS, STATEMENT_ELEMS,
 };
 pub use opening::{
     prove_opening, prove_opening_raw, verify_opening, CoinWitness, OpeningError, OpeningProof,

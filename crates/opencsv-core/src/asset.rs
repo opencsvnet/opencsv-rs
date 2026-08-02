@@ -12,8 +12,8 @@ pub type AssetId = Digest;
 /// pinned into clients trust-on-first-use (paper §4.2).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AssetGenesis {
-    /// Issuer public key for this asset (Ed25519 in this prototype; see
-    /// [`crate::issuer`]).
+    /// Poseidon2 commitment to the issuer seed for new assets. Legacy
+    /// prototype records may contain an Ed25519 public key and are read-only.
     pub issuer_pk: [u8; 32],
     /// ISO-4217-style currency code, e.g. `b"USD"`.
     pub currency_code: [u8; 3],

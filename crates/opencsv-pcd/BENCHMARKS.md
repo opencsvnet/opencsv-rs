@@ -1,5 +1,10 @@
 # opencsv-pcd benchmarks
 
+> Historical baseline: these measurements predate the D1 setup cache and
+> D3 version-2 issuer-authorization circuit. Proof sizes and timings are not
+> current production claims. D2 will replace them with reproducible
+> cold/warm and on-device receipts after parameters are frozen.
+
 Prove time, verify time, and proof size for the coin-proof circuits
 (stage 3–4, test-grade FRI parameters — `CoinFriParams::testing()`, **not a
 security claim**). Measured with `tests/bench.rs`:
@@ -49,8 +54,9 @@ for the consignment encoding).
   predecessor verification (plus fewer Poseidon2 rows: one coin opening,
   one ownership hash, one nullifier hash, no outputs, no conservation
   gadget).
-- These measurements predate the D1 setup cache, so each row includes a cold
-  `ProverData::from_airs_and_degrees` build. Current code caches that data by
+- These measurements predate the D1 setup cache and D3 issuer/version
+  boundary, so each row includes a cold `ProverData::from_airs_and_degrees`
+  build and the old mint/statement circuit. Current code caches setup by
   complete circuit/config/predecessor-vk identity (see README "Prover setup
   cache (D1)"). The table remains an honest receipt of the old run; cold/warm
   numbers will be re-measured with the final D2 parameters rather than

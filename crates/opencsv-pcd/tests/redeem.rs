@@ -6,15 +6,25 @@
 
 use std::time::Instant;
 
-use opencsv_core::{Coin, Digest, OwnerSecret};
+use opencsv_core::{AssetGenesis, Coin, Digest, OwnerSecret, PoseidonIssuerAuthorization};
 use opencsv_pcd::{
     prove_coin_transfer, prove_genesis_mint, prove_redeem, verify_redeem, CoinProof, NodeError,
     NodeMode,
 };
 
-/// Test asset id (arbitrary but fixed).
+const ISSUER_SECRET: [u8; 32] = [0x42; 32];
+
+fn asset_genesis() -> AssetGenesis {
+    AssetGenesis {
+        issuer_pk: PoseidonIssuerAuthorization::public_key(&ISSUER_SECRET),
+        currency_code: *b"USD",
+        terms_hash: Digest::from_bytes([0x74; 32]),
+        nonce: 1,
+    }
+}
+
 fn asset_id() -> Digest {
-    Digest::from_bytes([0x11; 32])
+    asset_genesis().asset_id()
 }
 
 fn osk(tag: u8) -> OwnerSecret {
@@ -41,7 +51,8 @@ fn proof_size(proof: &CoinProof) -> usize {
 fn genesis() -> (CoinProof, [Coin; 2]) {
     let coins = [coin(60, 0x22, 0x33), coin(40, 0x44, 0x55)];
     let nonce = Digest::from_bytes([0xaa; 32]);
-    let proof = prove_genesis_mint(&asset_id(), &nonce, &coins).expect("mint proving");
+    let proof =
+        prove_genesis_mint(&asset_genesis(), &ISSUER_SECRET, &nonce, &coins).expect("mint proving");
     (proof, coins)
 }
 
@@ -103,6 +114,7 @@ fn mint_to_redeem_round_trip() {
 
     // A redeem proof must not verify as a plain coin proof of another mode.
     let as_mint = CoinProof {
+        version: redeem.version,
         mode: NodeMode::Mint,
         statement: redeem.statement.clone(),
         proof: redeem.proof,

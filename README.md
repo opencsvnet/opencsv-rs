@@ -27,15 +27,16 @@ rule, resolved from node data → supply audit from chain data. (Earlier,
 2026-07-31: the same protocol flow live-tested over the demo chain with
 consignment delivery via production Signal.) Numbers:
 
-- constant-size coin proofs (~46–56 KB) and constant verification (~3.6 ms),
-  independent of history length — the PCD property, measured
+- constant-size coin proofs and history-independent verification — the PCD
+  property, measured (the D2 parameter freeze will refresh performance and
+  size receipts after the version-2 issuer circuit landed)
 - ~3 s proving per transfer hop (release, 64-core Xeon; test-grade FRI params)
 - see `crates/opencsv-pcd/BENCHMARKS.md`
 
-Known gaps are documented in `crates/opencsv-pcd/README.md` (off-circuit issuer
-signature, single-asset transfers, test-grade FRI parameters, and explicit
-root-key allowlisting/versioning). Recursive predecessor keys are now
-hard-bound in-circuit.
+Known gaps are documented in `crates/opencsv-pcd/README.md` (single-asset
+transfers, test-grade FRI parameters, and explicit root-key allowlisting).
+Issuer authorization and recursive predecessor keys are bound in-circuit;
+proof envelopes and lineages are fail-closed at version 2.
 
 ## Build & test
 

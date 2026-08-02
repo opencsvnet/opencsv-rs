@@ -1,17 +1,50 @@
-//! Issuer signatures `Σ` (paper §4.1, §4.4).
+//! Issuer authorization (paper §4.1, §4.4).
 //!
-//! The paper requires an **AIR-friendly** signature scheme whose verification
-//! is expressible natively over 𝔽 (candidates: Schnorr over an 𝔽-base-field
-//! curve, or a Poseidon-based hash signature). This prototype instead uses
-//! **Ed25519** (`ed25519-dalek`) behind the [`IssuerSignature`] trait as a
-//! pragmatic stand-in: Ed25519 verification is *not* AIR-native and must be
-//! replaced before the PCD engine (`opencsv-pcd`) proves mints in-circuit.
-//! The trait is the seam where the production scheme plugs in.
+//! New assets use [`PoseidonIssuerAuthorization`]: the public key is a
+//! domain-separated Poseidon2 commitment to a 32-byte issuer seed. The mint
+//! PCD circuit proves knowledge of that seed, binds the derived key through
+//! [`crate::AssetGenesis`] to the asset id, and constrains the exact mint
+//! statement in the same proof. The resulting non-interactive PCD proof is
+//! the transferable signature-of-knowledge; no reusable secret material or
+//! standalone signature bytes are disclosed.
+//!
+//! [`Ed25519IssuerSignature`] remains solely for recognizing/exporting legacy
+//! prototype records. New mint paths do not use it, because the old signature
+//! was never carried in consignments and therefore could not authorize a mint
+//! at the receiver's verification boundary.
 
 use ed25519_dalek::{Signer, SigningKey, VerifyingKey};
 
 use crate::asset::AssetId;
 use crate::digest::Digest;
+use crate::field::{bytes_to_felts, hash_felts};
+
+/// Domain separation for the Poseidon issuer-key commitment.
+pub const POSEIDON_ISSUER_KEY_DOMAIN: &str = "issuer-key-v1";
+
+/// AIR-native issuer authorization for version-2 mint proofs.
+///
+/// This type creates the long-lived key commitment. Verification of a mint
+/// authorization is performed by the PCD circuit as a proof of knowledge,
+/// not by a standalone `verify(pk, msg, sig)` function.
+pub struct PoseidonIssuerAuthorization;
+
+impl PoseidonIssuerAuthorization {
+    /// Derive `(secret_seed, public_key)` from a 32-byte seed.
+    pub fn keypair_from_seed(seed: [u8; 32]) -> ([u8; 32], [u8; 32]) {
+        (seed, Self::public_key(&seed))
+    }
+
+    /// Derive the public key committed to by a version-2 mint circuit.
+    pub fn public_key(seed: &[u8; 32]) -> [u8; 32] {
+        *hash_felts(POSEIDON_ISSUER_KEY_DOMAIN, &[&bytes_to_felts(seed)]).as_bytes()
+    }
+
+    /// Return whether a stored seed controls `public_key` under this scheme.
+    pub fn controls(seed: &[u8; 32], public_key: &[u8; 32]) -> bool {
+        Self::public_key(seed) == *public_key
+    }
+}
 
 /// An issuer signature scheme `Σ` with interface
 /// `Σ.Verify(ipk, m, σ) ∈ {0,1}` (paper §4.1).
@@ -29,10 +62,13 @@ pub trait IssuerSignature {
     fn verify(pk: &Self::PublicKey, msg: &[u8], sig: &Self::Signature) -> bool;
 }
 
-/// Ed25519 issuer signatures — **prototype stand-in only**, not AIR-friendly.
-/// See module docs.
+/// Ed25519 issuer signatures — **legacy prototype records only**.
+///
+/// This scheme is not accepted by version-2 mint proving. See module docs.
+#[deprecated(note = "legacy only; use PoseidonIssuerAuthorization for new assets")]
 pub struct Ed25519IssuerSignature;
 
+#[allow(deprecated)]
 impl Ed25519IssuerSignature {
     /// Derive the keypair for a 32-byte secret seed.
     pub fn keypair_from_seed(seed: [u8; 32]) -> ([u8; 32], [u8; 32]) {
@@ -41,6 +77,7 @@ impl Ed25519IssuerSignature {
     }
 }
 
+#[allow(deprecated)]
 impl IssuerSignature for Ed25519IssuerSignature {
     type PublicKey = [u8; 32];
     type SecretKey = [u8; 32];

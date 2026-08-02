@@ -216,7 +216,7 @@ All files are bincode (serde data model) unless noted.
 ```text
 <wallet-dir>/
 ├── keys.bin                 # Vec<OwnerSecret> — owner identities (SECRET)
-├── issuers.bin              # Vec<IssuerRecord> — Ed25519 isk + AssetGenesis (SECRET)
+├── issuers.bin              # Vec<IssuerRecord> — issuer seed + AssetGenesis (SECRET)
 ├── assets/<asset_id>.genesis       # pinned AssetGenesis (trust-on-first-use, §4.2)
 ├── coins/<commitment>.coin         # StoredCoin { coin, status, proof, selector, anchor }
 ├── consignments/<h>-<p>-<txid>.bin # raw received consignment blobs
@@ -276,13 +276,11 @@ All files are bincode (serde data model) unless noted.
   file via `--chain` (a consignment's `anchor_ref` is meaningless against a
   chain that never saw the anchor). Demo confirmations are simulated:
   nothing advances the demo tip except `chain advance`.
-- **Mint authorization signature is not propagated.** `mint` produces and
-  self-checks the Ed25519 signature over `(asset_id, V, mint_nonce)` (paper
-  §4.4 item 1), but `Consignment`/`accept` have no field for it, so
-  recipients do not verify it yet. (The `opencsv-pcd` README says the accept
-  driver checks it — that is aspirational; the check does not exist in
-  `opencsv-core` today.) The production target is in-AIR verification of an
-  AIR-native signature.
+- **Mint authorization is proof-native.** `mint` passes the issuer seed and
+  genesis to the version-2 mint circuit, which proves seed control, derives
+  the asset id, and binds the exact statement. No standalone signature field
+  is omitted from the consignment. Stored legacy Ed25519 issuer records fail
+  explicitly at new-mint proving and remain read/export-only.
 - **vk binding.** The `CoinProofVerifier` adapter ignores the `vk` argument
   and proofs self-describe their common data — see `opencsv-pcd`'s README
   for the current vk-binding caveats.

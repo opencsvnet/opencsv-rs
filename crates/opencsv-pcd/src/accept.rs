@@ -38,9 +38,9 @@
 //! never appears on-chain; the circuits and statements are unchanged — the
 //! binding lives purely at the anchor layer.
 //!
-//! `vk` is ignored: the circuit shapes are fixed by this crate and each
-//! proof self-describes its common data (the same call-site-discipline
-//! caveat as predecessor vk binding — see `README.md`).
+//! `vk` is currently ignored: recursive predecessor keys are hard-bound, but
+//! the self-described root proof still needs an explicit production
+//! circuit/version allowlist (see `README.md`).
 
 use opencsv_core::accept::ProofVerifier;
 use opencsv_core::anchor::AnchorRecord;
@@ -49,18 +49,29 @@ use opencsv_core::digest::Digest;
 use serde::{Deserialize, Serialize};
 
 use crate::node::{verify_coin_proof, NODE_OUTPUTS};
-use crate::{CoinProof, NodeMode, NodeStatement};
+use crate::{CoinProof, NodeMode, NodeStatement, COIN_PROOF_VERSION};
 
 /// Byte length of one opening inside the accept driver's public input
 /// (`asset_id(32) ∥ v(8) ∥ owner(32) ∥ r(32)`, see
 /// [`CoinOpening::to_public_input_bytes`]).
 const OPENING_BYTES: usize = 104;
 
-/// Serialized form of a [`CoinProof`] for a consignment's opaque proof
-/// bytes: the mode and full statement, plus the postcard-serialized
-/// batch-STARK proof.
+/// Unambiguous prefix for versioned coin-proof envelopes.
+const PROOF_ENVELOPE_MAGIC: &[u8; 7] = b"OCSVPCD";
+
+/// Version-2 serialized form of a [`CoinProof`] after the magic/version
+/// prefix: the mode and full statement, plus the postcard-serialized proof.
 #[derive(Serialize, Deserialize)]
-struct ProofEnvelope {
+struct ProofEnvelopeV2 {
+    mode: NodeMode,
+    statement: NodeStatement,
+    proof: Vec<u8>,
+}
+
+/// Pre-versioning envelope retained solely for read-only inspection. Proofs
+/// decoded through this shape are assigned version 1 and fail verification.
+#[derive(Serialize, Deserialize)]
+struct LegacyProofEnvelope {
     mode: NodeMode,
     statement: NodeStatement,
     proof: Vec<u8>,
@@ -69,13 +80,22 @@ struct ProofEnvelope {
 /// Serialize a coin proof into the opaque bytes a
 /// [`opencsv_core::consignment::Consignment`] carries as its `proof` field.
 pub fn encode_coin_proof(proof: &CoinProof) -> Vec<u8> {
+    assert_eq!(
+        proof.version, COIN_PROOF_VERSION,
+        "only the current authenticated proof lineage may be encoded"
+    );
     let inner = postcard::to_allocvec(&proof.proof).expect("batch-STARK proof serializes");
-    postcard::to_allocvec(&ProofEnvelope {
+    let payload = postcard::to_allocvec(&ProofEnvelopeV2 {
         mode: proof.mode,
         statement: proof.statement.clone(),
         proof: inner,
     })
-    .expect("proof envelope serializes")
+    .expect("proof envelope serializes");
+    let mut encoded = Vec::with_capacity(PROOF_ENVELOPE_MAGIC.len() + 1 + payload.len());
+    encoded.extend_from_slice(PROOF_ENVELOPE_MAGIC);
+    encoded.push(proof.version);
+    encoded.extend_from_slice(&payload);
+    encoded
 }
 
 /// Inverse of [`encode_coin_proof`]: decode a coin proof from a
@@ -85,9 +105,22 @@ pub fn encode_coin_proof(proof: &CoinProof) -> Vec<u8> {
 /// *created* each consumed coin as its in-circuit predecessor, so wallets
 /// store the received envelope and decode it at spending time.
 pub fn decode_coin_proof(bytes: &[u8]) -> Option<CoinProof> {
-    let envelope: ProofEnvelope = postcard::from_bytes(bytes).ok()?;
+    if let Some(payload) = bytes.strip_prefix(PROOF_ENVELOPE_MAGIC) {
+        let (&version, payload) = payload.split_first()?;
+        let envelope: ProofEnvelopeV2 = postcard::from_bytes(payload).ok()?;
+        let proof = postcard::from_bytes(&envelope.proof).ok()?;
+        return Some(CoinProof {
+            version,
+            mode: envelope.mode,
+            statement: envelope.statement,
+            proof,
+        });
+    }
+
+    let envelope: LegacyProofEnvelope = postcard::from_bytes(bytes).ok()?;
     let proof = postcard::from_bytes(&envelope.proof).ok()?;
     Some(CoinProof {
+        version: 1,
         mode: envelope.mode,
         statement: envelope.statement,
         proof,
@@ -224,12 +257,20 @@ impl ProofVerifier for CoinProofVerifier {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use opencsv_core::{AssetGenesis, PoseidonIssuerAuthorization};
 
     /// The envelope round-trips (guards the postcard encoding the
     /// consignment relies on).
     #[test]
     fn envelope_round_trip() {
-        let asset_id = Digest::from_bytes([0x11; 32]);
+        let issuer_secret = [0x42; 32];
+        let genesis = AssetGenesis {
+            issuer_pk: PoseidonIssuerAuthorization::public_key(&issuer_secret),
+            currency_code: *b"USD",
+            terms_hash: Digest::from_bytes([0x74; 32]),
+            nonce: 1,
+        };
+        let asset_id = genesis.asset_id();
         let coins = [
             opencsv_core::Coin {
                 asset_id,
@@ -245,12 +286,25 @@ mod tests {
             },
         ];
         let nonce = Digest::from_bytes([0xaa; 32]);
-        let proof = crate::prove_genesis_mint(&asset_id, &nonce, &coins).expect("mint proving");
+        let proof = crate::prove_genesis_mint(&genesis, &issuer_secret, &nonce, &coins)
+            .expect("mint proving");
         let bytes = encode_coin_proof(&proof);
         let decoded = decode_coin_proof(&bytes).expect("envelope decodes");
         assert_eq!(decoded.mode, proof.mode);
         assert_eq!(decoded.statement, proof.statement);
         crate::verify_coin_proof(&proof.statement, &decoded).expect("decoded proof verifies");
+
+        // The pre-versioning shape remains decodable for inspection but is
+        // assigned version 1 and cannot cross the verification boundary.
+        let legacy_bytes = postcard::to_allocvec(&LegacyProofEnvelope {
+            mode: proof.mode,
+            statement: proof.statement.clone(),
+            proof: postcard::to_allocvec(&proof.proof).expect("inner proof serializes"),
+        })
+        .expect("legacy envelope serializes");
+        let legacy = decode_coin_proof(&legacy_bytes).expect("legacy envelope is inspectable");
+        assert_eq!(legacy.version, 1);
+        assert!(crate::verify_coin_proof(&legacy.statement, &legacy).is_err());
         // Garbage does not decode.
         assert!(decode_coin_proof(&bytes[..bytes.len() / 2]).is_none());
     }

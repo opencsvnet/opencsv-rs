@@ -18,10 +18,10 @@
 use opencsv_core::accept::{accept, AcceptParams, ProofVerifier};
 use opencsv_core::chain::{AnchorChain, AnchorLocation};
 use opencsv_core::consignment::{CoinOpening, Consignment};
+use opencsv_core::PoseidonIssuerAuthorization;
 use opencsv_core::{
     mint_commit, AnchorRecord, AssetId, Coin, Digest, Owner, OwnerSecret, RejectReason,
 };
-use opencsv_core::{mint_signing_message, Ed25519IssuerSignature, IssuerSignature};
 use opencsv_pcd::{decode_coin_proof, encode_coin_proof, NODE_INPUTS, NODE_OUTPUTS};
 use rand::RngExt;
 
@@ -32,7 +32,7 @@ use crate::store::{consignment_name, CoinStatus, IssuerRecord, StoredCoin, Walle
 
 /// vk tag passed to the accept driver. `opencsv_pcd::CoinProofVerifier`
 /// ignores it (circuit shapes are fixed — see the adapter docs).
-pub const COIN_VK: &[u8] = b"opencsv-pcd-coin-v1";
+pub const COIN_VK: &[u8] = b"opencsv-pcd-coin-v2";
 
 /// Default confirmation depth required by [`receive`] (paper §4.7 rule 2).
 pub const DEFAULT_CONFIRMATIONS: u64 = 6;
@@ -69,7 +69,7 @@ pub fn keygen(wallet: &mut Wallet) -> Result<Owner, Error> {
 /// nonce is a per-wallet counter.
 pub fn issuer_init(wallet: &mut Wallet, currency: [u8; 3]) -> Result<AssetId, Error> {
     let seed: [u8; 32] = rand::rng().random();
-    let (isk, ipk) = Ed25519IssuerSignature::keypair_from_seed(seed);
+    let (isk, ipk) = PoseidonIssuerAuthorization::keypair_from_seed(seed);
     let genesis = opencsv_core::AssetGenesis {
         issuer_pk: ipk,
         currency_code: currency,
@@ -105,12 +105,9 @@ pub enum ReceiveReport {
     Rejected(RejectReason),
 }
 
-/// Issuer-signed mint of 1–2 coins to `to` (paper §4.4).
-///
-/// The Ed25519 authorization over `(asset_id, V, mint_nonce)` is produced and
-/// self-checked here, but **not carried in the consignment** — the core
-/// `Consignment`/`accept` has no signature field yet (the paper's §4.4 item 1
-/// check belongs in the mint AIR; see the crate README's caveats).
+/// Issuer-authorized mint of 1–2 coins to `to` (paper §4.4). The recursive
+/// mint proof proves knowledge of the issuer seed committed by the genesis;
+/// no standalone signature is omitted from the consignment.
 pub fn mint<C: AnchorWriter>(
     wallet: &mut Wallet,
     chain: &mut C,
@@ -126,16 +123,8 @@ pub fn mint<C: AnchorWriter>(
     let total = checked_total(amounts)?;
     let mint_nonce = random_digest();
 
-    // Off-circuit issuer authorization (paper §4.4 item 1; see doc note).
-    let message = mint_signing_message(asset_id, total, &mint_nonce);
-    let sig = Ed25519IssuerSignature::sign(&issuer.isk, &message);
-    debug_assert!(Ed25519IssuerSignature::verify(
-        &issuer.genesis.issuer_pk,
-        &message,
-        &sig
-    ));
-
-    let proof = opencsv_pcd::prove_genesis_mint(asset_id, &mint_nonce, &outputs)?;
+    let proof =
+        opencsv_pcd::prove_genesis_mint(&issuer.genesis, &issuer.isk, &mint_nonce, &outputs)?;
     let record = AnchorRecord::Mint {
         asset_id: asset_id.to_anchor(),
         value: total,

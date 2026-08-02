@@ -5,12 +5,25 @@
 
 use std::time::Instant;
 
-use opencsv_core::{mint_commit, Coin, Digest, OwnerSecret};
+use opencsv_core::{
+    mint_commit, AssetGenesis, Coin, Digest, OwnerSecret, PoseidonIssuerAuthorization,
+};
 use opencsv_pcd::{prove_mint, prove_mint_raw, verify_mint, MintError, MintStatement};
 
-/// Test asset id (arbitrary but fixed).
+const ISSUER_SECRET: [u8; 32] = [0x42; 32];
+
+fn genesis() -> AssetGenesis {
+    AssetGenesis {
+        issuer_pk: PoseidonIssuerAuthorization::public_key(&ISSUER_SECRET),
+        currency_code: *b"USD",
+        terms_hash: Digest::from_bytes([0x74; 32]),
+        nonce: 1,
+    }
+}
+
+/// Test asset id derived from an issuer-controlled genesis.
 fn asset_id() -> Digest {
-    Digest::from_bytes([0x11; 32])
+    genesis().asset_id()
 }
 
 /// A coin in the test asset with the given value/owner/randomness.
@@ -36,7 +49,15 @@ fn prove_raw(
     outputs: &[Coin; 2],
 ) -> Result<opencsv_pcd::MintProof, MintError> {
     let mc = mint_commit(asset_id, value, nonce);
-    prove_mint_raw(asset_id, value, &mc, nonce, outputs)
+    prove_mint_raw(
+        asset_id,
+        &genesis(),
+        &ISSUER_SECRET,
+        value,
+        &mc,
+        nonce,
+        outputs,
+    )
 }
 
 /// Positive end-to-end test, covering the value edge cases `v = 0` and
@@ -46,7 +67,8 @@ fn prove_and_verify_mint() {
     let outputs = [coin(u64::MAX, 0x22, 0x33), coin(0, 0x44, 0x55)];
 
     let t = Instant::now();
-    let mint = prove_mint(&asset_id(), &mint_nonce(), &outputs).expect("proving should succeed");
+    let mint = prove_mint(&genesis(), &ISSUER_SECRET, &mint_nonce(), &outputs)
+        .expect("proving should succeed");
     let prove_time = t.elapsed();
     println!("prove_mint: {prove_time:?}");
 
@@ -87,7 +109,7 @@ fn unbalanced_mint_fails() {
 fn overflowing_mint_fails() {
     let outputs = [coin(u64::MAX, 0x22, 0x33), coin(1, 0x44, 0x55)];
 
-    let err = match prove_mint(&asset_id(), &mint_nonce(), &outputs) {
+    let err = match prove_mint(&genesis(), &ISSUER_SECRET, &mint_nonce(), &outputs) {
         Ok(_) => panic!("u64-overflowing outputs must be rejected up front"),
         Err(e) => e,
     };
@@ -111,7 +133,15 @@ fn wrong_mint_commit_fails() {
     // mint_commit binds a different nonce than the witness nonce.
     let other_nonce = Digest::from_bytes([0x77; 32]);
     let wrong_commit = mint_commit(&asset_id(), 15, &other_nonce);
-    let err = match prove_mint_raw(&asset_id(), 15, &wrong_commit, &mint_nonce(), &outputs) {
+    let err = match prove_mint_raw(
+        &asset_id(),
+        &genesis(),
+        &ISSUER_SECRET,
+        15,
+        &wrong_commit,
+        &mint_nonce(),
+        &outputs,
+    ) {
         Ok(_) => panic!("proving with a mismatched mint_commit must fail"),
         Err(e) => e,
     };
@@ -124,7 +154,8 @@ fn wrong_mint_commit_fails() {
 #[test]
 fn tampered_statement_fails_verification() {
     let outputs = [coin(5, 0x22, 0x33), coin(6, 0x44, 0x55)];
-    let mint = prove_mint(&asset_id(), &mint_nonce(), &outputs).expect("proving should succeed");
+    let mint = prove_mint(&genesis(), &ISSUER_SECRET, &mint_nonce(), &outputs)
+        .expect("proving should succeed");
 
     let mut tampered: MintStatement = mint.statement.clone();
     tampered.value += 1;
@@ -137,4 +168,49 @@ fn tampered_statement_fails_verification() {
     let err = verify_mint(&tampered, &mint)
         .expect_err("verification against tampered mint_commit must fail");
     assert!(matches!(err, MintError::StatementMismatch));
+}
+
+/// A forged issuer seed and a mismatched genesis both fail inside the AIR,
+/// independently of the checked API's early rejection.
+#[test]
+fn issuer_forgery_and_wrong_genesis_fail() {
+    let outputs = [coin(5, 0x22, 0x33), coin(6, 0x44, 0x55)];
+    let wrong_secret = [0x43; 32];
+
+    let err = match prove_mint(&genesis(), &wrong_secret, &mint_nonce(), &outputs) {
+        Ok(_) => panic!("checked proving must reject a foreign issuer seed"),
+        Err(error) => error,
+    };
+    assert!(matches!(err, MintError::IssuerKeyMismatch));
+
+    let mc = mint_commit(&asset_id(), 11, &mint_nonce());
+    let err = match prove_mint_raw(
+        &asset_id(),
+        &genesis(),
+        &wrong_secret,
+        11,
+        &mc,
+        &mint_nonce(),
+        &outputs,
+    ) {
+        Ok(_) => panic!("the circuit must reject a forged issuer seed"),
+        Err(error) => error,
+    };
+    assert!(matches!(err, MintError::Circuit(_)));
+
+    let mut wrong_genesis = genesis();
+    wrong_genesis.currency_code = *b"EUR";
+    let err = match prove_mint_raw(
+        &asset_id(),
+        &wrong_genesis,
+        &ISSUER_SECRET,
+        11,
+        &mc,
+        &mint_nonce(),
+        &outputs,
+    ) {
+        Ok(_) => panic!("the circuit must reject genesis data for another asset id"),
+        Err(error) => error,
+    };
+    assert!(matches!(err, MintError::Circuit(_)));
 }

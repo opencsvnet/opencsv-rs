@@ -34,8 +34,8 @@
 //! dedicated statement table (see [`crate::statement`]):
 //!
 //! ```text
-//! [mode(1) | asset_id(8) | V(3) | mint_commit(8) | nf_1(8) | nf_2(8) |
-//!  out_1(8) | out_2(8)]                                        (52 elements)
+//! [version(1) | mode(1) | asset_id(8) | V(3) | mint_commit(8) | nf_1(8) |
+//!  nf_2(8) | out_1(8) | out_2(8)]                         (53 elements)
 //! ```
 //!
 //! `mode` is `1` for mints, `0` for transfers, `2` for redeems (stage 4,
@@ -73,7 +73,10 @@
 //! allowlist the accepted root circuit/version rather than treating recursive
 //! predecessor binding as root-key authorization.
 
-use opencsv_core::{mint_commit, AssetId, Coin, Commitment, Digest, Nullifier, OwnerSecret};
+use opencsv_core::{
+    mint_commit, AssetGenesis, AssetId, Coin, Commitment, Digest, Nullifier, OwnerSecret,
+    PoseidonIssuerAuthorization,
+};
 use p3_baby_bear::BabyBear;
 use p3_circuit::{Circuit, CircuitBuilder, CircuitBuilderError, CircuitError, ExprId, NpoTypeId};
 use p3_circuit_prover::batch_stark_prover::{
@@ -87,6 +90,10 @@ use p3_recursion::{FriRecursionConfig, ObservableCommitment, Poseidon2Config, Re
 use serde::{Deserialize, Serialize};
 
 use crate::hash::{coin_commitment_base, connect_digest, hash_felts_base, hash_felts_limbs};
+use crate::issuer::{
+    enforce_authorization, witness_layout as issuer_witness_layout, witness_values, IssuerWitness,
+    ISSUER_AUTH_ELEMS,
+};
 use crate::recursion_config::{
     new_prover, node_table_provers, setup_circuit, setup_circuit_with_verification_keys,
     CoinFriParams, CoinRecursionConfig, RecSetup,
@@ -101,23 +108,24 @@ pub const NODE_INPUTS: usize = 2;
 /// Number of node outputs (created coins).
 pub const NODE_OUTPUTS: usize = 2;
 
-/// Statement layout, in field elements (see module docs):
-/// mode (1) + asset_id (8) + V (3) + mint_commit (8) + nullifiers (16) +
-/// output commitments (16).
-pub const STATEMENT_ELEMS: usize = 1 + 4 * DIGEST_ELEMS + VALUE_LIMBS + 2 * DIGEST_ELEMS; // 52
+/// Proof lineage version carrying in-circuit issuer authorization.
+pub const COIN_PROOF_VERSION: u8 = 2;
 
-// Statement element offsets.
-#[allow(dead_code)]
-const OFF_MODE: usize = 0;
-const OFF_ASSET: usize = 1;
-const OFF_VALUE: usize = OFF_ASSET + DIGEST_ELEMS; // 9
-const OFF_MINT_COMMIT: usize = OFF_VALUE + VALUE_LIMBS; // 12
-const OFF_NULLIFIERS: usize = OFF_MINT_COMMIT + DIGEST_ELEMS; // 20
-const OFF_OUTPUTS: usize = OFF_NULLIFIERS + NODE_INPUTS * DIGEST_ELEMS; // 36
+/// Statement layout, in field elements (see module docs):
+/// version (1) + mode (1) + asset_id (8) + V (3) + mint_commit (8) +
+/// nullifiers (16) + output commitments (16).
+pub const STATEMENT_ELEMS: usize = 2 + 4 * DIGEST_ELEMS + VALUE_LIMBS + 2 * DIGEST_ELEMS; // 53
+
+// Statement element offsets (version and mode occupy elements 0 and 1).
+const OFF_ASSET: usize = 2;
+const OFF_VALUE: usize = OFF_ASSET + DIGEST_ELEMS; // 10
+const OFF_MINT_COMMIT: usize = OFF_VALUE + VALUE_LIMBS; // 13
+const OFF_NULLIFIERS: usize = OFF_MINT_COMMIT + DIGEST_ELEMS; // 21
+const OFF_OUTPUTS: usize = OFF_NULLIFIERS + NODE_INPUTS * DIGEST_ELEMS; // 37
 
 /// Number of instance public values the statement table carries (D = 4
 /// coefficients per statement element).
-pub const STATEMENT_PUBLIC_VALUES: usize = 4 * STATEMENT_ELEMS; // 208
+pub const STATEMENT_PUBLIC_VALUES: usize = 4 * STATEMENT_ELEMS; // 212
 
 /// Private witness elements of the node (transfer) circuit: asset_id (8) +
 /// per input (v 3 + owner 8 + r 8 + osk 11) + per output (v 3 + owner 8 +
@@ -128,9 +136,12 @@ pub const NODE_PRIVATE_ELEMS: usize = DIGEST_ELEMS
     + NODE_INPUTS; // 108
 
 /// Private witness elements of the mint circuit: asset_id (8) + V (3) +
-/// mint_nonce (8) + per output (v 3 + owner 8 + r 8).
-pub const MINT_PRIVATE_ELEMS: usize =
-    2 * DIGEST_ELEMS + VALUE_LIMBS + NODE_OUTPUTS * (VALUE_LIMBS + 2 * DIGEST_ELEMS); // 57
+/// mint_nonce (8) + issuer authorization (23) + per output
+/// (v 3 + owner 8 + r 8).
+pub const MINT_PRIVATE_ELEMS: usize = 2 * DIGEST_ELEMS
+    + VALUE_LIMBS
+    + ISSUER_AUTH_ELEMS
+    + NODE_OUTPUTS * (VALUE_LIMBS + 2 * DIGEST_ELEMS); // 80
 
 /// Private witness elements of the redeem circuit: asset_id (8) + input coin
 /// (v 3 + owner 8 + r 8 + osk 11) + predecessor output selector `k` (1).
@@ -168,6 +179,7 @@ impl NodeStatement {
     /// coefficients per statement element, higher coefficients zero).
     pub fn to_public_values(&self, mode: NodeMode) -> Vec<BabyBear> {
         let mut elems = Vec::with_capacity(STATEMENT_ELEMS);
+        elems.push(BabyBear::new(COIN_PROOF_VERSION as u32));
         elems.push(match mode {
             NodeMode::Mint => BabyBear::ONE,
             NodeMode::Transfer => BabyBear::ZERO,
@@ -195,6 +207,8 @@ impl NodeStatement {
 /// A proof-carrying-data coin proof: a batch-STARK proof of the mint circuit
 /// or the node (transfer) circuit, with its statement.
 pub struct CoinProof {
+    /// Fail-closed proof lineage version.
+    pub version: u8,
     /// Mint or transfer.
     pub mode: NodeMode,
     /// The statement the circuit computed; equals the statement table's
@@ -284,8 +298,17 @@ fn verification_key_identity(coin: &CoinProof) -> SetupIdentity {
 /// Errors from proving or verifying a coin proof.
 #[derive(Debug)]
 pub enum NodeError {
+    /// The supplied issuer seed does not control the genesis issuer key.
+    IssuerKeyMismatch,
     /// Not all coins are denominated in the stated asset.
     AssetMismatch,
+    /// The minted output values sum to more than `u64::MAX`.
+    ValueOverflow,
+    /// The proof belongs to an unsupported or unauthenticated lineage.
+    UnsupportedProofVersion {
+        /// Version carried by the proof.
+        actual: u8,
+    },
     /// A predecessor's `asset_id` does not match this node's asset.
     PredecessorAssetMismatch,
     /// A predecessor's selected output commitment does not equal the consumed
@@ -293,6 +316,13 @@ pub enum NodeError {
     PredecessorOutputMismatch,
     /// A predecessor is not a [`CoinProof`]-shaped proof (no statement table).
     MissingStatement,
+    /// A predecessor's statement table belongs to another proof lineage.
+    PredecessorStatementShapeMismatch {
+        /// Number of statement public values in the predecessor proof.
+        actual: usize,
+        /// Number required by this proof lineage.
+        expected: usize,
+    },
     /// A predecessor or verifier circuit has no preprocessed verification key.
     MissingPredecessorVerificationKey,
     /// The allocated predecessor-key target has a different shape than the
@@ -322,7 +352,15 @@ pub enum NodeError {
 impl std::fmt::Display for NodeError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::IssuerKeyMismatch => {
+                write!(f, "issuer seed does not control the asset genesis key")
+            }
             Self::AssetMismatch => write!(f, "coin asset does not match the stated asset"),
+            Self::ValueOverflow => write!(f, "mint output values overflow u64"),
+            Self::UnsupportedProofVersion { actual } => write!(
+                f,
+                "unsupported coin-proof version {actual}; expected {COIN_PROOF_VERSION}"
+            ),
             Self::PredecessorAssetMismatch => {
                 write!(f, "predecessor asset does not match this node's asset")
             }
@@ -331,6 +369,10 @@ impl std::fmt::Display for NodeError {
                 "predecessor output commitment does not match the consumed input coin"
             ),
             Self::MissingStatement => write!(f, "predecessor proof has no statement table"),
+            Self::PredecessorStatementShapeMismatch { actual, expected } => write!(
+                f,
+                "predecessor statement shape mismatch: found {actual} public values, expected {expected}"
+            ),
             Self::MissingPredecessorVerificationKey => {
                 write!(f, "predecessor proof has no preprocessed verification key")
             }
@@ -419,6 +461,7 @@ struct MintWitness<'a> {
     asset_id: &'a [ExprId],
     value_total: &'a [ExprId],
     mint_nonce: &'a [ExprId],
+    issuer: IssuerWitness<'a>,
     outputs: [(&'a [ExprId], &'a [ExprId], &'a [ExprId]); NODE_OUTPUTS],
 }
 
@@ -427,7 +470,10 @@ fn mint_witness_layout(private: &[ExprId]) -> MintWitness<'_> {
     let asset_id = &private[0..DIGEST_ELEMS];
     let value_total = &private[DIGEST_ELEMS..DIGEST_ELEMS + VALUE_LIMBS];
     let mint_nonce = &private[DIGEST_ELEMS + VALUE_LIMBS..2 * DIGEST_ELEMS + VALUE_LIMBS];
-    let base = 2 * DIGEST_ELEMS + VALUE_LIMBS;
+    let issuer_start = 2 * DIGEST_ELEMS + VALUE_LIMBS;
+    let issuer_end = issuer_start + ISSUER_AUTH_ELEMS;
+    let issuer = issuer_witness_layout(&private[issuer_start..issuer_end]);
+    let base = issuer_end;
     let outputs = std::array::from_fn(|i| {
         let s = base + i * OUT_ELEMS;
         (
@@ -440,6 +486,7 @@ fn mint_witness_layout(private: &[ExprId]) -> MintWitness<'_> {
         asset_id,
         value_total,
         mint_nonce,
+        issuer,
         outputs,
     }
 }
@@ -454,6 +501,9 @@ fn build_mint_circuit() -> Result<Circuit<EF>, NodeError> {
 
     let private = builder.alloc_private_inputs(MINT_PRIVATE_ELEMS, "mint_witness");
     let witness = mint_witness_layout(&private);
+
+    // Issuer seed -> issuer key -> genesis -> statement asset id.
+    enforce_authorization(&mut builder, witness.asset_id, &witness.issuer)?;
 
     // Values in range: the public total and every output value.
     let v_total: [ExprId; VALUE_LIMBS] = witness.value_total.try_into().expect("V has 3 limbs");
@@ -486,8 +536,12 @@ fn build_mint_circuit() -> Result<Circuit<EF>, NodeError> {
         &[witness.asset_id, witness.value_total, witness.mint_nonce],
     )?;
 
-    // Statement: [mode=1 | asset | V | mint_commit | nf = 0 ×2 | out ×2].
+    // Statement: [version=2 | mode=1 | asset | V | mint_commit | nf = 0 ×2 | out ×2].
     let mut stmt = Vec::with_capacity(STATEMENT_ELEMS);
+    stmt.push(const_expr(
+        &mut builder,
+        BabyBear::new(COIN_PROOF_VERSION as u32),
+    ));
     stmt.push(const_expr(&mut builder, BabyBear::ONE));
     stmt.extend_from_slice(witness.asset_id);
     stmt.extend_from_slice(witness.value_total);
@@ -632,8 +686,12 @@ fn build_node_circuit(
         Err(_) => unreachable!("two predecessors verified above"),
     };
 
-    // --- statement: [mode=0 | asset | V = 0 | mint_commit = 0 | nf ×2 | out ×2].
+    // --- statement: [version=2 | mode=0 | asset | V = 0 | mint_commit = 0 | nf ×2 | out ×2].
     let mut stmt = Vec::with_capacity(STATEMENT_ELEMS);
+    stmt.push(const_expr(
+        &mut builder,
+        BabyBear::new(COIN_PROOF_VERSION as u32),
+    ));
     stmt.push(ExprId::ZERO);
     stmt.extend_from_slice(witness.asset_id);
     for _ in 0..VALUE_LIMBS + DIGEST_ELEMS {
@@ -738,6 +796,11 @@ fn chain_predecessor(
     selector: ExprId,
     commitment: &[ExprId; DIGEST_ELEMS],
 ) -> Result<PredVerifier, NodeError> {
+    if pred.version != COIN_PROOF_VERSION {
+        return Err(NodeError::UnsupportedProofVersion {
+            actual: pred.version,
+        });
+    }
     let stmt_instance = pred
         .proof
         .non_primitives
@@ -772,7 +835,12 @@ fn chain_predecessor(
     bind_predecessor_verification_key(builder, &verifier_inputs, pred)?;
 
     let stmt_targets = &verifier_inputs.air_public_targets[stmt_instance];
-    assert_eq!(stmt_targets.len(), STATEMENT_PUBLIC_VALUES);
+    if stmt_targets.len() != STATEMENT_PUBLIC_VALUES {
+        return Err(NodeError::PredecessorStatementShapeMismatch {
+            actual: stmt_targets.len(),
+            expected: STATEMENT_PUBLIC_VALUES,
+        });
+    }
     // Statement element `e` coefficient-0 target (all statement elements
     // are base-embedded by construction).
     let elem = |e: usize| stmt_targets[4 * e];
@@ -868,8 +936,12 @@ fn build_redeem_circuit(
         &commitment,
     )?;
 
-    // --- statement: [mode=2 | asset | V = v | mint_commit = 0 | nf | 0 | 0 | 0].
+    // --- statement: [version=2 | mode=2 | asset | V = v | mint_commit = 0 | nf | 0 | 0 | 0].
     let mut stmt = Vec::with_capacity(STATEMENT_ELEMS);
+    stmt.push(const_expr(
+        &mut builder,
+        BabyBear::new(COIN_PROOF_VERSION as u32),
+    ));
     stmt.push(const_expr(&mut builder, BabyBear::new(2)));
     stmt.extend_from_slice(asset_id);
     stmt.extend_from_slice(v);
@@ -903,11 +975,28 @@ fn mint_setup() -> Result<RecSetup, NodeError> {
     )?)
 }
 
-/// Prove a genesis mint: no predecessors (paper §4.4 predicate plus the
-/// statement table). The issuer signature stays off-circuit (stage-2
-/// deviation, unchanged).
+/// Prove an issuer-authorized genesis mint with no predecessors (paper §4.4
+/// predicate plus the statement table).
 pub fn prove_genesis_mint(
+    genesis: &AssetGenesis,
+    issuer_secret: &[u8; 32],
+    mint_nonce: &Digest,
+    outputs: &[Coin; NODE_OUTPUTS],
+) -> Result<CoinProof, NodeError> {
+    if !PoseidonIssuerAuthorization::controls(issuer_secret, &genesis.issuer_pk) {
+        return Err(NodeError::IssuerKeyMismatch);
+    }
+    let asset_id = genesis.asset_id();
+    prove_genesis_mint_raw(&asset_id, genesis, issuer_secret, mint_nonce, outputs)
+}
+
+/// Low-level genesis prover that skips the native key/genesis consistency
+/// precheck so adversarial tests exercise the circuit constraints directly.
+#[doc(hidden)]
+pub fn prove_genesis_mint_raw(
     asset_id: &AssetId,
+    genesis: &AssetGenesis,
+    issuer_secret: &[u8; 32],
     mint_nonce: &Digest,
     outputs: &[Coin; NODE_OUTPUTS],
 ) -> Result<CoinProof, NodeError> {
@@ -916,7 +1005,7 @@ pub fn prove_genesis_mint(
     }
     let mut value = 0u64;
     for c in outputs {
-        value = value.checked_add(c.value).ok_or(NodeError::AssetMismatch)?;
+        value = value.checked_add(c.value).ok_or(NodeError::ValueOverflow)?;
     }
     let mc = mint_commit(asset_id, value, mint_nonce);
 
@@ -924,6 +1013,11 @@ pub fn prove_genesis_mint(
     private_values.extend(asset_id.to_elems().iter().map(|&x| EF::from(x)));
     private_values.extend(u64_to_felts(value).iter().map(|&x| EF::from(x)));
     private_values.extend(mint_nonce.to_elems().iter().map(|&x| EF::from(x)));
+    private_values.extend(
+        witness_values(issuer_secret, genesis)
+            .iter()
+            .map(|&x| EF::from(x)),
+    );
     for c in outputs {
         private_values.extend(u64_to_felts(c.value).iter().map(|&x| EF::from(x)));
         private_values.extend(c.owner.to_elems().iter().map(|&x| EF::from(x)));
@@ -941,6 +1035,7 @@ pub fn prove_genesis_mint(
     let proof = prover.prove_all_tables(&traces, &circuit_prover_data)?;
 
     Ok(CoinProof {
+        version: COIN_PROOF_VERSION,
         mode: NodeMode::Mint,
         statement: NodeStatement {
             asset_id: *asset_id,
@@ -1053,6 +1148,7 @@ pub fn prove_transfer(
     let proof = prover.prove_all_tables(&traces, &circuit_prover_data)?;
 
     Ok(CoinProof {
+        version: COIN_PROOF_VERSION,
         mode: NodeMode::Transfer,
         statement: NodeStatement {
             asset_id: *asset_id,
@@ -1070,6 +1166,11 @@ pub fn prove_transfer(
 /// `expected` (this is the cryptographically bound channel — see module
 /// docs), then natively verifies the batch-STARK proof.
 pub fn verify_coin_proof(expected: &NodeStatement, coin: &CoinProof) -> Result<(), NodeError> {
+    if coin.version != COIN_PROOF_VERSION {
+        return Err(NodeError::UnsupportedProofVersion {
+            actual: coin.version,
+        });
+    }
     let pvs = coin
         .statement_public_values()
         .ok_or(NodeError::MissingStatement)?;
@@ -1169,6 +1270,7 @@ pub fn prove_redeem(
     let proof = prover.prove_all_tables(&traces, &circuit_prover_data)?;
 
     Ok(CoinProof {
+        version: COIN_PROOF_VERSION,
         mode: NodeMode::Redeem,
         statement: NodeStatement {
             asset_id: *asset_id,
