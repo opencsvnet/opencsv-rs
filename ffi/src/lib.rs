@@ -703,6 +703,40 @@ pub unsafe extern "C" fn opencsv_scan_verify(
     })
 }
 
+/// Open a persistent CBF client (peers stay connected between syncs —
+/// see [`scan`]). Returns
+/// `{"client_id":N,"tip_height":N,"handshakes":N}`.
+///
+/// # Safety
+/// `config_json` must be a valid NUL-terminated C string.
+#[no_mangle]
+pub unsafe extern "C" fn opencsv_cbf_open(config_json: *const c_char) -> *mut c_char {
+    guarded(|| {
+        match unsafe { in_str(config_json, "config_json") }.and_then(scan::open_json) {
+            Ok(value) => out(value),
+            Err(e) => err(e),
+        }
+    })
+}
+
+/// Drop a persistent CBF client. Returns `{"ok":true}`.
+#[no_mangle]
+pub extern "C" fn opencsv_cbf_close(client_id: u64) -> *mut c_char {
+    guarded(|| out(scan::close_json(client_id)))
+}
+
+/// Sync with a persistent client opened by [`opencsv_cbf_open`]:
+/// headers on the existing connections (no re-handshake), then the
+/// scan index. Returns the [`opencsv_scan_sync`] shape plus
+/// `{"handshakes":N}` (constant across calls on one client).
+#[no_mangle]
+pub extern "C" fn opencsv_scan_sync_with(client_id: u64) -> *mut c_char {
+    guarded(|| match scan::sync_with_json(client_id) {
+        Ok(value) => out(value),
+        Err(e) => err(e),
+    })
+}
+
 /// Free a string returned by any function in this library.
 ///
 /// # Safety

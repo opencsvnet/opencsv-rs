@@ -103,6 +103,15 @@ char *opencsv_wallet_mark_spent(uint64_t handle, const char *coin_ids_json);
 char *opencsv_balance(uint64_t handle);
 char *opencsv_audit(const char *asset_id_hex, const char *anchor_snapshot_json);
 
+/* Persistent CBF client: opencsv_cbf_open handshakes once and returns
+ * {"client_id":N,"tip_height":N,"handshakes":N}; opencsv_scan_sync_with
+ * syncs on the existing connections (no per-call re-dial) with the
+ * opencsv_scan_sync result shape plus "handshakes" (constant per client).
+ * The one-shot opencsv_scan_sync keeps working (re-dials per call). */
+char *opencsv_cbf_open(const char *config_json);
+char *opencsv_cbf_close(uint64_t client_id);
+char *opencsv_scan_sync_with(uint64_t client_id);
+
 /* Free any string returned by this library. */
 void opencsv_string_free(char *s);
 

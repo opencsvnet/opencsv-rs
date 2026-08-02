@@ -20,9 +20,10 @@ pub fn bitcoind_path() -> Option<PathBuf> {
     path.exists().then_some(path)
 }
 
-/// A currently-free TCP port (small race with the later bind; fine for
-/// tests).
-pub fn free_port() -> u16 {
+/// A currently-free TCP port (small race with the later bind — the
+/// startup retry below covers it, since several test binaries run
+/// concurrently and can draw the same port).
+fn free_port() -> u16 {
     TcpListener::bind("127.0.0.1:0")
         .unwrap()
         .local_addr()
@@ -41,7 +42,24 @@ pub struct Node {
 
 impl Node {
     /// Spawn bitcoind on `datadir` and wait for its RPC interface.
+    /// Port-draw races between concurrent test binaries occasionally
+    /// make bitcoind exit at startup (address already in use); retry a
+    /// few times with fresh ports.
     pub fn start(bitcoind: &PathBuf, datadir: PathBuf) -> Self {
+        for attempt in 0..5 {
+            let datadir = if attempt == 0 {
+                datadir.clone()
+            } else {
+                datadir.with_extension(format!("retry{attempt}"))
+            };
+            if let Some(node) = Self::try_start(bitcoind, datadir) {
+                return node;
+            }
+        }
+        panic!("bitcoind did not come up after 5 attempts");
+    }
+
+    fn try_start(bitcoind: &PathBuf, datadir: PathBuf) -> Option<Self> {
         std::fs::create_dir_all(&datadir).unwrap();
         let rpc_port = free_port();
         let p2p_port = free_port();
@@ -63,26 +81,30 @@ impl Node {
             .stderr(Stdio::null())
             .spawn()
             .expect("spawn bitcoind");
-        let node = Self {
-            child,
+        let mut node = Self {
             rpc_url: format!("http://127.0.0.1:{rpc_port}"),
             cookie: datadir.join("regtest/.cookie"),
             p2p_port,
             debug_log: datadir.join("regtest/debug.log"),
+            child,
         };
-        let deadline = Instant::now() + Duration::from_secs(60);
+        let deadline = Instant::now() + Duration::from_secs(30);
         loop {
             if node.cookie.exists() && node.rpc(None).call("getblockcount", json!([])).is_ok() {
-                break;
+                return Some(node);
             }
-            assert!(
-                Instant::now() < deadline,
-                "bitcoind RPC did not come up; see {}",
-                node.debug_log.display()
-            );
+            // bitcoind died at startup (e.g. the port draw lost a race)?
+            if let Ok(Some(_)) = node.child.try_wait() {
+                return None;
+            }
+            if Instant::now() >= deadline {
+                let mut node = node;
+                let _ = node.child.kill();
+                let _ = node.child.wait();
+                return None;
+            }
             std::thread::sleep(Duration::from_millis(200));
         }
-        node
     }
 
     /// An RPC client (optionally scoped to a wallet).

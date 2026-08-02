@@ -49,6 +49,126 @@ struct ScanRegistration {
 
 static LAST_SCAN: LazyLock<Mutex<Option<ScanRegistration>>> = LazyLock::new(|| Mutex::new(None));
 
+/// A persistent CBF client: peers stay connected between syncs (the
+/// one-shot [`sync_json`] re-dials on every call — the persistent
+/// client is for hosts that sync often, e.g. on every foregrounding).
+struct PersistentClient {
+    client: CbfClient,
+    network: Network,
+    cache_dir: String,
+    from_height: u64,
+    required_confirmations: u64,
+}
+
+struct ClientRegistry {
+    clients: std::collections::HashMap<u64, PersistentClient>,
+    next_id: u64,
+}
+
+static CLIENTS: LazyLock<Mutex<ClientRegistry>> = LazyLock::new(|| {
+    Mutex::new(ClientRegistry {
+        clients: std::collections::HashMap::new(),
+        next_id: 1,
+    })
+});
+
+/// Open a persistent client (handshakes once) and register it for
+/// [`sync_with_json`]. Returns
+/// `{"client_id":N,"tip_height":N,"handshakes":N}`.
+pub fn open_json(config_json: &str) -> Result<Value, String> {
+    let config: ScanConfigJson =
+        serde_json::from_str(config_json).map_err(|e| format!("scan config JSON: {e}"))?;
+    let network = Network::parse(&config.network).map_err(|e| e.to_string())?;
+    let client = CbfClient::connect(&CbfConfig {
+        network,
+        peers: config.peers.clone(),
+        cache_dir: config.cache_dir.clone().into(),
+        timeout: std::time::Duration::from_millis(config.timeout_ms.unwrap_or(30_000)),
+    })
+    .map_err(|e| e.to_string())?;
+    let entry = PersistentClient {
+        from_height: config.from_height,
+        required_confirmations: config.required_confirmations.unwrap_or(0),
+        cache_dir: config.cache_dir,
+        network,
+        client,
+    };
+    let handshakes = entry.client.handshake_count();
+    let tip = entry.client.tip_height();
+    let mut registry = match CLIENTS.lock() {
+        Ok(registry) => registry,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    let client_id = registry.next_id;
+    registry.next_id += 1;
+    registry.clients.insert(client_id, entry);
+    Ok(json!({
+        "client_id": client_id,
+        "tip_height": tip,
+        "handshakes": handshakes,
+    }))
+}
+
+/// Drop a persistent client. Returns `{"ok":true}`.
+pub fn close_json(client_id: u64) -> Value {
+    let mut registry = match CLIENTS.lock() {
+        Ok(registry) => registry,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    match registry.clients.remove(&client_id) {
+        Some(_) => json!({ "ok": true }),
+        None => json!({ "error": format!("unknown client id {client_id}") }),
+    }
+}
+
+/// Sync with a persistent client opened by [`open_json`]: headers on
+/// the existing connections (no re-handshake — the response's
+/// `handshakes` counter does not move), then the scan index. Same
+/// result shape as [`sync_json`], plus `handshakes`.
+pub fn sync_with_json(client_id: u64) -> Result<Value, String> {
+    let mut registry = match CLIENTS.lock() {
+        Ok(registry) => registry,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    let entry = registry
+        .clients
+        .get_mut(&client_id)
+        .ok_or_else(|| format!("unknown client id {client_id}"))?;
+    entry.client.sync().map_err(|e| e.to_string())?;
+    let mut index = ScanIndex::open(
+        std::path::Path::new(&entry.cache_dir).join("scan"),
+        entry.network,
+    )
+    .map_err(|e| e.to_string())?;
+    index
+        .scan_sync(&mut entry.client, entry.from_height)
+        .map_err(|e| e.to_string())?;
+    let counters = index.counters();
+    let tip = index.synced_tip();
+    let anchors = index.occurrences().len();
+    let handshakes = entry.client.handshake_count();
+    let network = entry.network;
+    let cache_dir = entry.cache_dir.clone();
+    let required_confirmations = entry.required_confirmations;
+    drop(registry);
+    let mut registration = match LAST_SCAN.lock() {
+        Ok(registration) => registration,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    *registration = Some(ScanRegistration {
+        network,
+        cache_dir,
+        required_confirmations,
+    });
+    Ok(json!({
+        "tip_height": tip,
+        "filters_bytes": counters.filters_bytes,
+        "blocks_bytes": counters.blocks_bytes,
+        "anchors": anchors,
+        "handshakes": handshakes,
+    }))
+}
+
 /// The sync config (module docs).
 #[derive(Deserialize)]
 pub struct ScanConfigJson {
