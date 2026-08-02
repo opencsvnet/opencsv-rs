@@ -26,6 +26,32 @@ Both reuse the opening circuit's sponge pattern (now factored into
 `src/hash.rs`), and share proving plumbing (`src/prove.rs`) and the u64
 value gadget (`src/value.rs`).
 
+## Prover setup cache (D1)
+
+Expensive AIR/preprocessed `CircuitProverData` is cached process-wide for
+both the standalone and recursive circuits. The cache key is a SHA-256
+identity over the full canonical circuit structure, table packing, AIR and
+constraint-profile identity, FRI parameters, crate version, and the pinned
+Plonky3-recursion revision. Recursive entries additionally include each
+predecessor's verification-key identity: proof metadata, table manifest,
+lookup description, preprocessed commitment, and commitment metadata. Proof
+witnesses and proof bytes are deliberately not part of that identity.
+
+The cache is bounded to eight least-recently-used entries per configuration
+family. Circuit executors at the pinned upstream revision are neither `Send`
+nor `Sync`, so circuits remain local to each caller. Only preprocessed prover
+data is shared, behind a mutex because its upstream ALU schedule cache is
+internally mutable. Witness generation remains concurrent; proving calls that
+reuse one setup serialize only while accessing that setup data. Poisoned
+locks are recovered because setup data is deterministic and contains no
+transactional application state.
+
+Tests cover cold/warm reuse, identity invalidation (circuit, setup parameters,
+and predecessor verification keys), bounded eviction, and concurrent cold
+access with exactly one construction. This cache-key binding does not close
+the predecessor-vk soundness gap described below; D4 must still enforce that
+identity independently of call-site discipline.
+
 **Stage 3:** real PCD recursion (paper §4.5 item 4). The
 `src/node.rs` module adds:
 

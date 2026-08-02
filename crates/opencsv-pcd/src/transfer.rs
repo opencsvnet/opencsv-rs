@@ -38,6 +38,7 @@ use crate::hash::{
     OSK_ELEMS,
 };
 use crate::prove::{new_prover, setup, Setup};
+use crate::setup_cache::lock_setup;
 use crate::value::{enforce_sum_eq, range_check_value, u64_to_felts, VALUE_LIMBS};
 use crate::{DIGEST_ELEMS, EF};
 
@@ -275,7 +276,8 @@ pub fn prove_transfer(
     let traces = runner.run()?;
 
     let prover = new_prover(s.stark_config, s.table_packing);
-    let proof = prover.prove_all_tables(&traces, &s.circuit_prover_data)?;
+    let circuit_prover_data = lock_setup(&s.circuit_prover_data);
+    let proof = prover.prove_all_tables(&traces, &circuit_prover_data)?;
 
     Ok(TransferProof {
         statement: TransferStatement {

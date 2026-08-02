@@ -10,6 +10,7 @@ opencsv-core = { path = "../opencsv-core" }
 hashbrown = "0.17.1"
 serde = { version = "1", features = ["derive"] }
 postcard = { version = "1.1.3", features = ["alloc"] }
+sha2 = "0.10"
 p3-air = "0.6.3"
 p3-baby-bear = "0.6.3"
 p3-batch-stark = "0.6.3"

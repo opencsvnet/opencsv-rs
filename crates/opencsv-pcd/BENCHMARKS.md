@@ -49,9 +49,12 @@ for the consignment encoding).
   predecessor verification (plus fewer Poseidon2 rows: one coin opening,
   one ownership hash, one nullifier hash, no outputs, no conservation
   gadget).
-- Prover-side setup (`ProverData::from_airs_and_degrees` per circuit shape)
-  is rebuilt per proof and included in the prove times above; caching it
-  per vk is a known optimization (see README "What's next").
+- These measurements predate the D1 setup cache, so each row includes a cold
+  `ProverData::from_airs_and_degrees` build. Current code caches that data by
+  complete circuit/config/predecessor-vk identity (see README "Prover setup
+  cache (D1)"). The table remains an honest receipt of the old run; cold/warm
+  numbers will be re-measured with the final D2 parameters rather than
+  retroactively relabeling these results.
 
 ## Core scaling (2026-07-31, same machine, release)
 

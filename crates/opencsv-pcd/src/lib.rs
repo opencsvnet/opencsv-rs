@@ -82,6 +82,7 @@ mod node;
 mod opening;
 mod prove;
 mod recursion_config;
+mod setup_cache;
 #[cfg(test)]
 mod spike;
 mod statement;

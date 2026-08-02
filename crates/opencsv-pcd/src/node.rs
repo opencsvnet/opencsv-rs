@@ -87,8 +87,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::hash::{coin_commitment_base, connect_digest, hash_felts_base, hash_felts_limbs};
 use crate::recursion_config::{
-    new_prover, node_table_provers, setup_circuit, CoinFriParams, CoinRecursionConfig, RecSetup,
+    new_prover, node_table_provers, setup_circuit, setup_circuit_with_verification_keys,
+    CoinFriParams, CoinRecursionConfig, RecSetup,
 };
+use crate::setup_cache::{lock_setup, SetupIdentity};
 use crate::statement::{statement_op_type, StatementCircuitPlugin};
 use crate::value::{enforce_sum_eq, range_check_value, u64_to_felts, VALUE_LIMBS};
 use crate::{DIGEST_ELEMS, EF};
@@ -211,6 +213,71 @@ impl CoinProof {
             .find(|e| e.op_type == statement_op_type())
             .map(|e| e.public_values.as_slice())
     }
+}
+
+/// Identity of exactly the predecessor verifier data consumed by recursive
+/// setup. D4 will additionally hard-bind this identity in-circuit; D1 uses it
+/// to prevent cache aliasing across foreign or changed verifier keys.
+fn verification_key_identity(coin: &CoinProof) -> SetupIdentity {
+    let proof = &coin.proof;
+    let packing = postcard::to_allocvec(&proof.table_packing)
+        .expect("table packing has an infallible postcard encoding");
+    let manifest = postcard::to_allocvec(&proof.non_primitives)
+        .expect("non-primitive manifest has an infallible postcard encoding");
+    let proof_metadata = format!(
+        "rows={:?}/alu={:?}/ext={}/w={:?}/quintic={}",
+        proof.rows,
+        proof.alu_variant,
+        proof.ext_degree,
+        proof.w_binomial,
+        proof.alu_quintic_trinomial,
+    );
+    let lookups = format!("{:?}", proof.stark_common.lookups);
+    let mut preprocessed_metadata = Vec::new();
+    let commitment = match &proof.stark_common.preprocessed {
+        Some(preprocessed) => {
+            preprocessed_metadata.extend_from_slice(b"present");
+            preprocessed_metadata
+                .extend_from_slice(&(preprocessed.instances.len() as u64).to_le_bytes());
+            for instance in &preprocessed.instances {
+                match instance {
+                    Some(instance) => {
+                        preprocessed_metadata.push(1);
+                        preprocessed_metadata
+                            .extend_from_slice(&(instance.matrix_index as u64).to_le_bytes());
+                        preprocessed_metadata
+                            .extend_from_slice(&(instance.width as u64).to_le_bytes());
+                        preprocessed_metadata
+                            .extend_from_slice(&(instance.degree_bits as u64).to_le_bytes());
+                    }
+                    None => preprocessed_metadata.push(0),
+                }
+            }
+            preprocessed_metadata
+                .extend_from_slice(&(preprocessed.matrix_to_instance.len() as u64).to_le_bytes());
+            for &instance in &preprocessed.matrix_to_instance {
+                preprocessed_metadata.extend_from_slice(&(instance as u64).to_le_bytes());
+            }
+            postcard::to_allocvec(&preprocessed.commitment)
+                .expect("preprocessed commitment has an infallible postcard encoding")
+        }
+        None => {
+            preprocessed_metadata.extend_from_slice(b"absent");
+            Vec::new()
+        }
+    };
+
+    SetupIdentity::for_verification_key(
+        b"coin-proof-verification-key",
+        &[
+            packing.as_slice(),
+            manifest.as_slice(),
+            proof_metadata.as_bytes(),
+            commitment.as_slice(),
+            preprocessed_metadata.as_slice(),
+            lookups.as_bytes(),
+        ],
+    )
 }
 
 /// Errors from proving or verifying a coin proof.
@@ -778,7 +845,8 @@ pub fn prove_genesis_mint(
     let traces = runner.run()?;
 
     let prover = new_prover::<STATEMENT_ELEMS>(&s.config, s.table_packing.clone());
-    let proof = prover.prove_all_tables(&traces, &s.circuit_prover_data)?;
+    let circuit_prover_data = lock_setup(&s.circuit_prover_data);
+    let proof = prover.prove_all_tables(&traces, &circuit_prover_data)?;
 
     Ok(CoinProof {
         mode: NodeMode::Mint,
@@ -828,7 +896,12 @@ pub fn prove_transfer(
 
     let config = CoinRecursionConfig::new(&coin_fri_params());
     let (circuit, preds) = build_node_circuit(&config, predecessors)?;
-    let s = setup_circuit::<STATEMENT_ELEMS>(circuit, &coin_fri_params())?;
+    let verification_keys = predecessors.map(verification_key_identity);
+    let s = setup_circuit_with_verification_keys::<STATEMENT_ELEMS>(
+        circuit,
+        &coin_fri_params(),
+        &verification_keys,
+    )?;
 
     // Private inputs: own witness, then per-predecessor verifier privates.
     let mut private_values = Vec::new();
@@ -884,7 +957,8 @@ pub fn prove_transfer(
     let traces = runner.run()?;
 
     let prover = new_prover::<STATEMENT_ELEMS>(&s.config, s.table_packing.clone());
-    let proof = prover.prove_all_tables(&traces, &s.circuit_prover_data)?;
+    let circuit_prover_data = lock_setup(&s.circuit_prover_data);
+    let proof = prover.prove_all_tables(&traces, &circuit_prover_data)?;
 
     Ok(CoinProof {
         mode: NodeMode::Transfer,
@@ -950,7 +1024,12 @@ pub fn prove_redeem(
 
     let config = CoinRecursionConfig::new(&coin_fri_params());
     let (circuit, pred) = build_redeem_circuit(&config, predecessor)?;
-    let s = setup_circuit::<STATEMENT_ELEMS>(circuit, &coin_fri_params())?;
+    let verification_keys = [verification_key_identity(predecessor)];
+    let s = setup_circuit_with_verification_keys::<STATEMENT_ELEMS>(
+        circuit,
+        &coin_fri_params(),
+        &verification_keys,
+    )?;
 
     // Private inputs: own witness, then the predecessor verifier privates.
     let mut private_values = Vec::new();
@@ -990,7 +1069,8 @@ pub fn prove_redeem(
     let traces = runner.run()?;
 
     let prover = new_prover::<STATEMENT_ELEMS>(&s.config, s.table_packing.clone());
-    let proof = prover.prove_all_tables(&traces, &s.circuit_prover_data)?;
+    let circuit_prover_data = lock_setup(&s.circuit_prover_data);
+    let proof = prover.prove_all_tables(&traces, &circuit_prover_data)?;
 
     Ok(CoinProof {
         mode: NodeMode::Redeem,

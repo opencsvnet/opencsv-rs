@@ -44,6 +44,7 @@ use p3_poseidon2_circuit_air::BabyBearD4Width16;
 
 use crate::hash::{connect_digest, hash_felts_limbs};
 use crate::prove::{new_prover, setup};
+use crate::setup_cache::lock_setup;
 use crate::value::u64_to_felts;
 use crate::{DIGEST_ELEMS, EF};
 
@@ -204,7 +205,8 @@ pub fn prove_opening_raw(
     let traces = runner.run()?;
 
     let prover = new_prover(s.stark_config, s.table_packing);
-    let proof = prover.prove_all_tables(&traces, &s.circuit_prover_data)?;
+    let circuit_prover_data = lock_setup(&s.circuit_prover_data);
+    let proof = prover.prove_all_tables(&traces, &circuit_prover_data)?;
 
     Ok(OpeningProof {
         commitment: *commitment,

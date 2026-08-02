@@ -21,6 +21,7 @@ use p3_recursion::FriRecursionConfig;
 use crate::recursion_config::{
     new_prover, node_table_provers, setup_circuit, CoinFriParams, CoinRecursionConfig,
 };
+use crate::setup_cache::lock_setup;
 use crate::statement::{statement_op_type, StatementCircuitPlugin, StatementProver};
 use crate::EF;
 
@@ -69,9 +70,12 @@ fn spike_statement_table_native() {
     let traces = runner.run().expect("witness gen");
 
     let prover = new_prover::<N>(&s.config, s.table_packing.clone());
-    let proof = prover
-        .prove_all_tables(&traces, &s.circuit_prover_data)
-        .expect("prove");
+    let proof = {
+        let circuit_prover_data = lock_setup(&s.circuit_prover_data);
+        prover
+            .prove_all_tables(&traces, &circuit_prover_data)
+            .expect("prove")
+    };
 
     // The statement table's instance public values must be the statement.
     let entry = proof
@@ -106,9 +110,12 @@ fn spike_in_circuit_verification() {
     runner0.set_private_inputs(&private).unwrap();
     let traces0 = runner0.run().expect("witness gen l0");
     let prover0 = new_prover::<N>(&s0.config, s0.table_packing.clone());
-    let proof0 = prover0
-        .prove_all_tables(&traces0, &s0.circuit_prover_data)
-        .expect("prove l0");
+    let proof0 = {
+        let circuit_prover_data = lock_setup(&s0.circuit_prover_data);
+        prover0
+            .prove_all_tables(&traces0, &circuit_prover_data)
+            .expect("prove l0")
+    };
     eprintln!("spike2 layer0 prove: {:?}", t0.elapsed());
 
     // --- layer 1: build the parent circuit verifying layer 0 in-circuit.
@@ -197,9 +204,12 @@ fn spike_in_circuit_verification() {
 
     let t3 = Instant::now();
     let prover1 = new_prover::<N>(&s1.config, s1.table_packing.clone());
-    let proof1 = prover1
-        .prove_all_tables(&traces1, &s1.circuit_prover_data)
-        .expect("prove l1");
+    let proof1 = {
+        let circuit_prover_data = lock_setup(&s1.circuit_prover_data);
+        prover1
+            .prove_all_tables(&traces1, &circuit_prover_data)
+            .expect("prove l1")
+    };
     eprintln!("spike2 parent prove: {:?}", t3.elapsed());
 
     let t4 = Instant::now();

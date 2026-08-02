@@ -15,7 +15,7 @@
 //! be re-chosen (and the in-circuit verifier cost re-measured) before any of
 //! this is relied upon.
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use p3_baby_bear::{default_babybear_poseidon2_16, BabyBear, Poseidon2BabyBear};
 use p3_challenger::DuplexChallenger;
@@ -275,7 +275,17 @@ use p3_circuit_prover::{
     RecomposePreprocessor, TablePacking,
 };
 
+use crate::setup_cache::{CachedSetup, SetupCache, SetupIdentity};
 use crate::statement::{StatementAirBuilder, StatementPreprocessor, StatementProver};
+
+const RECURSIVE_SETUP_CACHE_CAPACITY: usize = 8;
+
+type RecCircuitProverData = CircuitProverData<CoinRecursionConfig>;
+
+fn recursive_setup_cache() -> &'static SetupCache<RecCircuitProverData> {
+    static CACHE: OnceLock<SetupCache<RecCircuitProverData>> = OnceLock::new();
+    CACHE.get_or_init(|| SetupCache::new(RECURSIVE_SETUP_CACHE_CAPACITY))
+}
 
 /// Prover-side data for a built recursive node circuit (statement size `N`).
 pub(crate) struct RecSetup {
@@ -287,7 +297,7 @@ pub(crate) struct RecSetup {
     pub table_packing: TablePacking,
     /// Preprocessed prover data for this circuit shape (the "vk" side: the
     /// preprocessed commitment in `prover_data.common` binds the circuit).
-    pub circuit_prover_data: CircuitProverData<CoinRecursionConfig>,
+    pub circuit_prover_data: CachedSetup<RecCircuitProverData>,
 }
 
 /// Build the prover-side AIR/preprocessed data for a recursive node circuit
@@ -296,30 +306,65 @@ pub(crate) fn setup_circuit<const N: usize>(
     circuit: Circuit<EF>,
     fri_params: &CoinFriParams,
 ) -> Result<RecSetup, p3_circuit::CircuitError> {
+    setup_circuit_with_verification_keys::<N>(circuit, fri_params, &[])
+}
+
+/// Build or reuse recursive prover data, including every predecessor
+/// verification-key identity in the cache key. The predecessor keys are not
+/// a substitute for D4's in-circuit hard binding; they prevent setup data
+/// from being aliased across distinct verifier inputs before that boundary is
+/// enforced.
+pub(crate) fn setup_circuit_with_verification_keys<const N: usize>(
+    circuit: Circuit<EF>,
+    fri_params: &CoinFriParams,
+    verification_keys: &[SetupIdentity],
+) -> Result<RecSetup, p3_circuit::CircuitError> {
     let config = CoinRecursionConfig::new(fri_params);
     let table_packing = TablePacking::new(1, 3)
         .with_fri_params(fri_params.log_final_poly_len, fri_params.log_blowup);
+    let fri_identity = format!("{fri_params:?}");
+    let packing_identity = format!("{table_packing:?}");
+    let statement_identity = format!("statement-elements={N}");
+    let identity = SetupIdentity::for_circuit(
+        b"recursive-baby-bear",
+        &circuit,
+        &[
+            fri_identity.as_bytes(),
+            packing_identity.as_bytes(),
+            statement_identity.as_bytes(),
+            b"poseidon2-d4-w16/recompose-d4-limb1/statement-d4/constraint-standard",
+        ],
+        verification_keys,
+    );
 
-    let npo_prep: Vec<Box<dyn NpoPreprocessor<BabyBear>>> = vec![
-        Box::new(Poseidon2Preprocessor),
-        Box::new(RecomposePreprocessor::default()),
-        Box::new(StatementPreprocessor),
-    ];
-    let mut air_builders = poseidon2_air_builders::<CoinRecursionConfig, 4>();
-    air_builders.extend(recompose_air_builders(1, false));
-    air_builders.push(Box::new(StatementAirBuilder::<4, N>));
-    let (airs_degrees, primitive_columns, non_primitive_columns) =
-        get_airs_and_degrees_with_prep::<CoinRecursionConfig, _, 4>(
-            &circuit,
-            &table_packing,
-            &npo_prep,
-            &air_builders,
-            ConstraintProfile::Standard,
-        )?;
-    let (airs, degrees): (Vec<_>, Vec<usize>) = airs_degrees.into_iter().unzip();
-    let prover_data = ProverData::from_airs_and_degrees(&config, &airs, &degrees);
-    let circuit_prover_data =
-        CircuitProverData::new(prover_data, primitive_columns, non_primitive_columns);
+    let circuit_prover_data = recursive_setup_cache().get_or_try_insert_with(
+        identity,
+        || -> Result<RecCircuitProverData, p3_circuit::CircuitError> {
+            let npo_prep: Vec<Box<dyn NpoPreprocessor<BabyBear>>> = vec![
+                Box::new(Poseidon2Preprocessor),
+                Box::new(RecomposePreprocessor::default()),
+                Box::new(StatementPreprocessor),
+            ];
+            let mut air_builders = poseidon2_air_builders::<CoinRecursionConfig, 4>();
+            air_builders.extend(recompose_air_builders(1, false));
+            air_builders.push(Box::new(StatementAirBuilder::<4, N>));
+            let (airs_degrees, primitive_columns, non_primitive_columns) =
+                get_airs_and_degrees_with_prep::<CoinRecursionConfig, _, 4>(
+                    &circuit,
+                    &table_packing,
+                    &npo_prep,
+                    &air_builders,
+                    ConstraintProfile::Standard,
+                )?;
+            let (airs, degrees): (Vec<_>, Vec<usize>) = airs_degrees.into_iter().unzip();
+            let prover_data = ProverData::from_airs_and_degrees(&config, &airs, &degrees);
+            Ok(CircuitProverData::new(
+                prover_data,
+                primitive_columns,
+                non_primitive_columns,
+            ))
+        },
+    )?;
 
     Ok(RecSetup {
         circuit,
