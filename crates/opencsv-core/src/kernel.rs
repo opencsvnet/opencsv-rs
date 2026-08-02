@@ -48,3 +48,12 @@ pub(crate) fn record(record: &AnchorRecord) -> opencsv_kernel::Record {
         },
     }
 }
+
+pub(crate) fn anchors(
+    anchors: &[(AnchorLocation, AnchorRecord)],
+) -> Vec<(opencsv_kernel::Location, opencsv_kernel::Record)> {
+    anchors
+        .iter()
+        .map(|(anchor_location, anchor_record)| (location(anchor_location), record(anchor_record)))
+        .collect()
+}

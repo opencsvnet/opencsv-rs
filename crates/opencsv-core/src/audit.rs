@@ -15,12 +15,8 @@
 //! `asset_id ∥ V ∥ mint_nonce`, so a genuine second mint of the same asset
 //! has a fresh nonce and a fresh commitment).
 
-use std::collections::HashSet;
-
-use crate::anchor::AnchorRecord;
 use crate::asset::AssetId;
 use crate::chain::AnchorChain;
-use crate::digest::TruncatedDigest;
 
 /// Failure modes of [`supply`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -46,23 +42,8 @@ pub fn supply<C: AnchorChain>(
     asset_id: &AssetId,
     height: u64,
 ) -> Result<u64, SupplyError> {
-    let target = asset_id.to_anchor();
-    let mut seen_mints: HashSet<TruncatedDigest> = HashSet::new();
-    let mut total: i128 = 0;
-    for (_, record) in chain.anchors_up_to(height) {
-        match record {
-            AnchorRecord::Mint {
-                asset_id,
-                value,
-                mint_commit,
-            } if asset_id == target && seen_mints.insert(mint_commit) => {
-                total += i128::from(value);
-            }
-            AnchorRecord::Redeem {
-                asset_id, value, ..
-            } if asset_id == target => total -= i128::from(value),
-            _ => {}
-        }
-    }
-    u64::try_from(total).map_err(|_| SupplyError::NegativeSupply)
+    let anchors = chain.anchors_up_to(height);
+    let kernel_anchors = crate::kernel::anchors(&anchors);
+    opencsv_kernel::supply(&kernel_anchors, &asset_id.to_anchor().0, height)
+        .map_err(|opencsv_kernel::SupplyError::NegativeSupply| SupplyError::NegativeSupply)
 }
