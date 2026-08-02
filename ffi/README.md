@@ -16,7 +16,11 @@ plus the 32-byte transaction context `ctx` it is bound to (the record's
 nullifier payloads are `H("bind" ∥ raw_nf ∥ ctx)`), to publish together
 (e.g. to `opencsv-anchor-server`), and
 `opencsv_consignment_finalize` builds the consignment blob once the host
-knows where it anchored. Between the two phases the pending transaction
+knows where it anchored. A consignment finalized before the anchor's mined
+position is known carries the mempool sentinel location `(0, 0)`: the
+snapshot chain resolves such references by transaction id (the same
+contract as `opencsv-bitcoin`'s backend), while explicitly claimed
+locations are matched strictly. Between the two phases the pending transaction
 lives only in memory; `opencsv_pending_export` / `opencsv_pending_import`
 persist it (proof, openings with their fresh randomness, aux, spend list)
 across the broadcast→finalize window, closing the crash-loses-consignment

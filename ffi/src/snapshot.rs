@@ -21,6 +21,7 @@
 //! testing the binding against the raw nullifier — something only the
 //! consignment holders can do.
 
+use opencsv_bitcoin::MEMPOOL_LOCATION;
 use opencsv_core::chain::{AnchorChain, AnchorLocation, AnchorRef};
 use opencsv_core::{AnchorRecord, Digest, ANCHOR_SIZE};
 use serde::{Deserialize, Serialize};
@@ -99,23 +100,41 @@ impl SnapshotChain {
     }
 }
 
+impl SnapshotChain {
+    /// Entry lookup: exact on `(location, txid)` — or by transaction id
+    /// alone when the reference carries the **mempool sentinel**
+    /// location [`MEMPOOL_LOCATION`] (0, 0), the same resolution
+    /// contract as `opencsv-bitcoin`'s `find()`/`locate()`: a
+    /// consignment written right after broadcast, before the anchor's
+    /// mined position was known, still resolves. A sentinel reference
+    /// whose txid is absent is the honest not-found; non-sentinel
+    /// references keep the exact-match behavior.
+    fn find(&self, anchor_ref: &AnchorRef) -> Option<&Entry> {
+        self.entries.iter().find(|e| {
+            e.txid == anchor_ref.txid
+                && (e.location == anchor_ref.location
+                    || anchor_ref.location == MEMPOOL_LOCATION)
+        })
+    }
+}
+
 impl AnchorChain for SnapshotChain {
     fn tip_height(&self) -> u64 {
         self.tip_height
     }
 
     fn anchor_at(&self, anchor_ref: &AnchorRef) -> Option<AnchorRecord> {
-        self.entries
-            .iter()
-            .find(|e| e.location == anchor_ref.location && e.txid == anchor_ref.txid)
-            .map(|e| e.record)
+        self.find(anchor_ref).map(|e| e.record)
     }
 
     fn ctx_at(&self, anchor_ref: &AnchorRef) -> Option<[u8; 32]> {
-        self.entries
-            .iter()
-            .find(|e| e.location == anchor_ref.location && e.txid == anchor_ref.txid)
-            .map(|e| e.ctx)
+        self.find(anchor_ref).map(|e| e.ctx)
+    }
+
+    fn locate(&self, anchor_ref: &AnchorRef) -> Option<AnchorLocation> {
+        // Resolve by transaction id (the sentinel contract above): the
+        // canonical location is the entry's real (height, position).
+        self.find(anchor_ref).map(|e| e.location)
     }
 
     fn first_nullifier_occurrence(&self, raw_nf: &Digest) -> Option<AnchorLocation> {

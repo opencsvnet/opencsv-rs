@@ -183,4 +183,182 @@ fn export_snapshot_enables_serverless_crediting() {
     assert_eq!(verified["status"].as_str().unwrap(), "verified", "{verified}");
     assert_eq!(verified["credits"][0]["amount"].as_u64().unwrap(), 80);
     println!("serverless crediting round trip: VERIFIED via exported snapshot");
+
+    // === the mempool-sentinel bug ---------------------------------------------
+    // A consignment written right after broadcast carries MEMPOOL_LOCATION
+    // (0,0) as the claimed anchor location. Prove + anchor a second mint,
+    // resync, re-export — then finalize its consignment with the SENTINEL
+    // ref, exactly the shape that produced AnchorNotFound on the phone.
+    let proved2 = take(unsafe {
+        opencsv_prove_mint(
+            issuer,
+            cstr(&asset_id).as_ptr(),
+            cstr(&receiver_owner).as_ptr(),
+            cstr("[25]").as_ptr(),
+        )
+    });
+    let record2_bytes: [u8; 64] = (0..64)
+        .map(|i| {
+            u8::from_str_radix(
+                &proved2["anchor_record_hex"].as_str().unwrap()[2 * i..2 * i + 2],
+                16,
+            )
+            .unwrap()
+        })
+        .collect::<Vec<u8>>()
+        .try_into()
+        .unwrap();
+    let mint2_ref = anchor_chain
+        .anchor(|_| AnchorRecord::from_bytes(&record2_bytes))
+        .unwrap();
+    anchor_chain.generate_blocks(6).unwrap();
+    let mint2_location = anchor_chain.locate(&mint2_ref).expect("second mint mined");
+    let tip = anchor_chain.tip_height();
+    node.wait_for_filter_index();
+    let synced = take(unsafe {
+        opencsv_scan_sync(
+            cstr(&json!({
+                "network": "regtest",
+                "peers": [format!("127.0.0.1:{}", node.p2p_port)],
+                "cache_dir": cache_dir,
+                "from_height": 102,
+                "required_confirmations": 6,
+            })
+            .to_string())
+            .as_ptr(),
+        )
+    });
+    assert_eq!(synced["tip_height"].as_u64().unwrap(), tip, "{synced}");
+    let snapshot2 = take(opencsv_scan_export_snapshot());
+
+    // (1) Sentinel ref + snapshot containing the mined anchor → VERIFIED
+    //     (previously AnchorNotFound).
+    let finalized2 = take(unsafe {
+        opencsv_consignment_finalize(
+            issuer,
+            proved2["pending_id"].as_u64().unwrap(),
+            cstr(&json!({
+                "txid": hex(&mint2_ref.txid),
+                "height": 0,
+                "position": 0,
+            })
+            .to_string())
+            .as_ptr(),
+        )
+    });
+    let blob2 = base64::engine::general_purpose::STANDARD
+        .decode(finalized2["consignment_base64"].as_str().unwrap())
+        .unwrap();
+    let verified2 = take(unsafe {
+        opencsv_verify_consignment(
+            receiver,
+            blob2.as_ptr(),
+            blob2.len(),
+            cstr(&snapshot2.to_string()).as_ptr(),
+            6,
+        )
+    });
+    assert_eq!(verified2["status"].as_str().unwrap(), "verified", "{verified2}");
+    // (4) The resolved location is the mined one — not (0,0).
+    assert_eq!(
+        verified2["anchor"]["height"].as_u64().unwrap(),
+        mint2_location.height,
+        "{verified2}"
+    );
+    assert_eq!(
+        verified2["anchor"]["position"].as_u64().unwrap(),
+        mint2_location.position as u64,
+        "{verified2}"
+    );
+    println!("mempool-sentinel consignment: VERIFIED (resolved to {mint2_location:?})");
+
+    // (2) Sentinel txid absent from the snapshot → honest AnchorNotFound
+    //     (the first export predates the second mint).
+    let rejected = take(unsafe {
+        opencsv_verify_consignment(
+            receiver,
+            blob2.as_ptr(),
+            blob2.len(),
+            cstr(&snapshot.to_string()).as_ptr(),
+            6,
+        )
+    });
+    assert_eq!(rejected["status"].as_str().unwrap(), "rejected", "{rejected}");
+    assert!(
+        rejected["reason"].as_str().unwrap().contains("AnchorNotFound"),
+        "{rejected}"
+    );
+
+    // (3) Non-sentinel claims unchanged: a wrong EXPLICIT location is
+    //     still rejected strictly (a third mint, finalized with the
+    //     wrong position while its entry sits elsewhere in the snapshot).
+    let proved3 = take(unsafe {
+        opencsv_prove_mint(
+            issuer,
+            cstr(&asset_id).as_ptr(),
+            cstr(&receiver_owner).as_ptr(),
+            cstr("[10]").as_ptr(),
+        )
+    });
+    let record3_bytes: [u8; 64] = (0..64)
+        .map(|i| {
+            u8::from_str_radix(
+                &proved3["anchor_record_hex"].as_str().unwrap()[2 * i..2 * i + 2],
+                16,
+            )
+            .unwrap()
+        })
+        .collect::<Vec<u8>>()
+        .try_into()
+        .unwrap();
+    let mint3_ref = anchor_chain
+        .anchor(|_| AnchorRecord::from_bytes(&record3_bytes))
+        .unwrap();
+    anchor_chain.generate_blocks(6).unwrap();
+    let mint3_location = anchor_chain.locate(&mint3_ref).expect("third mint mined");
+    node.wait_for_filter_index();
+    take(unsafe {
+        opencsv_scan_sync(
+            cstr(&json!({
+                "network": "regtest",
+                "peers": [format!("127.0.0.1:{}", node.p2p_port)],
+                "cache_dir": cache_dir,
+                "from_height": 102,
+                "required_confirmations": 6,
+            })
+            .to_string())
+            .as_ptr(),
+        )
+    });
+    let snapshot3 = take(opencsv_scan_export_snapshot());
+    let finalized3 = take(unsafe {
+        opencsv_consignment_finalize(
+            issuer,
+            proved3["pending_id"].as_u64().unwrap(),
+            cstr(&json!({
+                "txid": hex(&mint3_ref.txid),
+                "height": mint3_location.height,
+                "position": mint3_location.position + 1,
+            })
+            .to_string())
+            .as_ptr(),
+        )
+    });
+    let blob3 = base64::engine::general_purpose::STANDARD
+        .decode(finalized3["consignment_base64"].as_str().unwrap())
+        .unwrap();
+    let rejected = take(unsafe {
+        opencsv_verify_consignment(
+            receiver,
+            blob3.as_ptr(),
+            blob3.len(),
+            cstr(&snapshot3.to_string()).as_ptr(),
+            6,
+        )
+    });
+    assert_eq!(rejected["status"].as_str().unwrap(), "rejected", "{rejected}");
+    assert!(
+        rejected["reason"].as_str().unwrap().contains("AnchorNotFound"),
+        "explicit wrong location stays strict: {rejected}"
+    );
 }
