@@ -2,6 +2,14 @@
 //! core leaves the kernel independent of serde, traits, storage and I/O.
 
 use crate::anchor::AnchorRecord;
+use crate::chain::AnchorLocation;
+
+pub(crate) fn location(location: &AnchorLocation) -> opencsv_kernel::Location {
+    opencsv_kernel::Location {
+        height: location.height,
+        position: location.position,
+    }
+}
 
 pub(crate) fn record(record: &AnchorRecord) -> opencsv_kernel::Record {
     match *record {
