@@ -176,13 +176,11 @@ impl ScanIndex {
     ///
     /// `from_height` applies to a fresh index only (typically the
     /// wallet's birth height); an existing index resumes from its
-    /// synced tip.
+    /// synced tip. `from_height == 0` is accepted and clamped to 1
+    /// (genesis carries no anchors; 0 is the natural "scan everything"
+    /// spelling).
     pub fn scan_sync(&mut self, client: &mut CbfClient, from_height: u64) -> Result<(), Error> {
-        if from_height == 0 {
-            return Err(Error::InvalidInput(
-                "from_height 0 is the mempool sentinel / genesis".into(),
-            ));
-        }
+        let from_height = from_height.max(1);
         if self.from_height == 0 {
             self.from_height = from_height;
             self.synced_tip = from_height.saturating_sub(1);
