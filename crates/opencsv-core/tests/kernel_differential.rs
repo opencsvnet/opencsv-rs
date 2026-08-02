@@ -7,7 +7,14 @@ use std::collections::HashSet;
 use opencsv_core::anchor::{self, AnchorRecord};
 use opencsv_core::batch;
 use opencsv_core::field::hash_felts;
-use opencsv_core::{AnchorChain, Digest, MockAnchorChain, TruncatedDigest};
+use opencsv_core::{
+    AnchorChain, AnchorLocation, Digest, MockAnchorChain, RejectReason as CoreRejectReason,
+    TruncatedDigest,
+};
+use opencsv_kernel::accept::{
+    AcceptDecision, AcceptInput, AnchorObservation, AssetObservation, OccurrenceObservation,
+    RejectReason as KernelRejectReason,
+};
 use opencsv_kernel::audit::SupplyError as KernelSupplyError;
 use opencsv_kernel::record::Record as KernelRecord;
 use opencsv_kernel::types::{Entry as KernelEntry, Location as KernelLocation};
@@ -478,5 +485,175 @@ fn generated_batch_occurrence_mutations_match_legacy() {
             None,
             "production mutated batch {case}"
         );
+    }
+}
+
+fn legacy_accept(input: &AcceptInput) -> AcceptDecision {
+    if !input.has_openings {
+        return AcceptDecision::Reject(KernelRejectReason::EmptyConsignment);
+    }
+    match input.asset {
+        AssetObservation::GenesisMismatch => {
+            return AcceptDecision::Reject(KernelRejectReason::GenesisMismatch);
+        }
+        AssetObservation::UnknownAsset => {
+            return AcceptDecision::Reject(KernelRejectReason::UnknownAsset);
+        }
+        AssetObservation::Valid => {}
+    }
+    let AnchorObservation::Present {
+        location,
+        confirmations,
+        binds_nullifiers,
+        occurrences,
+    } = &input.anchor
+    else {
+        return AcceptDecision::Reject(KernelRejectReason::AnchorNotFound);
+    };
+    if !input.proof_valid {
+        return AcceptDecision::Reject(KernelRejectReason::InvalidProof);
+    }
+    if *confirmations < input.required_confirmations {
+        return AcceptDecision::Reject(KernelRejectReason::InsufficientConfirmations {
+            have: *confirmations,
+            required: input.required_confirmations,
+        });
+    }
+    if !binds_nullifiers {
+        return AcceptDecision::Reject(KernelRejectReason::IllFormedAnchor);
+    }
+    for occurrence in occurrences {
+        let Some(first) = occurrence.first else {
+            return AcceptDecision::Reject(KernelRejectReason::AnchorNotFound);
+        };
+        if first != *location {
+            return AcceptDecision::Reject(KernelRejectReason::NullifierConflict {
+                nullifier: occurrence.nullifier,
+                first,
+            });
+        }
+    }
+    if !input.has_owned_output {
+        return AcceptDecision::Reject(KernelRejectReason::NoOwnedOutput);
+    }
+    AcceptDecision::Accept { anchor: *location }
+}
+
+#[test]
+fn generated_accept_observations_match_legacy_precedence() {
+    let mut generator = Generator::new(0xA5_0001);
+    for case in 0..512 {
+        let location = KernelLocation {
+            height: generator.next() % 100_000,
+            position: generator.usize(4_000) as u32,
+        };
+        let mut occurrences = Vec::new();
+        for _ in 0..generator.usize(6) {
+            let first = match generator.usize(4) {
+                0 => None,
+                1 | 2 => Some(location),
+                _ => Some(KernelLocation {
+                    height: generator.next() % 100_000,
+                    position: generator.usize(4_000) as u32,
+                }),
+            };
+            occurrences.push(OccurrenceObservation {
+                nullifier: generator.bytes(),
+                first,
+            });
+        }
+        let anchor = if generator.usize(5) == 0 {
+            AnchorObservation::Missing
+        } else {
+            AnchorObservation::Present {
+                location,
+                confirmations: generator.next() % 12,
+                binds_nullifiers: generator.usize(3) != 0,
+                occurrences,
+            }
+        };
+        let asset = match generator.usize(3) {
+            0 => AssetObservation::Valid,
+            1 => AssetObservation::GenesisMismatch,
+            _ => AssetObservation::UnknownAsset,
+        };
+        let input = AcceptInput {
+            has_openings: generator.usize(5) != 0,
+            asset,
+            anchor,
+            proof_valid: generator.usize(4) != 0,
+            required_confirmations: generator.next() % 12,
+            has_owned_output: generator.usize(4) != 0,
+        };
+        assert_eq!(
+            opencsv_kernel::decide_accept(&input),
+            legacy_accept(&input),
+            "accept observation case {case}: {input:?}"
+        );
+    }
+}
+
+#[test]
+fn public_rejection_codes_match_the_kernel_boundary() {
+    let location = AnchorLocation {
+        height: 7,
+        position: 3,
+    };
+    let kernel_location = KernelLocation {
+        height: 7,
+        position: 3,
+    };
+    let pairs = [
+        (
+            CoreRejectReason::EmptyConsignment,
+            KernelRejectReason::EmptyConsignment,
+        ),
+        (
+            CoreRejectReason::GenesisMismatch,
+            KernelRejectReason::GenesisMismatch,
+        ),
+        (
+            CoreRejectReason::UnknownAsset,
+            KernelRejectReason::UnknownAsset,
+        ),
+        (
+            CoreRejectReason::AnchorNotFound,
+            KernelRejectReason::AnchorNotFound,
+        ),
+        (
+            CoreRejectReason::InsufficientConfirmations {
+                have: 1,
+                required: 6,
+            },
+            KernelRejectReason::InsufficientConfirmations {
+                have: 1,
+                required: 6,
+            },
+        ),
+        (
+            CoreRejectReason::NullifierConflict {
+                nullifier: TruncatedDigest([9u8; 24]),
+                first: location,
+            },
+            KernelRejectReason::NullifierConflict {
+                nullifier: [9u8; 24],
+                first: kernel_location,
+            },
+        ),
+        (
+            CoreRejectReason::IllFormedAnchor,
+            KernelRejectReason::IllFormedAnchor,
+        ),
+        (
+            CoreRejectReason::InvalidProof,
+            KernelRejectReason::InvalidProof,
+        ),
+        (
+            CoreRejectReason::NoOwnedOutput,
+            KernelRejectReason::NoOwnedOutput,
+        ),
+    ];
+    for (core, kernel) in pairs {
+        assert_eq!(core.code(), kernel.code());
     }
 }

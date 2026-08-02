@@ -16,6 +16,7 @@ Aeneas spike validated for Rust→Lean 4 translation:
 
 | kernel item | mirrors (opencsv-core) |
 |---|---|
+| `accept::decide` | `accept::accept` result and rejection precedence |
 | `binding::binding` | `anchor::binding` + `Digest::to_anchor` |
 | `record::Record::well_formed` | `anchor::AnchorRecord::well_formed` (+ `payload_slots`) |
 | `scan::first_occurrence` | `chain::AnchorChain::first_nullifier_occurrence` (mock semantics) |
@@ -28,7 +29,7 @@ scenarios and asserts kernel ≡ core on shared cases.
 
 ## Boundary
 
-- `types`, `binding`, `record`, `scan`, `batch`, `audit` are the
+- `types`, `accept`, `binding`, `record`, `scan`, `batch`, `audit` are the
   **verification surface**: plain data in, plain data out.
 - `hash` is the **crypto boundary**: a self-contained, byte-identical
   Poseidon2 implementation of binding and batch commitments. For the Aeneas
@@ -54,6 +55,9 @@ production decisions move to the kernel one surface at a time.
 - first-occurrence selection for the canonical mock chain;
 - public supply calculation, including mint deduplication and negative-supply
   rejection.
+- receiver accept/reject selection over explicit asset, proof, chain,
+  first-occurrence and ownership observations. The core driver retains proof
+  verification, chain access, storage and key-derived output construction.
 
 Core retains its public types, serde formats, traits and error types, so CLI
 and FFI consumers see no interface change. The independent legacy oracle is
