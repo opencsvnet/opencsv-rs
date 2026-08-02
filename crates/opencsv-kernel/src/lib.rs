@@ -4,13 +4,11 @@
 //! `batch`, `audit` — is written for Aeneas translation: loops only, no
 //! serde/dyn/RNG, no generics beyond plain byte arrays and integers. The
 //! `hash` module is the cryptographic boundary (translated as opaque).
-//! `interop` is glue outside the verification surface.
 
 pub mod audit;
 pub mod batch;
 pub mod binding;
 pub mod hash;
-pub mod interop;
 pub mod record;
 pub mod scan;
 pub mod types;

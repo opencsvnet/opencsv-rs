@@ -6,9 +6,9 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-opencsv-core = { path = "../opencsv-core" }
-
-[dev-dependencies]
+p3-baby-bear = "0.6.3"
+p3-field = "0.6.3"
+p3-symmetric = "0.6.3"
 
 [features]
 default = []

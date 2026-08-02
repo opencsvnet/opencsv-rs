@@ -30,19 +30,17 @@ scenarios and asserts kernel ≡ core on shared cases.
 
 - `types`, `binding`, `record`, `scan`, `batch`, `audit` are the
   **verification surface**: plain data in, plain data out.
-- `hash` is the **crypto boundary**: the only place the kernel calls into
-  `opencsv-core` (`anchor::binding`, `batch::batch_commit`). For the
-  Aeneas run it is translated as an opaque (uninterpreted) function —
-  exactly the model's `bindHash` axiom.
-- `interop` (conversions from `opencsv-core` types) is glue for callers and
-  tests; it is **not** part of the verification surface (excluded from
-  translation).
+- `hash` is the **crypto boundary**: a self-contained, byte-identical
+  Poseidon2 implementation of binding and batch commitments. For the Aeneas
+  run it is translated as an opaque (uninterpreted) function — exactly the
+  model's `bindHash` axiom. The kernel does not depend on `opencsv-core`, so
+  core can adopt verified decisions without a package cycle.
 - `scan::first_occurrence` takes the entries in **canonical chain order**
   (block height, then in-block position — the caller's responsibility,
   same contract as `AnchorChain`) and returns the *index* of the first
   well-formed entry; the entry's `Location` is read off the input. The
   core returns the location directly — equivalent by construction.
 
-Wiring the kernel into `opencsv-core` (replacing the duplicated logic) is a
-later decision; for now the two coexist and the equivalence tests pin them
-together.
+Generated differential tests in `opencsv-core` preserve the pre-adoption
+algorithms as a test-only oracle and exercise valid and mutated traces while
+production decisions move to the kernel one surface at a time.
