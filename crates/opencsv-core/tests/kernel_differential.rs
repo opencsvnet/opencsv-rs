@@ -7,7 +7,7 @@ use std::collections::HashSet;
 use opencsv_core::anchor::{self, AnchorRecord};
 use opencsv_core::batch;
 use opencsv_core::field::hash_felts;
-use opencsv_core::{Digest, TruncatedDigest};
+use opencsv_core::{AnchorChain, Digest, MockAnchorChain, TruncatedDigest};
 use opencsv_kernel::audit::SupplyError as KernelSupplyError;
 use opencsv_kernel::record::Record as KernelRecord;
 use opencsv_kernel::types::{Entry as KernelEntry, Location as KernelLocation};
@@ -110,6 +110,42 @@ fn kernel_record(record: &AnchorRecord) -> KernelRecord {
             asset_id: asset_id.0,
             value,
             payload: payload.0,
+        },
+    }
+}
+
+fn core_record(record: KernelRecord) -> AnchorRecord {
+    match record {
+        KernelRecord::Mint {
+            asset_id,
+            value,
+            mint_commit,
+        } => AnchorRecord::Mint {
+            asset_id: TruncatedDigest(asset_id),
+            value,
+            mint_commit: TruncatedDigest(mint_commit),
+        },
+        KernelRecord::Xfer { payloads } => AnchorRecord::Xfer {
+            payloads: [TruncatedDigest(payloads[0]), TruncatedDigest(payloads[1])],
+        },
+        KernelRecord::XferCompressed { payload } => AnchorRecord::XferCompressed {
+            nullifier_commit: TruncatedDigest(payload),
+        },
+        KernelRecord::BatchHeader {
+            count,
+            batch_commit,
+        } => AnchorRecord::BatchHeader {
+            count,
+            batch_commit: TruncatedDigest(batch_commit),
+        },
+        KernelRecord::Redeem {
+            asset_id,
+            value,
+            payload,
+        } => AnchorRecord::Redeem {
+            asset_id: TruncatedDigest(asset_id),
+            value,
+            payload: TruncatedDigest(payload),
         },
     }
 }
@@ -237,6 +273,7 @@ fn generated_first_occurrence_traces_match_legacy() {
         let occurrence_at = generator.usize(length + 1);
         let mut legacy_entries = Vec::with_capacity(length);
         let mut kernel_entries = Vec::with_capacity(length);
+        let mut chain = MockAnchorChain::new();
 
         for index in 0..length {
             let ctx = generator.bytes();
@@ -262,6 +299,15 @@ fn generated_first_occurrence_traces_match_legacy() {
                 ctx,
                 location,
             });
+            if location.height > chain.tip_height() {
+                chain.advance_blocks(location.height - chain.tip_height());
+            }
+            let anchor_ref = chain.append_with_ctx(record, ctx);
+            assert_eq!(
+                (anchor_ref.location.height, anchor_ref.location.position),
+                (location.height, location.position),
+                "generated trace stays in canonical order"
+            );
         }
 
         let expected = legacy_entries
@@ -271,6 +317,14 @@ fn generated_first_occurrence_traces_match_legacy() {
             opencsv_kernel::first_occurrence(&kernel_entries, raw.as_bytes()),
             expected,
             "first-occurrence trace {case}"
+        );
+        assert_eq!(
+            chain.first_nullifier_occurrence(&raw),
+            expected.map(|index| opencsv_core::AnchorLocation {
+                height: kernel_entries[index].location.height,
+                position: kernel_entries[index].location.position,
+            }),
+            "production first-occurrence trace {case}"
         );
     }
 }
@@ -309,6 +363,7 @@ fn generated_supply_traces_match_legacy() {
         let other_asset = generator.bytes();
         let mut previous_commit = generator.bytes();
         let mut anchors = Vec::new();
+        let mut chain = MockAnchorChain::new();
         for index in 0..(1 + generator.usize(40)) {
             let record = match generator.usize(5) {
                 0 | 1 => {
@@ -341,19 +396,30 @@ fn generated_supply_traces_match_legacy() {
                     payloads: [generator.bytes(), generator.bytes()],
                 },
             };
-            anchors.push((
-                KernelLocation {
-                    height: (index / 2) as u64,
-                    position: (index % 2) as u32,
-                },
-                record,
-            ));
+            let location = KernelLocation {
+                height: (index / 2) as u64,
+                position: (index % 2) as u32,
+            };
+            anchors.push((location, record));
+            if location.height > chain.tip_height() {
+                chain.advance_blocks(location.height - chain.tip_height());
+            }
+            chain.append_with_ctx(core_record(record), generator.bytes());
         }
         let height = generator.usize(anchors.len().div_ceil(2) + 2) as u64;
+        let expected = legacy_supply(&anchors, &asset, height);
         assert_eq!(
             opencsv_kernel::supply(&anchors, &asset, height),
-            legacy_supply(&anchors, &asset, height),
+            expected,
             "supply trace {case}"
+        );
+        let mut asset_digest = [0u8; 32];
+        asset_digest[..24].copy_from_slice(&asset);
+        assert_eq!(
+            opencsv_core::supply(&chain, &Digest::from_bytes(asset_digest), height)
+                .map_err(|_| KernelSupplyError::NegativeSupply),
+            expected,
+            "production supply trace {case}"
         );
     }
 }
@@ -372,6 +438,10 @@ fn generated_batch_occurrence_mutations_match_legacy() {
         payloads[occurrence] = legacy_binding(&raw, &ctx);
         let committed = legacy_batch_commit(&payloads, &ctx);
         let kernel_payloads: Vec<_> = payloads.iter().map(|payload| payload.0).collect();
+        let record = AnchorRecord::BatchHeader {
+            count: length as u8,
+            batch_commit: committed,
+        };
         assert_eq!(
             opencsv_kernel::batch_occurrence(
                 length as u8,
@@ -382,6 +452,11 @@ fn generated_batch_occurrence_mutations_match_legacy() {
             ),
             Some(occurrence as u32),
             "valid batch {case}"
+        );
+        assert_eq!(
+            batch::envelope_occurrence(&record, &payloads, &ctx, &raw),
+            Some(occurrence as u32),
+            "production valid batch {case}"
         );
 
         let mut mutated = kernel_payloads.clone();
@@ -396,6 +471,12 @@ fn generated_batch_occurrence_mutations_match_legacy() {
             ),
             None,
             "mutated batch {case}"
+        );
+        let mutated_core: Vec<_> = mutated.into_iter().map(TruncatedDigest).collect();
+        assert_eq!(
+            batch::envelope_occurrence(&record, &mutated_core, &ctx, &raw),
+            None,
+            "production mutated batch {case}"
         );
     }
 }

@@ -44,3 +44,17 @@ scenarios and asserts kernel ≡ core on shared cases.
 Generated differential tests in `opencsv-core` preserve the pre-adoption
 algorithms as a test-only oracle and exercise valid and mutated traces while
 production decisions move to the kernel one surface at a time.
+
+## Production adoption
+
+`opencsv-core` now delegates the verified surfaces to this crate:
+
+- full and truncated transaction-context binding;
+- record well-formedness and batch-envelope occurrence;
+- first-occurrence selection for the canonical mock chain;
+- public supply calculation, including mint deduplication and negative-supply
+  rejection.
+
+Core retains its public types, serde formats, traits and error types, so CLI
+and FFI consumers see no interface change. The independent legacy oracle is
+test-only and is run over deterministic generated valid and mutated traces.
