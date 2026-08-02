@@ -1,0 +1,14 @@
+[package]
+name = "opencsv-kernel"
+description = "Pure decision-logic kernel of opencsv-core, written for Aeneas verification (loops only, no serde/dyn/RNG, hash behind an opaque boundary)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+opencsv-core = { path = "../opencsv-core" }
+
+[dev-dependencies]
+
+[features]
+default = []
