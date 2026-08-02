@@ -69,7 +69,14 @@ pub fn params(network: Network) -> Params {
             pow_limit_bits: 0x1e0377ae,
             pow_target_spacing: 600,
             pow_target_timespan: 14 * 24 * 60 * 60,
-            allow_min_difficulty: true,
+            // Signet uses MAINNET-style difficulty rules (Bitcoin Core's
+            // chainparams: fPowAllowMinDifficultyBlocks = false,
+            // enforce_BIP94 = false): within a retarget period bits must
+            // equal the previous block's, with no testnet-style
+            // min-difficulty timestamp exception. (The min-difficulty
+            // branch below models testnet4-style networks; none of the
+            // supported networks use it.)
+            allow_min_difficulty: false,
             no_retargeting: false,
         },
         Network::Regtest => Params {
@@ -492,12 +499,14 @@ mod tests {
     }
 
     #[test]
-    fn signet_min_difficulty_rule() {
+    fn signet_uses_mainnet_style_rules() {
+        // Regression test for the signet sync failure at the first
+        // retarget boundary (iOS host report: scan_sync died at height
+        // 2016 on signet). Signet has fPowAllowMinDifficultyBlocks =
+        // false: the testnet-style >20min min-difficulty exception does
+        // NOT exist, so a slow block must still carry its parent's bits.
         let params = params(Network::Signet);
-        // One non-min-difficulty block (simulated), then a slow block
-        // may use the limit.
-        let hard_bits = 0x1d0ffff0;
-        let mut headers = Vec::new();
+        let hard_bits = 0x1e012fa7; // the real signet post-2016 bits
         let base = BlockHeader {
             version: 1,
             prev_block: [0u8; 32],
@@ -506,7 +515,42 @@ mod tests {
             bits: hard_bits,
             nonce: 0,
         };
-        headers.push(base);
+        let headers = vec![base];
+        let slow = BlockHeader {
+            time: base.time + 2 * params.pow_target_spacing as u32 + 1,
+            ..base
+        };
+        assert_eq!(
+            required_bits(&params, &headers, 1, &slow),
+            hard_bits,
+            "signet has no min-difficulty timestamp exception"
+        );
+        let fast = BlockHeader {
+            time: base.time + 60,
+            ..base
+        };
+        assert_eq!(required_bits(&params, &headers, 1, &fast), hard_bits);
+    }
+
+    #[test]
+    fn testnet_style_min_difficulty_rule() {
+        // The min-difficulty branch models testnet4-style networks
+        // (none of the supported networks enable it); keep it covered
+        // with synthetic params.
+        let params = Params {
+            allow_min_difficulty: true,
+            ..params(Network::Signet)
+        };
+        let hard_bits = 0x1d0ffff0;
+        let base = BlockHeader {
+            version: 1,
+            prev_block: [0u8; 32],
+            merkle_root: [0u8; 32],
+            time: 1_600_000_000,
+            bits: hard_bits,
+            nonce: 0,
+        };
+        let headers = vec![base];
         // height 1 % 2016 != 0: slow candidate → pow limit allowed.
         let slow = BlockHeader {
             time: base.time + 2 * params.pow_target_spacing as u32 + 1,
@@ -522,5 +566,74 @@ mod tests {
             ..base
         };
         assert_eq!(required_bits(&params, &headers, 1, &fast), hard_bits);
+    }
+
+    /// Real signet headers 2016–2022 (hex, from a synced node) through
+    /// the first retarget boundary, validated against a synthetic
+    /// prefix with the real boundary timestamps. Height 2019 is the
+    /// exact case that broke the iOS host: it came 1631 s after its
+    /// parent (a testnet-style rule would demand min-difficulty bits)
+    /// yet carries the retargeted bits 0x1e012fa7.
+    #[test]
+    fn signet_first_retarget_boundary_real_headers() {
+        const GENESIS_TIME: u32 = 1598918400; // real signet genesis
+        const T_2015: u32 = 1599332177; // real block-2015 time
+        const REAL: [&str; 7] = [
+            "000000204de7ca88f25ebdb6a499b2bf22d50fb41453e24a86454ce66a1a84a3c0000000eef4cadbdfb67370f88951a0ad863a87d00b50bfa68c099705657a7b79a966e6ece1535fa72f011e37fc8a00", // 2016
+            "0000002074a66cc632aa5e66569bc2c66d5b1d03d686757f30818a00650ec1d88f00000093a8147f9329e6d3a61ff5b769ad2c8ac232531aef0def5a94983e602211aa145ae3535fa72f011e4f3bd000", // 2017
+            "0000002065c90fb9dc8a9bebdf8acf12342861865919f40964b6335c28c09f2d13000000ab15ac2a8bb6405d8892b30df8e8f4e890888909775ba5e46094a2d08341922c7ee5535fa72f011e27986b02", // 2018
+            "00000020caa66b60a472df08b4c8e786f1468e03948c2489890106c4d10284f07f000000ea8e51a87cf10466fa5085bacbe74528f634a1a2ab20317f73957926b668e87cddeb535fa72f011e8ddb3002", // 2019
+            "00000020d7f29dd46ff80f747622f3dadf85337e9c341db4469a96a91e8d98db07000000bf2b63df90626422e85e5501239ef90d5326e175468529178547bb2fff19fef0a1f1535fa72f011eebe24100", // 2020
+            "0000002084197245c22736900bc5a1210322a693b7f8f9ef8ac27028378a63749e0000008c046085c3ada8b12ea9ca49cfada0057de629d0a2c981a9827601cfe1b87b794ff2535fa72f011e02f08800", // 2021
+            "00000020cc83c07db8814d99223157e6617b7fed07c98c6324048ef376da0752f50000005d4cf07f35bb62bab8a5d203eb5912fb6f82fa55b30be7ce200d61819e365f70b7f3535fa72f011eb17ce300", // 2022
+        ];
+        let params = params(Network::Signet);
+        // Synthetic prefix 0..=2015: real signet blocks all carried the
+        // pow-limit bits through 2015, and the boundary retarget uses
+        // only the endpoint timestamps (both real here).
+        let mut headers = Vec::new();
+        let mut prev = BlockHeader {
+            version: 1,
+            prev_block: [0u8; 32],
+            merkle_root: [0u8; 32],
+            time: GENESIS_TIME,
+            bits: 0x1e0377ae,
+            nonce: 0,
+        };
+        headers.push(prev);
+        for i in 1..=2015usize {
+            let h = BlockHeader {
+                time: GENESIS_TIME + (T_2015 - GENESIS_TIME) * i as u32 / 2015,
+                prev_block: prev.hash(),
+                ..prev
+            };
+            headers.push(h);
+            prev = h;
+        }
+        // The boundary retarget: base = block-2015 bits (pow limit),
+        // timespan over the real endpoint times → the retargeted bits.
+        let real: Vec<BlockHeader> = REAL
+            .iter()
+            .map(|h| BlockHeader::parse(&crate::hash::from_hex(h).unwrap()).unwrap())
+            .collect();
+        assert_eq!(next_work_required(&params, &headers, 2016), real[0].bits);
+        assert_eq!(real[0].bits, 0x1e012fa7);
+        // Full validation of 2016 is impossible against the synthetic
+        // prefix (linkage), so check its bits + PoW + MTP directly...
+        let target = from_compact(real[0].bits).unwrap();
+        assert!(u256_ge(&target, &u256_from_hash(&real[0].hash())));
+        // ...and validate 2017–2022 end-to-end (real linkage).
+        for (offset, header) in real.iter().enumerate().skip(1) {
+            let height = 2016 + offset;
+            headers.push(real[offset - 1]);
+            validate_header(&params, &headers, height, header).unwrap();
+        }
+        // The exact iOS failure: block 2019 came 1631 s after its
+        // parent; a testnet-style rule would demand 0x1e0377ae here.
+        assert_eq!(real[3].time - real[2].time, 1631);
+        assert_eq!(
+            required_bits(&params, &headers[..2019], 2019, &real[3]),
+            0x1e012fa7
+        );
     }
 }
