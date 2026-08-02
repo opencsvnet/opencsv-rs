@@ -48,9 +48,9 @@ transactional application state.
 
 Tests cover cold/warm reuse, identity invalidation (circuit, setup parameters,
 and predecessor verification keys), bounded eviction, and concurrent cold
-access with exactly one construction. This cache-key binding does not close
-the predecessor-vk soundness gap described below; D4 must still enforce that
-identity independently of call-site discipline.
+access with exactly one construction. D4 additionally constrains that cached
+predecessor-key identity in-circuit, independently of cache selection or
+call-site discipline.
 
 **Stage 3:** real PCD recursion (paper §4.5 item 4). The
 `src/node.rs` module adds:
@@ -100,8 +100,10 @@ identity independently of call-site discipline.
   native batch-STARK verification). The full statement must ride in the
   proof bytes because anchors carry only truncated digests and openings do
   not carry nullifiers — this is sound because the statement-table values
-  are transcript-bound. `vk` is ignored (fixed circuit shapes; the proof
-  self-describes its common data — same caveat as predecessor vk binding).
+  are transcript-bound. `vk` is currently ignored by this adapter.
+  Recursive predecessor keys are pinned inside every transfer/redeem
+  circuit, but the self-described *root* proof remains a separate
+  allowlisting/versioning boundary (below).
 - **Acceptance test** (`tests/acceptance.rs`, `#[ignore]`d): the full
   protocol flow end-to-end — issuer keygen → mint → anchor → `accept()`
   with the real verifier → 2-in/2-out transfer → anchor → `accept()` →
@@ -179,18 +181,21 @@ statement-table public values against the expected statement and natively
 verifies the proof — the carried-and-compared limitation of stages 1–2 is
 gone for coin proofs (the stage-1/2 standalone circuits keep it).
 
-**Remaining binding gaps (honest):**
+**Verification-key binding and remaining gaps (honest):**
 
-- *Predecessor vk is bound by call-site discipline.* In-circuit
-  verification runs against the predecessor's own `stark_common` (the
-  self-describing common data carried in each proof — upstream's
-  `RecursionOutput::into_recursion_input` discipline). Hard-binding the
-  predecessor vk against an in-circuit constant needs the
-  preprocessed-commitment *targets*, which are `pub(crate)` in
-  `p3-recursion` at this pin (`CommonDataTargets.preprocessed`); a custom
-  prover could substitute foreign common data for a predecessor slot.
-  Closing this needs an upstream patch (expose those targets) or
-  primitive-table public-value exposure.
+- *Predecessor keys are hard-bound.* The parent circuit extracts each
+  recursive verifier's preprocessed-commitment targets and constrains every
+  element to the native predecessor key selected at circuit construction.
+  The relay uses the `recompose/coeff` WitnessChecks table, which also forces
+  every commitment element to be base-field embedded; changing coefficient
+  zero or injecting non-zero extension coefficients fails witness
+  generation. Circuits without this table (genesis) retain their original
+  table manifest, while transfer/redeem proofs advertise it explicitly.
+- *Root key authorization remains external.* `verify_coin_proof` verifies
+  the proof-carried root common data. A production verifier must map the
+  accepted proof-format/circuit version to an allowlisted root identity; D4
+  prevents a fixed parent circuit from accepting a foreign predecessor, but
+  does not authorize an arbitrary custom root circuit.
 - *Statement elements are EF-embedded base values by construction;* a
   custom prover injecting non-base EF private inputs is not ruled out
   in-circuit (same caveat as stage 2).
@@ -219,14 +224,17 @@ work):
 - Proving stack: published Plonky3 crates **0.6.3** (`p3-baby-bear`,
   `p3-field`, `p3-batch-stark`, …) — shared with `opencsv-core`, single
   version in `Cargo.lock`.
-- Circuit/recursion crates: the official
-  [`Plonky3/Plonky3-recursion`](https://github.com/Plonky3/Plonky3-recursion)
-  repo, pinned to commit
-  **`b36339709a7a67ee9760fb578b3d4339fd983709`** (main @ 2026-07-06, tracks
-  p3 0.6). Used crates: `p3-circuit`, `p3-circuit-prover`,
-  `p3-poseidon2-circuit-air`, and (stage 3) `p3-recursion` (all version
-  0.1.0, unaudited upstream PoC — expect API churn; do not bump the pin
-  blindly).
+- Circuit/recursion crates: the
+  [`opencsvnet/Plonky3-recursion`](https://github.com/opencsvnet/Plonky3-recursion)
+  fork, pinned to
+  **`d6510eb629097d733d631e8e833fc962025f25f5`**. It is exactly one narrow
+  read-only accessor commit over official Plonky3-recursion
+  `b36339709a7a67ee9760fb578b3d4339fd983709` (main @ 2026-07-06, tracks p3
+  0.6); the accessor exposes only the allocated preprocessed-commitment
+  target and keeps its metadata private. Used crates: `p3-circuit`,
+  `p3-circuit-prover`, `p3-poseidon2-circuit-air`, and `p3-recursion` (all
+  version 0.1.0, unaudited upstream PoC — expect API churn; do not bump the
+  pin blindly).
 - The crates.io `p3-recursion 0.1.0` is a **stub** — do not use it.
 
 ## Field and hash configuration
@@ -477,8 +485,8 @@ Confidence check for the pinned upstream dependency (run in a clone of the
 recursion repo at the pinned commit — the same sources Cargo fetches):
 
 ```
-git clone https://github.com/Plonky3/Plonky3-recursion.git
-cd Plonky3-recursion && git checkout b36339709a7a67ee9760fb578b3d4339fd983709
+git clone https://github.com/opencsvnet/Plonky3-recursion.git
+cd Plonky3-recursion && git checkout d6510eb629097d733d631e8e833fc962025f25f5
 cargo run --release --example poseidon2_perm_chain -p p3-circuit-prover 3
 ```
 
@@ -491,12 +499,10 @@ spike.)
 
 1. **Production parameters:** `CoinFriParams::testing()` is test-grade (a
    few bits of conjectured soundness); choose real FRI parameters and
-   re-measure the in-circuit verifier cost. Per-circuit `ProverData` setup
-   is currently rebuilt per proof — cache per (circuit-shape) vk.
-2. **vk hard-binding:** patch upstream (or wrap) to expose the predecessor's
-   preprocessed-commitment targets so the node circuit can pin the
-   predecessor vk to a constant instead of trusting the proof-carried
-   `stark_common` (see "Public-input binding").
+   re-measure the in-circuit verifier cost.
+2. **Root-key registry/versioning:** bind the accept adapter's `vk` argument
+   to an explicit allowlist of production root circuit identities and proof
+   versions. Recursive predecessor hard-binding is already enforced.
 3. **Paper gaps carried from stage 2:** issuer signature off-circuit
    (§4.4 item 1), single-asset transfers (§4.5), test-grade FRI parameters.
 4. **Shipped in stage 4:** the redeem circuit (§4.6), accept-driver

@@ -69,7 +69,7 @@ fn spike_statement_table_native() {
     runner.set_private_inputs(&private).unwrap();
     let traces = runner.run().expect("witness gen");
 
-    let prover = new_prover::<N>(&s.config, s.table_packing.clone());
+    let prover = new_prover::<N>(&s.config, s.table_packing.clone(), false);
     let proof = {
         let circuit_prover_data = lock_setup(&s.circuit_prover_data);
         prover
@@ -85,7 +85,7 @@ fn spike_statement_table_native() {
         .expect("statement table present");
     assert_eq!(entry.public_values, toy_public_values(vals));
 
-    let verifier = new_prover::<N>(&s.config, s.table_packing.clone());
+    let verifier = new_prover::<N>(&s.config, s.table_packing.clone(), false);
     verifier
         .verify_all_tables::<EF>(&proof)
         .expect("native verify");
@@ -109,7 +109,7 @@ fn spike_in_circuit_verification() {
     runner0.set_public_inputs(&[]).unwrap();
     runner0.set_private_inputs(&private).unwrap();
     let traces0 = runner0.run().expect("witness gen l0");
-    let prover0 = new_prover::<N>(&s0.config, s0.table_packing.clone());
+    let prover0 = new_prover::<N>(&s0.config, s0.table_packing.clone(), false);
     let proof0 = {
         let circuit_prover_data = lock_setup(&s0.circuit_prover_data);
         prover0
@@ -203,7 +203,7 @@ fn spike_in_circuit_verification() {
     eprintln!("spike2 parent witness gen: {:?}", t2.elapsed());
 
     let t3 = Instant::now();
-    let prover1 = new_prover::<N>(&s1.config, s1.table_packing.clone());
+    let prover1 = new_prover::<N>(&s1.config, s1.table_packing.clone(), false);
     let proof1 = {
         let circuit_prover_data = lock_setup(&s1.circuit_prover_data);
         prover1
@@ -213,7 +213,7 @@ fn spike_in_circuit_verification() {
     eprintln!("spike2 parent prove: {:?}", t3.elapsed());
 
     let t4 = Instant::now();
-    let verifier1 = new_prover::<N>(&s1.config, s1.table_packing.clone());
+    let verifier1 = new_prover::<N>(&s1.config, s1.table_packing.clone(), false);
     verifier1
         .verify_all_tables::<EF>(&proof1)
         .expect("verify l1");

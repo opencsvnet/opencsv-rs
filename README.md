@@ -33,8 +33,9 @@ consignment delivery via production Signal.) Numbers:
 - see `crates/opencsv-pcd/BENCHMARKS.md`
 
 Known gaps are documented in `crates/opencsv-pcd/README.md` (off-circuit issuer
-signature, single-asset transfers, test-grade FRI parameters, vk binding by
-call-site discipline).
+signature, single-asset transfers, test-grade FRI parameters, and explicit
+root-key allowlisting/versioning). Recursive predecessor keys are now
+hard-bound in-circuit.
 
 ## Build & test
 

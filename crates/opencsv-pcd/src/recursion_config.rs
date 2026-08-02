@@ -332,7 +332,7 @@ pub(crate) fn setup_circuit_with_verification_keys<const N: usize>(
             fri_identity.as_bytes(),
             packing_identity.as_bytes(),
             statement_identity.as_bytes(),
-            b"poseidon2-d4-w16/recompose-d4-limb1/statement-d4/constraint-standard",
+            b"poseidon2-d4-w16/recompose-d4-limb1+coeff/statement-d4/constraint-standard",
         ],
         verification_keys,
     );
@@ -342,11 +342,11 @@ pub(crate) fn setup_circuit_with_verification_keys<const N: usize>(
         || -> Result<RecCircuitProverData, p3_circuit::CircuitError> {
             let npo_prep: Vec<Box<dyn NpoPreprocessor<BabyBear>>> = vec![
                 Box::new(Poseidon2Preprocessor),
-                Box::new(RecomposePreprocessor::default()),
+                Box::new(RecomposePreprocessor::new(true)),
                 Box::new(StatementPreprocessor),
             ];
             let mut air_builders = poseidon2_air_builders::<CoinRecursionConfig, 4>();
-            air_builders.extend(recompose_air_builders(1, false));
+            air_builders.extend(recompose_air_builders(1, true));
             air_builders.push(Box::new(StatementAirBuilder::<4, N>));
             let (airs_degrees, primitive_columns, non_primitive_columns) =
                 get_airs_and_degrees_with_prep::<CoinRecursionConfig, _, 4>(
@@ -379,10 +379,11 @@ pub(crate) fn setup_circuit_with_verification_keys<const N: usize>(
 pub(crate) fn new_prover<const N: usize>(
     config: &CoinRecursionConfig,
     packing: TablePacking,
+    split_recompose_coefficients: bool,
 ) -> BatchStarkProver<CoinRecursionConfig> {
     let mut prover = BatchStarkProver::new(config.clone()).with_table_packing(packing);
     prover.register_poseidon2_table::<4>(Poseidon2Config::BABY_BEAR_D4_W16);
-    prover.register_recompose_table::<4>(false);
+    prover.register_recompose_table::<4>(split_recompose_coefficients);
     prover.register_table_prover(Box::new(StatementProver::<4, N>::new()));
     prover
 }
@@ -390,14 +391,21 @@ pub(crate) fn new_prover<const N: usize>(
 /// The non-primitive table provers of a recursive node proof, in proof order
 /// (must match the registration order in [`new_prover`]); used to reconstruct
 /// the table AIRs for in-circuit verification.
-pub(crate) fn node_table_provers<const N: usize>() -> Vec<Box<dyn TableProver<CoinRecursionConfig>>>
-{
-    vec![
+pub(crate) fn node_table_provers<const N: usize>(
+    split_recompose_coefficients: bool,
+) -> Vec<Box<dyn TableProver<CoinRecursionConfig>>> {
+    let mut provers: Vec<Box<dyn TableProver<CoinRecursionConfig>>> = vec![
         Box::new(p3_circuit_prover::Poseidon2Prover::new(
             Poseidon2Config::BABY_BEAR_D4_W16,
             ConstraintProfile::Standard,
         )),
         Box::new(p3_circuit_prover::RecomposeProver::<4>::new(1, false)),
-        Box::new(StatementProver::<4, N>::new()),
-    ]
+    ];
+    if split_recompose_coefficients {
+        provers.push(Box::new(p3_circuit_prover::RecomposeProver::<4>::new(
+            1, true,
+        )));
+    }
+    provers.push(Box::new(StatementProver::<4, N>::new()));
+    provers
 }

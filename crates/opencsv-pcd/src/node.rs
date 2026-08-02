@@ -59,22 +59,23 @@
 //! computation (AIR + witness bus), and connected to the successor's
 //! recomputed commitments.
 //!
-//! # vk binding status (honest)
+//! # Verification-key binding (honest)
 //!
-//! In-circuit predecessor verification is run against the predecessor's own
-//! `stark_common` (the self-describing common data carried in each proof —
-//! the same discipline as upstream's `RecursionOutput::into_recursion_input`).
-//! The preprocessed-commitment *targets* that would be needed to hard-bind
-//! the predecessor vk against a constant in-circuit are `pub(crate)` in
-//! `p3-recursion` at this pin, so a custom prover could substitute foreign
-//! common data for a predecessor slot. Closing this needs upstream to expose
-//! those targets (or primitive-table public values); see `README.md`. The
-//! root check in [`verify_coin_proof`] compares the proof's statement-table
-//! public values and natively verifies the proof.
+//! Every predecessor verifier's preprocessed commitment is constrained to
+//! the key selected when the parent circuit is built. The proof-carried
+//! `stark_common` is therefore a witness for that fixed key, not authority to
+//! substitute a different predecessor circuit. The narrow upstream accessor
+//! needed for this constraint is pinned with the other recursion sources; see
+//! `README.md`.
+//!
+//! The *root* remains a separate trust boundary: [`verify_coin_proof`]
+//! natively verifies the self-described root proof. Production callers must
+//! allowlist the accepted root circuit/version rather than treating recursive
+//! predecessor binding as root-key authorization.
 
 use opencsv_core::{mint_commit, AssetId, Coin, Commitment, Digest, Nullifier, OwnerSecret};
 use p3_baby_bear::BabyBear;
-use p3_circuit::{Circuit, CircuitBuilder, CircuitBuilderError, CircuitError, ExprId};
+use p3_circuit::{Circuit, CircuitBuilder, CircuitBuilderError, CircuitError, ExprId, NpoTypeId};
 use p3_circuit_prover::batch_stark_prover::{
     BatchStarkProof, BatchStarkProverError, NUM_PRIMITIVE_TABLES,
 };
@@ -82,7 +83,7 @@ use p3_field::PrimeCharacteristicRing;
 use p3_lookup::logup::LogUpGadget;
 use p3_recursion::public_inputs::BatchStarkVerifierInputsBuilder;
 use p3_recursion::verifier::{verify_p3_batch_proof_circuit, VerificationError};
-use p3_recursion::{FriRecursionConfig, Poseidon2Config};
+use p3_recursion::{FriRecursionConfig, ObservableCommitment, Poseidon2Config, Recursive};
 use serde::{Deserialize, Serialize};
 
 use crate::hash::{coin_commitment_base, connect_digest, hash_felts_base, hash_felts_limbs};
@@ -292,6 +293,16 @@ pub enum NodeError {
     PredecessorOutputMismatch,
     /// A predecessor is not a [`CoinProof`]-shaped proof (no statement table).
     MissingStatement,
+    /// A predecessor or verifier circuit has no preprocessed verification key.
+    MissingPredecessorVerificationKey,
+    /// The allocated predecessor-key target has a different shape than the
+    /// expected native verification key.
+    PredecessorVerificationKeyShapeMismatch {
+        /// Number of allocated commitment elements.
+        actual: usize,
+        /// Number of expected commitment elements.
+        expected: usize,
+    },
     /// Circuit construction failed.
     Builder(CircuitBuilderError),
     /// Witness generation / circuit execution failed (e.g. unbalanced values,
@@ -320,6 +331,13 @@ impl std::fmt::Display for NodeError {
                 "predecessor output commitment does not match the consumed input coin"
             ),
             Self::MissingStatement => write!(f, "predecessor proof has no statement table"),
+            Self::MissingPredecessorVerificationKey => {
+                write!(f, "predecessor proof has no preprocessed verification key")
+            }
+            Self::PredecessorVerificationKeyShapeMismatch { actual, expected } => write!(
+                f,
+                "predecessor verification-key shape mismatch: allocated {actual} elements, expected {expected}"
+            ),
             Self::Builder(e) => write!(f, "circuit build error: {e}"),
             Self::Circuit(e) => write!(f, "circuit execution error: {e}"),
             Self::Verification(e) => write!(f, "in-circuit verifier error: {e}"),
@@ -636,6 +654,77 @@ fn build_node_circuit(
 // Shared in-circuit predecessor verification + chaining
 // ============================================================================
 
+/// Relay a base-embedded public input through the recompose table.
+///
+/// The coefficient-lookups variant is important here: besides yielding an
+/// ordinary NPO output that is safe to use in ALU constraints, it receives
+/// the source witness as a base-field coefficient. That forces extension
+/// coefficients 1..D to zero instead of checking only coefficient zero.
+fn relay_base_public_input(
+    builder: &mut CircuitBuilder<EF>,
+    target: ExprId,
+) -> Result<ExprId, NodeError> {
+    Ok(
+        builder.recompose_base_coeffs_to_ext_with_coeff_lookups::<BabyBear>(&[
+            target,
+            ExprId::ZERO,
+            ExprId::ZERO,
+            ExprId::ZERO,
+        ])?,
+    )
+}
+
+/// Constrain one recursive verifier's proof-carried preprocessed commitment
+/// to the verification key selected when its parent circuit was built.
+fn bind_predecessor_verification_key(
+    builder: &mut CircuitBuilder<EF>,
+    verifier_inputs: &BatchStarkVerifierInputsBuilder<
+        CoinRecursionConfig,
+        <CoinRecursionConfig as FriRecursionConfig>::Commitment,
+        <CoinRecursionConfig as FriRecursionConfig>::OpeningProof,
+    >,
+    predecessor: &CoinProof,
+) -> Result<(), NodeError> {
+    let allocated = verifier_inputs
+        .common_data
+        .preprocessed_commitment()
+        .ok_or(NodeError::MissingPredecessorVerificationKey)?
+        .to_observation_targets();
+    let expected_commitment = &predecessor
+        .proof
+        .stark_common
+        .preprocessed
+        .as_ref()
+        .ok_or(NodeError::MissingPredecessorVerificationKey)?
+        .commitment;
+    let expected =
+        <<CoinRecursionConfig as FriRecursionConfig>::Commitment as Recursive<EF>>::get_values(
+            expected_commitment,
+        );
+
+    if allocated.len() != expected.len() {
+        return Err(NodeError::PredecessorVerificationKeyShapeMismatch {
+            actual: allocated.len(),
+            expected: expected.len(),
+        });
+    }
+
+    for (target, value) in allocated.into_iter().zip(expected) {
+        let relayed = relay_base_public_input(builder, target)?;
+        let expected = builder.define_const(value);
+        let difference = builder.sub(relayed, expected);
+        builder.assert_zero(difference);
+    }
+    Ok(())
+}
+
+fn proof_uses_split_recompose_coefficients(proof: &BatchStarkProof<CoinRecursionConfig>) -> bool {
+    proof
+        .non_primitives
+        .iter()
+        .any(|entry| entry.op_type == NpoTypeId::recompose_with_coeff_lookups())
+}
+
 /// Verify one predecessor coin proof in-circuit and enforce the chaining
 /// constraints (module docs): the predecessor's bound `asset_id` equals this
 /// circuit's asset, and `select(k, out_1, out_0)` equals the recomputed input
@@ -657,7 +746,8 @@ fn chain_predecessor(
         .map(|p| NUM_PRIMITIVE_TABLES + p)
         .ok_or(NodeError::MissingStatement)?;
 
-    let table_provers = node_table_provers::<STATEMENT_ELEMS>();
+    let table_provers =
+        node_table_provers::<STATEMENT_ELEMS>(proof_uses_split_recompose_coefficients(&pred.proof));
     let (verifier_inputs, op_ids) = verify_p3_batch_proof_circuit::<
         CoinRecursionConfig,
         <CoinRecursionConfig as FriRecursionConfig>::Commitment,
@@ -678,6 +768,8 @@ fn chain_predecessor(
         Poseidon2Config::BABY_BEAR_D4_W16,
         &table_provers,
     )?;
+
+    bind_predecessor_verification_key(builder, &verifier_inputs, pred)?;
 
     let stmt_targets = &verifier_inputs.air_public_targets[stmt_instance];
     assert_eq!(stmt_targets.len(), STATEMENT_PUBLIC_VALUES);
@@ -844,7 +936,7 @@ pub fn prove_genesis_mint(
     runner.set_private_inputs(&private_values)?;
     let traces = runner.run()?;
 
-    let prover = new_prover::<STATEMENT_ELEMS>(&s.config, s.table_packing.clone());
+    let prover = new_prover::<STATEMENT_ELEMS>(&s.config, s.table_packing.clone(), false);
     let circuit_prover_data = lock_setup(&s.circuit_prover_data);
     let proof = prover.prove_all_tables(&traces, &circuit_prover_data)?;
 
@@ -956,7 +1048,7 @@ pub fn prove_transfer(
     }
     let traces = runner.run()?;
 
-    let prover = new_prover::<STATEMENT_ELEMS>(&s.config, s.table_packing.clone());
+    let prover = new_prover::<STATEMENT_ELEMS>(&s.config, s.table_packing.clone(), true);
     let circuit_prover_data = lock_setup(&s.circuit_prover_data);
     let proof = prover.prove_all_tables(&traces, &circuit_prover_data)?;
 
@@ -985,7 +1077,11 @@ pub fn verify_coin_proof(expected: &NodeStatement, coin: &CoinProof) -> Result<(
         return Err(NodeError::StatementMismatch);
     }
     let config = CoinRecursionConfig::new(&coin_fri_params());
-    let verifier = new_prover::<STATEMENT_ELEMS>(&config, coin.proof.table_packing.clone());
+    let verifier = new_prover::<STATEMENT_ELEMS>(
+        &config,
+        coin.proof.table_packing.clone(),
+        proof_uses_split_recompose_coefficients(&coin.proof),
+    );
     verifier.verify_all_tables::<EF>(&coin.proof)?;
     Ok(())
 }
@@ -1068,7 +1164,7 @@ pub fn prove_redeem(
     .map_err(NodeError::FriPrivateData)?;
     let traces = runner.run()?;
 
-    let prover = new_prover::<STATEMENT_ELEMS>(&s.config, s.table_packing.clone());
+    let prover = new_prover::<STATEMENT_ELEMS>(&s.config, s.table_packing.clone(), true);
     let circuit_prover_data = lock_setup(&s.circuit_prover_data);
     let proof = prover.prove_all_tables(&traces, &circuit_prover_data)?;
 
@@ -1083,6 +1179,53 @@ pub fn prove_redeem(
         },
         proof,
     })
+}
+
+#[cfg(test)]
+mod verification_key_binding_tests {
+    use super::*;
+    use p3_field::BasedVectorSpace;
+
+    fn run_key_binding(actual: EF, expected: EF) -> Result<(), NodeError> {
+        let mut builder = CircuitBuilder::<EF>::new();
+        let target = builder.public_input();
+        let relayed = relay_base_public_input(&mut builder, target)?;
+        let expected = builder.define_const(expected);
+        let difference = builder.sub(relayed, expected);
+        builder.assert_zero(difference);
+
+        let circuit = builder.build()?;
+        let mut runner = circuit.runner();
+        runner.set_public_inputs(&[actual])?;
+        runner.run()?;
+        Ok(())
+    }
+
+    #[test]
+    fn predecessor_key_binding_accepts_the_expected_commitment_element() {
+        run_key_binding(EF::ONE, EF::ONE).expect("matching predecessor key element must bind");
+    }
+
+    #[test]
+    fn predecessor_key_binding_rejects_a_different_commitment_element() {
+        let error = run_key_binding(EF::ONE, EF::ZERO)
+            .expect_err("foreign predecessor key element must not bind");
+        assert!(matches!(error, NodeError::Circuit(_)));
+    }
+
+    #[test]
+    fn predecessor_key_binding_rejects_non_base_extension_coefficients() {
+        let non_base = EF::from_basis_coefficients_slice(&[
+            BabyBear::ONE,
+            BabyBear::ONE,
+            BabyBear::ZERO,
+            BabyBear::ZERO,
+        ])
+        .expect("quartic extension has four coefficients");
+        let error = run_key_binding(non_base, EF::ONE)
+            .expect_err("predecessor key elements must be base-field embedded");
+        assert!(matches!(error, NodeError::Circuit(_)));
+    }
 }
 
 /// Verify a redeem proof: a mode-checked wrapper around
