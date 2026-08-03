@@ -18,7 +18,8 @@ Date: 2026-08-03
   `SIGNET_READINESS.md`.
 - `scripts/reproducible-build.sh --verify dist/reproducible` built default and
   Signal-free release binaries twice in isolated, path-remapped target
-  directories and byte-compared both pairs before the safe-marker migration.
+  directories and byte-compared both pairs from clean implementation commit
+  `cfb902b2d7c3b6cb748882c99381d99398ef12d2`.
 - Post-migration focused suites passed with warnings denied:
   `opencsv-bitcoin --lib` (25 tests), `opencsv-cbf --lib` (33 tests), and
   `opencsv-anchor-server --bin opencsv-anchor-server` (7 tests).
@@ -32,16 +33,15 @@ Date: 2026-08-03
   height equality, and rerun successfully: 320 filter bytes, 1,140 block bytes,
   two fetched blocks over an eight-filter window.
 
-## Superseded pre-marker binary hashes
+## Reproducible post-marker binary hashes
 
 ```text
-7e603c0fa6298239a5863c09f7531046ee30d174dcdc5800ff654400b5e41773  opencsv-signal
-cb66002a7b1abe9d251738cf7ac23adfb31a69adaf2b30d984c28b011715e84f  opencsv-core
+ffaddbb207e8ceedc8d895d5d8e7cea22610ea84821079790465c09f4b8ed947  opencsv-signal
+d7cd77de564dd8ece5a575f98d5c892a4672d80ed50a9d2a0913cab3a5bcb7a4  opencsv-core
 ```
 
-These hashes predate the unspendable-marker fix and are not release candidates.
-Post-fix hashes will be recorded after the implementation commit is clean and
-the reproducibility harness is rerun. The generated `dist/` directory is
+The provenance records Rust 1.97.1, Cargo 1.97.1, libprotoc 35.1,
+`verified_twice=1`, and `dirty_tree=0`. The generated `dist/` directory is
 intentionally ignored; release artifacts must be rebuilt from a clean reviewed
 commit, and the script refuses a dirty tree unless explicitly placed in
 non-release diagnostic mode.
