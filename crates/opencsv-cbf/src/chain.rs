@@ -10,6 +10,7 @@ use crate::peer::Peer;
 
 /// A fully validated header chain (index = height), with cumulative
 /// work per height.
+#[derive(Clone)]
 pub struct HeaderChain {
     params: Params,
     headers: Vec<BlockHeader>,
@@ -112,6 +113,15 @@ impl HeaderChain {
         self.chainwork.last().copied().unwrap_or(0)
     }
 
+    /// Number of identical headers at the start of both chains.
+    pub fn common_prefix_len(&self, other: &Self) -> u64 {
+        self.hashes
+            .iter()
+            .zip(&other.hashes)
+            .take_while(|(left, right)| left == right)
+            .count() as u64
+    }
+
     /// Sync headers from a peer to its tip. Follows the peer across
     /// reorgs by truncating back to the fork point when a batch
     /// attaches below our tip. Returns the number of new headers
@@ -144,8 +154,7 @@ impl HeaderChain {
                 if self.hashes.last() == Some(&header.prev_block) {
                     self.append_validated(header)?;
                     appended += 1;
-                } else if let Some(fork) =
-                    self.hashes.iter().position(|h| h == &header.prev_block)
+                } else if let Some(fork) = self.hashes.iter().position(|h| h == &header.prev_block)
                 {
                     // The peer's chain forks below our tip: truncate to
                     // the fork point and follow it.
@@ -200,12 +209,25 @@ fn filter_hashes_path(cache_dir: &Path) -> PathBuf {
 /// cross-checks the chain across all connected peers (see
 /// `CbfClient::connect`); agreement means at least one honest peer
 /// suffices for correctness (BIP157's security model).
+#[derive(Clone)]
 pub struct FilterHeaderChain {
     /// Filter hash per height (internal order).
     filter_hashes: Vec<[u8; 32]>,
 }
 
 impl FilterHeaderChain {
+    /// Start with no cached filter hashes.
+    pub fn empty() -> Self {
+        Self {
+            filter_hashes: Vec::new(),
+        }
+    }
+
+    /// Adopt a complete hash chain cross-checked across peers.
+    pub fn from_verified(filter_hashes: Vec<[u8; 32]>) -> Self {
+        Self { filter_hashes }
+    }
+
     /// Load from `cache_dir/filter-hashes.bin` (no independent
     /// validation is possible — the chain is re-derived from peers on
     /// every connect anyway, and only entries re-validated against a
@@ -226,7 +248,10 @@ impl FilterHeaderChain {
             });
         }
         Ok(Self {
-            filter_hashes: bytes.chunks_exact(32).map(|c| c.try_into().expect("32")).collect(),
+            filter_hashes: bytes
+                .chunks_exact(32)
+                .map(|c| c.try_into().expect("32"))
+                .collect(),
         })
     }
 
@@ -272,9 +297,9 @@ impl FilterHeaderChain {
     /// Verify a downloaded filter for `height` against the committed
     /// filter hash.
     pub fn verify_filter(&self, height: u64, filter_bytes: &[u8]) -> Result<(), Error> {
-        let committed = self.filter_hash_at(height).ok_or_else(|| {
-            Error::Filter(format!("no filter hash synced for height {height}"))
-        })?;
+        let committed = self
+            .filter_hash_at(height)
+            .ok_or_else(|| Error::Filter(format!("no filter hash synced for height {height}")))?;
         if crate::gcs::filter_hash(filter_bytes) != committed {
             return Err(Error::Filter(format!(
                 "filter for height {height} does not match the committed filter hash"

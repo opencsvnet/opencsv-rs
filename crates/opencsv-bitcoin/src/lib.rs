@@ -74,12 +74,18 @@ pub mod batch_v2;
 pub mod bech32;
 pub mod chain;
 pub mod error;
+pub mod fee_model;
+pub mod replacement;
 pub mod rpc;
 
 pub use batch::BATCH_FUNDING_SATS;
 pub use chain::{
-    display_txid, funding_ctx, marker_address, BitcoinAnchorChain, Config, Network,
-    MARKER_DUST_BTC, MARKER_DUST_SATS, MARKER_SCRIPT, MARKER_SPK, MEMPOOL_LOCATION,
+    display_txid, funding_ctx, is_marker_spk, marker_address, BitcoinAnchorChain, Config, Network,
+    LEGACY_MARKER_SCRIPT, LEGACY_MARKER_SPK, MARKER_DUST_BTC, MARKER_DUST_SATS, MARKER_SCRIPT,
+    MARKER_SPK, MEMPOOL_LOCATION,
 };
 pub use error::Error;
+pub use replacement::{
+    validate_solo_anchor_replacement, SoloReplacementReceipt, SoloReplacementRejection,
+};
 pub use rpc::{HttpTransport, RpcAuth, RpcClient, Transport};

@@ -356,6 +356,7 @@ pub fn scan_new_blocks(client: &EsploraClient, state: &mut ScanState) -> Result<
         let height = state.scanned_to + 1;
         let hash = client.block_hash_at(height)?;
         let marker_hex = to_hex(&opencsv_bitcoin::MARKER_SPK);
+        let legacy_marker_hex = to_hex(&opencsv_bitcoin::LEGACY_MARKER_SPK);
         let mut has_marker = false;
         let mut index = 0usize;
         loop {
@@ -369,7 +370,10 @@ pub fn scan_new_blocks(client: &EsploraClient, state: &mut ScanState) -> Result<
                     has_marker = tx
                         .vout
                         .iter()
-                        .any(|vout| vout.scriptpubkey == marker_hex);
+                        .any(|vout| {
+                            vout.scriptpubkey == marker_hex
+                                || vout.scriptpubkey == legacy_marker_hex
+                        });
                 }
                 let position = (index + offset) as u32;
                 for vout in &tx.vout {

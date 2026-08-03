@@ -130,7 +130,7 @@ fn regtest_end_to_end() {
 
     // Protocol-fixed anchor transaction layout: output 0 is the
     // 64-byte OP_RETURN record, output 1 is the constant marker output
-    // (546 sats to OP_0 <sha256(OP_TRUE)>), which makes the block
+    // (546 sats to OP_0 <sha256(OP_RETURN)>), which makes the block
     // discoverable by BIP158 filter scans.
     let anchor_tx = &block.txs[location.position as usize];
     assert_eq!(anchor_tx.outputs[0].script_pubkey, anchor_script(&record.to_bytes()));

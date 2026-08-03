@@ -1,6 +1,7 @@
 //! The product surface: `CbfClient` — multi-peer header/filter-header
 //! sync and trustless point verification of claimed anchors.
 
+use std::collections::HashSet;
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::path::PathBuf;
 use std::time::Duration;
@@ -129,6 +130,7 @@ impl CbfClient {
 
         let mut peers = Vec::new();
         let mut failures = Vec::new();
+        let mut resolved_peers = HashSet::new();
         for peer in &config.peers {
             let addr = match resolve(peer, params.default_port) {
                 Ok(addr) => addr,
@@ -137,6 +139,10 @@ impl CbfClient {
                     continue;
                 }
             };
+            if !resolved_peers.insert(addr) {
+                failures.push(format!("{peer}: duplicate resolved peer {addr}"));
+                continue;
+            }
             let tip = chain.tip_height().unwrap_or(0);
             match Peer::connect(addr, &params, config.timeout, tip) {
                 Ok(peer) => peers.push(peer),
@@ -154,40 +160,59 @@ impl CbfClient {
             filter_chain,
             cache_dir,
         };
-        client.sync()?;
+        client.sync_inner(true)?;
         Ok(client)
     }
 
     /// Resync headers (every peer, tip agreement enforced) and filter
     /// headers (every peer, chain agreement enforced).
     pub fn sync(&mut self) -> Result<(), Error> {
-        // Header sync on every peer; all must agree on the tip.
-        let mut tips = Vec::with_capacity(self.peers.len());
+        self.sync_inner(false)
+    }
+
+    fn sync_inner(&mut self, revalidate_filter_cache: bool) -> Result<(), Error> {
+        // Every peer independently advances a clone of the same validated
+        // base chain. Sharing one mutable chain here would let later peers
+        // merely observe the first peer's result instead of attesting it.
+        let base_chain = self.chain.clone();
+        let mut candidates = Vec::with_capacity(self.peers.len());
         for peer in &mut self.peers {
-            self.chain.sync(peer)?;
+            let mut candidate = base_chain.clone();
+            candidate.sync(peer)?;
             let tip = (
-                self.chain.tip_height(),
-                self.chain.tip_height().and_then(|h| self.chain.hash_at(h)),
+                candidate.tip_height(),
+                candidate.tip_height().and_then(|h| candidate.hash_at(h)),
+                candidate.tip_work(),
             );
-            tips.push((peer.addr(), tip));
+            candidates.push((peer.addr(), tip, candidate));
         }
-        let (_, first_tip) = tips[0];
-        if tips.iter().any(|(_, tip)| *tip != first_tip) {
-            let detail = tips
+        let first_tip = candidates[0].1;
+        if candidates.iter().any(|(_, tip, _)| *tip != first_tip) {
+            let detail = candidates
                 .iter()
-                .map(|(addr, tip)| format!("{addr} -> {tip:?}"))
+                .map(|(addr, tip, _)| format!("{addr} -> {tip:?}"))
                 .collect::<Vec<_>>()
                 .join(", ");
             return Err(Error::DivergentPeers(format!("header tips: {detail}")));
         }
+        let agreed_chain = candidates.remove(0).2;
+        let common_prefix = self.chain.common_prefix_len(&agreed_chain);
+        self.chain = agreed_chain;
+        self.filter_chain.truncate(common_prefix);
 
-        // Filter-header sync: fetch the range from every peer and
-        // require byte-identical filter hashes (a faulty or malicious
-        // peer is detectable because filters are deterministic).
+        // On every new connection, re-fetch the complete filter-hash chain
+        // from each peer. Filter hashes are not committed in block headers,
+        // so a disk cache cannot be authoritative. Later syncs on these same
+        // authenticated connections fetch only the newly appended range.
         let stop = self.chain.tip_height().expect("genesis synced");
+        let base_filters = if revalidate_filter_cache {
+            FilterHeaderChain::empty()
+        } else {
+            self.filter_chain.clone()
+        };
         let mut reference: Option<Vec<[u8; 32]>> = None;
         for peer in &mut self.peers {
-            let fetched = self.filter_chain.fetch_range(peer, &self.chain, stop)?;
+            let fetched = base_filters.fetch_range(peer, &self.chain, stop)?;
             match &reference {
                 None => reference = Some(fetched),
                 Some(expected) => {
@@ -200,7 +225,11 @@ impl CbfClient {
             }
         }
         if let Some(new_hashes) = reference {
-            self.filter_chain.extend(&new_hashes);
+            if revalidate_filter_cache {
+                self.filter_chain = FilterHeaderChain::from_verified(new_hashes);
+            } else {
+                self.filter_chain.extend(&new_hashes);
+            }
         }
         self.chain.persist(&self.cache_dir)?;
         self.filter_chain.persist(&self.cache_dir)?;
@@ -217,6 +246,21 @@ impl CbfClient {
     /// client must not re-handshake).
     pub fn handshake_count(&self) -> u64 {
         self.peers.iter().map(|p| p.versions_sent).sum()
+    }
+
+    /// Number of independently connected peers participating in agreement.
+    pub fn connected_peer_count(&self) -> usize {
+        self.peers.len()
+    }
+
+    /// Complete P2P wire bytes sent and received by this client.
+    pub fn network_bytes(&self) -> (u64, u64) {
+        self.peers.iter().fold((0, 0), |(sent, received), peer| {
+            (
+                sent + peer.wire_bytes_sent,
+                received + peer.wire_bytes_received,
+            )
+        })
     }
 
     /// Internal-order hash of the block at `height`.
@@ -292,10 +336,7 @@ impl CbfClient {
     /// by the scan engine's accounting.
     pub fn fetched_bytes(&self) -> (u64, u64) {
         self.peers.iter().fold((0, 0), |(f, b), peer| {
-            (
-                f + peer.filter_bytes_fetched,
-                b + peer.block_bytes_fetched,
-            )
+            (f + peer.filter_bytes_fetched, b + peer.block_bytes_fetched)
         })
     }
 
@@ -341,8 +382,7 @@ impl CbfClient {
     ) -> Result<AnchorVerdict, Error> {
         if location.height == 0 {
             return Err(Error::InvalidInput(
-                "height 0 is the mempool sentinel / genesis: anchors live in mined blocks"
-                    .into(),
+                "height 0 is the mempool sentinel / genesis: anchors live in mined blocks".into(),
             ));
         }
         let tip = self.tip_height();
@@ -395,9 +435,10 @@ impl CbfClient {
         if !carries_record {
             return Ok(AnchorVerdict::NotPresent(NotPresentReason::RecordNotInTx));
         }
-        let funding_input = tx.inputs.first().ok_or_else(|| {
-            Error::Protocol("anchor transaction has no inputs".into())
-        })?;
+        let funding_input = tx
+            .inputs
+            .first()
+            .ok_or_else(|| Error::Protocol("anchor transaction has no inputs".into()))?;
         if tx.is_coinbase() {
             return Ok(AnchorVerdict::NotPresent(NotPresentReason::RecordNotInTx));
         }

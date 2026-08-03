@@ -52,16 +52,29 @@ and persistence of the verified signed transaction before any broadcast.
 There is no required coordinator or OpenCSV-specific server; any peer with the
 complete transcript can finalize and broadcast.
 
+The dated signet measurements, executable fee model, security findings, and
+release gates are in [`SIGNET_READINESS.md`](SIGNET_READINESS.md),
+[`SECURITY_REVIEW.md`](SECURITY_REVIEW.md), and [`RELEASE.md`](RELEASE.md).
+The complete command and artifact receipt is [`VALIDATION.md`](VALIDATION.md).
+These are readiness receipts, not mainnet authorization.
+
+New anchors use a BIP158-visible, unspendable P2WSH marker committing to
+`OP_RETURN`. Readers retain exact compatibility with the historical
+`OP_TRUE` marker, but constructors never recreate its child-pinning risk.
+Solo fee replacements must pass the Rust protocol validator; generic Bitcoin
+wallet fee-bump APIs are not protocol-safe.
+
 ## Build & test
 
 ```sh
-cargo build --release -p opencsv-cli   # needs protoc for the Signal feature
-cargo test --workspace                 # debug; slow proving tests are #[ignore]d
+cargo build --locked --release -p opencsv-cli  # needs protoc for Signal
+cargo test --locked --workspace               # slow proving tests are #[ignore]d
+./scripts/reproducible-build.sh --verify dist/reproducible
 ```
 
 `protoc`: `apt-get install protobuf-compiler`, or set `PROTOC=/path/to/protoc`.
 The Signal feature is on by default; build without it via
-`cargo build --no-default-features -p opencsv-cli` (MIT/Apache only — the
+`cargo build --locked --no-default-features -p opencsv-cli` (MIT/Apache only — the
 `signal` feature pulls in AGPL-licensed presage).
 
 ## License

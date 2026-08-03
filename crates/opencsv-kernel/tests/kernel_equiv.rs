@@ -6,7 +6,6 @@
 use opencsv_core::anchor::{self, AnchorRecord};
 use opencsv_core::chain::MockAnchorChain;
 use opencsv_core::{AnchorChain, Digest, TruncatedDigest};
-use opencsv_kernel::types::Entry;
 use opencsv_kernel::{audit as kaudit, batch as kbatch, binding as kbinding, interop, record::Record as KRecord, scan as kscan};
 
 fn byte_seed(seed: u8) -> [u8; 32] {

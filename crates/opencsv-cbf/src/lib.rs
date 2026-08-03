@@ -76,7 +76,7 @@ pub mod wire;
 
 pub use client::{AnchorVerdict, CbfClient, Config, NotPresentReason};
 pub use fullscan::{FullScanChain, ScannedAnchor, MAX_WINDOW_BLOCKS};
-pub use scan::{ScanCounters, ScanIndex};
+pub use scan::{ScanCounters, ScanIndex, ScanLoadStatus};
 pub use error::Error;
 pub use opencsv_bitcoin::Network;
 pub use opencsv_core::chain::AnchorLocation;

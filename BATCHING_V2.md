@@ -79,7 +79,8 @@ semantics.
 | `SEQUENCE` | `0xfffffffd` | Opt-in replacement, no relative lock |
 | `LOCK_TIME` | `0` | Initial C1 lock time |
 | `SIGHASH` | `SIGHASH_ALL` (`0x01`) | Required for every input |
-| `MARKER_VALUE` | `546` sats | Existing OpenCSV marker value |
+| `MARKER_VALUE` | `546` sats | OpenCSV marker value |
+| `MARKER_SCRIPT` | `OP_0 PUSH32(SHA256(OP_RETURN))` | BIP158-visible, unspendable marker scriptPubKey |
 | `MIN_CHANGE` | `546` sats | Conservative v2 change floor |
 | `MIN_STOCK_VALUE` | `546` sats | Conservative reusable-stock floor |
 
@@ -281,7 +282,7 @@ inputs:
 
 outputs:
   0       value 0, OP_RETURN <64-byte v2 batch-header record>
-  1       value 546, the existing constant OpenCSV marker scriptPubKey
+  1       value 546, the constant unspendable OpenCSV marker scriptPubKey
   2       stock_value, the exact input-0 P2WSH scriptPubKey
   3..N+2  participant P2WPKH change outputs in participant order
 ```
@@ -291,6 +292,14 @@ are no extra inputs or outputs, no merged or omitted change, and no coordinator
 output. Input 0 and protocol outputs intentionally override general-purpose
 lexicographic transaction ordering; the remaining outpoints use the same
 determinism principle as [BIP 69][bip69].
+
+Pre-readiness prototypes used `OP_0 PUSH32(SHA256(OP_TRUE))` at output 1.
+That output was anyone-can-spend: a signet observer immediately attached a
+child transaction and pinned ordinary BIP125 replacement. New manifests use
+the unspendable `OP_RETURN` witness-script hash above. Readers and canonical
+manifest validation recognize the exact historical script for old receipts,
+but builders never create it and historical manifests cannot enter a new
+replacement epoch. There is no heuristic script fallback.
 
 Before signing, every participant MUST verify:
 

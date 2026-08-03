@@ -90,7 +90,7 @@ fn export_snapshot_enables_serverless_crediting() {
     let mut anchor_chain = BitcoinAnchorChain::open(&btc_config).unwrap();
     let mint_ref = anchor_chain.anchor(|_| mint_record).unwrap();
     // An XFER anchor too, so the export has more than one entry.
-    let (raw_nf, xfer_ref) = common::anchor_xfer_retry(&mut anchor_chain, 33);
+    let (_raw_nf, xfer_ref) = common::anchor_xfer_retry(&mut anchor_chain, 33);
     anchor_chain.generate_blocks(6).unwrap();
     let mint_location = anchor_chain.locate(&mint_ref).expect("mint mined");
     let xfer_location = anchor_chain.locate(&xfer_ref).expect("xfer mined");

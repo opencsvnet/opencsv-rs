@@ -176,11 +176,17 @@ impl Node {
     pub fn wait_for_filter_index(&self) {
         let deadline = Instant::now() + Duration::from_secs(60);
         loop {
-            let info = self.rpc(None).call("getindexinfo", json!([])).unwrap();
-            let synced = info["basic block filter index"]["synced"]
-                .as_bool()
-                .or_else(|| info["blockfilterindex"]["synced"].as_bool());
-            if synced == Some(true) {
+            let rpc = self.rpc(None);
+            let tip = rpc.call("getblockcount", json!([])).unwrap().as_u64().unwrap();
+            let info = rpc.call("getindexinfo", json!([])).unwrap();
+            let index = info
+                .get("basic block filter index")
+                .or_else(|| info.get("blockfilterindex"));
+            let caught_up = index.is_some_and(|index| {
+                index["synced"].as_bool() == Some(true)
+                    && index["best_block_height"].as_u64() == Some(tip)
+            });
+            if caught_up {
                 break;
             }
             assert!(

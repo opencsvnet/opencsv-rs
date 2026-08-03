@@ -25,7 +25,7 @@ use bitcoin::{
 use opencsv_core::{envelope_v2_encode, AnchorRecord, TruncatedDigest, MAX_BATCH_V2_PARTICIPANTS};
 use sha2::{Digest as _, Sha256};
 
-use crate::{funding_ctx, MARKER_DUST_SATS, MARKER_SPK};
+use crate::{funding_ctx, LEGACY_MARKER_SPK, MARKER_DUST_SATS, MARKER_SPK};
 
 /// Batching-v2 transcript version.
 pub const VERSION: u16 = 2;
@@ -562,9 +562,25 @@ impl Manifest {
 
     fn build_at(
         proposal: &Proposal,
+        commitments: Vec<ParticipantCommitment>,
+        replacement_epoch: u32,
+        feerate_sat_vb: u32,
+    ) -> Result<Self, ProtocolError> {
+        Self::build_at_with_marker(
+            proposal,
+            commitments,
+            replacement_epoch,
+            feerate_sat_vb,
+            &MARKER_SPK,
+        )
+    }
+
+    fn build_at_with_marker(
+        proposal: &Proposal,
         mut commitments: Vec<ParticipantCommitment>,
         replacement_epoch: u32,
         feerate_sat_vb: u32,
+        marker_spk: &[u8; 34],
     ) -> Result<Self, ProtocolError> {
         proposal.validate()?;
         if commitments.len() != proposal.participant_count() {
@@ -662,7 +678,7 @@ impl Manifest {
         });
         outputs.push(TxOut {
             value: Amount::from_sat(MARKER_DUST_SATS),
-            script_pubkey: ScriptBuf::from_bytes(MARKER_SPK.to_vec()),
+            script_pubkey: ScriptBuf::from_bytes(marker_spk.to_vec()),
         });
         outputs.push(TxOut {
             value: Amount::from_sat(proposal.stock_value),
@@ -1085,7 +1101,14 @@ impl Manifest {
                 "replacement feerate must increase",
             ));
         }
-        let replacement = Self::build_at(
+        let marker_spk = self.marker_spk()?;
+        if marker_spk != &MARKER_SPK {
+            return Err(ProtocolError::new(
+                RejectionReason::ReplacementViolation,
+                "historical spendable-marker manifests are read-only",
+            ));
+        }
+        let replacement = Self::build_at_with_marker(
             proposal,
             self.commitments.clone(),
             self.replacement_epoch.checked_add(1).ok_or_else(|| {
@@ -1095,6 +1118,7 @@ impl Manifest {
                 )
             })?,
             new_feerate_sat_vb,
+            marker_spk,
         )?;
         if self.unsigned_tx.input != replacement.unsigned_tx.input
             || self.unsigned_tx.output[..3] != replacement.unsigned_tx.output[..3]
@@ -1121,11 +1145,12 @@ impl Manifest {
 
     /// Recompute the canonical manifest and reject any mutation.
     pub fn validate(&self, proposal: &Proposal) -> Result<(), ProtocolError> {
-        let expected = Self::build_at(
+        let expected = Self::build_at_with_marker(
             proposal,
             self.commitments.clone(),
             self.replacement_epoch,
             self.feerate_sat_vb,
+            self.marker_spk()?,
         )?;
         if self != &expected {
             return Err(ProtocolError::new(
@@ -1134,6 +1159,25 @@ impl Manifest {
             ));
         }
         Ok(())
+    }
+
+    fn marker_spk(&self) -> Result<&'static [u8; 34], ProtocolError> {
+        let marker = self.unsigned_tx.output.get(1).ok_or_else(|| {
+            ProtocolError::new(
+                RejectionReason::ProtocolLayoutViolation,
+                "transaction has no marker output",
+            )
+        })?;
+        if marker.script_pubkey.as_bytes() == MARKER_SPK {
+            Ok(&MARKER_SPK)
+        } else if marker.script_pubkey.as_bytes() == LEGACY_MARKER_SPK {
+            Ok(&LEGACY_MARKER_SPK)
+        } else {
+            Err(ProtocolError::new(
+                RejectionReason::ProtocolLayoutViolation,
+                "marker script is neither the current nor historical constant",
+            ))
+        }
     }
 
     fn check_layout(&self, proposal: &Proposal) -> Result<(), ProtocolError> {
@@ -1654,6 +1698,25 @@ mod tests {
     }
 
     #[test]
+    fn new_manifests_use_unspendable_markers_and_legacy_remains_readable() {
+        let (proposal, commitments, _, _) = fixture();
+        let current = Manifest::build(&proposal, commitments.clone()).unwrap();
+        assert_eq!(
+            current.unsigned_tx.output[1].script_pubkey.as_bytes(),
+            MARKER_SPK
+        );
+
+        let mut legacy = current;
+        legacy.unsigned_tx.output[1].script_pubkey =
+            ScriptBuf::from_bytes(LEGACY_MARKER_SPK.to_vec());
+        legacy.validate(&proposal).unwrap();
+        let decoded = Manifest::from_wire(&proposal, commitments, &legacy.wire_bytes()).unwrap();
+        assert_eq!(decoded, legacy);
+        let error = legacy.replacement(&proposal, 3).unwrap_err();
+        assert_eq!(error.reason, RejectionReason::ReplacementViolation);
+    }
+
+    #[test]
     fn manifest_orders_allocates_signs_and_finalizes() {
         let (proposal, commitments, participant_secrets, stock_secret) = fixture();
         let manifest = Manifest::build(&proposal, commitments).unwrap();
@@ -1961,13 +2024,13 @@ mod tests {
                 "manifest",
                 manifest_wire.as_slice(),
                 514,
-                "9c426fea03d7ec47013e932429fd379dcdfd05e95436d1ba6a407deeed580776",
+                "2380dfa619cca1827e52c526797962e3fc3120c4550dac7a96f59145a55c1e7a",
             ),
             (
                 "signature",
                 signature_wire.as_slice(),
                 153,
-                "ea9058cfe1a6ab94b367fa016cff89d3ff7f97a24478f09ed7e9adda50c2056e",
+                "201bdbd20b8861d43ae09dc58ebedb823f935ec87b387a23550fbdd0dbdde185",
             ),
         ] {
             assert_eq!(bytes.len(), expected_len, "{name} wire length changed");
@@ -1988,9 +2051,9 @@ mod tests {
         assert_eq!(
             manifest.manifest_id(),
             [
-                0xa2, 0x69, 0x19, 0x2a, 0x9b, 0x61, 0xde, 0x5d, 0x57, 0x49, 0x79, 0x07, 0x49, 0x1e,
-                0x91, 0x80, 0x66, 0xdd, 0x0b, 0x87, 0xf9, 0x8e, 0xd7, 0x86, 0xb8, 0x70, 0x4e, 0xc8,
-                0x45, 0xf8, 0x8e, 0x14,
+                0x0e, 0xca, 0x65, 0x2e, 0xea, 0xf1, 0x85, 0x9d, 0xc0, 0xbe, 0xb0, 0x38, 0xbc, 0xec,
+                0x3a, 0x61, 0xab, 0x7b, 0x7e, 0xaf, 0x43, 0x87, 0x10, 0x72, 0x16, 0x61, 0xfd, 0xd9,
+                0x08, 0x3d, 0xe2, 0x23,
             ]
         );
 
