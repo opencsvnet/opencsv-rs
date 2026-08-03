@@ -705,6 +705,8 @@ impl AccountWallet {
                     validate_hex_32_config(expected, "expected device binding commitment")?;
                 }
                 let stored = db.meta("device_binding_commitment")?;
+                let missing_binding_seen =
+                    db.meta("device_binding_missing_seen")?.as_deref() == Some("1");
                 if let (Some(stored), Some(expected)) = (
                     stored.as_deref(),
                     config.expected_device_binding_commitment.as_deref(),
@@ -718,7 +720,16 @@ impl AccountWallet {
                 }
                 let authoritative = stored
                     .or_else(|| config.expected_device_binding_commitment.clone())
-                    .or_else(|| current_device_binding_commitment.clone());
+                    .or_else(|| {
+                        if missing_binding_seen {
+                            None
+                        } else {
+                            current_device_binding_commitment.clone()
+                        }
+                    });
+                if current_device_binding_commitment.is_none() && !missing_binding_seen {
+                    db.set_meta("device_binding_missing_seen", "1")?;
+                }
                 if db.meta("device_binding_commitment")?.is_none() {
                     if let Some(authoritative) = authoritative.as_deref() {
                         db.set_meta("device_binding_commitment", authoritative)?;
@@ -2932,6 +2943,35 @@ mod tests {
             "device_binding_mismatch"
         );
         drop(missing);
+
+        let sticky_path = dir.path().join("missing-binding.sqlite");
+        let mut missing_clean =
+            AccountWallet::open_device_bound(&cfg, &key, &[], sticky_path.to_str().unwrap())
+                .unwrap();
+        assert_eq!(
+            missing_clean.status().unwrap()["device_binding"]["status"],
+            "mismatch_read_only"
+        );
+        drop(missing_clean);
+        let mut replacement_attempt = AccountWallet::open_device_bound(
+            &cfg,
+            &key,
+            &restored_binding,
+            sticky_path.to_str().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            replacement_attempt.status().unwrap()["device_binding"]["status"],
+            "mismatch_read_only"
+        );
+        assert_eq!(
+            replacement_attempt
+                .fee_bump("does-not-exist", 5)
+                .unwrap_err()
+                .code,
+            "device_binding_mismatch"
+        );
+        drop(replacement_attempt);
 
         let mut cloned =
             AccountWallet::open_device_bound(&cfg, &key, &restored_binding, path.to_str().unwrap())

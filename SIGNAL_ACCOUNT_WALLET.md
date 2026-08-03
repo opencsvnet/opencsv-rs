@@ -31,9 +31,10 @@ clean restore. Fresh setup must create the root and binding atomically. If a
 root already exists but its non-migratable binding is missing after an OS
 restore, the host passes an empty binding and Rust opens read/export-only; it
 must not generate a replacement binding or silently treat the restored root as
-a new wallet. Re-arming another device requires an explicit recovery/rekey
-flow that moves the fee reserve and assets; replacing the root locally would
-strand ownership.
+a new wallet. Rust persists that missing-binding state, so a later open with a
+newly generated binding remains read/export-only. Re-arming another device
+requires an explicit recovery/rekey flow that moves the fee reserve and assets;
+replacing the root locally would strand ownership.
 
 The action boundary contains no WIF, caller-selected Bitcoin UTXO, change
 address, arbitrary Bitcoin recipient, raw-transaction broadcast, OpenCSV coin

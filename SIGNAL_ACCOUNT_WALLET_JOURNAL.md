@@ -100,7 +100,9 @@ Fresh setup must create the root and binding atomically. If an OS restore
 presents an existing root without its `ThisDeviceOnly` binding, Swift passes an
 empty binding rather than generating a replacement. Rust opens that primary
 read/export-only and returns `device_binding_mismatch` from every writing call;
-the regression covers this missing-binding form as well as a mismatched clone.
+the missing state is sticky, so supplying a new binding on a later open still
+cannot arm it. The regression covers the missing binding, later replacement
+attempt, and mismatched-clone forms.
 
 ## 2026-08-03 — post-reservation cleanup gate
 
