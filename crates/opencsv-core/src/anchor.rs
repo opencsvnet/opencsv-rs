@@ -79,7 +79,7 @@
 use crate::asset::AssetId;
 use crate::coin::Nullifier;
 use crate::digest::{Digest, TruncatedDigest, TRUNCATED_DIGEST_BYTES};
-use crate::field::{bytes_to_felts, hash_felts};
+use crate::field::hash_felts;
 
 /// Exact byte length of every serialized anchor record.
 pub const ANCHOR_SIZE: usize = 64;
@@ -114,7 +114,7 @@ pub fn nullifier_commit(nullifiers: &[Nullifier]) -> Digest {
 /// docs). Records carry the 24-byte prefix ([`Digest::to_anchor`]) of this
 /// digest as their payload; the raw value never appears on-chain.
 pub fn binding(raw: &Digest, ctx: &[u8; 32]) -> Digest {
-    hash_felts("bind", &[&raw.to_elems(), &bytes_to_felts(ctx)])
+    Digest::from_bytes(opencsv_kernel::hash::hash_bind(raw.as_bytes(), ctx))
 }
 
 /// An OpenCSV anchor record (paper §4.4–4.6, amended: bound payloads).
@@ -256,8 +256,7 @@ impl AnchorRecord {
     /// `raw_nf` (the consignment holders) can evaluate this — by design.
     /// For XFERC records, pass the raw nullifier *commitment*.
     pub fn well_formed(&self, ctx: &[u8; 32], raw_nf: &Digest) -> bool {
-        let bound = binding(raw_nf, ctx).to_anchor();
-        self.payload_slots().contains(&bound)
+        crate::kernel::record(self).well_formed(ctx, raw_nf.as_bytes())
     }
 
     /// Serialize to exactly 64 bytes.

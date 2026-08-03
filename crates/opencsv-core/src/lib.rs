@@ -60,6 +60,7 @@ pub mod crosscheck;
 pub mod digest;
 pub mod field;
 pub mod issuer;
+mod kernel;
 
 pub use accept::{accept, AcceptParams, AcceptedCoins, MockVerifier, ProofVerifier, RejectReason};
 pub use anchor::{binding, mint_commit, nullifier_commit, AnchorRecord, ANCHOR_SIZE};

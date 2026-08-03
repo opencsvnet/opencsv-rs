@@ -1,21 +1,23 @@
 //! Pure decision-logic kernel of opencsv-core (see crate README).
 //!
-//! The **verification surface** — `types`, `binding`, `record`, `scan`,
-//! `batch`, `audit` — is written for Aeneas translation: loops only, no
-//! serde/dyn/RNG, no generics beyond plain byte arrays and integers. The
+//! The **verification surface** — `types`, `accept`, `binding`, `record`,
+//! `scan`, `batch`, `audit` — is written for Aeneas translation: loops only,
+//! no serde/dyn/RNG, no generics beyond plain byte arrays and integers. The
 //! `hash` module is the cryptographic boundary (translated as opaque).
-//! `interop` is glue outside the verification surface.
 
 pub mod audit;
+pub mod accept;
 pub mod batch;
 pub mod binding;
 pub mod hash;
-pub mod interop;
 pub mod record;
 pub mod scan;
 pub mod types;
 
 pub use audit::{supply, SupplyError};
+pub use accept::{
+    decide as decide_accept, AcceptDecision, AcceptInput, RejectReason as AcceptRejectReason,
+};
 pub use batch::batch_occurrence;
 pub use binding::{binding, truncate24};
 pub use record::Record;

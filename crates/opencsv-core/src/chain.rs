@@ -197,7 +197,17 @@ impl AnchorChain for MockAnchorChain {
     }
 
     fn first_nullifier_occurrence(&self, raw_nf: &Digest) -> Option<AnchorLocation> {
-        self.nullifier_occurrences(raw_nf).into_iter().next()
+        let entries: Vec<_> = self
+            .entries
+            .iter()
+            .map(|entry| opencsv_kernel::Entry {
+                record: crate::kernel::record(&entry.record),
+                ctx: entry.ctx,
+                location: crate::kernel::location(&entry.location),
+            })
+            .collect();
+        opencsv_kernel::first_occurrence(&entries, raw_nf.as_bytes())
+            .map(|index| self.entries[index].location)
     }
 
     fn nullifier_occurrences(&self, raw_nf: &Digest) -> Vec<AnchorLocation> {

@@ -57,9 +57,8 @@
 //! within the 80-byte item limit, and the witness cost of two extra
 //! items per payload is negligible at batch sizes anyone should use.
 
-use crate::anchor::{binding, AnchorRecord};
+use crate::anchor::AnchorRecord;
 use crate::digest::{Digest, TruncatedDigest, TRUNCATED_DIGEST_BYTES};
-use crate::field::{bytes_to_felts, hash_felts};
 
 /// The magic tag of a batch witness envelope (first witness item).
 pub const WITNESS_MAGIC: [u8; 4] = *b"OCSV";
@@ -85,11 +84,8 @@ pub const MAX_WITNESS_ITEM: usize = 80;
 /// `batch_commit = H("batch" ∥ P_1 ∥ … ∥ P_n ∥ ctx)` — the header's
 /// commitment to the full payload envelope (module docs).
 pub fn batch_commit(payloads: &[TruncatedDigest], ctx: &[u8; 32]) -> Digest {
-    let mut concatenated = Vec::with_capacity(payloads.len() * TRUNCATED_DIGEST_BYTES);
-    for payload in payloads {
-        concatenated.extend_from_slice(payload.as_bytes());
-    }
-    hash_felts("batch", &[&bytes_to_felts(&concatenated), &bytes_to_felts(ctx)])
+    let kernel_payloads: Vec<_> = payloads.iter().map(|payload| payload.0).collect();
+    Digest::from_bytes(opencsv_kernel::hash::hash_batch(&kernel_payloads, ctx))
 }
 
 /// `batch_commit_v2 = H("batch-v2" ∥ P_1 ∥ … ∥ P_n ∥ ctx)` — the
@@ -222,17 +218,14 @@ pub fn envelope_occurrence(
     else {
         return None;
     };
-    if envelope.len() != *count as usize {
-        return None;
-    }
-    if batch_commit(envelope, ctx).to_anchor() != *committed {
-        return None;
-    }
-    let bound = binding(raw_nf, ctx).to_anchor();
-    envelope
-        .iter()
-        .position(|payload| *payload == bound)
-        .map(|index| index as u32)
+    let kernel_envelope: Vec<_> = envelope.iter().map(|payload| payload.0).collect();
+    opencsv_kernel::batch_occurrence(
+        *count,
+        &committed.0,
+        &kernel_envelope,
+        ctx,
+        raw_nf.as_bytes(),
+    )
 }
 
 /// Version-aware batch occurrence test. The witness magic selects the
@@ -266,7 +259,7 @@ pub fn versioned_envelope_occurrence(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::anchor::AnchorRecord;
+    use crate::anchor::{binding, AnchorRecord};
 
     fn digest(seed: u8) -> Digest {
         Digest::from_bytes([seed; 32])
@@ -324,10 +317,16 @@ mod tests {
         let mut tampered = payloads.clone();
         tampered[1] = binding(&digest(99), &ctx).to_anchor();
         assert_eq!(envelope_occurrence(&record, &tampered, &ctx, &nf2), None);
-        assert_eq!(envelope_occurrence(&record, &tampered, &ctx, &digest(99)), None);
+        assert_eq!(
+            envelope_occurrence(&record, &tampered, &ctx, &digest(99)),
+            None
+        );
 
         // Wrong ctx and wrong count reject too.
-        assert_eq!(envelope_occurrence(&record, &payloads, &[8u8; 32], &nf1), None);
+        assert_eq!(
+            envelope_occurrence(&record, &payloads, &[8u8; 32], &nf1),
+            None
+        );
         assert_eq!(
             envelope_occurrence(&record, &payloads[..1], &ctx, &nf1),
             None,

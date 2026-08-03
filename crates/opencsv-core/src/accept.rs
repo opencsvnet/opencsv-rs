@@ -1,7 +1,13 @@
 //! Receiver verification driver `Accept` (paper §4.8) and the proof-verifier
 //! seam where `opencsv-pcd` plugs in.
+//!
+//! The driver retains chain I/O, proof verification, key-derived ownership
+//! and output construction. It projects those observations into
+//! [`opencsv_kernel::accept`], the pure deterministic accept/reject boundary.
 
 use std::collections::HashSet;
+
+use opencsv_kernel::accept as accept_kernel;
 
 use crate::anchor::{binding, nullifier_commit, AnchorRecord};
 use crate::asset::AssetId;
@@ -119,6 +125,25 @@ pub enum RejectReason {
     NoOwnedOutput,
 }
 
+impl RejectReason {
+    /// Stable machine-readable code for logs, FFI and durable operation
+    /// records. The human-readable [`std::fmt::Display`] text may evolve;
+    /// these values do not.
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::EmptyConsignment => "empty_consignment",
+            Self::GenesisMismatch => "genesis_mismatch",
+            Self::UnknownAsset => "unknown_asset",
+            Self::AnchorNotFound => "anchor_not_found",
+            Self::InsufficientConfirmations { .. } => "insufficient_confirmations",
+            Self::NullifierConflict { .. } => "nullifier_conflict",
+            Self::IllFormedAnchor => "ill_formed_anchor",
+            Self::InvalidProof => "invalid_proof",
+            Self::NoOwnedOutput => "no_owned_output",
+        }
+    }
+}
+
 impl std::fmt::Display for RejectReason {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -176,61 +201,65 @@ pub fn accept<V: ProofVerifier, C: AnchorChain>(
     params: &AcceptParams,
 ) -> Result<AcceptedCoins, RejectReason> {
     let openings = &consignment.coin_openings;
-    if openings.is_empty() {
-        return Err(RejectReason::EmptyConsignment);
-    }
+    reject_if(accept_kernel::preflight_rejection(
+        !openings.is_empty(),
+        accept_kernel::AssetObservation::Valid,
+    ))?;
 
     // Step 1 — parse & type-check. If genesis aux is present it must
     // recompute to the openings' asset ID; otherwise the asset must already
     // be pinned. (Pinning itself, including any user confirmation for new
     // assets, is client UX outside this crate.)
     let asset_ids: HashSet<AssetId> = openings.iter().map(|o| o.asset_id).collect();
-    match &consignment.aux {
+    let asset = match &consignment.aux {
         Some(genesis) => {
             let id = genesis.asset_id();
             if asset_ids.iter().any(|a| *a != id) {
-                return Err(RejectReason::GenesisMismatch);
+                accept_kernel::AssetObservation::GenesisMismatch
+            } else {
+                accept_kernel::AssetObservation::Valid
             }
         }
         None => {
             if asset_ids.iter().any(|a| !params.known_assets.contains(a)) {
-                return Err(RejectReason::UnknownAsset);
+                accept_kernel::AssetObservation::UnknownAsset
+            } else {
+                accept_kernel::AssetObservation::Valid
             }
         }
-    }
+    };
+    reject_if(accept_kernel::preflight_rejection(true, asset))?;
 
     // Anchor lookup (step 3a, performed before the proof check because the
     // public input is reconstructed from the on-chain record and its
     // transaction context).
     let record = chain
         .anchor_at(&consignment.anchor_ref)
-        .ok_or(RejectReason::AnchorNotFound)?;
+        .ok_or_else(|| from_kernel_rejection(accept_kernel::RejectReason::AnchorNotFound))?;
     let ctx = chain
         .ctx_at(&consignment.anchor_ref)
-        .ok_or(RejectReason::AnchorNotFound)?;
+        .ok_or_else(|| from_kernel_rejection(accept_kernel::RejectReason::AnchorNotFound))?;
     // The canonical location: for backends that anchor into a mempool
     // (bitcoind), the consignment's claimed location is a placeholder and
     // the chain resolves the confirmed position by transaction ID.
     let location = chain
         .locate(&consignment.anchor_ref)
-        .ok_or(RejectReason::AnchorNotFound)?;
+        .ok_or_else(|| from_kernel_rejection(accept_kernel::RejectReason::AnchorNotFound))?;
 
     // Step 2 — proof check.
     let x = public_input(&record, &ctx, openings);
-    if !verifier.verify(params.vk, &x, &consignment.proof) {
-        return Err(RejectReason::InvalidProof);
-    }
+    let proof_valid = verifier.verify(params.vk, &x, &consignment.proof);
+    reject_if(accept_kernel::proof_rejection(proof_valid))?;
 
     // Step 3 — anchor check: confirmation depth (paper §4.7 rule 2), then
     // the binding and occurrence checks for the consignment's raw
     // nullifiers (paper §4.7 rule 1, amended; see `crate::anchor`).
     let have = chain.confirmations_at(location.height);
-    if have < params.required_confirmations {
-        return Err(RejectReason::InsufficientConfirmations {
-            have,
-            required: params.required_confirmations,
-        });
-    }
+    reject_if(accept_kernel::chain_prefix_rejection(
+        have,
+        params.required_confirmations,
+        true,
+    ))?;
 
     // (a) The anchor record must bind exactly the consignment's raw
     // nullifiers under the anchor's ctx: every `H("bind" ∥ nf ∥ ctx)`
@@ -239,9 +268,12 @@ pub fn accept<V: ProofVerifier, C: AnchorChain>(
     // occurrence check by omitting one of the record's nullifiers). A
     // byte-copy of the record under a different ctx fails here: the copy's
     // payloads are bound to the victim's ctx, not the copier's.
-    if !record_binds_nullifiers(&record, &ctx, &consignment.nullifiers) {
-        return Err(RejectReason::IllFormedAnchor);
-    }
+    let binds_nullifiers = record_binds_nullifiers(&record, &ctx, &consignment.nullifiers);
+    reject_if(accept_kernel::chain_prefix_rejection(
+        have,
+        params.required_confirmations,
+        binds_nullifiers,
+    ))?;
 
     // (b) No EARLIER record may bind any of these nullifiers: the first
     // occurrence of each occurrence key (recognized via the binding, see
@@ -258,16 +290,19 @@ pub fn accept<V: ProofVerifier, C: AnchorChain>(
             vec![nullifier_commit(&consignment.nullifiers)]
         }
     };
+    let kernel_location = crate::kernel::location(&location);
+    let mut occurrences = Vec::with_capacity(occurrence_keys.len());
     for key in &occurrence_keys {
-        let first = chain
-            .first_nullifier_occurrence(key)
-            .ok_or(RejectReason::AnchorNotFound)?;
-        if first != location {
-            return Err(RejectReason::NullifierConflict {
-                nullifier: key.to_anchor(),
-                first,
-            });
-        }
+        let first = chain.first_nullifier_occurrence(key);
+        let observation = accept_kernel::OccurrenceObservation {
+            nullifier: key.to_anchor().0,
+            first: first.as_ref().map(crate::kernel::location),
+        };
+        occurrences.push(observation);
+        reject_if(accept_kernel::occurrence_rejection(
+            kernel_location,
+            std::slice::from_ref(&observation),
+        ))?;
     }
 
     // Step 4 — ownership check.
@@ -277,15 +312,60 @@ pub fn accept<V: ProofVerifier, C: AnchorChain>(
         .filter(|o| owners.contains(&o.owner))
         .map(CoinOpening::to_coin)
         .collect();
-    if coins.is_empty() {
-        return Err(RejectReason::NoOwnedOutput);
+    // Step 5 — the pure kernel is the authoritative decision boundary. The
+    // trait-heavy driver above owns all I/O and cryptographic work and passes
+    // only explicit observations into this deterministic function.
+    let input = accept_kernel::AcceptInput {
+        has_openings: true,
+        asset,
+        anchor: accept_kernel::AnchorObservation::Present {
+            location: kernel_location,
+            confirmations: have,
+            binds_nullifiers,
+            occurrences,
+        },
+        proof_valid,
+        required_confirmations: params.required_confirmations,
+        has_owned_output: !coins.is_empty(),
+    };
+    match accept_kernel::decide(&input) {
+        accept_kernel::AcceptDecision::Accept { .. } => Ok(AcceptedCoins {
+            coins,
+            anchor: location,
+        }),
+        accept_kernel::AcceptDecision::Reject(reason) => Err(from_kernel_rejection(reason)),
     }
+}
 
-    // Step 5 — accept.
-    Ok(AcceptedCoins {
-        coins,
-        anchor: location,
-    })
+fn reject_if(reason: Option<accept_kernel::RejectReason>) -> Result<(), RejectReason> {
+    match reason {
+        Some(reason) => Err(from_kernel_rejection(reason)),
+        None => Ok(()),
+    }
+}
+
+fn from_kernel_rejection(reason: accept_kernel::RejectReason) -> RejectReason {
+    match reason {
+        accept_kernel::RejectReason::EmptyConsignment => RejectReason::EmptyConsignment,
+        accept_kernel::RejectReason::GenesisMismatch => RejectReason::GenesisMismatch,
+        accept_kernel::RejectReason::UnknownAsset => RejectReason::UnknownAsset,
+        accept_kernel::RejectReason::AnchorNotFound => RejectReason::AnchorNotFound,
+        accept_kernel::RejectReason::InsufficientConfirmations { have, required } => {
+            RejectReason::InsufficientConfirmations { have, required }
+        }
+        accept_kernel::RejectReason::NullifierConflict { nullifier, first } => {
+            RejectReason::NullifierConflict {
+                nullifier: TruncatedDigest(nullifier),
+                first: AnchorLocation {
+                    height: first.height,
+                    position: first.position,
+                },
+            }
+        }
+        accept_kernel::RejectReason::IllFormedAnchor => RejectReason::IllFormedAnchor,
+        accept_kernel::RejectReason::InvalidProof => RejectReason::InvalidProof,
+        accept_kernel::RejectReason::NoOwnedOutput => RejectReason::NoOwnedOutput,
+    }
 }
 
 /// Check (a) of [`accept`]: does `record` bind exactly `raw_nullifiers`
