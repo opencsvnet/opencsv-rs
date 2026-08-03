@@ -24,12 +24,19 @@ extern "C" {
 #endif
 
 /* Signal-native account wallet. The primary passes a random 32-byte account
- * root as a byte buffer; linked devices pass NULL/0 plus watch descriptors in
- * config_json. No secret key, WIF, UTXO, change address, or coin-selection
- * result is accepted in JSON. */
+ * root plus a distinct 32-byte device binding from a non-migratable
+ * ThisDeviceOnly keystore item. Fresh setup creates both atomically. A primary
+ * whose root exists after restore but whose binding is missing passes NULL/0
+ * for the binding and opens read/export-only. Linked devices pass NULL/0 for
+ * both plus watch descriptors in config_json. The public binding commitment
+ * returned in status/checkpoints must accompany the account root during
+ * recovery. No secret key, WIF, UTXO, change address, or coin-selection result
+ * is accepted in JSON. */
 char *opencsv_account_open(const char *config_json,
                            const uint8_t *account_key,
                            size_t account_key_len,
+                           const uint8_t *device_binding_key,
+                           size_t device_binding_key_len,
                            const char *database_path);
 char *opencsv_account_close(uint64_t handle);
 char *opencsv_account_status(uint64_t handle);

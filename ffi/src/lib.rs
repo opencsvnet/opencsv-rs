@@ -212,19 +212,27 @@ fn proved_json(proved: wallet::Proved) -> serde_json::Value {
 /// Open or initialize a Signal-native account wallet.
 ///
 /// `config_json` contains public network/endpoint/role policy,
-/// `account_key` is exactly 32 bytes on the primary phone and empty on a
-/// linked device, and `database_path` names the account SQLite database.
-/// Returns `{"handle":N,...status}`. No key is accepted in JSON.
+/// `account_key` and the non-migratable `device_binding_key` are each exactly
+/// 32 bytes on a fresh primary phone and empty on a linked device. A primary
+/// with a restored 32-byte root but missing binding passes an empty binding and
+/// opens read/export-only. The binding key must come from a `ThisDeviceOnly`
+/// platform-keystore item. Its public commitment, returned in
+/// status/checkpoints, detects a restored clone.
+/// `database_path` names the account SQLite database. Returns
+/// `{"handle":N,...status}`. No key is accepted in JSON.
 ///
 /// # Safety
 /// Strings must be valid NUL-terminated UTF-8. `account_key` must be valid
-/// for `account_key_len` bytes; a null pointer is accepted only for a
-/// zero-length linked-device key.
+/// for `account_key_len` bytes and `device_binding_key` must be valid for
+/// `device_binding_key_len` bytes. Null pointers are accepted only for the
+/// zero-length linked-device values.
 #[no_mangle]
 pub unsafe extern "C" fn opencsv_account_open(
     config_json: *const c_char,
     account_key: *const u8,
     account_key_len: usize,
+    device_binding_key: *const u8,
+    device_binding_key_len: usize,
     database_path: *const c_char,
 ) -> *mut c_char {
     guarded(|| {
@@ -236,11 +244,21 @@ pub unsafe extern "C" fn opencsv_account_open(
             Ok(value) => value,
             Err(error) => return err(error),
         };
+        let device_binding = match unsafe {
+            in_bytes(
+                device_binding_key,
+                device_binding_key_len,
+                "device_binding_key",
+            )
+        } {
+            Ok(value) => value,
+            Err(error) => return err(error),
+        };
         let path = match unsafe { in_str(database_path, "database_path") } {
             Ok(value) => value,
             Err(error) => return err(error),
         };
-        match AccountWallet::open(config, key, path) {
+        match AccountWallet::open_device_bound(config, key, device_binding, path) {
             Ok(mut account) => {
                 let status = match account.status() {
                     Ok(status) => status,

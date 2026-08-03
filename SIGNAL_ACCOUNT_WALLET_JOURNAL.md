@@ -39,10 +39,13 @@ still require separate mempool observation.
 ## RBF decision
 
 The initial pure validator froze every input. Review correctly identified that
-vin 0 alone fixes the OpenCSV context. The validator now permits new fee inputs
-only after the immutable original input prefix and rejects duplicates,
-insertion before vin 0, protocol-output mutation, reordering, change removal,
-dust, and non-increasing fees.
+vin 0 alone fixes the OpenCSV context, but the account wallet cannot safely add
+an input unless it also authoritatively verifies and durably reserves that
+input. The production fee-bump builder therefore uses a stricter change-only
+profile: it freezes every input and output script/position, pins the original
+change destination, and only reduces non-dust change. The general validator
+still rejects duplicates, insertion before vin 0, protocol-output mutation,
+reordering, change removal, dust, and non-increasing fees.
 
 ## Asset-selection correction
 
@@ -52,23 +55,87 @@ request now accepts only asset, recipient, and amount. Rust selects exactly two
 unreserved protocol inputs, minimizes change, creates the second output, and
 excludes every input named by an in-memory or restored pending proof.
 
+## 2026-08-03 — authoritative fee-input and recovery gates
+
+- Added an account-owned compact-filter verifier. It connects to independently
+  attested peers, locates the exact creating output in a merkle-checked full
+  block, and scans through the verified tip for a later spend. The check runs
+  after reservation, again immediately before initial signing, and before fee
+  bump signing. Esplora remains discovery/relay acceleration only.
+- Changed UTXO reservation to use an immediate SQLite transaction and a unique
+  `(txid, vout)` key across handles. A second handle retries the next eligible
+  output instead of reusing or silently racing the first.
+- Restoring the database explicitly re-locks every durable reservation before
+  pending proofs are imported.
+- Added adversarial receipts for a false explorer hint, a recently spent
+  outpoint between prepare and sign, two simultaneously open account handles,
+  every durable operation state, and replacement persistence/reopen/resume.
+- The tests found two bugs before publication. The funding fixture reused a
+  dummy prevout, making two test deposits conflict. Separately, BDK selected a
+  fresh change script for RBF unless the original script was explicitly
+  pinned, and equal-second `last_seen` timestamps made conflict restoration
+  nondeterministic. Unique test prevouts, a pinned change script, and strictly
+  increasing replacement observation time fixed those failures.
+
+## 2026-08-03 — device-clone blocker
+
+Hardware review reported that iOS restored Keychain state onto the iPhone 16e.
+An account root alone therefore cannot identify one primary device. The
+accepted gate adds a second random 32-byte device binding supplied outside
+JSON from a non-migratable `ThisDeviceOnly` item. Rust stores its root-bound
+commitment in SQLite and in the Secure Backup checkpoint. A mismatched restored
+device opens read/export-only and every new Bitcoin-writing action fails with
+`device_binding_mismatch`.
+
+A plain migratable nonce and silent root rotation were rejected. Clean-database
+recovery must supply the old checkpoint commitment; explicit recovery/rekey is
+required to move signing authority and existing assets. Signal receive/render
+integration must also deduplicate by an identity over the canonicalized
+consignment, not attachment id, delivery nonce, raw field order, or whitespace,
+so byte-distinct delivery retries cannot render one payment twice. The physical
+acceptance test must crash/resume the sender into two attachments and observe
+exactly one verified payment bubble.
+
+Fresh setup must create the root and binding atomically. If an OS restore
+presents an existing root without its `ThisDeviceOnly` binding, Swift passes an
+empty binding rather than generating a replacement. Rust opens that primary
+read/export-only and returns `device_binding_mismatch` from every writing call;
+the regression covers this missing-binding form as well as a mismatched clone.
+
+## 2026-08-03 — post-reservation cleanup gate
+
+The prepare path originally released a fee reservation when authoritative
+verification or proof creation failed, but later failures in asset creation,
+context rebinding, pending export, database transition, or checkpoint export
+could return without cleanup. Every error after the planned operation is now
+routed through one fail-closed helper that cancels any pending proof, unlocks
+and deletes the durable fee reservation, and records the stable rejection.
+A regression forces an invalid issuer request after reservation and proves the
+operation is cancelled with no locked or persisted reservation.
+
+Fee bump already reverified the funding output before building a replacement.
+A new scripted-verifier regression now rejects that third verification and
+proves the original signed bytes, txid, and state remain unchanged.
+
 ## Validation receipt
 
-- `RUSTFLAGS='-D warnings' cargo check -p opencsv-ffi --all-targets` — pass.
-- `RUSTFLAGS='-D warnings' cargo test -p opencsv-ffi --all-targets` — pass:
-  eight account/unit tests and every existing export, cross-check,
-  persistent-client, round-trip, and scan integration test.
-- `RUSTFLAGS='-D warnings' cargo test -p opencsv-bitcoin --lib` — 28 passed.
+- Warnings-denied `opencsv-ffi --all-targets`: 28 passed, 0 failed.
+- Warnings-denied `opencsv-bitcoin --lib`: 31 passed, 0 failed.
+- `opencsv-ffi --all-targets --no-deps` Clippy with `-D warnings`: passed.
+- Device-clone read-only enforcement passes.
+- Cross-handle distinct fee reservation passes.
+- Every durable operation-state reopen matrix passes.
+- Exact replacement persistence, failed relay, reopen, and resume passes.
+- Post-reservation failure cleanup and fee-bump revalidation preservation pass.
 
 ## Explicit remaining gates
 
-- authoritative header/filter/full-block revalidation of the selected fee
-  outpoint before context/proof/signing;
-- dishonest-Esplora and conflicting-UTXO tests for that boundary;
-- restore tests at every operation transition and concurrent-operation tests;
-- end-to-end fee-bump journal/rebroadcast tests;
-- Swift Secure Backup policy integration, in-place database migration, both
-  build flags, and physical signet acceptance on the iPhone 16e.
+- hosted wallet CI after publication;
+- hosted CI and independent re-review of the completed C2 adversarial audit;
+- Swift `ThisDeviceOnly` binding and checkpoint recovery integration;
+- canonical-consignment verdict/render deduplication;
+- in-place database migration, both build flags, and physical signet
+  acceptance on the iPhone 16e.
 
 These open items prevent a mainnet-readiness claim. No PR, merge, release,
 mainnet broadcast, upstream submission, or destructive device action is part

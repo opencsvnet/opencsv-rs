@@ -8,7 +8,7 @@
 
 use std::collections::HashMap;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -22,20 +22,22 @@ use bdk_wallet::bitcoin::script::PushBytesBuf;
 use bdk_wallet::bitcoin::{
     Amount, FeeRate, Network, OutPoint, ScriptBuf, Sequence, Transaction, Txid,
 };
-use bdk_wallet::chain::Merge;
+use bdk_wallet::chain::{ChainPosition, Merge};
 use bdk_wallet::psbt::PsbtUtils;
 use bdk_wallet::{
     ChangeSet, KeychainKind, PersistedWallet, SignOptions, TxOrdering, Wallet, WalletPersister,
 };
 use hkdf::Hkdf;
 use opencsv_bitcoin::{
-    funding_ctx, relay_transaction, validate_solo_anchor_replacement, MARKER_DUST_SATS, MARKER_SPK,
-    MEMPOOL_LOCATION,
+    funding_ctx, relay_transaction, validate_solo_anchor_replacement, Network as OpenCsvNetwork,
+    MARKER_DUST_SATS, MARKER_SPK, MEMPOOL_LOCATION,
 };
+use opencsv_cbf::block::OutPoint as CbfOutPoint;
+use opencsv_cbf::{CbfClient, Config as CbfConfig, OutpointVerdict};
 use opencsv_core::chain::AnchorRef;
 use opencsv_core::{AssetId, OwnerSecret};
 use rand::RngExt as _;
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::Sha256;
@@ -48,6 +50,8 @@ const SCHEMA_VERSION: u32 = 1;
 const CHECKPOINT_VERSION: u32 = 1;
 const DEFAULT_STOP_GAP: usize = 20;
 const DEFAULT_PARALLEL_REQUESTS: usize = 4;
+const DEFAULT_VERIFICATION_TIMEOUT_SECS: u64 = 8;
+const DEFAULT_MAX_VERIFICATION_BLOCKS: u64 = 10_000;
 const MIN_FEE_RESERVE_SATS: u64 = 2_500;
 
 /// Stable account-wallet failure crossing the JSON/FFI boundary.
@@ -113,6 +117,14 @@ fn default_parallel_requests() -> usize {
     DEFAULT_PARALLEL_REQUESTS
 }
 
+fn default_verification_timeout_secs() -> u64 {
+    DEFAULT_VERIFICATION_TIMEOUT_SECS
+}
+
+fn default_max_verification_blocks() -> u64 {
+    DEFAULT_MAX_VERIFICATION_BLOCKS
+}
+
 /// Account configuration supplied by Signal. It contains no secret key.
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -120,19 +132,33 @@ pub struct AccountConfig {
     /// Schema version, currently one.
     #[serde(default = "schema_version")]
     pub version: u32,
-    /// `mainnet`, `signet`, `testnet`, `testnet4`, or `regtest`.
+    /// `mainnet`, `signet`, or `regtest`.
     pub network: String,
     /// Esplora endpoint used as a read accelerator and generic relay fallback.
     pub esplora_url: String,
     /// P2P peers used for direct transaction relay.
     #[serde(default)]
     pub peers: Vec<String>,
+    /// Compact-filter peers used for authoritative fee-outpoint validation.
+    /// If empty, the direct-relay peer set is used.
+    #[serde(default)]
+    pub verification_peers: Vec<String>,
+    /// Connect/read timeout for authoritative peer operations.
+    #[serde(default = "default_verification_timeout_secs")]
+    pub verification_timeout_secs: u64,
+    /// Maximum blocks scanned while proving one selected outpoint unspent.
+    #[serde(default = "default_max_verification_blocks")]
+    pub max_verification_blocks: u64,
     /// Primary or linked-device role.
     #[serde(default = "default_role")]
     pub role: AccountRole,
     /// Initial Secure Backup state. Later changes use the explicit setter.
     #[serde(default)]
     pub backup_verified: bool,
+    /// Public binding commitment carried beside the account root and in the
+    /// Secure Backup checkpoint. It is mandatory on clean-database recovery.
+    #[serde(default)]
+    pub expected_device_binding_commitment: Option<String>,
     /// Required confirmations for protocol crediting.
     #[serde(default = "default_confirmations")]
     pub required_confirmations: u32,
@@ -151,6 +177,126 @@ pub struct AccountConfig {
     /// Public OpenCSV owner identity supplied to linked devices.
     #[serde(default)]
     pub watch_owner: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+struct FundingVerificationRequest {
+    outpoint: OutPoint,
+    txout: bdk_wallet::bitcoin::TxOut,
+    birth_height: u64,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+struct FundingVerificationReceipt {
+    creation_height: u64,
+    checked_through: u64,
+    matched_blocks: u64,
+    verified_at: i64,
+    source: &'static str,
+}
+
+trait FundingVerifier: Send + Sync {
+    fn verify(
+        &self,
+        request: &FundingVerificationRequest,
+    ) -> Result<FundingVerificationReceipt, AccountError>;
+}
+
+struct CbfFundingVerifier {
+    network: String,
+    peers: Vec<String>,
+    cache_dir: PathBuf,
+    timeout: Duration,
+    max_blocks: u64,
+}
+
+impl FundingVerifier for CbfFundingVerifier {
+    fn verify(
+        &self,
+        request: &FundingVerificationRequest,
+    ) -> Result<FundingVerificationReceipt, AccountError> {
+        let network = parse_cbf_network(&self.network)?;
+        if self.peers.is_empty() || self.timeout.is_zero() || self.max_blocks == 0 {
+            return Err(AccountError::new(
+                "stale_chain_state",
+                "authoritative fee-outpoint verifier is not configured",
+            ));
+        }
+        if network != OpenCsvNetwork::Regtest && self.peers.len() < 2 {
+            return Err(AccountError::new(
+                "stale_chain_state",
+                "signet/mainnet fee validation requires at least two compact-filter peers",
+            ));
+        }
+        let config = CbfConfig {
+            network,
+            peers: self.peers.clone(),
+            cache_dir: self.cache_dir.clone(),
+            timeout: self.timeout,
+        };
+        let mut client = CbfClient::connect(&config).map_err(|error| {
+            AccountError::new(
+                "stale_chain_state",
+                format!("authoritative fee-outpoint sync: {error}"),
+            )
+        })?;
+        let verdict = client
+            .verify_outpoint_unspent(
+                CbfOutPoint {
+                    txid: request.outpoint.txid.to_byte_array(),
+                    vout: request.outpoint.vout,
+                },
+                request.txout.value.to_sat(),
+                request.txout.script_pubkey.as_bytes(),
+                request.birth_height,
+                self.max_blocks,
+            )
+            .map_err(|error| {
+                AccountError::new(
+                    "stale_chain_state",
+                    format!("authoritative fee-outpoint check: {error}"),
+                )
+            })?;
+        match verdict {
+            OutpointVerdict::Unspent {
+                creation_height,
+                checked_through,
+                matched_blocks,
+            } => Ok(FundingVerificationReceipt {
+                creation_height,
+                checked_through,
+                matched_blocks,
+                verified_at: unix_time()?,
+                source: "headers+bip158+verified-blocks",
+            }),
+            OutpointVerdict::Spent {
+                spend_height,
+                spending_txid,
+                ..
+            } => Err(AccountError::new(
+                "conflicting_operation",
+                format!(
+                    "reserved funding outpoint was spent at height {spend_height} by {}",
+                    hex_encode(&spending_txid)
+                ),
+            )),
+            OutpointVerdict::NotFound {
+                checked_from,
+                checked_through,
+            } => Err(AccountError::new(
+                "stale_chain_state",
+                format!(
+                    "reserved funding outpoint was not found in verified blocks {checked_from}..={checked_through}"
+                ),
+            )),
+            OutpointVerdict::OutputMismatch { creation_height } => Err(AccountError::new(
+                "stale_chain_state",
+                format!(
+                    "reserved funding value/script disagrees with verified block {creation_height}"
+                ),
+            )),
+        }
+    }
 }
 
 /// Stable durable operation states.
@@ -237,6 +383,7 @@ struct OperationRow {
     signed_tx_hex: Option<String>,
     txid: Option<String>,
     receipt_json: Option<String>,
+    rejection_reason: Option<String>,
     delivery_nonce: String,
     checkpoint_hash: Option<String>,
     backup_acked: bool,
@@ -397,19 +544,23 @@ impl WalletPersister for SqlitePersister {
 /// An open Signal account wallet.
 pub struct AccountWallet {
     config: AccountConfig,
+    funding_verifier: Arc<dyn FundingVerifier>,
     bitcoin: PersistedWallet<SqlitePersister>,
     db: SqlitePersister,
     protocol: Option<MemWallet>,
     issuer_root: Option<Zeroizing<[u8; 32]>>,
     root_fingerprint: String,
+    device_binding_commitment: Option<String>,
+    device_binding_valid: bool,
     pending_by_operation: HashMap<String, u64>,
 }
 
 impl AccountWallet {
     /// Open or initialize an account database.
-    pub fn open(
+    pub fn open_device_bound(
         config_json: &str,
         account_key: &[u8],
+        device_binding_key: &[u8],
         database_path: &str,
     ) -> Result<Self, AccountError> {
         let config: AccountConfig = serde_json::from_str(config_json).map_err(|error| {
@@ -424,7 +575,14 @@ impl AccountWallet {
         let network = parse_network(&config.network)?;
         validate_esplora_url(&config.esplora_url)?;
 
-        let (external, internal, protocol, issuer_root, root_fingerprint) = match config.role {
+        let (
+            external,
+            internal,
+            protocol,
+            issuer_root,
+            root_fingerprint,
+            current_device_binding_commitment,
+        ) = match config.role {
             AccountRole::Primary => {
                 let root: Zeroizing<[u8; 32]> =
                     Zeroizing::new(account_key.try_into().map_err(|_| {
@@ -449,12 +607,35 @@ impl AccountWallet {
                     &[b"OpenCSV account fingerprint v1".as_slice(), root.as_ref()].concat(),
                 )
                 .to_string();
+                let binding_commitment = if device_binding_key.is_empty() {
+                    None
+                } else {
+                    let device_binding: Zeroizing<[u8; 32]> =
+                        Zeroizing::new(device_binding_key.try_into().map_err(|_| {
+                            AccountError::new(
+                                "invalid_device_binding",
+                                "primary device binding must be empty or exactly 32 bytes",
+                            )
+                        })?);
+                    Some(
+                        sha256::Hash::hash(
+                            &[
+                                b"OpenCSV device binding v1".as_slice(),
+                                root.as_ref(),
+                                device_binding.as_ref(),
+                            ]
+                            .concat(),
+                        )
+                        .to_string(),
+                    )
+                };
                 (
                     external,
                     internal,
                     Some(MemWallet::from_owner_seed(*owner_seed)),
                     Some(issuer_root),
                     fingerprint,
+                    binding_commitment,
                 )
             }
             AccountRole::Linked => {
@@ -462,6 +643,18 @@ impl AccountWallet {
                     return Err(AccountError::new(
                         "linked_key_forbidden",
                         "linked devices must open without an account key",
+                    ));
+                }
+                if !device_binding_key.is_empty() {
+                    return Err(AccountError::new(
+                        "linked_binding_forbidden",
+                        "linked devices must open without a primary device binding",
+                    ));
+                }
+                if config.expected_device_binding_commitment.is_some() {
+                    return Err(AccountError::new(
+                        "invalid_config",
+                        "linked devices do not accept a primary binding commitment",
                     ));
                 }
                 let external = config.watch_external_descriptor.clone().ok_or_else(|| {
@@ -473,7 +666,7 @@ impl AccountWallet {
                 let fingerprint =
                     sha256::Hash::hash(&[external.as_bytes(), b"\0", internal.as_bytes()].concat())
                         .to_string();
-                (external, internal, None, None, fingerprint)
+                (external, internal, None, None, fingerprint, None)
             }
         };
 
@@ -505,6 +698,40 @@ impl AccountWallet {
             )?;
         }
 
+        let (device_binding_commitment, device_binding_valid) = match config.role {
+            AccountRole::Linked => (None, false),
+            AccountRole::Primary => {
+                if let Some(expected) = config.expected_device_binding_commitment.as_deref() {
+                    validate_hex_32_config(expected, "expected device binding commitment")?;
+                }
+                let stored = db.meta("device_binding_commitment")?;
+                if let (Some(stored), Some(expected)) = (
+                    stored.as_deref(),
+                    config.expected_device_binding_commitment.as_deref(),
+                ) {
+                    if stored != expected {
+                        return Err(AccountError::new(
+                            "account_binding_mismatch",
+                            "database and recovery checkpoint name different device bindings",
+                        ));
+                    }
+                }
+                let authoritative = stored
+                    .or_else(|| config.expected_device_binding_commitment.clone())
+                    .or_else(|| current_device_binding_commitment.clone());
+                if db.meta("device_binding_commitment")?.is_none() {
+                    if let Some(authoritative) = authoritative.as_deref() {
+                        db.set_meta("device_binding_commitment", authoritative)?;
+                    }
+                }
+                let valid = matches!(
+                    (&current_device_binding_commitment, &authoritative),
+                    (Some(current), Some(authoritative)) if current == authoritative
+                );
+                (authoritative, valid)
+            }
+        };
+
         let loaded = Wallet::load()
             .descriptor(KeychainKind::External, Some(external.clone()))
             .descriptor(KeychainKind::Internal, Some(internal.clone()))
@@ -520,19 +747,50 @@ impl AccountWallet {
                 .map_err(|error| AccountError::new("wallet_create_failed", error.to_string()))?,
         };
 
+        let verification_peers = if config.verification_peers.is_empty() {
+            config.peers.clone()
+        } else {
+            config.verification_peers.clone()
+        };
+        let funding_verifier: Arc<dyn FundingVerifier> = Arc::new(CbfFundingVerifier {
+            network: config.network.clone(),
+            peers: verification_peers,
+            cache_dir: PathBuf::from(format!("{database_path}.cbf")),
+            timeout: Duration::from_secs(config.verification_timeout_secs),
+            max_blocks: config.max_verification_blocks,
+        });
         let mut account = Self {
             config,
+            funding_verifier,
             bitcoin,
             db,
             protocol,
             issuer_root,
             root_fingerprint,
+            device_binding_commitment,
+            device_binding_valid,
             pending_by_operation: HashMap::new(),
         };
         account.restore_issuers()?;
         account.restore_consignment_state()?;
+        account.restore_fee_reservations()?;
         account.restore_pending_operations()?;
         Ok(account)
+    }
+
+    #[cfg(test)]
+    fn open(
+        config_json: &str,
+        account_key: &[u8],
+        database_path: &str,
+    ) -> Result<Self, AccountError> {
+        const TEST_DEVICE_BINDING: [u8; 32] = [0xa5; 32];
+        let binding = if account_key.is_empty() {
+            &[][..]
+        } else {
+            &TEST_DEVICE_BINDING
+        };
+        Self::open_device_bound(config_json, account_key, binding, database_path)
     }
 
     /// Return balances, descriptors, fee reserve, deposit address and sync provenance.
@@ -589,9 +847,22 @@ impl AccountWallet {
             },
             "backup_verified": self.backup_verified()?,
             "write_enabled": self.write_enabled()?,
+            "device_binding": {
+                "status": match self.config.role {
+                    AccountRole::Linked => "not_applicable",
+                    AccountRole::Primary if self.device_binding_valid => "bound",
+                    AccountRole::Primary => "mismatch_read_only",
+                },
+                "commitment": self.device_binding_commitment.clone(),
+            },
             "sync_provenance": {
                 "accelerator": self.config.esplora_url,
                 "authoritative": "headers+bip158+verified-blocks",
+                "verification_peer_count": if self.config.verification_peers.is_empty() {
+                    self.config.peers.len()
+                } else {
+                    self.config.verification_peers.len()
+                },
                 "last_sync_at": self.db.meta("last_sync_at")?,
                 "last_sync_tip": self.db.meta("last_sync_tip")?,
             },
@@ -620,7 +891,7 @@ impl AccountWallet {
             "tip_height": tip,
             "fee_reserve_sats": balance.total().to_sat(),
             "source": self.config.esplora_url,
-            "authoritative_spend_check": "pending_local_cbf_revalidation",
+            "authoritative_spend_check": "required_at_prepare_and_sign",
         }))
     }
 
@@ -717,7 +988,7 @@ impl AccountWallet {
                 "mint requires one or two positive outputs",
             ));
         }
-        if request.amounts.iter().any(|amount| *amount == 0) {
+        if request.amounts.contains(&0) {
             return Err(AccountError::new(
                 "invalid_request",
                 "mint outputs must be positive",
@@ -730,7 +1001,14 @@ impl AccountWallet {
         let funding = match self.reserve_fee_utxo(&operation_id) {
             Ok(funding) => funding,
             Err(error) => {
-                self.reject_operation(&operation_id, error.code)?;
+                self.reject_prebroadcast_operation(&operation_id, error.code)?;
+                return Err(error);
+            }
+        };
+        let verification = match self.verify_funding(&funding) {
+            Ok(receipt) => receipt,
+            Err(error) => {
+                self.reject_prebroadcast_operation(&operation_id, error.code)?;
                 return Err(error);
             }
         };
@@ -738,48 +1016,79 @@ impl AccountWallet {
 
         let asset_id = match request.asset_id {
             Some(asset_id) => asset_id,
-            None => self.create_asset(
-                request.currency.as_deref().ok_or_else(|| {
-                    AccountError::new(
-                        "invalid_request",
-                        "new mint requires a 3-byte currency code",
-                    )
-                })?,
-                request.terms_hash.as_deref(),
-            )?,
-        };
-        let protocol = self.primary_protocol_mut()?;
-        let to_owner = request
-            .to_owner
-            .unwrap_or_else(|| protocol.owners().into_iter().next().unwrap_or_default());
-        let proved = match protocol.prove_mint(&asset_id, &to_owner, &request.amounts) {
-            Ok(proved) => proved,
-            Err(error) => {
-                self.release_fee_reservation(&operation_id)?;
-                self.reject_operation(&operation_id, "invalid_proof_request")?;
-                return Err(AccountError::new("invalid_proof_request", error));
+            None => {
+                let currency = match request.currency.as_deref() {
+                    Some(currency) => currency,
+                    None => {
+                        return self.fail_prebroadcast(
+                            &operation_id,
+                            AccountError::new(
+                                "invalid_request",
+                                "new mint requires a 3-byte currency code",
+                            ),
+                        );
+                    }
+                };
+                match self.create_asset(currency, request.terms_hash.as_deref()) {
+                    Ok(asset_id) => asset_id,
+                    Err(error) => return self.fail_prebroadcast(&operation_id, error),
+                }
             }
         };
-        let record = protocol
-            .rebind_pending(proved.pending_id, ctx)
-            .map_err(|error| AccountError::new("protocol_layout_violation", error))?;
-        let pending_json = protocol
-            .export_pending(proved.pending_id)
-            .map_err(|error| AccountError::new("database_error", error))?;
+        let (to_owner, proved) = {
+            let protocol = match self.primary_protocol_mut() {
+                Ok(protocol) => protocol,
+                Err(error) => return self.fail_prebroadcast(&operation_id, error),
+            };
+            let to_owner = request
+                .to_owner
+                .unwrap_or_else(|| protocol.owners().into_iter().next().unwrap_or_default());
+            let proved = match protocol.prove_mint(&asset_id, &to_owner, &request.amounts) {
+                Ok(proved) => proved,
+                Err(error) => {
+                    return self.fail_prebroadcast(
+                        &operation_id,
+                        AccountError::new("invalid_proof_request", error),
+                    );
+                }
+            };
+            (to_owner, proved)
+        };
         self.pending_by_operation
             .insert(operation_id.clone(), proved.pending_id);
+        let record = match self.primary_protocol_mut().and_then(|protocol| {
+            protocol
+                .rebind_pending(proved.pending_id, ctx)
+                .map_err(|error| AccountError::new("protocol_layout_violation", error))
+        }) {
+            Ok(record) => record,
+            Err(error) => return self.fail_prebroadcast(&operation_id, error),
+        };
+        let pending_json = match self.primary_protocol_mut().and_then(|protocol| {
+            protocol
+                .export_pending(proved.pending_id)
+                .map_err(|error| AccountError::new("database_error", error))
+        }) {
+            Ok(pending_json) => pending_json,
+            Err(error) => return self.fail_prebroadcast(&operation_id, error),
+        };
         let normalized_request = json!({
             "asset_id": asset_id,
             "to_owner": to_owner,
             "amounts": request.amounts,
         });
-        self.mark_proof_ready(
+        if let Err(error) = self.mark_proof_ready(
             &operation_id,
             &normalized_request,
             &pending_json,
             &hex_encode(&record),
-        )?;
-        self.prepared_receipt(&operation_id, funding, &record)
+        ) {
+            return self.fail_prebroadcast(&operation_id, error);
+        }
+        match self.prepared_receipt(&operation_id, funding, &verification, &record) {
+            Ok(receipt) => Ok(receipt),
+            Err(error) => self.fail_prebroadcast(&operation_id, error),
+        }
     }
 
     /// Prepare an OpenCSV asset transfer. There is deliberately no Bitcoin
@@ -795,33 +1104,56 @@ impl AccountWallet {
         let funding = match self.reserve_fee_utxo(&operation_id) {
             Ok(funding) => funding,
             Err(error) => {
-                self.reject_operation(&operation_id, error.code)?;
+                self.reject_prebroadcast_operation(&operation_id, error.code)?;
+                return Err(error);
+            }
+        };
+        let verification = match self.verify_funding(&funding) {
+            Ok(receipt) => receipt,
+            Err(error) => {
+                self.reject_prebroadcast_operation(&operation_id, error.code)?;
                 return Err(error);
             }
         };
         let ctx = funding_context(funding.outpoint);
-        let protocol = self.primary_protocol_mut()?;
-        let proved = match protocol.prove_transfer_amount(
-            &request.asset_id,
-            &request.to_owner,
-            request.amount,
-        ) {
-            Ok(proved) => proved,
-            Err(error) => {
-                self.release_fee_reservation(&operation_id)?;
-                self.reject_operation(&operation_id, "unavailable_assets")?;
-                return Err(AccountError::new("unavailable_assets", error));
+        let proved = {
+            let protocol = match self.primary_protocol_mut() {
+                Ok(protocol) => protocol,
+                Err(error) => return self.fail_prebroadcast(&operation_id, error),
+            };
+            match protocol.prove_transfer_amount(
+                &request.asset_id,
+                &request.to_owner,
+                request.amount,
+            ) {
+                Ok(proved) => proved,
+                Err(error) => {
+                    return self.fail_prebroadcast(
+                        &operation_id,
+                        AccountError::new("unavailable_assets", error),
+                    );
+                }
             }
         };
-        let record = protocol
-            .rebind_pending(proved.pending_id, ctx)
-            .map_err(|error| AccountError::new("protocol_layout_violation", error))?;
-        let pending_json = protocol
-            .export_pending(proved.pending_id)
-            .map_err(|error| AccountError::new("database_error", error))?;
         self.pending_by_operation
             .insert(operation_id.clone(), proved.pending_id);
-        self.mark_proof_ready(
+        let record = match self.primary_protocol_mut().and_then(|protocol| {
+            protocol
+                .rebind_pending(proved.pending_id, ctx)
+                .map_err(|error| AccountError::new("protocol_layout_violation", error))
+        }) {
+            Ok(record) => record,
+            Err(error) => return self.fail_prebroadcast(&operation_id, error),
+        };
+        let pending_json = match self.primary_protocol_mut().and_then(|protocol| {
+            protocol
+                .export_pending(proved.pending_id)
+                .map_err(|error| AccountError::new("database_error", error))
+        }) {
+            Ok(pending_json) => pending_json,
+            Err(error) => return self.fail_prebroadcast(&operation_id, error),
+        };
+        if let Err(error) = self.mark_proof_ready(
             &operation_id,
             &json!({
                 "asset_id": request.asset_id,
@@ -830,8 +1162,13 @@ impl AccountWallet {
             }),
             &pending_json,
             &hex_encode(&record),
-        )?;
-        self.prepared_receipt(&operation_id, funding, &record)
+        ) {
+            return self.fail_prebroadcast(&operation_id, error);
+        }
+        match self.prepared_receipt(&operation_id, funding, &verification, &record) {
+            Ok(receipt) => Ok(receipt),
+            Err(error) => self.fail_prebroadcast(&operation_id, error),
+        }
     }
 
     /// Acknowledge that Signal Secure Backup durably accepted the exact
@@ -897,7 +1234,7 @@ impl AccountWallet {
             ));
         }
         let outpoint = operation_outpoint(&operation)?;
-        let _funding = self
+        let funding_output = self
             .bitcoin
             .list_unspent()
             .find(|utxo| utxo.outpoint == outpoint)
@@ -913,6 +1250,14 @@ impl AccountWallet {
                 "funding outpoint lost its durable reservation",
             ));
         }
+        let funding = ReservedFunding::from_local(funding_output)?;
+        let verification = match self.verify_funding(&funding) {
+            Ok(receipt) => receipt,
+            Err(error) => {
+                self.reject_operation(operation_id, error.code)?;
+                return Err(error);
+            }
+        };
         let pending_id = *self
             .pending_by_operation
             .get(operation_id)
@@ -984,6 +1329,7 @@ impl AccountWallet {
             "fee_sats": fee.to_sat(),
             "fee_rate_sat_per_vb": policy.target_sat_per_vb,
             "funding_outpoint": outpoint.to_string(),
+            "funding_verification": verification,
             "record_vout": 0,
             "marker_vout": 1,
             "change_vout": 2,
@@ -1163,6 +1509,12 @@ impl AccountWallet {
         target_sat_per_vb: u64,
     ) -> Result<Value, AccountError> {
         self.require_write_enabled()?;
+        if target_sat_per_vb == 0 {
+            return Err(AccountError::new(
+                "invalid_fee_policy",
+                "target_sat_per_vb must be positive",
+            ));
+        }
         let operation = self.operation(operation_id)?;
         if !matches!(
             operation.state.as_str(),
@@ -1180,6 +1532,55 @@ impl AccountWallet {
             deserialize(&hex_decode(original_hex, "signed transaction")?)
                 .map_err(|error| AccountError::new("database_corrupt", error.to_string()))?;
         let original_txid = original.compute_txid();
+        let original_last_seen = self.bitcoin.get_tx(original_txid).and_then(|transaction| {
+            match transaction.chain_position {
+                ChainPosition::Unconfirmed { last_seen, .. } => last_seen,
+                ChainPosition::Confirmed { .. } => None,
+            }
+        });
+        let funding_outpoint = operation_outpoint(&operation)?;
+        let funding_transaction = self.bitcoin.get_tx(funding_outpoint.txid).ok_or_else(|| {
+            AccountError::new(
+                "stale_chain_state",
+                "fee-bump funding transaction is absent from the wallet graph",
+            )
+        })?;
+        let funding_txout = funding_transaction
+            .tx_node
+            .tx
+            .output
+            .get(funding_outpoint.vout as usize)
+            .cloned()
+            .ok_or_else(|| {
+                AccountError::new(
+                    "database_corrupt",
+                    "fee-bump funding vout is outside its transaction",
+                )
+            })?;
+        let funding_birth_height = match &funding_transaction.chain_position {
+            ChainPosition::Confirmed {
+                anchor,
+                transitively: None,
+            } => u64::from(anchor.block_id.height),
+            _ => {
+                return Err(AccountError::new(
+                    "stale_chain_state",
+                    "fee-bump funding output lacks an exact confirmed birth height",
+                ));
+            }
+        };
+        let funding = ReservedFunding {
+            outpoint: funding_outpoint,
+            txout: funding_txout,
+            birth_height: funding_birth_height,
+        };
+        let verification = match self.verify_funding(&funding) {
+            Ok(receipt) => receipt,
+            Err(error) => {
+                self.reject_operation(operation_id, error.code)?;
+                return Err(error);
+            }
+        };
         let fee_rate = FeeRate::from_sat_per_vb(target_sat_per_vb).ok_or_else(|| {
             AccountError::new("invalid_fee_policy", "fee rate exceeds Bitcoin limits")
         })?;
@@ -1188,6 +1589,11 @@ impl AccountWallet {
             .build_fee_bump(original_txid)
             .map_err(|error| AccountError::new("fee_bump_rejected", error.to_string()))?;
         builder.ordering(TxOrdering::Untouched);
+        builder.drain_to(original.output[2].script_pubkey.clone());
+        // The product path bumps by reducing protected change. Adding a new
+        // input would require another independently verified durable
+        // reservation, so general wallet coin selection is forbidden here.
+        builder.manually_selected_only();
         builder.fee_rate(fee_rate);
         let mut psbt = builder
             .finish()
@@ -1216,6 +1622,7 @@ impl AccountWallet {
             "target_sat_per_vb": target_sat_per_vb,
             "fee_increment_sats": validation.fee_increment_sats,
             "replacement_change_sats": validation.replacement_change_sats,
+            "funding_verification": verification,
             "record_vout": 0,
             "marker_vout": 1,
             "change_vout": 2,
@@ -1233,6 +1640,14 @@ impl AccountWallet {
                 unix_time()?,
             ],
         )?;
+        let now = u64::try_from(unix_time()?)
+            .map_err(|_| AccountError::new("clock_error", "negative timestamp"))?;
+        let seen_at = original_last_seen
+            .and_then(|last_seen| last_seen.checked_add(1))
+            .map_or(now, |next| next.max(now));
+        self.bitcoin
+            .apply_unconfirmed_txs([(Arc::new(replacement.clone()), seen_at)]);
+        self.bitcoin.persist(&mut self.db)?;
         let relay = relay_transaction(
             self.bitcoin.network(),
             &self.config.peers,
@@ -1356,6 +1771,7 @@ impl AccountWallet {
             "version": CHECKPOINT_VERSION,
             "network": self.config.network,
             "root_fingerprint": self.root_fingerprint,
+            "device_binding_commitment": self.device_binding_commitment,
             "owners": owners,
             "assets": assets,
             "operations": operations,
@@ -1376,6 +1792,12 @@ impl AccountWallet {
                 "linked devices are watch-only",
             ));
         }
+        if !self.device_binding_valid {
+            return Err(AccountError::new(
+                "device_binding_mismatch",
+                "this restored device is read/export-only until explicit wallet recovery",
+            ));
+        }
         if !self.backup_verified()? {
             return Err(AccountError::new(
                 "backup_required",
@@ -1388,6 +1810,17 @@ impl AccountWallet {
     fn primary_protocol_mut(&mut self) -> Result<&mut MemWallet, AccountError> {
         self.protocol.as_mut().ok_or_else(|| {
             AccountError::new("primary_required", "linked devices cannot sign or mint")
+        })
+    }
+
+    fn verify_funding(
+        &self,
+        funding: &ReservedFunding,
+    ) -> Result<FundingVerificationReceipt, AccountError> {
+        self.funding_verifier.verify(&FundingVerificationRequest {
+            outpoint: funding.outpoint,
+            txout: funding.txout.clone(),
+            birth_height: funding.birth_height,
         })
     }
 
@@ -1420,54 +1853,78 @@ impl AccountWallet {
     }
 
     fn reserve_fee_utxo(&mut self, operation_id: &str) -> Result<ReservedFunding, AccountError> {
-        let candidate = self
-            .bitcoin
-            .list_unspent()
-            .filter(|utxo| !self.bitcoin.is_outpoint_locked(utxo.outpoint))
-            .filter(|utxo| utxo.txout.value.to_sat() >= MIN_FEE_RESERVE_SATS)
-            .max_by_key(|utxo| utxo.txout.value.to_sat())
-            .ok_or_else(|| {
-                AccountError::new(
-                    "insufficient_fees",
-                    format!("no unreserved fee UTXO of at least {MIN_FEE_RESERVE_SATS} sats"),
-                )
-            })?;
-        let funding = ReservedFunding {
-            outpoint: candidate.outpoint,
-            value_sats: candidate.txout.value.to_sat(),
-        };
-        self.bitcoin.lock_outpoint(funding.outpoint);
-        self.bitcoin.persist(&mut self.db)?;
+        let mut candidates = Vec::new();
+        for output in self.bitcoin.list_unspent() {
+            if self.bitcoin.is_outpoint_locked(output.outpoint)
+                || output.txout.value.to_sat() < MIN_FEE_RESERVE_SATS
+            {
+                continue;
+            }
+            if let Ok(funding) = ReservedFunding::from_local(output) {
+                candidates.push(funding);
+            }
+        }
+        candidates.sort_by_key(|funding| std::cmp::Reverse(funding.value_sats()));
+        if candidates.is_empty() {
+            return Err(AccountError::new(
+                "insufficient_fees",
+                format!(
+                    "no confirmed, unreserved fee UTXO of at least {MIN_FEE_RESERVE_SATS} sats"
+                ),
+            ));
+        }
+
         let now = unix_time()?;
-        let transaction = self.db.conn.transaction()?;
-        transaction.execute(
-            "INSERT INTO opencsv_utxo_reservations(
-                 txid, vout, operation_id, state, created_at
-             ) VALUES(?1, ?2, ?3, 'reserved', ?4)",
-            params![
-                funding.outpoint.txid.to_string(),
-                funding.outpoint.vout,
-                operation_id,
-                now,
-            ],
-        )?;
-        transaction.execute(
-            "UPDATE opencsv_operations SET state = ?2, funding_txid = ?3,
-             funding_vout = ?4, funding_value_sats = ?5, updated_at = ?6
-             WHERE operation_id = ?1",
-            params![
-                operation_id,
-                OperationState::FeeReserved.as_str(),
-                funding.outpoint.txid.to_string(),
-                funding.outpoint.vout,
-                i64::try_from(funding.value_sats).map_err(|_| {
-                    AccountError::new("database_error", "funding value exceeds SQLite range")
-                })?,
-                now,
-            ],
-        )?;
-        transaction.commit()?;
-        Ok(funding)
+        let mut saw_conflict = false;
+        for funding in candidates {
+            let transaction = self
+                .db
+                .conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let inserted = transaction.execute(
+                "INSERT OR IGNORE INTO opencsv_utxo_reservations(
+                     txid, vout, operation_id, state, created_at
+                 ) VALUES(?1, ?2, ?3, 'reserved', ?4)",
+                params![
+                    funding.outpoint.txid.to_string(),
+                    funding.outpoint.vout,
+                    operation_id,
+                    now,
+                ],
+            )?;
+            if inserted == 0 {
+                saw_conflict = true;
+                continue;
+            }
+            transaction.execute(
+                "UPDATE opencsv_operations SET state = ?2, funding_txid = ?3,
+                 funding_vout = ?4, funding_value_sats = ?5, updated_at = ?6
+                 WHERE operation_id = ?1",
+                params![
+                    operation_id,
+                    OperationState::FeeReserved.as_str(),
+                    funding.outpoint.txid.to_string(),
+                    funding.outpoint.vout,
+                    i64::try_from(funding.value_sats()).map_err(|_| {
+                        AccountError::new("database_error", "funding value exceeds SQLite range")
+                    })?,
+                    now,
+                ],
+            )?;
+            transaction.commit()?;
+            self.bitcoin.lock_outpoint(funding.outpoint);
+            self.bitcoin.persist(&mut self.db)?;
+            return Ok(funding);
+        }
+
+        Err(AccountError::new(
+            if saw_conflict {
+                "conflicting_operation"
+            } else {
+                "insufficient_fees"
+            },
+            "every eligible fee UTXO is already reserved by another operation",
+        ))
     }
 
     fn release_fee_reservation(&mut self, operation_id: &str) -> Result<(), AccountError> {
@@ -1491,7 +1948,7 @@ impl AccountWallet {
         currency: &str,
         terms_hash: Option<&str>,
     ) -> Result<String, AccountError> {
-        if currency.as_bytes().len() != 3 {
+        if currency.len() != 3 {
             return Err(AccountError::new(
                 "invalid_request",
                 "currency must be exactly three UTF-8 bytes",
@@ -1569,26 +2026,35 @@ impl AccountWallet {
         &self,
         operation_id: &str,
         funding: ReservedFunding,
+        verification: &FundingVerificationReceipt,
         record: &[u8; 64],
     ) -> Result<Value, AccountError> {
         let checkpoint = self.checkpoint()?;
         let checkpoint_hash = checkpoint["checkpoint_hash"]
             .as_str()
             .ok_or_else(|| AccountError::new("checkpoint_failed", "missing checkpoint hash"))?;
-        self.db.conn.execute(
-            "UPDATE opencsv_operations SET checkpoint_hash = ?2, updated_at = ?3
-             WHERE operation_id = ?1",
-            params![operation_id, checkpoint_hash, unix_time()?],
-        )?;
-        Ok(json!({
+        let receipt = json!({
             "operation_id": operation_id,
             "state": OperationState::ProofReady.as_str(),
             "funding_outpoint": funding.outpoint.to_string(),
-            "funding_value_sats": funding.value_sats,
+            "funding_value_sats": funding.value_sats(),
+            "funding_verification": verification,
             "anchor_record_hex": hex_encode(record),
             "checkpoint_hash": checkpoint_hash,
             "backup_ack_required": true,
-        }))
+        });
+        self.db.conn.execute(
+            "UPDATE opencsv_operations SET checkpoint_hash = ?2, receipt_json = ?3,
+             updated_at = ?4
+             WHERE operation_id = ?1",
+            params![
+                operation_id,
+                checkpoint_hash,
+                receipt.to_string(),
+                unix_time()?
+            ],
+        )?;
+        Ok(receipt)
     }
 
     fn reject_operation(&self, operation_id: &str, reason: &str) -> Result<(), AccountError> {
@@ -1600,13 +2066,55 @@ impl AccountWallet {
         Ok(())
     }
 
+    fn reject_prebroadcast_operation(
+        &mut self,
+        operation_id: &str,
+        reason: &str,
+    ) -> Result<(), AccountError> {
+        if let Some(pending_id) = self.pending_by_operation.remove(operation_id) {
+            if let Some(protocol) = self.protocol.as_mut() {
+                protocol.cancel_pending(pending_id);
+            }
+        }
+        self.release_fee_reservation(operation_id)?;
+        self.db.conn.execute(
+            "UPDATE opencsv_operations SET state = ?2, rejection_reason = ?3,
+             updated_at = ?4 WHERE operation_id = ?1",
+            params![
+                operation_id,
+                OperationState::Cancelled.as_str(),
+                reason,
+                unix_time()?,
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn fail_prebroadcast<T>(
+        &mut self,
+        operation_id: &str,
+        error: AccountError,
+    ) -> Result<T, AccountError> {
+        self.reject_prebroadcast_operation(operation_id, error.code)
+            .map_err(|cleanup| {
+                AccountError::new(
+                    "database_error",
+                    format!(
+                        "{}; additionally failed to release the pre-broadcast operation: {}",
+                        error, cleanup
+                    ),
+                )
+            })?;
+        Err(error)
+    }
+
     fn operation(&self, operation_id: &str) -> Result<OperationRow, AccountError> {
         self.db
             .conn
             .query_row(
                 "SELECT operation_id, kind, state, request_json,
                         funding_txid, funding_vout, signed_tx_hex, txid,
-                        receipt_json, delivery_nonce,
+                        receipt_json, rejection_reason, delivery_nonce,
                         checkpoint_hash, backup_acked
                  FROM opencsv_operations WHERE operation_id = ?1",
                 [operation_id],
@@ -1622,9 +2130,10 @@ impl AccountWallet {
                         signed_tx_hex: row.get(6)?,
                         txid: row.get(7)?,
                         receipt_json: row.get(8)?,
-                        delivery_nonce: row.get(9)?,
-                        checkpoint_hash: row.get(10)?,
-                        backup_acked: row.get::<_, i64>(11)? != 0,
+                        rejection_reason: row.get(9)?,
+                        delivery_nonce: row.get(10)?,
+                        checkpoint_hash: row.get(11)?,
+                        backup_acked: row.get::<_, i64>(12)? != 0,
                     })
                 },
             )
@@ -1755,7 +2264,9 @@ impl AccountWallet {
     }
 
     fn write_enabled(&self) -> Result<bool, AccountError> {
-        Ok(self.config.role == AccountRole::Primary && self.backup_verified()?)
+        Ok(self.config.role == AccountRole::Primary
+            && self.device_binding_valid
+            && self.backup_verified()?)
     }
 
     fn owner_secrets(&self) -> Result<Vec<OwnerSecret>, AccountError> {
@@ -1875,6 +2386,37 @@ impl AccountWallet {
         Ok(())
     }
 
+    fn restore_fee_reservations(&mut self) -> Result<(), AccountError> {
+        let outpoints = {
+            let mut statement = self.db.conn.prepare(
+                "SELECT txid, vout FROM opencsv_utxo_reservations
+                 WHERE state = 'reserved' ORDER BY created_at",
+            )?;
+            let rows = statement.query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        let mut changed = false;
+        for (txid, vout) in outpoints {
+            let txid = Txid::from_str(&txid).map_err(|error| {
+                AccountError::new("database_corrupt", format!("reserved txid: {error}"))
+            })?;
+            let vout = u32::try_from(vout).map_err(|_| {
+                AccountError::new("database_corrupt", "reserved vout is outside u32")
+            })?;
+            let outpoint = OutPoint::new(txid, vout);
+            if !self.bitcoin.is_outpoint_locked(outpoint) {
+                self.bitcoin.lock_outpoint(outpoint);
+                changed = true;
+            }
+        }
+        if changed {
+            self.bitcoin.persist(&mut self.db)?;
+        }
+        Ok(())
+    }
+
     fn restore_pending_operations(&mut self) -> Result<(), AccountError> {
         let Some(protocol) = self.protocol.as_mut() else {
             return Ok(());
@@ -1900,10 +2442,46 @@ impl AccountWallet {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 struct ReservedFunding {
     outpoint: OutPoint,
-    value_sats: u64,
+    txout: bdk_wallet::bitcoin::TxOut,
+    birth_height: u64,
+}
+
+impl ReservedFunding {
+    fn from_local(output: bdk_wallet::LocalOutput) -> Result<Self, AccountError> {
+        let birth_height = match output.chain_position {
+            ChainPosition::Confirmed {
+                anchor,
+                transitively: None,
+            } => u64::from(anchor.block_id.height),
+            ChainPosition::Confirmed {
+                transitively: Some(_),
+                ..
+            } => {
+                return Err(AccountError::new(
+                    "stale_chain_state",
+                    "fee outpoint has only a transitive confirmation height",
+                ));
+            }
+            ChainPosition::Unconfirmed { .. } => {
+                return Err(AccountError::new(
+                    "stale_chain_state",
+                    "fee outpoint must be confirmed before reservation",
+                ));
+            }
+        };
+        Ok(Self {
+            outpoint: output.outpoint,
+            txout: output.txout,
+            birth_height,
+        })
+    }
+
+    fn value_sats(&self) -> u64 {
+        self.txout.value.to_sat()
+    }
 }
 
 fn operation_outpoint(operation: &OperationRow) -> Result<OutPoint, AccountError> {
@@ -1939,6 +2517,7 @@ fn operation_json(operation: &OperationRow) -> Result<Value, AccountError> {
         "funding_vout": operation.funding_vout,
         "txid": operation.txid,
         "receipt": receipt,
+        "rejection_reason": operation.rejection_reason,
         "delivery_nonce": operation.delivery_nonce,
         "checkpoint_hash": operation.checkpoint_hash,
         "backup_acked": operation.backup_acked,
@@ -2015,8 +2594,26 @@ fn derive<const N: usize>(
 }
 
 fn parse_network(name: &str) -> Result<Network, AccountError> {
-    Network::from_str(name)
-        .map_err(|_| AccountError::new("invalid_config", format!("unknown network `{name}`")))
+    match name {
+        "mainnet" | "signet" | "regtest" => Network::from_str(name)
+            .map_err(|_| AccountError::new("invalid_config", format!("unknown network `{name}`"))),
+        _ => Err(AccountError::new(
+            "invalid_config",
+            format!("unsupported account-wallet network `{name}`"),
+        )),
+    }
+}
+
+fn parse_cbf_network(name: &str) -> Result<OpenCsvNetwork, AccountError> {
+    match name {
+        "mainnet" | "bitcoin" => Ok(OpenCsvNetwork::Mainnet),
+        "signet" => Ok(OpenCsvNetwork::Signet),
+        "regtest" => Ok(OpenCsvNetwork::Regtest),
+        _ => Err(AccountError::new(
+            "stale_chain_state",
+            format!("authoritative compact-filter validation is unavailable for `{name}`"),
+        )),
+    }
 }
 
 fn validate_esplora_url(url: &str) -> Result<(), AccountError> {
@@ -2059,7 +2656,7 @@ fn hex_encode(bytes: &[u8]) -> String {
 }
 
 fn hex_decode(value: &str, what: &str) -> Result<Vec<u8>, AccountError> {
-    if value.len() % 2 != 0 {
+    if !value.len().is_multiple_of(2) {
         return Err(AccountError::new(
             "database_corrupt",
             format!("{what} has odd-length hexadecimal"),
@@ -2072,6 +2669,16 @@ fn hex_decode(value: &str, what: &str) -> Result<Vec<u8>, AccountError> {
                 .map_err(|_| AccountError::new("database_corrupt", format!("invalid {what} hex")))
         })
         .collect()
+}
+
+fn validate_hex_32_config(value: &str, what: &str) -> Result<(), AccountError> {
+    if value.len() != 64 || !value.as_bytes().iter().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(AccountError::new(
+            "invalid_config",
+            format!("{what} must be 64 hexadecimal characters"),
+        ));
+    }
+    Ok(())
 }
 
 fn decode_hex_32(value: &str, what: &str) -> Result<[u8; 32], AccountError> {
@@ -2092,9 +2699,90 @@ fn decode_hex_32(value: &str, what: &str) -> Result<[u8; 32], AccountError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::VecDeque;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
+
     use bdk_wallet::bitcoin::absolute;
+    use bdk_wallet::bitcoin::block::{Header, Version};
+    use bdk_wallet::bitcoin::hash_types::TxMerkleNode;
     use bdk_wallet::bitcoin::transaction;
-    use bdk_wallet::bitcoin::{TxIn, TxOut, Witness};
+    use bdk_wallet::bitcoin::{Block, CompactTarget, TxIn, TxOut, Witness};
+
+    struct AcceptingVerifier;
+
+    impl FundingVerifier for AcceptingVerifier {
+        fn verify(
+            &self,
+            request: &FundingVerificationRequest,
+        ) -> Result<FundingVerificationReceipt, AccountError> {
+            Ok(FundingVerificationReceipt {
+                creation_height: request.birth_height,
+                checked_through: request.birth_height + 6,
+                matched_blocks: 1,
+                verified_at: 1,
+                source: "test-verified-blocks",
+            })
+        }
+    }
+
+    fn allow_funding_verification(wallet: &mut AccountWallet) {
+        wallet.funding_verifier = Arc::new(AcceptingVerifier);
+    }
+
+    #[derive(Clone, Copy)]
+    enum VerificationVerdict {
+        Accept,
+        Reject(&'static str, &'static str),
+    }
+
+    struct ScriptedVerifier {
+        verdicts: Mutex<VecDeque<VerificationVerdict>>,
+        calls: AtomicUsize,
+    }
+
+    impl ScriptedVerifier {
+        fn new(verdicts: impl IntoIterator<Item = VerificationVerdict>) -> Self {
+            Self {
+                verdicts: Mutex::new(verdicts.into_iter().collect()),
+                calls: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    impl FundingVerifier for ScriptedVerifier {
+        fn verify(
+            &self,
+            request: &FundingVerificationRequest,
+        ) -> Result<FundingVerificationReceipt, AccountError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            match self
+                .verdicts
+                .lock()
+                .expect("scripted verifier mutex")
+                .pop_front()
+                .unwrap_or(VerificationVerdict::Accept)
+            {
+                VerificationVerdict::Accept => Ok(FundingVerificationReceipt {
+                    creation_height: request.birth_height,
+                    checked_through: request.birth_height + 6,
+                    matched_blocks: 1,
+                    verified_at: 1,
+                    source: "scripted-verified-blocks",
+                }),
+                VerificationVerdict::Reject(code, message) => Err(AccountError::new(code, message)),
+            }
+        }
+    }
+
+    fn use_scripted_verifier(
+        wallet: &mut AccountWallet,
+        verdicts: impl IntoIterator<Item = VerificationVerdict>,
+    ) -> Arc<ScriptedVerifier> {
+        let verifier = Arc::new(ScriptedVerifier::new(verdicts));
+        wallet.funding_verifier = verifier.clone();
+        verifier
+    }
 
     fn config(role: AccountRole, backup_verified: bool) -> String {
         config_with_url(role, backup_verified, "https://mempool.space/signet/api")
@@ -2116,11 +2804,15 @@ mod tests {
             .bitcoin
             .next_unused_address(KeychainKind::External)
             .address;
+        let tip = wallet.bitcoin.latest_checkpoint().block_id();
+        let height = tip.height.checked_add(1).unwrap();
+        let mut previous_txid = [42u8; 32];
+        previous_txid[..4].copy_from_slice(&height.to_be_bytes());
         let transaction = Transaction {
             version: transaction::Version::TWO,
             lock_time: absolute::LockTime::ZERO,
             input: vec![TxIn {
-                previous_output: OutPoint::new(Txid::from_byte_array([42u8; 32]), 0),
+                previous_output: OutPoint::new(Txid::from_byte_array(previous_txid), 0),
                 script_sig: ScriptBuf::new(),
                 sequence: Sequence::MAX,
                 witness: Witness::new(),
@@ -2131,9 +2823,19 @@ mod tests {
             }],
         };
         let outpoint = OutPoint::new(transaction.compute_txid(), 0);
-        wallet
-            .bitcoin
-            .apply_unconfirmed_txs([(Arc::new(transaction), 1)]);
+        let mut block = Block {
+            header: Header {
+                version: Version::ONE,
+                prev_blockhash: tip.hash,
+                merkle_root: TxMerkleNode::all_zeros(),
+                time: height,
+                bits: CompactTarget::from_consensus(0x207f_ffff),
+                nonce: height,
+            },
+            txdata: vec![transaction],
+        };
+        block.header.merkle_root = block.compute_merkle_root().unwrap();
+        wallet.bitcoin.apply_block(&block, height).unwrap();
         wallet.bitcoin.persist(&mut wallet.db).unwrap();
         assert!(wallet
             .bitcoin
@@ -2190,6 +2892,85 @@ mod tests {
         .err()
         .unwrap();
         assert_eq!(error.code, "account_key_mismatch");
+    }
+
+    #[test]
+    fn restored_primary_with_different_device_binding_is_read_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wallet.sqlite");
+        let restored_path = dir.path().join("restored.sqlite");
+        let key = [21u8; 32];
+        let original_binding = [22u8; 32];
+        let restored_binding = [23u8; 32];
+        let cfg = config(AccountRole::Primary, true);
+        let mut original =
+            AccountWallet::open_device_bound(&cfg, &key, &original_binding, path.to_str().unwrap())
+                .unwrap();
+        let original_status = original.status().unwrap();
+        assert_eq!(original_status["device_binding"]["status"], "bound");
+        let commitment = original_status["device_binding"]["commitment"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert_eq!(
+            original.checkpoint().unwrap()["checkpoint"]["device_binding_commitment"],
+            commitment
+        );
+        drop(original);
+
+        let mut missing =
+            AccountWallet::open_device_bound(&cfg, &key, &[], path.to_str().unwrap()).unwrap();
+        assert_eq!(
+            missing.status().unwrap()["device_binding"]["status"],
+            "mismatch_read_only"
+        );
+        assert_eq!(
+            missing
+                .mint_prepare(&json!({ "currency": "USD", "amounts": [1] }).to_string())
+                .unwrap_err()
+                .code,
+            "device_binding_mismatch"
+        );
+        drop(missing);
+
+        let mut cloned =
+            AccountWallet::open_device_bound(&cfg, &key, &restored_binding, path.to_str().unwrap())
+                .unwrap();
+        let cloned_status = cloned.status().unwrap();
+        assert_eq!(
+            cloned_status["device_binding"]["status"],
+            "mismatch_read_only"
+        );
+        assert_eq!(cloned_status["write_enabled"], false);
+        assert_eq!(
+            cloned
+                .mint_prepare(&json!({ "currency": "USD", "amounts": [1] }).to_string())
+                .unwrap_err()
+                .code,
+            "device_binding_mismatch"
+        );
+        drop(cloned);
+
+        let mut restored_config: Value = serde_json::from_str(&cfg).unwrap();
+        restored_config["expected_device_binding_commitment"] = json!(commitment);
+        let mut clean_restore = AccountWallet::open_device_bound(
+            &restored_config.to_string(),
+            &key,
+            &restored_binding,
+            restored_path.to_str().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            clean_restore.status().unwrap()["device_binding"]["status"],
+            "mismatch_read_only"
+        );
+        assert_eq!(
+            clean_restore
+                .mint_prepare(&json!({ "currency": "USD", "amounts": [1] }).to_string())
+                .unwrap_err()
+                .code,
+            "device_binding_mismatch"
+        );
     }
 
     #[test]
@@ -2280,6 +3061,7 @@ mod tests {
             path.to_str().unwrap(),
         )
         .unwrap();
+        allow_funding_verification(&mut wallet);
         let funding = fund(&mut wallet, 50_000);
         let prepared = wallet
             .mint_prepare(&json!({ "currency": "USD", "amounts": [100] }).to_string())
@@ -2310,6 +3092,7 @@ mod tests {
             dir.path().join("wallet.sqlite").to_str().unwrap(),
         )
         .unwrap();
+        allow_funding_verification(&mut wallet);
         let funding = fund(&mut wallet, 50_000);
         let prepared = wallet
             .mint_prepare(&json!({ "currency": "EUR", "amounts": [25] }).to_string())
@@ -2341,5 +3124,444 @@ mod tests {
         assert!(transaction.output[0].script_pubkey.is_op_return());
         assert_eq!(transaction.output[1].script_pubkey.as_bytes(), MARKER_SPK);
         assert!(!transaction.output[2].script_pubkey.is_op_return());
+    }
+
+    #[test]
+    fn authoritative_rejection_blocks_dishonest_explorer_hint() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut wallet = AccountWallet::open(
+            &config(AccountRole::Primary, true),
+            &[7u8; 32],
+            dir.path().join("wallet.sqlite").to_str().unwrap(),
+        )
+        .unwrap();
+        let funding = fund(&mut wallet, 50_000);
+        let verifier = use_scripted_verifier(
+            &mut wallet,
+            [VerificationVerdict::Reject(
+                "stale_chain_state",
+                "verified blocks do not contain the explorer-advertised outpoint",
+            )],
+        );
+
+        let error = wallet
+            .mint_prepare(&json!({ "currency": "CAD", "amounts": [10] }).to_string())
+            .unwrap_err();
+        assert_eq!(error.code, "stale_chain_state");
+        assert_eq!(verifier.calls.load(Ordering::SeqCst), 1);
+        assert!(!wallet.bitcoin.is_outpoint_locked(funding));
+        let reservations: u32 = wallet
+            .db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM opencsv_utxo_reservations",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(reservations, 0);
+        let (state, reason): (String, Option<String>) = wallet
+            .db
+            .conn
+            .query_row(
+                "SELECT state, rejection_reason FROM opencsv_operations
+                 ORDER BY created_at DESC LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(state, OperationState::Cancelled.as_str());
+        assert_eq!(reason.as_deref(), Some("stale_chain_state"));
+    }
+
+    #[test]
+    fn recently_spent_funding_is_rejected_again_at_sign_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut wallet = AccountWallet::open(
+            &config_with_url(AccountRole::Primary, true, "http://127.0.0.1:1"),
+            &[8u8; 32],
+            dir.path().join("wallet.sqlite").to_str().unwrap(),
+        )
+        .unwrap();
+        fund(&mut wallet, 50_000);
+        let verifier = use_scripted_verifier(
+            &mut wallet,
+            [
+                VerificationVerdict::Accept,
+                VerificationVerdict::Reject(
+                    "conflicting_operation",
+                    "verified block spends reserved fee outpoint",
+                ),
+            ],
+        );
+        let prepared = wallet
+            .mint_prepare(&json!({ "currency": "GBP", "amounts": [10] }).to_string())
+            .unwrap();
+        let operation_id = prepared["operation_id"].as_str().unwrap();
+        wallet
+            .acknowledge_operation_backup(
+                operation_id,
+                prepared["checkpoint_hash"].as_str().unwrap(),
+            )
+            .unwrap();
+
+        let error = wallet
+            .sign_and_broadcast(
+                operation_id,
+                &json!({ "target_sat_per_vb": 1, "max_fee_sats": 5_000 }).to_string(),
+            )
+            .unwrap_err();
+        assert_eq!(error.code, "conflicting_operation");
+        assert_eq!(verifier.calls.load(Ordering::SeqCst), 2);
+        let operation = wallet.operation(operation_id).unwrap();
+        assert_eq!(operation.state, OperationState::ProofReady.as_str());
+        assert!(operation.signed_tx_hex.is_none());
+        assert_eq!(
+            operation.rejection_reason.as_deref(),
+            Some("conflicting_operation")
+        );
+    }
+
+    #[test]
+    fn concurrent_handles_reserve_distinct_fee_outpoints() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wallet.sqlite");
+        let key = [9u8; 32];
+        let mut first = AccountWallet::open(
+            &config(AccountRole::Primary, true),
+            &key,
+            path.to_str().unwrap(),
+        )
+        .unwrap();
+        let larger = fund(&mut first, 60_000);
+        let smaller = fund(&mut first, 50_000);
+        assert_ne!(larger, smaller);
+        let mut second = AccountWallet::open(
+            &config(AccountRole::Primary, true),
+            &key,
+            path.to_str().unwrap(),
+        )
+        .unwrap();
+        let second_outpoints: Vec<OutPoint> = second
+            .bitcoin
+            .list_unspent()
+            .map(|output| output.outpoint)
+            .collect();
+        assert!(second_outpoints.contains(&larger));
+        assert!(second_outpoints.contains(&smaller));
+        allow_funding_verification(&mut first);
+        allow_funding_verification(&mut second);
+
+        let first_prepared = first
+            .mint_prepare(&json!({ "currency": "USD", "amounts": [10] }).to_string())
+            .unwrap();
+        let second_prepared = second
+            .mint_prepare(&json!({ "currency": "EUR", "amounts": [10] }).to_string())
+            .unwrap();
+        assert_eq!(
+            first_prepared["funding_outpoint"],
+            json!(larger.to_string())
+        );
+        assert_eq!(
+            second_prepared["funding_outpoint"],
+            json!(smaller.to_string())
+        );
+        assert_ne!(
+            first_prepared["funding_outpoint"],
+            second_prepared["funding_outpoint"]
+        );
+        let first_operation = first_prepared["operation_id"].as_str().unwrap().to_owned();
+        let second_operation = second_prepared["operation_id"].as_str().unwrap().to_owned();
+        drop(first);
+        drop(second);
+
+        let reopened = AccountWallet::open(
+            &config(AccountRole::Primary, true),
+            &key,
+            path.to_str().unwrap(),
+        )
+        .unwrap();
+        assert!(reopened.bitcoin.is_outpoint_locked(larger));
+        assert!(reopened.bitcoin.is_outpoint_locked(smaller));
+        assert!(reopened.pending_by_operation.contains_key(&first_operation));
+        assert!(reopened
+            .pending_by_operation
+            .contains_key(&second_operation));
+    }
+
+    #[test]
+    fn every_durable_operation_state_reopens_with_expected_material() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wallet.sqlite");
+        let key = [24u8; 32];
+        let cfg = config(AccountRole::Primary, true);
+        let mut wallet = AccountWallet::open(&cfg, &key, path.to_str().unwrap()).unwrap();
+        allow_funding_verification(&mut wallet);
+        fund(&mut wallet, 70_000);
+        fund(&mut wallet, 60_000);
+
+        wallet
+            .insert_planned_operation("planned-op", "mint", "{}", "planned-delivery")
+            .unwrap();
+        wallet
+            .insert_planned_operation("reserved-op", "mint", "{}", "reserved-delivery")
+            .unwrap();
+        let reserved = wallet.reserve_fee_utxo("reserved-op").unwrap().outpoint;
+        let prepared = wallet
+            .mint_prepare(&json!({ "currency": "CHF", "amounts": [10] }).to_string())
+            .unwrap();
+        let proof_operation = prepared["operation_id"].as_str().unwrap().to_owned();
+        let proof_outpoint =
+            operation_outpoint(&wallet.operation(&proof_operation).unwrap()).unwrap();
+        drop(wallet);
+
+        let mut reopened = AccountWallet::open(&cfg, &key, path.to_str().unwrap()).unwrap();
+        assert_eq!(
+            reopened.operation("planned-op").unwrap().state,
+            OperationState::Planned.as_str()
+        );
+        assert_eq!(
+            reopened.operation("reserved-op").unwrap().state,
+            OperationState::FeeReserved.as_str()
+        );
+        assert!(reopened.bitcoin.is_outpoint_locked(reserved));
+        assert!(reopened.bitcoin.is_outpoint_locked(proof_outpoint));
+        assert!(reopened.pending_by_operation.contains_key(&proof_operation));
+
+        for state in [
+            OperationState::ProofReady,
+            OperationState::SignedPersisted,
+            OperationState::BroadcastUnobserved,
+            OperationState::Broadcast,
+        ] {
+            reopened
+                .db
+                .conn
+                .execute(
+                    "UPDATE opencsv_operations SET state = ?2 WHERE operation_id = ?1",
+                    params![&proof_operation, state.as_str()],
+                )
+                .unwrap();
+            drop(reopened);
+            reopened = AccountWallet::open(&cfg, &key, path.to_str().unwrap()).unwrap();
+            assert_eq!(
+                reopened.operation(&proof_operation).unwrap().state,
+                state.as_str()
+            );
+            assert!(reopened.pending_by_operation.contains_key(&proof_operation));
+            assert!(reopened.bitcoin.is_outpoint_locked(proof_outpoint));
+        }
+
+        for state in [
+            OperationState::Mempool,
+            OperationState::Confirmed,
+            OperationState::ConsignmentDelivered,
+        ] {
+            reopened
+                .db
+                .conn
+                .execute(
+                    "UPDATE opencsv_operations SET state = ?2 WHERE operation_id = ?1",
+                    params![&proof_operation, state.as_str()],
+                )
+                .unwrap();
+            drop(reopened);
+            reopened = AccountWallet::open(&cfg, &key, path.to_str().unwrap()).unwrap();
+            assert_eq!(
+                reopened.operation(&proof_operation).unwrap().state,
+                state.as_str()
+            );
+            assert!(!reopened.pending_by_operation.contains_key(&proof_operation));
+            assert!(reopened.bitcoin.is_outpoint_locked(proof_outpoint));
+        }
+
+        assert_eq!(
+            reopened.cancel_operation("planned-op").unwrap()["state"],
+            OperationState::Cancelled.as_str()
+        );
+        drop(reopened);
+        let reopened = AccountWallet::open(&cfg, &key, path.to_str().unwrap()).unwrap();
+        assert_eq!(
+            reopened.operation("planned-op").unwrap().state,
+            OperationState::Cancelled.as_str()
+        );
+    }
+
+    #[test]
+    fn fee_bump_bytes_survive_failed_relay_and_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wallet.sqlite");
+        let key = [10u8; 32];
+        let mut wallet = AccountWallet::open(
+            &config_with_url(AccountRole::Primary, true, "http://127.0.0.1:1"),
+            &key,
+            path.to_str().unwrap(),
+        )
+        .unwrap();
+        allow_funding_verification(&mut wallet);
+        fund(&mut wallet, 100_000);
+        let prepared = wallet
+            .mint_prepare(&json!({ "currency": "JPY", "amounts": [10] }).to_string())
+            .unwrap();
+        let operation_id = prepared["operation_id"].as_str().unwrap().to_owned();
+        wallet
+            .acknowledge_operation_backup(
+                &operation_id,
+                prepared["checkpoint_hash"].as_str().unwrap(),
+            )
+            .unwrap();
+        assert_eq!(
+            wallet
+                .sign_and_broadcast(
+                    &operation_id,
+                    &json!({ "target_sat_per_vb": 1, "max_fee_sats": 5_000 }).to_string(),
+                )
+                .unwrap_err()
+                .code,
+            "broadcast_unobserved"
+        );
+        let original_hex = wallet
+            .operation(&operation_id)
+            .unwrap()
+            .signed_tx_hex
+            .unwrap();
+        assert_eq!(
+            wallet.fee_bump(&operation_id, 5).unwrap_err().code,
+            "broadcast_unobserved"
+        );
+        let bumped = wallet.operation(&operation_id).unwrap();
+        assert_eq!(bumped.state, OperationState::SignedPersisted.as_str());
+        let replacement_hex = bumped.signed_tx_hex.unwrap();
+        assert_ne!(replacement_hex, original_hex);
+        let original: Transaction =
+            deserialize(&hex_decode(&original_hex, "original tx").unwrap()).unwrap();
+        let replacement: Transaction =
+            deserialize(&hex_decode(&replacement_hex, "replacement tx").unwrap()).unwrap();
+        validate_solo_anchor_replacement(&original, &replacement).unwrap();
+        let replacement_txid = replacement.compute_txid();
+        drop(wallet);
+
+        let mut reopened = AccountWallet::open(
+            &config_with_url(AccountRole::Primary, true, "http://127.0.0.1:1"),
+            &key,
+            path.to_str().unwrap(),
+        )
+        .unwrap();
+        let restored = reopened.operation(&operation_id).unwrap();
+        assert_eq!(restored.state, OperationState::SignedPersisted.as_str());
+        assert_eq!(
+            restored.signed_tx_hex.as_deref(),
+            Some(replacement_hex.as_str())
+        );
+        assert!(reopened.bitcoin.get_tx(replacement_txid).is_some());
+        assert_eq!(
+            reopened.resume_operation(&operation_id).unwrap_err().code,
+            "sync_failed"
+        );
+        assert_eq!(
+            reopened
+                .operation(&operation_id)
+                .unwrap()
+                .signed_tx_hex
+                .as_deref(),
+            Some(replacement_hex.as_str())
+        );
+    }
+
+    #[test]
+    fn post_reservation_prepare_failure_releases_fee_input() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wallet.sqlite");
+        let key = [11u8; 32];
+        let mut wallet = AccountWallet::open(
+            &config(AccountRole::Primary, true),
+            &key,
+            path.to_str().unwrap(),
+        )
+        .unwrap();
+        allow_funding_verification(&mut wallet);
+        let funding = fund(&mut wallet, 100_000);
+
+        let error = wallet
+            .mint_prepare(&json!({ "currency": "US", "amounts": [10] }).to_string())
+            .unwrap_err();
+        assert_eq!(error.code, "invalid_request");
+        assert!(!wallet.bitcoin.is_outpoint_locked(funding));
+        let reservations: u32 = wallet
+            .db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM opencsv_utxo_reservations",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(reservations, 0);
+        let (state, reason): (String, Option<String>) = wallet
+            .db
+            .conn
+            .query_row(
+                "SELECT state, rejection_reason FROM opencsv_operations
+                 ORDER BY created_at DESC LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(state, OperationState::Cancelled.as_str());
+        assert_eq!(reason.as_deref(), Some("invalid_request"));
+    }
+
+    #[test]
+    fn fee_bump_reverification_failure_preserves_original_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wallet.sqlite");
+        let key = [12u8; 32];
+        let mut wallet = AccountWallet::open(
+            &config_with_url(AccountRole::Primary, true, "http://127.0.0.1:1"),
+            &key,
+            path.to_str().unwrap(),
+        )
+        .unwrap();
+        let verifier = use_scripted_verifier(
+            &mut wallet,
+            [
+                VerificationVerdict::Accept,
+                VerificationVerdict::Accept,
+                VerificationVerdict::Reject(
+                    "stale_chain_state",
+                    "reserved funding outpoint was recently spent",
+                ),
+            ],
+        );
+        fund(&mut wallet, 100_000);
+        let prepared = wallet
+            .mint_prepare(&json!({ "currency": "SEK", "amounts": [10] }).to_string())
+            .unwrap();
+        let operation_id = prepared["operation_id"].as_str().unwrap().to_owned();
+        wallet
+            .acknowledge_operation_backup(
+                &operation_id,
+                prepared["checkpoint_hash"].as_str().unwrap(),
+            )
+            .unwrap();
+        assert_eq!(
+            wallet
+                .sign_and_broadcast(
+                    &operation_id,
+                    &json!({ "target_sat_per_vb": 1, "max_fee_sats": 5_000 }).to_string(),
+                )
+                .unwrap_err()
+                .code,
+            "broadcast_unobserved"
+        );
+        let before = wallet.operation(&operation_id).unwrap();
+        let error = wallet.fee_bump(&operation_id, 5).unwrap_err();
+        assert_eq!(error.code, "stale_chain_state");
+        let after = wallet.operation(&operation_id).unwrap();
+        assert_eq!(after.state, before.state);
+        assert_eq!(after.signed_tx_hex, before.signed_tx_hex);
+        assert_eq!(after.txid, before.txid);
+        assert_eq!(after.rejection_reason.as_deref(), Some("stale_chain_state"));
+        assert_eq!(verifier.calls.load(Ordering::SeqCst), 3);
     }
 }

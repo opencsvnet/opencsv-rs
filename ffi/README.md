@@ -1,11 +1,14 @@
 # opencsv-ffi
 
 C ABI for embedding the OpenCSV wallet in native apps (iOS-first). All
-protocol logic stays in Rust over `opencsv-core` / `opencsv-pcd`; the host
-app supplies transport, persistence, and the anchor-log view. Full contract
-in `src/lib.rs` and `include/opencsv.h`.
+protocol logic stays in Rust over `opencsv-core` / `opencsv-pcd`. The preferred
+Signal boundary is the persistent `opencsv_account_*` API documented in
+`../SIGNAL_ACCOUNT_WALLET.md`: Rust owns keys, asset/Bitcoin coin selection,
+reservations, proofs, signing, P2P relay, and crash recovery while Swift sends
+action intent. Full ABI contract is in `src/lib.rs` and `include/opencsv.h`.
 
-The model, in one paragraph: `opencsv_wallet_create` returns a small secrets
+The older in-memory compatibility model is retained temporarily:
+`opencsv_wallet_create` returns a small secrets
 JSON the host keeps in its keystore (iOS Keychain) and passes back to
 `opencsv_wallet_open`; coins are rebuilt at open by replaying verified
 consignment blobs through `opencsv_verify_consignment` (milliseconds each)
@@ -23,8 +26,9 @@ contract as `opencsv-bitcoin`'s backend), while explicitly claimed
 locations are matched strictly. Between the two phases the pending transaction
 lives only in memory; `opencsv_pending_export` / `opencsv_pending_import`
 persist it (proof, openings with their fresh randomness, aux, spend list)
-across the broadcast→finalize window, closing the crash-loses-consignment
-gap.
+across the broadcast→finalize window, closing the crash-loses-consignment gap.
+Its anchor-server examples are compatibility documentation, not the target
+Signal send architecture.
 
 Beyond the wallet core, three host-facing verification surfaces:
 
