@@ -15,7 +15,7 @@ use opencsv_bitcoin::rpc::RpcAuth;
 use opencsv_bitcoin::{BitcoinAnchorChain, Config as BtcConfig, Network};
 use opencsv_cbf::{CbfClient, Config, FullScanChain};
 use opencsv_core::chain::AnchorChain;
-use opencsv_core::{AnchorRecord, Digest};
+use opencsv_core::Digest;
 
 #[test]
 fn fullscan_finds_first_occurrence_of_double_spend() {

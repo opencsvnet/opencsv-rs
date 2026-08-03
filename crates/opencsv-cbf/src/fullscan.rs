@@ -26,7 +26,7 @@
 
 use opencsv_bitcoin::funding_ctx;
 use opencsv_core::chain::{AnchorChain, AnchorLocation, AnchorRef};
-use opencsv_core::{AnchorRecord, Digest, TruncatedDigest};
+use opencsv_core::{AnchorRecord, BatchVersion, Digest, TruncatedDigest};
 
 use crate::block::op_return_payload;
 use crate::client::CbfClient;
@@ -62,15 +62,14 @@ pub(crate) fn anchors_in_block(block: &crate::block::Block, height: u64) -> Vec<
                 };
                 let txid = tx.txid();
                 if let AnchorRecord::BatchHeader { .. } = record {
-                    // The envelope is the funding input's witness minus
-                    // the final witness-script item.
+                    // The witness magic selects v1 (payloads + script)
+                    // or v2 (payloads + stock signature + script).
                     let envelope = tx
                         .witnesses
                         .first()
-                        .and_then(|w| w.split_last())
-                        .and_then(|(_, items)| opencsv_core::batch::envelope_decode(items));
+                        .and_then(|w| opencsv_core::batch::witness_envelope_decode(w));
                     match envelope {
-                        Some(envelope) => {
+                        Some((version, envelope)) => {
                             for (index, _) in envelope.iter().enumerate() {
                                 entries.push(ScannedAnchor {
                                     location,
@@ -78,6 +77,7 @@ pub(crate) fn anchors_in_block(block: &crate::block::Block, height: u64) -> Vec<
                                     record,
                                     ctx,
                                     batch: Some(BatchCandidate {
+                                        version,
                                         index: index as u32,
                                         envelope: envelope.clone(),
                                     }),
@@ -115,6 +115,8 @@ pub(crate) fn anchors_in_block(block: &crate::block::Block, height: u64) -> Vec<
 /// and the full payload envelope it was decoded from.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BatchCandidate {
+    /// Fail-closed witness/header commitment version selected by magic.
+    pub version: BatchVersion,
     /// This candidate's index in the witness envelope.
     pub index: u32,
     /// The full decoded payload envelope of the batch.
@@ -147,7 +149,8 @@ impl ScannedAnchor {
         match &self.batch {
             None => self.record.well_formed(&self.ctx, raw_nf),
             Some(batch) => {
-                opencsv_core::batch::envelope_occurrence(
+                opencsv_core::batch::versioned_envelope_occurrence(
+                    batch.version,
                     &self.record,
                     &batch.envelope,
                     &self.ctx,

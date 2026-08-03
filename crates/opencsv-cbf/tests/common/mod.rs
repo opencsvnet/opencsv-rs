@@ -2,6 +2,8 @@
 //! `bitcoind` (regtest, `blockfilterindex=1 peerblockfilters=1`) on a
 //! fresh temp datadir, wait for RPC, and stop it on drop.
 
+#![allow(dead_code)]
+
 use std::net::TcpListener;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};

@@ -70,6 +70,7 @@
 #![warn(missing_docs)]
 
 pub mod batch;
+pub mod batch_v2;
 pub mod bech32;
 pub mod chain;
 pub mod error;

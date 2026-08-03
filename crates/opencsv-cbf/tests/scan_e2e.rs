@@ -17,7 +17,7 @@ use opencsv_cbf::{CbfClient, Config, ScanIndex};
 use opencsv_core::accept::{accept, public_input, AcceptParams, MockVerifier};
 use opencsv_core::chain::AnchorChain;
 use opencsv_core::consignment::{CoinOpening, Consignment};
-use opencsv_core::{AnchorRecord, AssetGenesis, Digest, OwnerSecret};
+use opencsv_core::{AssetGenesis, Digest, OwnerSecret};
 
 const VK: &[u8] = b"scan-e2e-vk";
 

@@ -89,6 +89,10 @@ default exclusion path on top of this:
   `blocks_fetched`) are exposed.
 - `scan_check(raw_nf, birth, spend)` answers occurrence queries
   **locally** — no network at check time; earliest occurrence wins.
+- Batch headers expand into one indexed candidate per witness payload. `OCSV`
+  selects the legacy `batch` commitment; `OCS2` skips the stock signature and
+  selects `batch-v2`. The selected version is persisted, and an invalid stack
+  never falls back across versions.
 - The `AnchorChain` impl (tip = synced tip) lets `accept()` run against
   the scan alone: no RPC to the anchoring node, no indexer.
 
@@ -194,6 +198,9 @@ inclusion, **not** transaction or block validity. Its security rests on:
   (regtest, `blockfilterindex=1 peerblockfilters=1`; real anchor via
   `opencsv-bitcoin`). Skips silently when no `bitcoind` is found;
   override the path with `OPENCSV_BITCOIND`.
+- `tests/batch_v2_e2e.rs` — three independently keyed funding inputs,
+  co-funded construction, output-mutation rejection, real mempool RBF,
+  confirmation, and two payload occurrences recovered through the scan.
 
 ## TODO / future work
 

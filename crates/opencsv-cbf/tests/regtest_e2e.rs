@@ -47,7 +47,7 @@ fn regtest_end_to_end() {
         index_path: tmp.path().join("bitcoin-index.log"),
     };
     let mut anchor_chain = BitcoinAnchorChain::open(&btc_config).unwrap();
-    let (raw_nf, anchor_ref) = common::anchor_xfer_retry(&mut anchor_chain, 7);
+    let (_raw_nf, anchor_ref) = common::anchor_xfer_retry(&mut anchor_chain, 7);
     anchor_chain.generate_blocks(6).unwrap();
     let location: AnchorLocation = anchor_chain.locate(&anchor_ref).expect("anchor mined");
     let record = anchor_chain.anchor_at(&anchor_ref).unwrap();

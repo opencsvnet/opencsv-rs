@@ -129,12 +129,17 @@ impl ScanIndex {
                     };
                     let batch = match rest {
                         [] => None,
-                        ["batch", index, envelope] => {
+                        [kind @ ("batch" | "batch1" | "batch2"), index, envelope] => {
                             let envelope_bytes = from_hex(envelope).map_err(|_| bad())?;
                             if envelope_bytes.len() % 24 != 0 {
                                 return Err(bad());
                             }
                             Some(crate::fullscan::BatchCandidate {
+                                version: if *kind == "batch2" {
+                                    opencsv_core::BatchVersion::V2
+                                } else {
+                                    opencsv_core::BatchVersion::V1
+                                },
                                 index: index.parse().map_err(|_| bad())?,
                                 envelope: envelope_bytes
                                     .chunks_exact(24)
@@ -193,7 +198,11 @@ impl ScanIndex {
                     .iter()
                     .flat_map(|p| *p.as_bytes())
                     .collect();
-                line.push_str(&format!(" batch {} {}", batch.index, to_hex(&envelope)));
+                let kind = match batch.version {
+                    opencsv_core::BatchVersion::V1 => "batch1",
+                    opencsv_core::BatchVersion::V2 => "batch2",
+                };
+                line.push_str(&format!(" {kind} {} {}", batch.index, to_hex(&envelope)));
             }
             out.push_str(&line);
             out.push('\n');

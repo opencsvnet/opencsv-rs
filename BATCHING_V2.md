@@ -1,6 +1,6 @@
 # OpenCSV batching v2 protocol and threat model (C0)
 
-Status: **frozen for C1 implementation**
+Status: **frozen and implemented by C1**
 
 Protocol version: `2`
 
@@ -14,6 +14,14 @@ The existing Rust batching implementation is batching v1. It is useful
 prototype evidence, but its coordinator-funded, anyone-can-spend funding stock
 is not the v2 protocol. V1 remains readable during migration; new batch
 creation MUST use v2 after C1 lands.
+
+C1 implementation map: `opencsv-core::batch` owns versioned envelope and
+occurrence semantics; `opencsv-bitcoin::batch_v2` owns canonical transcripts,
+transaction construction, PSBT material, signatures, fees, and replacement;
+`opencsv-cbf` scans and persists both fail-closed witness versions. The real
+`batch_v2_e2e` regtest uses separate stock and participant keys, rejects a
+mutated output, replaces the signed transaction unanimously, mines it, and
+recovers both payload occurrences over BIP158/P2P scanning.
 
 ## 1. Goals and non-goals
 

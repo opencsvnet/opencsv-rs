@@ -41,9 +41,11 @@ Issuer authorization and recursive predecessor keys are bound in-circuit;
 proof envelopes, FRI parameters, and accept tags are fail-closed at version 3.
 
 The frozen co-funded batching protocol and threat model is
-[`BATCHING_V2.md`](BATCHING_V2.md). The current Rust batch constructor is the
-legacy v1 prototype; C1 implements the signed-stock, participant-funded v2
-semantics before the CLI/P2P flow changes.
+[`BATCHING_V2.md`](BATCHING_V2.md). C1 is implemented in
+`opencsv-bitcoin::batch_v2`: signed stock, canonical participant commitments,
+exact fee allocation, PSBT signer material, unanimous replacement, and
+multi-party regtest evidence. The older `batch` module remains the fail-closed
+v1 reader/compatibility path; CLI/P2P coordination follows in C2.
 
 ## Build & test
 

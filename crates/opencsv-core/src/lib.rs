@@ -65,7 +65,12 @@ pub use accept::{accept, AcceptParams, AcceptedCoins, MockVerifier, ProofVerifie
 pub use anchor::{binding, mint_commit, nullifier_commit, AnchorRecord, ANCHOR_SIZE};
 pub use asset::{AssetGenesis, AssetId};
 pub use audit::{supply, SupplyError};
-pub use batch::{batch_commit, envelope_decode, envelope_encode, envelope_occurrence, WITNESS_MAGIC};
+pub use batch::{
+    batch_commit, batch_commit_v2, envelope_decode, envelope_encode, envelope_occurrence,
+    envelope_v2_encode, versioned_batch_commit, versioned_envelope_occurrence,
+    witness_envelope_decode, BatchVersion, MAX_BATCH_V2_PARTICIPANTS, WITNESS_MAGIC,
+    WITNESS_MAGIC_V2,
+};
 pub use chain::{AnchorChain, AnchorLocation, AnchorRef, MockAnchorChain};
 pub use crosscheck::{CrossCheckError, CrossCheckedChain};
 pub use coin::{Coin, Commitment, Nullifier, Owner, OwnerSecret};

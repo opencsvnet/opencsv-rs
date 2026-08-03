@@ -155,8 +155,8 @@ pub enum AnchorRecord {
     BatchHeader {
         /// Number of payloads in the batch (`count` of the envelope).
         count: u8,
-        /// `H("batch" ∥ P_1 ∥ … ∥ P_n ∥ ctx)`, committing to the full
-        /// witness envelope.
+        /// Commitment to the full witness envelope. `OCSV` selects
+        /// `H("batch" ∥ ...)`; `OCS2` selects `H("batch-v2" ∥ ...)`.
         batch_commit: TruncatedDigest,
     },
     /// `REDEEM ∥ asset_id ∥ V ∥ P` — transparent burn back to the issuer
@@ -210,6 +210,19 @@ impl AnchorRecord {
         Self::BatchHeader {
             count: payloads.len() as u8,
             batch_commit: crate::batch::batch_commit(payloads, ctx).to_anchor(),
+        }
+    }
+
+    /// A batching-v2 [`AnchorRecord::BatchHeader`] under the fail-closed
+    /// `batch-v2` hash domain (see `BATCHING_V2.md`).
+    pub fn batch_header_v2(payloads: &[TruncatedDigest], ctx: &[u8; 32]) -> Self {
+        assert!(
+            !payloads.is_empty() && payloads.len() <= crate::batch::MAX_BATCH_V2_PARTICIPANTS,
+            "a batching-v2 envelope carries 1–64 payloads"
+        );
+        Self::BatchHeader {
+            count: payloads.len() as u8,
+            batch_commit: crate::batch::batch_commit_v2(payloads, ctx).to_anchor(),
         }
     }
 

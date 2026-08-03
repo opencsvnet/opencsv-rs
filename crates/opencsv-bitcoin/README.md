@@ -27,6 +27,13 @@ mismatch is a hard error at open.
   existing anchor-server client pattern. The `Transport` trait is the
   seam where unit tests script canned responses; the product path always
   uses `HttpTransport`.
+- **Batching v2 (C1)** — `batch_v2` implements the serverless co-funded
+  protocol in `BATCHING_V2.md`: signed count-specific P2WSH stock at input 0,
+  one P2WPKH fee input/change/payload per participant, canonical transcript
+  parsing, exact fee sharing, PSBT-v0 signer material, `SIGHASH_ALL`
+  finalization, and unanimous invariant-preserving RBF. The legacy `batch`
+  module remains v1 compatibility code and its anyone-can-spend stock is never
+  reinterpreted as v2.
 
 Used by `opencsv-cli` (default `--chain bitcoin`). See the crate-level
 rustdoc for the full design notes.
