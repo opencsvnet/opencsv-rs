@@ -30,6 +30,7 @@ use opencsv_core::{
 use opencsv_pcd::{decode_coin_proof, encode_coin_proof, NODE_INPUTS, NODE_OUTPUTS};
 use rand::RngExt;
 use serde::{Deserialize, Serialize};
+use zeroize::Zeroize;
 
 use crate::hex::{from_hex_array, to_hex};
 use crate::snapshot::SnapshotChain;
@@ -279,10 +280,7 @@ fn opening_from_json(opening: &OpeningJson) -> Result<CoinOpening, OpError> {
         asset_id: Digest::from_bytes(from_hex_array::<32>(&opening.asset_id, "asset id")?),
         value: opening.value,
         owner: Digest::from_bytes(from_hex_array::<32>(&opening.owner, "owner")?),
-        randomness: Digest::from_bytes(from_hex_array::<32>(
-            &opening.randomness,
-            "randomness",
-        )?),
+        randomness: Digest::from_bytes(from_hex_array::<32>(&opening.randomness, "randomness")?),
     })
 }
 
@@ -404,6 +402,16 @@ impl MemWallet {
         wallet
     }
 
+    /// Create a wallet whose first owner is deterministically derived by
+    /// the account layer. The seed is already domain-separated from the
+    /// Bitcoin fee and issuer branches before it reaches this boundary.
+    pub fn from_owner_seed(mut seed: [u8; 32]) -> Self {
+        let mut wallet = Self::empty();
+        wallet.keys.push(OwnerSecret::from_bytes(seed));
+        seed.zeroize();
+        wallet
+    }
+
     fn empty() -> Self {
         Self {
             keys: Vec::new(),
@@ -497,6 +505,40 @@ impl MemWallet {
         let asset_id = genesis.asset_id();
         self.pin_asset(genesis.clone());
         self.issuers.push(IssuerRecord { isk, genesis });
+        Ok(to_hex(asset_id.as_bytes()))
+    }
+
+    /// Create a deterministically derived issuer identity. The account
+    /// layer supplies a domain-separated per-asset seed and stable nonce,
+    /// allowing Secure Backup recovery without persisting another private
+    /// key. Replaying the same metadata is idempotent.
+    pub fn init_issuer_from_seed(
+        &mut self,
+        currency: &str,
+        seed: [u8; 32],
+        nonce: u64,
+        terms_hash: [u8; 32],
+    ) -> Result<String, OpError> {
+        let code: [u8; 3] = currency
+            .as_bytes()
+            .try_into()
+            .map_err(|_| format!("currency code `{currency}` is not 3 bytes"))?;
+        let (isk, ipk) = PoseidonIssuerAuthorization::keypair_from_seed(seed);
+        let genesis = AssetGenesis {
+            issuer_pk: ipk,
+            currency_code: code,
+            terms_hash: Digest::from_bytes(terms_hash),
+            nonce,
+        };
+        let asset_id = genesis.asset_id();
+        if !self
+            .issuers
+            .iter()
+            .any(|record| record.genesis.asset_id() == asset_id)
+        {
+            self.pin_asset(genesis.clone());
+            self.issuers.push(IssuerRecord { isk, genesis });
+        }
         Ok(to_hex(asset_id.as_bytes()))
     }
 
@@ -666,6 +708,28 @@ impl MemWallet {
         ))
     }
 
+    /// Select OpenCSV inputs and prove a payment from an action-level intent.
+    ///
+    /// The host names only the asset, recipient, and amount. Coin selection
+    /// stays inside Rust so Signal cannot accidentally reuse a coin, choose a
+    /// different asset, or construct change. The current circuit consumes
+    /// exactly two coins; selection minimizes change and then breaks ties by
+    /// coin id for deterministic crash/retry behavior.
+    pub fn prove_transfer_amount(
+        &mut self,
+        asset_id_hex: &str,
+        to_owner_hex: &str,
+        amount: u64,
+    ) -> Result<Proved, OpError> {
+        let (coin_ids, input_total) = self.select_transfer_inputs(asset_id_hex, amount)?;
+        let amounts = if input_total == amount {
+            vec![amount]
+        } else {
+            vec![amount, input_total - amount]
+        };
+        self.prove_transfer(&coin_ids, to_owner_hex, &amounts)
+    }
+
     /// Burn a coin back to the issuer (paper §4.6).
     pub fn prove_redeem(&mut self, coin_id: &str) -> Result<Proved, OpError> {
         let stored = self.find_coin(coin_id)?.clone();
@@ -790,7 +854,10 @@ impl MemWallet {
         let export: PendingExport =
             serde_json::from_str(pending_json).map_err(|e| format!("pending export JSON: {e}"))?;
         if export.version != 1 {
-            return Err(format!("unsupported pending export version {}", export.version));
+            return Err(format!(
+                "unsupported pending export version {}",
+                export.version
+            ));
         }
         let pending = Pending {
             shape: shape_from_json(&export.shape)?,
@@ -814,6 +881,13 @@ impl MemWallet {
         self.next_pending += 1;
         self.pending.insert(pending_id, pending);
         Ok(pending_id)
+    }
+
+    /// Forget a proved transaction that has not been broadcast. This never
+    /// marks inputs spent; the account layer separately releases its Bitcoin
+    /// fee-UTXO reservation. Returns whether a pending entry existed.
+    pub fn cancel_pending(&mut self, pending_id: u64) -> bool {
+        self.pending.remove(&pending_id).is_some()
     }
 
     /// The wallet's owner secrets, for accept-side verification params
@@ -978,6 +1052,60 @@ impl MemWallet {
             unspent: stored.status == CoinStatus::Unspent,
         }
     }
+
+    fn select_transfer_inputs(
+        &self,
+        asset_id_hex: &str,
+        amount: u64,
+    ) -> Result<(Vec<String>, u64), OpError> {
+        if amount == 0 {
+            return Err("transfer amount must be positive".into());
+        }
+        let asset_id = parse_digest(asset_id_hex, "asset id")?;
+        let reserved: std::collections::HashSet<&str> = self
+            .pending
+            .values()
+            .flat_map(|pending| pending.spent_ids.iter().map(String::as_str))
+            .collect();
+        let mut eligible: Vec<(String, u64)> = self
+            .coins
+            .iter()
+            .filter(|stored| {
+                stored.status == CoinStatus::Unspent
+                    && stored.coin.asset_id == asset_id
+                    && self.secret_for(&stored.coin.owner).is_some()
+                    && !reserved.contains(stored.id().as_str())
+            })
+            .map(|stored| (stored.id(), stored.coin.value))
+            .collect();
+        eligible.sort_by(|left, right| left.0.cmp(&right.0));
+
+        let mut selected: Option<(u64, String, String)> = None;
+        for first in 0..eligible.len() {
+            for second in first + 1..eligible.len() {
+                let Some(total) = eligible[first].1.checked_add(eligible[second].1) else {
+                    continue;
+                };
+                if total < amount {
+                    continue;
+                }
+                let candidate = (
+                    total - amount,
+                    eligible[first].0.clone(),
+                    eligible[second].0.clone(),
+                );
+                if selected.as_ref().is_none_or(|current| &candidate < current) {
+                    selected = Some(candidate);
+                }
+            }
+        }
+        let (change, first, second) = selected.ok_or_else(|| {
+            format!(
+                "no unreserved pair of spendable coins for asset {asset_id_hex} covers {amount}"
+            )
+        })?;
+        Ok((vec![first, second], amount + change))
+    }
 }
 
 /// Public supply of `asset_id` at the snapshot tip (paper §4.9).
@@ -1051,4 +1179,59 @@ fn openings_of(coins: &[Coin; NODE_OUTPUTS]) -> Vec<CoinOpening> {
             randomness: c.randomness,
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn store_coin(wallet: &mut MemWallet, asset_id: AssetId, value: u64, tag: u8) {
+        wallet.coins.push(StoredCoin {
+            coin: Coin {
+                asset_id,
+                value,
+                owner: wallet.keys[0].owner(),
+                randomness: Digest::from_bytes([tag; 32]),
+            },
+            status: CoinStatus::Unspent,
+            proof: Vec::new(),
+            selector: 0,
+        });
+    }
+
+    #[test]
+    fn action_selection_minimizes_change_and_excludes_pending_inputs() {
+        let mut wallet = MemWallet::from_owner_seed([7u8; 32]);
+        let asset_id = Digest::from_bytes([9u8; 32]);
+        store_coin(&mut wallet, asset_id, 7, 1);
+        store_coin(&mut wallet, asset_id, 5, 2);
+        store_coin(&mut wallet, asset_id, 4, 3);
+        store_coin(&mut wallet, Digest::from_bytes([8u8; 32]), 100, 4);
+
+        let asset_hex = to_hex(asset_id.as_bytes());
+        let (selected, total) = wallet.select_transfer_inputs(&asset_hex, 9).unwrap();
+        assert_eq!(total, 9);
+        let selected_values: Vec<u64> = selected
+            .iter()
+            .map(|id| wallet.find_coin(id).unwrap().coin.value)
+            .collect();
+        assert_eq!(selected_values.iter().sum::<u64>(), 9);
+
+        wallet.pending.insert(
+            1,
+            Pending {
+                shape: RecordShape::Fixed(AnchorRecord::xfer(
+                    &[Digest::from_bytes([1u8; 32])],
+                    &[0u8; 32],
+                )),
+                openings: Vec::new(),
+                nullifiers: Vec::new(),
+                proof: Vec::new(),
+                aux: None,
+                spent_ids: selected,
+            },
+        );
+        assert!(wallet.select_transfer_inputs(&asset_hex, 9).is_err());
+        assert!(wallet.select_transfer_inputs(&asset_hex, 0).is_err());
+    }
 }

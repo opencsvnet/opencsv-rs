@@ -30,9 +30,10 @@
 
 #![warn(missing_docs)]
 
-mod hex;
+pub mod account;
 pub mod cbf;
 pub mod crosscheck;
+mod hex;
 pub mod scan;
 pub mod snapshot;
 pub mod wallet;
@@ -47,6 +48,7 @@ use opencsv_core::chain::{AnchorLocation, AnchorRef};
 use serde::Deserialize;
 use serde_json::json;
 
+use crate::account::AccountWallet;
 use crate::hex::{from_hex_array, to_hex};
 use crate::snapshot::SnapshotChain;
 use crate::wallet::MemWallet;
@@ -58,8 +60,20 @@ static WALLETS: LazyLock<Mutex<Registry>> = LazyLock::new(|| {
     })
 });
 
+static ACCOUNTS: LazyLock<Mutex<AccountRegistry>> = LazyLock::new(|| {
+    Mutex::new(AccountRegistry {
+        accounts: HashMap::new(),
+        next_handle: 1,
+    })
+});
+
 struct Registry {
     wallets: HashMap<u64, MemWallet>,
+    next_handle: u64,
+}
+
+struct AccountRegistry {
+    accounts: HashMap<u64, AccountWallet>,
     next_handle: u64,
 }
 
@@ -104,6 +118,20 @@ unsafe fn in_str<'a>(ptr: *const c_char, what: &str) -> Result<&'a str, String> 
         .map_err(|_| format!("{what} is not UTF-8"))
 }
 
+/// # Safety
+/// `ptr` must be valid for `len` bytes. A null pointer is accepted only when
+/// `len` is zero (the linked-device account-open case).
+unsafe fn in_bytes<'a>(ptr: *const u8, len: usize, what: &str) -> Result<&'a [u8], String> {
+    if ptr.is_null() {
+        return if len == 0 {
+            Ok(&[])
+        } else {
+            Err(format!("{what} is null"))
+        };
+    }
+    Ok(unsafe { std::slice::from_raw_parts(ptr, len) })
+}
+
 fn with_wallet(
     handle: u64,
     f: impl FnOnce(&mut MemWallet) -> Result<serde_json::Value, String>,
@@ -118,6 +146,26 @@ fn with_wallet(
             Err(e) => err(e),
         },
         None => err(format!("unknown wallet handle {handle}")),
+    }
+}
+
+fn with_account(
+    handle: u64,
+    f: impl FnOnce(&mut AccountWallet) -> Result<serde_json::Value, account::AccountError>,
+) -> *mut c_char {
+    let mut registry = match ACCOUNTS.lock() {
+        Ok(registry) => registry,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    match registry.accounts.get_mut(&handle) {
+        Some(account) => match f(account) {
+            Ok(value) => out(value),
+            Err(error) => out(error.json()),
+        },
+        None => out(json!({
+            "error": format!("unknown account handle {handle}"),
+            "reason": "unknown_handle",
+        })),
     }
 }
 
@@ -160,6 +208,374 @@ fn proved_json(proved: wallet::Proved) -> serde_json::Value {
 // ---------------------------------------------------------------------------
 // C ABI.
 // ---------------------------------------------------------------------------
+
+/// Open or initialize a Signal-native account wallet.
+///
+/// `config_json` contains public network/endpoint/role policy,
+/// `account_key` is exactly 32 bytes on the primary phone and empty on a
+/// linked device, and `database_path` names the account SQLite database.
+/// Returns `{"handle":N,...status}`. No key is accepted in JSON.
+///
+/// # Safety
+/// Strings must be valid NUL-terminated UTF-8. `account_key` must be valid
+/// for `account_key_len` bytes; a null pointer is accepted only for a
+/// zero-length linked-device key.
+#[no_mangle]
+pub unsafe extern "C" fn opencsv_account_open(
+    config_json: *const c_char,
+    account_key: *const u8,
+    account_key_len: usize,
+    database_path: *const c_char,
+) -> *mut c_char {
+    guarded(|| {
+        let config = match unsafe { in_str(config_json, "config_json") } {
+            Ok(value) => value,
+            Err(error) => return err(error),
+        };
+        let key = match unsafe { in_bytes(account_key, account_key_len, "account_key") } {
+            Ok(value) => value,
+            Err(error) => return err(error),
+        };
+        let path = match unsafe { in_str(database_path, "database_path") } {
+            Ok(value) => value,
+            Err(error) => return err(error),
+        };
+        match AccountWallet::open(config, key, path) {
+            Ok(mut account) => {
+                let status = match account.status() {
+                    Ok(status) => status,
+                    Err(error) => return out(error.json()),
+                };
+                let mut registry = match ACCOUNTS.lock() {
+                    Ok(registry) => registry,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
+                let handle = registry.next_handle;
+                registry.next_handle += 1;
+                registry.accounts.insert(handle, account);
+                let mut response = status.as_object().cloned().unwrap_or_default();
+                response.insert("handle".into(), json!(handle));
+                out(serde_json::Value::Object(response))
+            }
+            Err(error) => out(error.json()),
+        }
+    })
+}
+
+/// Close a Signal-native account handle.
+#[no_mangle]
+pub extern "C" fn opencsv_account_close(handle: u64) -> *mut c_char {
+    guarded(|| {
+        let mut registry = match ACCOUNTS.lock() {
+            Ok(registry) => registry,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        match registry.accounts.remove(&handle) {
+            Some(_) => out(json!({ "ok": true })),
+            None => out(json!({
+                "error": format!("unknown account handle {handle}"),
+                "reason": "unknown_handle",
+            })),
+        }
+    })
+}
+
+/// Return Bitcoin reserve, OpenCSV balances, deposit address, public watch
+/// descriptors, backup policy, and sync provenance.
+#[no_mangle]
+pub extern "C" fn opencsv_account_status(handle: u64) -> *mut c_char {
+    guarded(|| with_account(handle, AccountWallet::status))
+}
+
+/// Synchronize the fee wallet through the configured Esplora accelerator.
+#[no_mangle]
+pub extern "C" fn opencsv_account_sync(handle: u64) -> *mut c_char {
+    guarded(|| with_account(handle, AccountWallet::sync))
+}
+
+/// Update Secure Backup policy. Disabling it freezes new Bitcoin-writing
+/// operations without removing read or receive access.
+#[no_mangle]
+pub extern "C" fn opencsv_account_set_backup_state(
+    handle: u64,
+    verified: bool,
+    checkpoint_version: u32,
+) -> *mut c_char {
+    guarded(|| {
+        with_account(handle, |account| {
+            account.set_backup_state(verified, checkpoint_version)
+        })
+    })
+}
+
+/// Export the compact versioned OpenCSV checkpoint for Signal Secure
+/// Backups. BDK chain data is excluded because it is rebuildable.
+#[no_mangle]
+pub extern "C" fn opencsv_account_checkpoint(handle: u64) -> *mut c_char {
+    guarded(|| with_account(handle, |account| account.checkpoint()))
+}
+
+/// Credit a received consignment through the unified account wallet.
+///
+/// # Safety
+/// `blob` must be valid for `blob_len` bytes and `snapshot_json` must be a
+/// valid NUL-terminated UTF-8 string.
+#[no_mangle]
+pub unsafe extern "C" fn opencsv_account_verify_consignment(
+    handle: u64,
+    blob: *const u8,
+    blob_len: usize,
+    snapshot_json: *const c_char,
+) -> *mut c_char {
+    guarded(|| {
+        if blob_len == 0 {
+            return out(json!({
+                "error": "consignment is empty",
+                "reason": "invalid_consignment",
+            }));
+        }
+        let blob = match unsafe { in_bytes(blob, blob_len, "blob") } {
+            Ok(value) => value,
+            Err(error) => return err(error),
+        };
+        let snapshot = match unsafe { in_str(snapshot_json, "snapshot_json") } {
+            Ok(value) => value,
+            Err(error) => return err(error),
+        };
+        with_account(handle, |account| account.verify_consignment(blob, snapshot))
+    })
+}
+
+/// Read-only consignment decision against the locally verified BIP158 scan.
+///
+/// # Safety
+/// `consignment_hex` must be a valid NUL-terminated UTF-8 string.
+#[no_mangle]
+pub unsafe extern "C" fn opencsv_account_scan_verify(
+    handle: u64,
+    consignment_hex: *const c_char,
+) -> *mut c_char {
+    guarded(|| {
+        let consignment = match unsafe { in_str(consignment_hex, "consignment_hex") } {
+            Ok(value) => value,
+            Err(error) => return err(error),
+        };
+        with_account(handle, |account| account.scan_verify(consignment))
+    })
+}
+
+/// Read-only N-of-M chain-view decision using the account's private owner
+/// identity without exposing it to Swift.
+///
+/// # Safety
+/// `request_json` must be a valid NUL-terminated UTF-8 string.
+#[no_mangle]
+pub unsafe extern "C" fn opencsv_account_cross_check(
+    handle: u64,
+    request_json: *const c_char,
+) -> *mut c_char {
+    guarded(|| {
+        let request = match unsafe { in_str(request_json, "request_json") } {
+            Ok(value) => value,
+            Err(error) => return err(error),
+        };
+        with_account(handle, |account| account.cross_check(request))
+    })
+}
+
+/// Prepare an OpenCSV mint and reserve its Bitcoin fee input. The request
+/// contains asset/amount/owner data only; no Bitcoin key, UTXO, change
+/// address, or coin-selection result is accepted.
+///
+/// # Safety
+/// `request_json` must be a valid NUL-terminated UTF-8 string.
+#[no_mangle]
+pub unsafe extern "C" fn opencsv_mint_prepare(
+    handle: u64,
+    request_json: *const c_char,
+) -> *mut c_char {
+    guarded(|| {
+        let request = match unsafe { in_str(request_json, "request_json") } {
+            Ok(value) => value,
+            Err(error) => return err(error),
+        };
+        with_account(handle, |account| account.mint_prepare(request))
+    })
+}
+
+/// Prepare an OpenCSV transfer and reserve its Bitcoin fee input. The strict
+/// request is `{"asset_id":"<hex>","to_owner":"<hex>","amount":N}`;
+/// Rust selects both OpenCSV coins, all Bitcoin inputs, and both kinds of
+/// change.
+///
+/// # Safety
+/// `request_json` must be a valid NUL-terminated UTF-8 string.
+#[no_mangle]
+pub unsafe extern "C" fn opencsv_transfer_prepare(
+    handle: u64,
+    request_json: *const c_char,
+) -> *mut c_char {
+    guarded(|| {
+        let request = match unsafe { in_str(request_json, "request_json") } {
+            Ok(value) => value,
+            Err(error) => return err(error),
+        };
+        with_account(handle, |account| account.transfer_prepare(request))
+    })
+}
+
+/// Acknowledge the exact prepared checkpoint after Signal Secure Backup has
+/// durably accepted it.
+///
+/// # Safety
+/// Both arguments must be valid NUL-terminated UTF-8 strings.
+#[no_mangle]
+pub unsafe extern "C" fn opencsv_operation_ack_backup(
+    handle: u64,
+    operation_id: *const c_char,
+    checkpoint_hash: *const c_char,
+) -> *mut c_char {
+    guarded(|| {
+        let operation_id = match unsafe { in_str(operation_id, "operation_id") } {
+            Ok(value) => value,
+            Err(error) => return err(error),
+        };
+        let checkpoint_hash = match unsafe { in_str(checkpoint_hash, "checkpoint_hash") } {
+            Ok(value) => value,
+            Err(error) => return err(error),
+        };
+        with_account(handle, |account| {
+            account.acknowledge_operation_backup(operation_id, checkpoint_hash)
+        })
+    })
+}
+
+/// Build the exact protocol transaction, sign it, persist it, and only then
+/// broadcast it through the configured relays.
+///
+/// # Safety
+/// Both arguments must be valid NUL-terminated UTF-8 strings.
+#[no_mangle]
+pub unsafe extern "C" fn opencsv_operation_sign_and_broadcast(
+    handle: u64,
+    operation_id: *const c_char,
+    fee_policy_json: *const c_char,
+) -> *mut c_char {
+    guarded(|| {
+        let operation_id = match unsafe { in_str(operation_id, "operation_id") } {
+            Ok(value) => value,
+            Err(error) => return err(error),
+        };
+        let fee_policy = match unsafe { in_str(fee_policy_json, "fee_policy_json") } {
+            Ok(value) => value,
+            Err(error) => return err(error),
+        };
+        with_account(handle, |account| {
+            account.sign_and_broadcast(operation_id, fee_policy)
+        })
+    })
+}
+
+/// Return and refresh a durable account operation.
+///
+/// # Safety
+/// `operation_id` must be a valid NUL-terminated UTF-8 string.
+#[no_mangle]
+pub unsafe extern "C" fn opencsv_operation_status(
+    handle: u64,
+    operation_id: *const c_char,
+) -> *mut c_char {
+    guarded(|| {
+        let operation_id = match unsafe { in_str(operation_id, "operation_id") } {
+            Ok(value) => value,
+            Err(error) => return err(error),
+        };
+        with_account(handle, |account| account.operation_status(operation_id))
+    })
+}
+
+/// Idempotently resume a crash-interrupted operation.
+///
+/// # Safety
+/// `operation_id` must be a valid NUL-terminated UTF-8 string.
+#[no_mangle]
+pub unsafe extern "C" fn opencsv_operation_resume(
+    handle: u64,
+    operation_id: *const c_char,
+) -> *mut c_char {
+    guarded(|| {
+        let operation_id = match unsafe { in_str(operation_id, "operation_id") } {
+            Ok(value) => value,
+            Err(error) => return err(error),
+        };
+        with_account(handle, |account| account.resume_operation(operation_id))
+    })
+}
+
+/// Cancel an operation before any broadcast attempt and release its fee
+/// reservation.
+///
+/// # Safety
+/// `operation_id` must be a valid NUL-terminated UTF-8 string.
+#[no_mangle]
+pub unsafe extern "C" fn opencsv_operation_cancel(
+    handle: u64,
+    operation_id: *const c_char,
+) -> *mut c_char {
+    guarded(|| {
+        let operation_id = match unsafe { in_str(operation_id, "operation_id") } {
+            Ok(value) => value,
+            Err(error) => return err(error),
+        };
+        with_account(handle, |account| account.cancel_operation(operation_id))
+    })
+}
+
+/// Create and broadcast a protocol-safe fee replacement.
+///
+/// # Safety
+/// `operation_id` must be a valid NUL-terminated UTF-8 string.
+#[no_mangle]
+pub unsafe extern "C" fn opencsv_fee_bump(
+    handle: u64,
+    operation_id: *const c_char,
+    target_sat_per_vb: u64,
+) -> *mut c_char {
+    guarded(|| {
+        let operation_id = match unsafe { in_str(operation_id, "operation_id") } {
+            Ok(value) => value,
+            Err(error) => return err(error),
+        };
+        with_account(handle, |account| {
+            account.fee_bump(operation_id, target_sat_per_vb)
+        })
+    })
+}
+
+/// Mark the Signal consignment attachment delivered using its stable nonce.
+///
+/// # Safety
+/// Both arguments must be valid NUL-terminated UTF-8 strings.
+#[no_mangle]
+pub unsafe extern "C" fn opencsv_operation_mark_delivered(
+    handle: u64,
+    operation_id: *const c_char,
+    delivery_nonce: *const c_char,
+) -> *mut c_char {
+    guarded(|| {
+        let operation_id = match unsafe { in_str(operation_id, "operation_id") } {
+            Ok(value) => value,
+            Err(error) => return err(error),
+        };
+        let delivery_nonce = match unsafe { in_str(delivery_nonce, "delivery_nonce") } {
+            Ok(value) => value,
+            Err(error) => return err(error),
+        };
+        with_account(handle, |account| {
+            account.mark_consignment_delivered(operation_id, delivery_nonce)
+        })
+    })
+}
 
 /// Create a fresh wallet (one owner key) and return its secrets JSON for the
 /// host keystore. Open it with [`opencsv_wallet_open`].
@@ -585,12 +1001,12 @@ pub unsafe extern "C" fn opencsv_cbf_verify_anchor(config_json: *const c_char) -
 /// `config_json` must be a valid NUL-terminated C string.
 #[no_mangle]
 pub unsafe extern "C" fn opencsv_cbf_sync(config_json: *const c_char) -> *mut c_char {
-    guarded(|| {
-        match unsafe { in_str(config_json, "config_json") }.and_then(cbf::sync_json) {
+    guarded(
+        || match unsafe { in_str(config_json, "config_json") }.and_then(cbf::sync_json) {
             Ok(value) => out(value),
             Err(e) => err(e),
-        }
-    })
+        },
+    )
 }
 
 /// Run the accept driver over a received consignment against an N-of-M
@@ -647,12 +1063,12 @@ pub unsafe extern "C" fn opencsv_cross_check(
 /// `config_json` must be a valid NUL-terminated C string.
 #[no_mangle]
 pub unsafe extern "C" fn opencsv_scan_sync(config_json: *const c_char) -> *mut c_char {
-    guarded(|| {
-        match unsafe { in_str(config_json, "config_json") }.and_then(scan::sync_json) {
+    guarded(
+        || match unsafe { in_str(config_json, "config_json") }.and_then(scan::sync_json) {
             Ok(value) => out(value),
             Err(e) => err(e),
-        }
-    })
+        },
+    )
 }
 
 /// Local-only earliest-occurrence check against the scan index built by
@@ -664,7 +1080,10 @@ pub unsafe extern "C" fn opencsv_scan_sync(config_json: *const c_char) -> *mut c
 /// # Safety
 /// `request_json` must be a valid NUL-terminated C string.
 #[no_mangle]
-pub unsafe extern "C" fn opencsv_scan_check(handle: u64, request_json: *const c_char) -> *mut c_char {
+pub unsafe extern "C" fn opencsv_scan_check(
+    handle: u64,
+    request_json: *const c_char,
+) -> *mut c_char {
     guarded(|| {
         let request_json = match unsafe { in_str(request_json, "request_json") } {
             Ok(s) => s.to_owned(),
@@ -711,12 +1130,12 @@ pub unsafe extern "C" fn opencsv_scan_verify(
 /// `config_json` must be a valid NUL-terminated C string.
 #[no_mangle]
 pub unsafe extern "C" fn opencsv_cbf_open(config_json: *const c_char) -> *mut c_char {
-    guarded(|| {
-        match unsafe { in_str(config_json, "config_json") }.and_then(scan::open_json) {
+    guarded(
+        || match unsafe { in_str(config_json, "config_json") }.and_then(scan::open_json) {
             Ok(value) => out(value),
             Err(e) => err(e),
-        }
-    })
+        },
+    )
 }
 
 /// Drop a persistent CBF client. Returns `{"ok":true}`.

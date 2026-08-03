@@ -17,7 +17,7 @@ pub enum SoloReplacementRejection {
     OriginalLayout,
     /// The replacement is not the canonical three-output OpenCSV layout.
     ReplacementLayout,
-    /// Transaction version, lock time, or funding inputs changed.
+    /// Transaction version, lock time, or the original funding-input prefix changed.
     FundingInputsChanged,
     /// The transaction is not explicitly replaceable with the canonical
     /// OpenCSV sequence.
@@ -72,11 +72,12 @@ pub struct SoloReplacementReceipt {
 ///
 /// The original and replacement must both have exactly three outputs:
 /// the zero-value 64-byte record, the current unspendable marker, and one
-/// non-dust change output. Funding outpoints and their order are immutable,
-/// as the first one defines the OpenCSV transaction context. Witnesses may
-/// change when the replacement is signed; all other protected structure is
-/// fixed. With identical inputs, a strict reduction in change is a strict fee
-/// increase.
+/// non-dust change output. Every original funding outpoint remains in the
+/// same prefix, so vin[0] continues to define the OpenCSV context. A
+/// replacement may append fee inputs after that prefix. Witnesses may change
+/// when the replacement is signed; all other protected structure is fixed.
+/// Requiring change to decrease guarantees a fee increase even when inputs
+/// are appended.
 pub fn validate_solo_anchor_replacement(
     original: &Transaction,
     replacement: &Transaction,
@@ -86,7 +87,7 @@ pub fn validate_solo_anchor_replacement(
 
     if original.version != replacement.version
         || original.lock_time != replacement.lock_time
-        || original.input.len() != replacement.input.len()
+        || replacement.input.len() < original.input.len()
         || original
             .input
             .iter()
@@ -96,6 +97,14 @@ pub fn validate_solo_anchor_replacement(
                     || old.sequence != new.sequence
                     || old.script_sig != new.script_sig
             })
+    {
+        return Err(SoloReplacementRejection::FundingInputsChanged);
+    }
+    let mut outpoints = std::collections::HashSet::new();
+    if replacement
+        .input
+        .iter()
+        .any(|input| !outpoints.insert(input.previous_output))
     {
         return Err(SoloReplacementRejection::FundingInputsChanged);
     }
@@ -164,6 +173,7 @@ fn validate_layout(transaction: &Transaction) -> Result<(), ()> {
 #[cfg(test)]
 mod tests {
     use bitcoin::absolute;
+    use bitcoin::hashes::Hash as _;
     use bitcoin::script::PushBytesBuf;
     use bitcoin::transaction;
     use bitcoin::{Amount, OutPoint, ScriptBuf, TxIn, TxOut, Witness};
@@ -215,6 +225,42 @@ mod tests {
         assert_eq!(
             validate_solo_anchor_replacement(&original, &replacement),
             Err(SoloReplacementRejection::ReplacementLayout)
+        );
+    }
+
+    #[test]
+    fn accepts_fee_input_appended_after_context_input() {
+        let original = anchor(2_298);
+        let mut replacement = anchor(1_500);
+        replacement.input.push(TxIn {
+            previous_output: OutPoint::new(bitcoin::Txid::from_byte_array([8u8; 32]), 1),
+            script_sig: ScriptBuf::new(),
+            sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+            witness: Witness::new(),
+        });
+        assert!(validate_solo_anchor_replacement(&original, &replacement).is_ok());
+        assert_eq!(
+            replacement.input[0].previous_output,
+            original.input[0].previous_output
+        );
+    }
+
+    #[test]
+    fn rejects_fee_input_inserted_before_context_input() {
+        let original = anchor(2_298);
+        let mut replacement = anchor(1_500);
+        replacement.input.insert(
+            0,
+            TxIn {
+                previous_output: OutPoint::new(bitcoin::Txid::from_byte_array([9u8; 32]), 0),
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                witness: Witness::new(),
+            },
+        );
+        assert_eq!(
+            validate_solo_anchor_replacement(&original, &replacement),
+            Err(SoloReplacementRejection::FundingInputsChanged)
         );
     }
 
