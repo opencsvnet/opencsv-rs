@@ -75,6 +75,7 @@ pub mod bech32;
 pub mod chain;
 pub mod error;
 pub mod fee_model;
+pub mod relay;
 pub mod replacement;
 pub mod rpc;
 
@@ -85,6 +86,7 @@ pub use chain::{
     MARKER_SPK, MEMPOOL_LOCATION,
 };
 pub use error::Error;
+pub use relay::{relay_transaction, PeerRelayResult, RelayReport};
 pub use replacement::{
     validate_solo_anchor_replacement, SoloReplacementReceipt, SoloReplacementRejection,
 };

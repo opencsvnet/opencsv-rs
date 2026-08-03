@@ -16,11 +16,54 @@
  */
 
 #include <stddef.h>
+#include <stdbool.h>
 #include <stdint.h>
 
 #ifdef __cplusplus
 extern "C" {
 #endif
+
+/* Signal-native account wallet. The primary passes a random 32-byte account
+ * root as a byte buffer; linked devices pass NULL/0 plus watch descriptors in
+ * config_json. No secret key, WIF, UTXO, change address, or coin-selection
+ * result is accepted in JSON. */
+char *opencsv_account_open(const char *config_json,
+                           const uint8_t *account_key,
+                           size_t account_key_len,
+                           const char *database_path);
+char *opencsv_account_close(uint64_t handle);
+char *opencsv_account_status(uint64_t handle);
+char *opencsv_account_sync(uint64_t handle);
+char *opencsv_account_set_backup_state(uint64_t handle, bool verified,
+                                       uint32_t checkpoint_version);
+char *opencsv_account_checkpoint(uint64_t handle);
+char *opencsv_account_verify_consignment(uint64_t handle,
+                                         const uint8_t *blob,
+                                         size_t blob_len,
+                                         const char *snapshot_json);
+char *opencsv_account_scan_verify(uint64_t handle,
+                                  const char *consignment_hex);
+char *opencsv_account_cross_check(uint64_t handle,
+                                  const char *request_json);
+char *opencsv_mint_prepare(uint64_t handle, const char *request_json);
+/* request_json is exactly
+ * {"asset_id":"<hex>","to_owner":"<hex>","amount":N}; Rust selects the
+ * OpenCSV coins, Bitcoin inputs, and change. */
+char *opencsv_transfer_prepare(uint64_t handle, const char *request_json);
+char *opencsv_operation_ack_backup(uint64_t handle,
+                                   const char *operation_id,
+                                   const char *checkpoint_hash);
+char *opencsv_operation_sign_and_broadcast(uint64_t handle,
+                                           const char *operation_id,
+                                           const char *fee_policy_json);
+char *opencsv_operation_status(uint64_t handle, const char *operation_id);
+char *opencsv_operation_resume(uint64_t handle, const char *operation_id);
+char *opencsv_operation_cancel(uint64_t handle, const char *operation_id);
+char *opencsv_fee_bump(uint64_t handle, const char *operation_id,
+                       uint64_t target_sat_per_vb);
+char *opencsv_operation_mark_delivered(uint64_t handle,
+                                       const char *operation_id,
+                                       const char *delivery_nonce);
 
 /* Wallet lifecycle. Secrets JSON belongs in the platform keystore. */
 char *opencsv_wallet_create(void);
