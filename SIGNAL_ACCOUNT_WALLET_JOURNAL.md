@@ -119,6 +119,16 @@ Fee bump already reverified the funding output before building a replacement.
 A new scripted-verifier regression now rejects that third verification and
 proves the original signed bytes, txid, and state remain unchanged.
 
+## 2026-08-03 — canonical consignment identity
+
+Hashing raw attachment bytes was rejected as the verdict/render identity.
+Bincode accepts semantically equivalent overlong integer encodings, so one
+consignment could otherwise have two byte hashes even before Signal delivery
+nonces are considered. The account receive path now decode→canonically encodes
+the consignment before verification, persistence, and SHA-256 identity, and
+returns that identity to the host. A regression constructs two distinct valid
+encodings of one consignment and proves their canonical bytes and IDs match.
+
 ## Validation receipt
 
 - Warnings-denied `opencsv-ffi --all-targets`: 28 passed, 0 failed.
@@ -129,13 +139,14 @@ proves the original signed bytes, txid, and state remain unchanged.
 - Every durable operation-state reopen matrix passes.
 - Exact replacement persistence, failed relay, reopen, and resume passes.
 - Post-reservation failure cleanup and fee-bump revalidation preservation pass.
+- Equivalent consignment encodings normalize to one returned identity.
 
 ## Explicit remaining gates
 
 - hosted wallet CI after publication;
 - hosted CI and independent re-review of the completed C2 adversarial audit;
 - Swift `ThisDeviceOnly` binding and checkpoint recovery integration;
-- canonical-consignment verdict/render deduplication;
+- Signal verdict/render storage keyed by Rust's canonical consignment identity;
 - in-place database migration, both build flags, and physical signet
   acceptance on the iPhone 16e.
 

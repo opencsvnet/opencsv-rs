@@ -113,11 +113,13 @@ mismatch, or a later spend fails closed. Signet/mainnet require at least two
 compact-filter peers; regtest accepts one isolated peer.
 
 This closes the selected-outpoint trust boundary, but does not itself make the
-wallet mainnet-ready. Signal recovery integration, canonicalized-consignment
-identity deduplication for both verdicts and rendered payment cells, hosted
-gates, and physical signet acceptance remain mandatory. The delivery
-acceptance test must produce two byte-distinct attachments through a sender
-crash/resume while rendering exactly one verified payment bubble.
+wallet mainnet-ready. Rust now decodes and canonically re-encodes every
+consignment before verification, persistence, and SHA-256 identity, and returns
+that identity for Signal to key both verdicts and rendered payment cells.
+Signal recovery integration, use of that identity in the UI, hosted gates, and
+physical signet acceptance remain mandatory. The delivery acceptance test must
+produce two byte-distinct attachments through a sender crash/resume while
+rendering exactly one verified payment bubble.
 
 ## Current C ABI
 

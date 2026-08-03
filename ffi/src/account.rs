@@ -35,6 +35,7 @@ use opencsv_bitcoin::{
 use opencsv_cbf::block::OutPoint as CbfOutPoint;
 use opencsv_cbf::{CbfClient, Config as CbfConfig, OutpointVerdict};
 use opencsv_core::chain::AnchorRef;
+use opencsv_core::consignment::Consignment;
 use opencsv_core::{AssetId, OwnerSecret};
 use rand::RngExt as _;
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
@@ -913,16 +914,16 @@ impl AccountWallet {
         blob: &[u8],
         snapshot_json: &str,
     ) -> Result<Value, AccountError> {
+        let (canonical_blob, consignment_id) = canonical_consignment_identity(blob)?;
         let chain = SnapshotChain::from_json(snapshot_json)
             .map_err(|error| AccountError::new("invalid_chain_view", error))?;
         let required_confirmations = u64::from(self.config.required_confirmations);
         let verdict = self
             .primary_protocol_mut()?
-            .verify(blob, &chain, required_confirmations)
+            .verify(&canonical_blob, &chain, required_confirmations)
             .map_err(|error| AccountError::new("invalid_consignment", error))?;
         match verdict {
             Ok(verified) => {
-                let consignment_id = sha256::Hash::hash(blob).to_string();
                 self.db.conn.execute(
                     "INSERT INTO opencsv_consignments(
                          consignment_id, consignment_base64, spent_state_json, created_at
@@ -931,7 +932,7 @@ impl AccountWallet {
                          consignment_base64 = excluded.consignment_base64",
                     params![
                         consignment_id,
-                        base64::engine::general_purpose::STANDARD.encode(blob),
+                        base64::engine::general_purpose::STANDARD.encode(&canonical_blob),
                         unix_time()?,
                     ],
                 )?;
@@ -944,6 +945,7 @@ impl AccountWallet {
                 )?;
                 Ok(json!({
                     "status": "verified",
+                    "consignment_id": consignment_id,
                     "credits": verified.credits,
                     "coins": verified.coins,
                     "anchor": {
@@ -2591,6 +2593,14 @@ fn query_json_rows(conn: &Connection, sql: &str) -> Result<Vec<Value>, AccountEr
     .collect()
 }
 
+fn canonical_consignment_identity(blob: &[u8]) -> Result<(Vec<u8>, String), AccountError> {
+    let consignment = Consignment::from_bytes(blob)
+        .map_err(|error| AccountError::new("invalid_consignment", error.to_string()))?;
+    let canonical = consignment.to_bytes();
+    let identity = sha256::Hash::hash(&canonical).to_string();
+    Ok((canonical, identity))
+}
+
 fn derive<const N: usize>(
     root: &[u8],
     label: &[u8],
@@ -2883,6 +2893,34 @@ mod tests {
         // Reopening with backup_verified=false does not silently downgrade
         // already-verified durable policy state.
         assert_eq!(second_status["backup_verified"], true);
+    }
+
+    #[test]
+    fn consignment_identity_normalizes_equivalent_wire_encodings() {
+        let consignment = Consignment {
+            coin_openings: Vec::new(),
+            nullifiers: Vec::new(),
+            proof: Vec::new(),
+            anchor_ref: AnchorRef {
+                txid: [0u8; 32],
+                location: MEMPOOL_LOCATION,
+            },
+            aux: None,
+        };
+        let canonical = consignment.to_bytes();
+        assert_eq!(canonical[0], 0, "first field is an empty opening vector");
+
+        // Bincode accepts this overlong u16 representation of the same zero
+        // length. Transport bytes differ, but verdict/render identity must not.
+        let mut overlong = vec![251, 0, 0];
+        overlong.extend_from_slice(&canonical[1..]);
+        assert_ne!(overlong, canonical);
+        assert_eq!(Consignment::from_bytes(&overlong).unwrap(), consignment);
+
+        let (canonical_bytes, canonical_id) = canonical_consignment_identity(&canonical).unwrap();
+        let (normalized_bytes, normalized_id) = canonical_consignment_identity(&overlong).unwrap();
+        assert_eq!(normalized_bytes, canonical_bytes);
+        assert_eq!(normalized_id, canonical_id);
     }
 
     #[test]
