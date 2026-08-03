@@ -5,12 +5,17 @@
 //! arguments, prints results, and moves consignment blobs as files (or
 //! base64/hex on stdout with `--print-blob`).
 
+use std::net::{SocketAddr, TcpListener};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use base64::Engine;
+use bitcoin::hashes::Hash as _;
 use clap::{Parser, Subcommand};
 use opencsv_cli::backend::{ChainBackend, ChainSpec};
+use opencsv_cli::batch_gossip::{
+    relay_once, send_frame, MessageKind, ProtocolPhase, Session, SessionPolicy, SignedFrame,
+};
 use opencsv_cli::error::{io_err, Error};
 use opencsv_cli::hexutil::{digest_from_hex, from_hex, to_hex};
 use opencsv_cli::ops::{self, Produced, ReceiveReport, DEFAULT_CONFIRMATIONS};
@@ -187,6 +192,96 @@ enum BatchCmd {
         #[arg(long)]
         payloads: String,
     },
+    /// Serverless batching-v2 proposal/commitment/manifest/signature gossip.
+    #[command(subcommand)]
+    V2(BatchV2Cmd),
+}
+
+#[derive(Subcommand)]
+enum BatchV2Cmd {
+    /// Initialize a durable session and relay identity.
+    Init {
+        /// Session directory.
+        #[arg(long)]
+        session: PathBuf,
+        /// Verified display-order genesis hash returned by Bitcoin Core.
+        #[arg(long)]
+        chain_id: String,
+        /// Independently verified current height.
+        #[arg(long)]
+        height: u32,
+    },
+    /// Publish a round-0 canonical proposal body.
+    Proposal {
+        #[arg(long)]
+        session: PathBuf,
+        #[arg(long)]
+        file: PathBuf,
+        #[arg(long = "peer")]
+        peers: Vec<SocketAddr>,
+    },
+    /// Publish a round-1 canonical participant commitment body.
+    Commitment {
+        #[arg(long)]
+        session: PathBuf,
+        #[arg(long)]
+        file: PathBuf,
+        #[arg(long = "peer")]
+        peers: Vec<SocketAddr>,
+    },
+    /// Publish a round-1 source-complete canonical manifest body.
+    Manifest {
+        #[arg(long)]
+        session: PathBuf,
+        #[arg(long)]
+        file: PathBuf,
+        #[arg(long = "peer")]
+        peers: Vec<SocketAddr>,
+    },
+    /// Publish a round-2 verified signature-share body.
+    Signature {
+        #[arg(long)]
+        session: PathBuf,
+        #[arg(long)]
+        file: PathBuf,
+        #[arg(long = "peer")]
+        peers: Vec<SocketAddr>,
+    },
+    /// Listen for authenticated frames, persist them, then forward new ones.
+    Relay {
+        #[arg(long)]
+        session: PathBuf,
+        #[arg(long)]
+        listen: SocketAddr,
+        #[arg(long = "peer")]
+        peers: Vec<SocketAddr>,
+    },
+    /// Print reconstructed durable session status.
+    Status {
+        #[arg(long)]
+        session: PathBuf,
+    },
+    /// Verify all shares and persist the signed transaction before returning.
+    Finalize {
+        #[arg(long)]
+        session: PathBuf,
+    },
+    /// Broadcast the already persisted transaction through bitcoind.
+    Broadcast {
+        #[arg(long)]
+        session: PathBuf,
+    },
+    /// Record a post-broadcast/mempool/confirmation/delivery transition.
+    Mark {
+        #[arg(long)]
+        session: PathBuf,
+        /// `mempool`, `confirmed`, `payload_delivered`, or a terminal phase.
+        #[arg(long)]
+        phase: String,
+        /// One-line evidence receipt (txid, height, peer receipt, etc.).
+        #[arg(long)]
+        evidence: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -323,7 +418,9 @@ fn command_uses_chain(command: &Commands) -> bool {
         | Commands::Receive { .. }
         | Commands::Redeem { .. }
         | Commands::Audit { .. }
-        | Commands::Batch(_)
+        | Commands::Batch(BatchCmd::Ctx { .. })
+        | Commands::Batch(BatchCmd::Anchor { .. })
+        | Commands::Batch(BatchCmd::V2(BatchV2Cmd::Broadcast { .. }))
         | Commands::Chain(_) => true,
         #[cfg(feature = "signal")]
         Commands::Signal(SignalCmd::Listen { .. }) => true,
@@ -559,6 +656,9 @@ fn run(cli: Cli) -> Result<ExitCode, Error> {
             );
             eprintln!("anchor is in the mempool; it becomes verifiable once mined");
         }
+        Commands::Batch(BatchCmd::V2(command)) => {
+            run_batch_v2(command, &spec)?;
+        }
         Commands::Chain(ChainCmd::Tip) => {
             let chain = ChainBackend::open(&spec)?;
             println!("tip {}", chain.tip_height());
@@ -574,6 +674,178 @@ fn run(cli: Cli) -> Result<ExitCode, Error> {
         }
     }
     Ok(ExitCode::SUCCESS)
+}
+
+fn run_batch_v2(command: BatchV2Cmd, spec: &ChainSpec) -> Result<(), Error> {
+    match command {
+        BatchV2Cmd::Init {
+            session,
+            chain_id,
+            height,
+        } => {
+            let chain_id = chain_id
+                .parse::<bitcoin::BlockHash>()
+                .map_err(|error| Error::Parse(format!("invalid genesis block hash: {error}")))?
+                .to_byte_array();
+            let session_path = session;
+            let session = Session::init(
+                &session_path,
+                SessionPolicy {
+                    chain_id,
+                    current_height: height,
+                },
+            )?;
+            println!(
+                "batch-v2 session {} identity {}",
+                session.identity_pubkey(),
+                session_path.display()
+            );
+        }
+        BatchV2Cmd::Proposal {
+            session,
+            file,
+            peers,
+        } => publish_batch_body(&session, &file, MessageKind::Proposal, &peers)?,
+        BatchV2Cmd::Commitment {
+            session,
+            file,
+            peers,
+        } => publish_batch_body(&session, &file, MessageKind::Commitment, &peers)?,
+        BatchV2Cmd::Manifest {
+            session,
+            file,
+            peers,
+        } => publish_batch_body(&session, &file, MessageKind::Manifest, &peers)?,
+        BatchV2Cmd::Signature {
+            session,
+            file,
+            peers,
+        } => publish_batch_body(&session, &file, MessageKind::Signature, &peers)?,
+        BatchV2Cmd::Relay {
+            session,
+            listen,
+            peers,
+        } => {
+            let listener = TcpListener::bind(listen)
+                .map_err(|error| Error::Transport(format!("batch v2 bind {listen}: {error}")))?;
+            let mut session = Session::open(&session)?;
+            println!(
+                "batch-v2 relay {listen} identity {} peers {}",
+                session.identity_pubkey(),
+                peers.len()
+            );
+            loop {
+                let report = relay_once(&listener, &mut session, &peers)?;
+                println!(
+                    "relay {:?} forwarded {} failed {}",
+                    report.outcome,
+                    report.forwarded,
+                    report.failed_peers.len()
+                );
+                for failure in report.failed_peers {
+                    eprintln!("relay delivery failed: {failure}");
+                }
+            }
+        }
+        BatchV2Cmd::Status { session } => {
+            let session = Session::open(&session)?;
+            let status = session.status()?;
+            println!(
+                "phase {} batch {} commitments {} manifests {} latest {} signatures {}/{} identity {}",
+                status.phase.name(),
+                status
+                    .batch_id
+                    .as_ref()
+                    .map(|id| to_hex(id))
+                    .unwrap_or_else(|| "-".into()),
+                status.commitments,
+                status.manifests,
+                status
+                    .latest_manifest_id
+                    .as_ref()
+                    .map(|id| to_hex(id))
+                    .unwrap_or_else(|| "-".into()),
+                status.signature_shares,
+                status.required_signatures,
+                session.identity_pubkey(),
+            );
+        }
+        BatchV2Cmd::Finalize { session } => {
+            let mut session = Session::open(&session)?;
+            let transaction = session.finalize_latest()?;
+            println!(
+                "signed_persisted tx {} weight {}",
+                transaction.compute_txid(),
+                transaction.weight().to_wu()
+            );
+        }
+        BatchV2Cmd::Broadcast { session } => {
+            let mut session = Session::open(&session)?;
+            let transaction = session.latest_signed_transaction()?;
+            let status = session.status()?;
+            if status.phase == ProtocolPhase::SignedPersisted {
+                session.mark_phase(
+                    ProtocolPhase::Broadcast,
+                    &format!("attempt={}", transaction.compute_txid()),
+                )?;
+            } else if !matches!(
+                status.phase,
+                ProtocolPhase::Broadcast | ProtocolPhase::Mempool
+            ) {
+                return Err(Error::Transport(format!(
+                    "batch v2: cannot broadcast from phase {}",
+                    status.phase.name()
+                )));
+            }
+            let chain = ChainBackend::open(spec)?;
+            let txid = chain.broadcast_batch_transaction(&transaction)?;
+            session.mark_phase(ProtocolPhase::Mempool, &format!("txid={txid}"))?;
+            println!("mempool tx {txid}");
+        }
+        BatchV2Cmd::Mark {
+            session,
+            phase,
+            evidence,
+        } => {
+            let mut session = Session::open(&session)?;
+            let phase = ProtocolPhase::parse(&phase)?;
+            session.mark_phase(phase, &evidence)?;
+            println!("phase {}", phase.name());
+        }
+    }
+    Ok(())
+}
+
+fn publish_batch_body(
+    session_path: &Path,
+    file: &Path,
+    kind: MessageKind,
+    peers: &[SocketAddr],
+) -> Result<(), Error> {
+    let payload = std::fs::read(file).map_err(io_err(file))?;
+    let mut session = Session::open(session_path)?;
+    let wire = session.publish(kind, payload)?;
+    let frame = SignedFrame::from_wire(&wire)?;
+    let mut failures = Vec::new();
+    for peer in peers {
+        if let Err(error) = send_frame(*peer, &wire) {
+            failures.push(format!("{peer}: {error}"));
+        }
+    }
+    println!(
+        "published {} frame {} peers {}",
+        kind.name(),
+        to_hex(&frame.id()),
+        peers.len() - failures.len()
+    );
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(Error::Transport(format!(
+            "batch v2 delivery failures after local persistence: {}",
+            failures.join("; ")
+        )))
+    }
 }
 
 /// Signal transport commands. All Signal traffic runs on a small

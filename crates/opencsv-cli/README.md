@@ -183,10 +183,51 @@ audit --asset <hex> [--height h]    public supply from the anchor chain (§4.9)
 chain tip | chain advance [n]       tip height; advance = simulated on demo chains,
                                     real mining (generatetoaddress) on regtest,
                                     hard error on signet/mainnet
+batch v2 init                       create a durable peer session and relay identity
+batch v2 proposal|commitment        publish a canonical C1 body to peers
+batch v2 manifest|signature         publish a source-complete manifest/share to peers
+batch v2 relay                      validate, persist, deduplicate, and forward frames
+batch v2 status|finalize            resume state; persist the fully signed transaction
+batch v2 broadcast|mark             broadcast exact persisted tx; journal chain/delivery state
 signal link [--device-name n]     link to your Signal account as a secondary device (QR)
 signal send --to <dest> <file>    send a consignment blob as a Signal attachment
 signal listen                     verify incoming consignments into the wallet (Ctrl-C to stop)
 ```
+
+### Batching v2 peer flow
+
+`batch v2` is the serverless C2 coordination layer over the canonical C1
+proposal, participant-commitment, manifest, and signature-share bodies. Start
+each peer with an independently verified genesis hash and current height:
+
+```sh
+opencsv batch v2 init --session /path/to/session \
+  --chain-id <display-order-genesis-hash> --height <verified-height>
+opencsv batch v2 relay --session /path/to/session \
+  --listen 127.0.0.1:29001 --peer 127.0.0.1:29002
+```
+
+Publish each canonical body with its matching subcommand and repeat `--peer`
+for every participant. A manifest is rejected until all named source
+commitments are present; a signature is rejected unless it names the exact
+manifest, input, key, and `SIGHASH_ALL` digest. Once all shares arrive, any
+peer can run:
+
+```sh
+opencsv batch v2 finalize --session /path/to/session
+opencsv --network signet batch v2 broadcast --session /path/to/session
+opencsv batch v2 mark --session /path/to/session \
+  --phase confirmed --evidence 'height=<height>,block=<hash>'
+```
+
+The session stores the final consensus transaction before broadcast and makes
+replay/restart idempotent. Relay frames are signed and bounded, but the raw TCP
+transport is not confidential; use a protected peer channel when metadata
+privacy is required. No OpenCSV-specific server is involved.
+
+`--chain-id` accepts the ordinary display-order hash returned by
+`bitcoin-cli getblockhash 0`; the CLI converts it to the transaction-
+serialization order committed by the C1 wire protocol.
 
 The `signal` subcommands live behind the cargo feature `signal` (default
 ON); build with `--no-default-features` for a lean, Signal-free binary. The
@@ -223,6 +264,12 @@ All files are bincode (serde data model) unless noted.
 ├── bitcoin-index-<network>.log     # bitcoind backend: scanned-anchor index (rebuildable cache)
 └── chain.log                # FileAnchorChain (demo backend only)
 ```
+
+Batching-v2 sessions are intentionally separate from the wallet directory.
+Each session holds mode-0600 relay identity material, the independent chain
+snapshot, content-addressed frames, canonical protocol bodies, an append-only
+event receipt, and the finalized transaction. Only one process owns a session
+directory at a time.
 
 - `coins/*.coin` stores the **creating proof** (the `encode_coin_proof`
   envelope) and the output selector — both are needed to present the coin's

@@ -597,6 +597,15 @@ relays signatures to all participants, treats public transaction relay as a
 fallback only, and exposes stable rejection reasons. iOS integration is
 explicitly deferred to the final execution phase.
 
+The reference implementation is `opencsv_cli::batch_gossip` and the
+`opencsv batch v2` command family. Relay frames are versioned, bounded to 4
+MiB, content-addressed, authenticated by a separate secp256k1 relay identity,
+and persisted only after the C1 body passes protocol validation. Relay
+authentication does not provide confidentiality; deployments requiring
+transport privacy wrap the peer connection in an authenticated encrypted or
+privacy-preserving channel. C1 `SIGHASH_ALL` input signatures—not the relay
+identity—remain the authorization for the Bitcoin transaction.
+
 ## 17. Decision log
 
 | Decision | Accepted rationale | Superseded alternative |

@@ -34,6 +34,10 @@ mismatch is a hard error at open.
   finalization, and unanimous invariant-preserving RBF. The legacy `batch`
   module remains v1 compatibility code and its anyone-can-spend stock is never
   reinterpreted as v2.
+- **Batching v2 broadcast (C2)** — accepts only the complete, already signed
+  transaction that the peer journal persisted. It neither rebuilds nor wallet-
+  signs the transaction, verifies the returned txid, and treats an exact
+  transaction already known to Bitcoin Core as an idempotent success.
 
 Used by `opencsv-cli` (default `--chain bitcoin`). See the crate-level
 rustdoc for the full design notes.

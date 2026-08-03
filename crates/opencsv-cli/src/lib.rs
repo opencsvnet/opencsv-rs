@@ -47,6 +47,7 @@
 #![warn(missing_docs)]
 
 pub mod backend;
+pub mod batch_gossip;
 pub mod bitcoin;
 pub mod chain;
 pub mod error;

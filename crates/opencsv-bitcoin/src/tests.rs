@@ -5,6 +5,7 @@
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
+use bitcoin::{absolute, transaction, Transaction};
 use opencsv_core::chain::AnchorChain;
 use opencsv_core::digest::TruncatedDigest;
 use opencsv_core::{AnchorRecord, Digest};
@@ -31,6 +32,21 @@ impl ScriptTransport {
         self.script.lock().unwrap().push_back((
             method.to_string(),
             json!({"jsonrpc": "1.0", "id": 1, "result": result}).to_string(),
+        ));
+        self
+    }
+
+    /// Queue a JSON-RPC error reply to `method`.
+    fn rpc_error(&self, method: &str, code: i64, message: &str) -> &Self {
+        self.script.lock().unwrap().push_back((
+            method.to_string(),
+            json!({
+                "jsonrpc": "1.0",
+                "id": 1,
+                "result": null,
+                "error": {"code": code, "message": message}
+            })
+            .to_string(),
         ));
         self
     }
@@ -78,6 +94,54 @@ fn display_hash(b: u8) -> String {
 
 fn blockchaininfo(chain: &str, blocks: u64) -> Value {
     json!({"chain": chain, "blocks": blocks})
+}
+
+/// C2 broadcasts the exact persisted transaction and treats both mempool
+/// discovery and Core's already-known error as idempotent success.
+#[test]
+fn batch_broadcast_is_exact_and_idempotent() {
+    let tmp = tempfile::tempdir().unwrap();
+    let transaction = Transaction {
+        version: transaction::Version::TWO,
+        lock_time: absolute::LockTime::ZERO,
+        input: Vec::new(),
+        output: Vec::new(),
+    };
+    let expected = transaction.compute_txid().to_string();
+    let transport = ScriptTransport::new();
+    let requests = transport.requests();
+    transport
+        .reply("getblockchaininfo", blockchaininfo("regtest", 100))
+        .reply("getblockcount", json!(100))
+        .rpc_error("getmempoolentry", -5, "Transaction not in mempool")
+        .reply("sendrawtransaction", json!(expected))
+        .reply("getmempoolentry", json!({"vsize": 10}))
+        .rpc_error("getmempoolentry", -5, "Transaction not in mempool")
+        .rpc_error(
+            "sendrawtransaction",
+            -27,
+            "Transaction already in block chain",
+        );
+    let config = test_config(tmp.path().join("index.log"), Network::Regtest, Some(101));
+    let chain = BitcoinAnchorChain::with_transport(RpcClient::new(transport), &config).unwrap();
+
+    assert_eq!(chain.broadcast_transaction(&transaction).unwrap(), expected);
+    assert_eq!(chain.broadcast_transaction(&transaction).unwrap(), expected);
+    assert_eq!(chain.broadcast_transaction(&transaction).unwrap(), expected);
+
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests[3]["method"], "sendrawtransaction");
+    assert_eq!(
+        requests[3]["params"][0],
+        json!(to_hex(&bitcoin::consensus::encode::serialize(&transaction)))
+    );
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| request["method"] == "sendrawtransaction")
+            .count(),
+        2
+    );
 }
 
 /// The two-pass anchor construction: funding-input selection, ctx

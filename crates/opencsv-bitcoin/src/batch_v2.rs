@@ -320,6 +320,11 @@ impl Proposal {
         self.participant_count as usize
     }
 
+    /// Compressed public key controlling the signed input-0 stock.
+    pub fn stock_owner_pubkey(&self) -> PublicKey {
+        self.stock_owner_pubkey
+    }
+
     /// Validate network replay and expiry against independently observed chain state.
     pub fn validate_at(
         &self,
@@ -777,6 +782,50 @@ impl Manifest {
         Ok(manifest)
     }
 
+    /// Parse a manifest by selecting its ordered commitment IDs from an
+    /// unordered pool of independently validated commitment bodies.
+    /// Extra pool entries are ignored; missing or repeated selected IDs
+    /// fail closed.
+    pub fn from_wire_pool(
+        proposal: &Proposal,
+        commitment_pool: &[ParticipantCommitment],
+        wire: &[u8],
+    ) -> Result<Self, ProtocolError> {
+        let body = wire_body(wire, MANIFEST_KIND)?;
+        let mut reader = Reader::new(body);
+        let batch_id: [u8; 32] = reader.array()?;
+        let _replacement_epoch = reader.u32()?;
+        let participant_count = reader.u8()? as usize;
+        if batch_id != proposal.batch_id() || participant_count != proposal.participant_count() {
+            return Err(ProtocolError::new(
+                RejectionReason::InvalidCommitment,
+                "manifest identity/count differs from proposal",
+            ));
+        }
+        let mut selected = Vec::with_capacity(participant_count);
+        let mut seen = HashSet::with_capacity(participant_count);
+        for _ in 0..participant_count {
+            let commitment_id: [u8; 32] = reader.array()?;
+            if !seen.insert(commitment_id) {
+                return Err(ProtocolError::new(
+                    RejectionReason::DuplicateCommitment,
+                    "manifest repeats a commitment id",
+                ));
+            }
+            let commitment = commitment_pool
+                .iter()
+                .find(|candidate| candidate.commitment_id() == commitment_id)
+                .ok_or_else(|| {
+                    ProtocolError::new(
+                        RejectionReason::InvalidCommitment,
+                        "manifest source commitment is unavailable",
+                    )
+                })?;
+            selected.push(commitment.clone());
+        }
+        Self::from_wire(proposal, selected, wire)
+    }
+
     /// Exact unsigned transaction every signer must reconstruct.
     pub fn unsigned_transaction(&self) -> &Transaction {
         &self.unsigned_tx
@@ -795,6 +844,25 @@ impl Manifest {
     /// Exact miner fee in satoshis.
     pub fn miner_fee(&self) -> u64 {
         self.miner_fee
+    }
+
+    /// Replacement epoch committed by this manifest.
+    pub fn replacement_epoch(&self) -> u32 {
+        self.replacement_epoch
+    }
+
+    /// Feerate selected for this manifest epoch.
+    pub fn feerate_sat_vb(&self) -> u32 {
+        self.feerate_sat_vb
+    }
+
+    /// Domain-separated IDs of the selected source commitments, in
+    /// canonical participant order.
+    pub fn commitment_ids(&self) -> Vec<[u8; 32]> {
+        self.commitments
+            .iter()
+            .map(ParticipantCommitment::commitment_id)
+            .collect()
     }
 
     /// Canonically ordered participant signing key at `index`.
@@ -920,6 +988,89 @@ impl Manifest {
             ));
         }
         Ok(tx)
+    }
+
+    /// Verify one detached share against its manifest ID, exact input
+    /// index, expected signing key, and `SIGHASH_ALL` digest.
+    pub fn verify_signature_share(
+        &self,
+        proposal: &Proposal,
+        share: &SignatureShare,
+    ) -> Result<(), ProtocolError> {
+        self.validate(proposal)?;
+        if share.manifest_id != self.manifest_id() {
+            return Err(ProtocolError::new(
+                RejectionReason::InvalidSignature,
+                "signature share names another manifest",
+            ));
+        }
+        let input_index = usize::from(share.input_index);
+        if input_index == 0 {
+            if share.signer_pubkey != proposal.stock_owner_pubkey {
+                return Err(ProtocolError::new(
+                    RejectionReason::InvalidSignature,
+                    "input 0 share is not from the stock owner",
+                ));
+            }
+            return verify_stock_signature(self, proposal, &share.signature);
+        }
+        let participant_index = input_index - 1;
+        let commitment = self.commitments.get(participant_index).ok_or_else(|| {
+            ProtocolError::new(
+                RejectionReason::InvalidSignature,
+                "signature share input index is outside the manifest",
+            )
+        })?;
+        if share.signer_pubkey != commitment.fee_pubkey {
+            return Err(ProtocolError::new(
+                RejectionReason::InvalidSignature,
+                "participant share key does not match the ordered input",
+            ));
+        }
+        verify_participant_signature(self, participant_index, &share.signature)
+    }
+
+    /// Verify, deduplicate, order, and finalize a complete all-peer share
+    /// set. Exact duplicate shares are idempotent; conflicting shares for
+    /// one input are rejected.
+    pub fn finalize_shares(
+        &self,
+        proposal: &Proposal,
+        shares: &[SignatureShare],
+    ) -> Result<Transaction, ProtocolError> {
+        let mut ordered = vec![None; self.commitments.len() + 1];
+        for share in shares {
+            self.verify_signature_share(proposal, share)?;
+            let index = usize::from(share.input_index);
+            match ordered[index] {
+                Some(existing) if existing == share.signature => {}
+                Some(_) => {
+                    return Err(ProtocolError::new(
+                        RejectionReason::ConflictingOperation,
+                        "conflicting signature shares for one input",
+                    ));
+                }
+                None => ordered[index] = Some(share.signature),
+            }
+        }
+        let mut signatures = ordered.into_iter();
+        let stock = signatures.next().flatten().ok_or_else(|| {
+            ProtocolError::new(
+                RejectionReason::InvalidSignature,
+                "stock signature share is missing",
+            )
+        })?;
+        let participants: Vec<_> = signatures
+            .map(|signature| {
+                signature.ok_or_else(|| {
+                    ProtocolError::new(
+                        RejectionReason::InvalidSignature,
+                        "participant signature share is missing",
+                    )
+                })
+            })
+            .collect::<Result<_, _>>()?;
+        self.finalize(proposal, &stock, &participants)
     }
 
     /// Build the next unanimous, invariant-preserving replacement epoch.
@@ -1144,6 +1295,14 @@ fn require_all(signature: &bitcoin::ecdsa::Signature) -> Result<(), ProtocolErro
         return Err(ProtocolError::new(
             RejectionReason::SignaturePolicyViolation,
             "only SIGHASH_ALL is permitted",
+        ));
+    }
+    let mut normalized = signature.signature;
+    normalized.normalize_s();
+    if normalized != signature.signature {
+        return Err(ProtocolError::new(
+            RejectionReason::InvalidSignature,
+            "only low-S ECDSA signatures are permitted",
         ));
     }
     Ok(())
@@ -1888,6 +2047,81 @@ mod tests {
                 .unwrap_err()
                 .reason(),
             RejectionReason::ExpiredProposal
+        );
+    }
+
+    #[test]
+    fn peer_pool_reconstruction_and_share_finalization_are_idempotent() {
+        let (proposal, commitments, participant_secrets, stock_secret) = fixture();
+        let manifest = Manifest::build(&proposal, commitments.clone()).unwrap();
+        let mut pool = commitments;
+        let mut extra = pool[0].clone();
+        extra.operation_id = [99; 32];
+        extra.commit_nonce = [98; 32];
+        extra.fee_outpoint = outpoint(99, 9);
+        extra.payload = TruncatedDigest([97; 24]);
+        extra.change_spk = p2wpkh_script(public(&secret(96)));
+        pool.push(extra);
+        assert_eq!(
+            Manifest::from_wire_pool(&proposal, &pool, &manifest.wire_bytes()).unwrap(),
+            manifest
+        );
+
+        let stock_signature = manifest.sign_stock(&proposal, &stock_secret).unwrap();
+        let mut shares = vec![SignatureShare::new(
+            manifest.manifest_id(),
+            0,
+            proposal.stock_owner_pubkey(),
+            stock_signature,
+        )
+        .unwrap()];
+        for index in 0..manifest.commitments.len() {
+            let expected = manifest.participant_fee_pubkey(index).unwrap();
+            let key = participant_secrets
+                .iter()
+                .find(|key| public(key) == expected)
+                .unwrap();
+            let signature = manifest.sign_participant(&proposal, index, key).unwrap();
+            shares.push(
+                SignatureShare::new(
+                    manifest.manifest_id(),
+                    (index + 1) as u16,
+                    expected,
+                    signature,
+                )
+                .unwrap(),
+            );
+        }
+        let expected = manifest
+            .finalize(
+                &proposal,
+                &shares[0].signature(),
+                &shares[1..]
+                    .iter()
+                    .map(SignatureShare::signature)
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap();
+        let mut duplicated = shares.clone();
+        duplicated.push(shares[1].clone());
+        assert_eq!(
+            manifest.finalize_shares(&proposal, &duplicated).unwrap(),
+            expected
+        );
+
+        let wrong_manifest = SignatureShare::new(
+            [0x55; 32],
+            0,
+            proposal.stock_owner_pubkey(),
+            shares[0].signature(),
+        )
+        .unwrap();
+        assert_eq!(
+            manifest
+                .verify_signature_share(&proposal, &wrong_manifest)
+                .unwrap_err()
+                .reason(),
+            RejectionReason::InvalidSignature
         );
     }
 }

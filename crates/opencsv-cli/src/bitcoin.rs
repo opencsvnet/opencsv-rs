@@ -4,6 +4,7 @@
 //! [`AnchorWriter::append_bound`]; a caller-drawn `ctx` cannot be honored
 //! and is an error) and maps errors into the wallet [`Error`] type.
 
+use bitcoin::Transaction;
 use opencsv_bitcoin::{BitcoinAnchorChain, Config};
 use opencsv_core::chain::{AnchorChain, AnchorLocation, AnchorRef};
 use opencsv_core::{AnchorRecord, Digest, TruncatedDigest};
@@ -43,6 +44,12 @@ impl BitcoinBackend {
     /// [`opencsv_bitcoin::BitcoinAnchorChain::anchor_batch`]).
     pub fn anchor_batch(&mut self, payloads: &[TruncatedDigest]) -> Result<AnchorRef, Error> {
         Ok(self.inner.anchor_batch(payloads)?)
+    }
+
+    /// Broadcast an already signed and durably persisted batching-v2
+    /// transaction without invoking wallet signing or reconstruction.
+    pub fn broadcast_batch_transaction(&self, transaction: &Transaction) -> Result<String, Error> {
+        Ok(self.inner.broadcast_transaction(transaction)?)
     }
 }
 

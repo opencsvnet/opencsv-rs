@@ -9,6 +9,7 @@
 
 use std::path::PathBuf;
 
+use bitcoin::Transaction;
 use opencsv_core::chain::{AnchorChain, AnchorLocation, AnchorRef};
 use opencsv_core::{AnchorRecord, Digest, TruncatedDigest};
 
@@ -88,6 +89,17 @@ impl ChainBackend {
             Self::Bitcoin(c) => c.anchor_batch(payloads),
             _ => Err(Error::Backend(
                 "batch anchoring is only supported on the bitcoind backend".into(),
+            )),
+        }
+    }
+
+    /// Broadcast a complete batching-v2 transaction. Demo and remote
+    /// anchor-server backends are intentionally rejected.
+    pub fn broadcast_batch_transaction(&self, transaction: &Transaction) -> Result<String, Error> {
+        match self {
+            Self::Bitcoin(chain) => chain.broadcast_batch_transaction(transaction),
+            _ => Err(Error::Backend(
+                "batching-v2 broadcast requires the bitcoind backend".into(),
             )),
         }
     }

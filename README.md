@@ -45,7 +45,12 @@ The frozen co-funded batching protocol and threat model is
 `opencsv-bitcoin::batch_v2`: signed stock, canonical participant commitments,
 exact fee allocation, PSBT signer material, unanimous replacement, and
 multi-party regtest evidence. The older `batch` module remains the fail-closed
-v1 reader/compatibility path; CLI/P2P coordination follows in C2.
+v1 reader/compatibility path. C2 is implemented in
+`opencsv-cli::batch_gossip`: authenticated bounded peer frames, complete-source
+manifest reconstruction, all-peer signature relay, durable crash recovery,
+and persistence of the verified signed transaction before any broadcast.
+There is no required coordinator or OpenCSV-specific server; any peer with the
+complete transcript can finalize and broadcast.
 
 ## Build & test
 

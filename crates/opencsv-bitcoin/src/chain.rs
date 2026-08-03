@@ -4,6 +4,7 @@
 
 use std::path::PathBuf;
 
+use bitcoin::Transaction;
 use opencsv_core::chain::{AnchorChain, AnchorLocation, AnchorRef};
 use opencsv_core::{AnchorRecord, Digest, ANCHOR_SIZE};
 use serde_json::{json, Value};
@@ -361,6 +362,38 @@ impl<T: Transport> BitcoinAnchorChain<T> {
     /// Number of confirmed anchors in the index.
     pub fn entry_count(&self) -> usize {
         self.entries.len()
+    }
+
+    /// Broadcast an already signed, protocol-validated Bitcoin
+    /// transaction. The exact transaction is never rebuilt or wallet-
+    /// signed here; peers use this after durably persisting the C2 batch
+    /// transaction. A transaction already in this node's mempool is an
+    /// idempotent success, covering a crash after RPC acceptance but before
+    /// the session journal advances.
+    pub fn broadcast_transaction(&self, transaction: &Transaction) -> Result<String, Error> {
+        let expected = transaction.compute_txid().to_string();
+        if self
+            .client
+            .call("getmempoolentry", json!([expected]))
+            .is_ok()
+        {
+            return Ok(expected);
+        }
+        let raw = bitcoin::consensus::encode::serialize(transaction);
+        let txid = match self
+            .client
+            .call_str("sendrawtransaction", json!([to_hex(&raw)]))
+        {
+            Ok(txid) => txid,
+            Err(Error::Rpc { code: -27, .. }) => return Ok(expected),
+            Err(error) => return Err(error),
+        };
+        if txid != expected {
+            return Err(Error::Malformed(format!(
+                "sendrawtransaction returned {txid}, expected {expected}"
+            )));
+        }
+        Ok(txid)
     }
 
     /// Rescan from the last scanned height to the current tip, picking up

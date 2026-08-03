@@ -128,3 +128,40 @@ fn binary_smoke() {
     let output = run(&["--wallet-dir", w, "issuer", "init", "--currency", "USDD"]);
     assert!(!output.status.success());
 }
+
+#[test]
+fn batching_v2_cli_initializes_without_chain_io() {
+    let tmp = tempfile::tempdir().unwrap();
+    let wallet = tmp.path().join("wallet");
+    let session = tmp.path().join("batch-session");
+    let wallet = wallet.to_str().unwrap();
+    let session = session.to_str().unwrap();
+    let chain_id = "09".repeat(32);
+
+    let out = ok(&run(&[
+        "--wallet-dir",
+        wallet,
+        "batch",
+        "v2",
+        "init",
+        "--session",
+        session,
+        "--chain-id",
+        &chain_id,
+        "--height",
+        "100",
+    ]));
+    assert!(out.contains("batch-v2 session"), "{out}");
+
+    let out = ok(&run(&[
+        "--wallet-dir",
+        wallet,
+        "batch",
+        "v2",
+        "status",
+        "--session",
+        session,
+    ]));
+    assert!(out.contains("phase ready"), "{out}");
+    assert!(out.contains("commitments 0"), "{out}");
+}
