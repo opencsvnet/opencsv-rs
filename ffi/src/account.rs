@@ -1442,11 +1442,10 @@ impl AccountWallet {
             })
             .collect();
         let client = esplora_client::Builder::new(&self.config.esplora_url).build_blocking();
-        let fallback = if p2p_submissions == 0 {
-            client.broadcast(&tx).map(|_| true)
-        } else {
-            Ok(false)
-        };
+        // A completed P2P socket write proves submission only. Core can
+        // close before processing the unsolicited transaction, so never let
+        // `p2p_submissions` suppress the observable generic-relay path.
+        let fallback = relay_via_esplora_if_unobserved(&client, &tx);
         if let Some(object) = receipt.as_object_mut() {
             object.insert("p2p_submissions".into(), json!(p2p_submissions));
             object.insert("p2p_peers".into(), json!(relay_peers));
@@ -1534,27 +1533,23 @@ impl AccountWallet {
                 );
                 let client =
                     esplora_client::Builder::new(&self.config.esplora_url).build_blocking();
-                let observed = client
-                    .get_tx(&tx.compute_txid())
-                    .map_err(|error| AccountError::new("sync_failed", error.to_string()))?;
-                let fallback_used = if observed.is_none() {
-                    if let Err(error) = client.broadcast(&tx) {
-                        if let Some(value) = self.reconcile_confirmed_replacement(
-                            operation_id,
-                            tx.compute_txid(),
-                            &mut receipt,
-                        )? {
-                            return Ok(value);
+                let fallback_used =
+                    match relay_via_esplora_if_unobserved(&client, &tx) {
+                        Ok(used) => used,
+                        Err(error) => {
+                            if let Some(value) = self.reconcile_confirmed_replacement(
+                                operation_id,
+                                tx.compute_txid(),
+                                &mut receipt,
+                            )? {
+                                return Ok(value);
+                            }
+                            return Err(AccountError::new(
+                                "broadcast_unobserved",
+                                format!("signed transaction preserved for resume: {error}"),
+                            ));
                         }
-                        return Err(AccountError::new(
-                            "broadcast_unobserved",
-                            format!("signed transaction preserved for resume: {error}"),
-                        ));
-                    }
-                    true
-                } else {
-                    false
-                };
+                    };
                 if let Some(object) = receipt.as_object_mut() {
                     object.insert(
                         "resume_p2p_submissions".into(),
@@ -1860,18 +1855,14 @@ impl AccountWallet {
                 })
             })
             .collect();
-        let generic_relay_fallback = if p2p_submissions == 0 {
-            let client = esplora_client::Builder::new(&self.config.esplora_url).build_blocking();
-            client.broadcast(&replacement).map_err(|error| {
+        let client = esplora_client::Builder::new(&self.config.esplora_url).build_blocking();
+        let generic_relay_fallback = relay_via_esplora_if_unobserved(&client, &replacement)
+            .map_err(|error| {
                 AccountError::new(
                     "broadcast_unobserved",
                     format!("replacement persisted for resume: {error}"),
                 )
             })?;
-            true
-        } else {
-            false
-        };
         if let Some(object) = receipt.as_object_mut() {
             object.insert("p2p_submissions".into(), json!(p2p_submissions));
             object.insert("p2p_peers".into(), json!(relay_peers));
@@ -3013,6 +3004,21 @@ fn funding_context(outpoint: OutPoint) -> [u8; 32] {
     funding_ctx(&outpoint.txid.to_byte_array(), outpoint.vout)
 }
 
+/// Ensure a signed transaction reaches the generic relay unless that relay
+/// already observes it. A failed observation request is deliberately treated
+/// like a cache miss: the write path can still be healthy, and its result is
+/// the useful durability signal for the caller.
+fn relay_via_esplora_if_unobserved(
+    client: &esplora_client::BlockingClient,
+    transaction: &Transaction,
+) -> Result<bool, esplora_client::Error> {
+    if matches!(client.get_tx(&transaction.compute_txid()), Ok(Some(_))) {
+        return Ok(false);
+    }
+    client.broadcast(transaction)?;
+    Ok(true)
+}
+
 fn validate_initial_anchor(
     transaction: &Transaction,
     funding: OutPoint,
@@ -3324,6 +3330,37 @@ mod tests {
         (format!("http://{address}"), server)
     }
 
+    fn unobserved_relay_server() -> (String, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buffer = [0_u8; 4096];
+            let length = stream.read(&mut buffer).unwrap();
+            let first_request = std::str::from_utf8(&buffer[..length]).unwrap();
+            assert!(first_request.starts_with("GET /tx/"));
+            assert!(first_request.contains("/raw HTTP/1.1"));
+            write!(
+                stream,
+                "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            )
+            .unwrap();
+            stream.flush().unwrap();
+
+            let (mut stream, _) = listener.accept().unwrap();
+            let length = stream.read(&mut buffer).unwrap();
+            let second_request = std::str::from_utf8(&buffer[..length]).unwrap();
+            assert!(second_request.starts_with("POST /tx HTTP/1.1"));
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            )
+            .unwrap();
+            stream.flush().unwrap();
+        });
+        (format!("http://{address}"), server)
+    }
+
     fn fund(wallet: &mut AccountWallet, value_sats: u64) -> OutPoint {
         let address = wallet
             .bitcoin
@@ -3397,6 +3434,26 @@ mod tests {
         // Reopening with backup_verified=false does not silently downgrade
         // already-verified durable policy state.
         assert_eq!(second_status["backup_verified"], true);
+    }
+
+    #[test]
+    fn unobserved_transaction_uses_generic_relay_regardless_of_peer_receipt() {
+        let (url, server) = unobserved_relay_server();
+        let client = esplora_client::Builder::new(&url).build_blocking();
+        let transaction = Transaction {
+            version: transaction::Version::TWO,
+            lock_time: absolute::LockTime::ZERO,
+            input: Vec::new(),
+            output: vec![TxOut {
+                value: Amount::ZERO,
+                script_pubkey: ScriptBuf::new(),
+            }],
+        };
+
+        // A direct-peer submission count is intentionally not an input to
+        // this decision. Only independent observation can skip the POST.
+        assert!(relay_via_esplora_if_unobserved(&client, &transaction).unwrap());
+        server.join().unwrap();
     }
 
     #[test]

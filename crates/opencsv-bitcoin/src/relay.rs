@@ -42,9 +42,10 @@ impl RelayReport {
 
 /// Submit a signed transaction to every configured Bitcoin P2P peer.
 ///
-/// Failures are isolated per peer. The caller decides whether zero
-/// successful writes should fall back to a generic public relay. A non-zero
-/// count still requires independent read-side observation before delivery.
+/// Failures are isolated per peer. Every successful write still requires
+/// independent read-side observation; callers should use a generic public
+/// relay whenever the transaction is not observable, regardless of this
+/// report's submission count.
 pub fn relay_transaction(
     network: Network,
     peers: &[String],
