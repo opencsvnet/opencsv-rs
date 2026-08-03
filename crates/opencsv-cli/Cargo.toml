@@ -13,6 +13,7 @@ signal = ["dep:opencsv-signal", "dep:tokio", "dep:tracing-subscriber"]
 opencsv-core = { path = "../opencsv-core" }
 opencsv-pcd = { path = "../opencsv-pcd" }
 opencsv-bitcoin = { path = "../opencsv-bitcoin" }
+opencsv-cbf = { path = "../opencsv-cbf" }
 bitcoin = { version = "0.32", features = ["rand-std"] }
 sha2 = "0.10"
 opencsv-signal = { path = "../opencsv-signal", optional = true }

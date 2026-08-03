@@ -8,13 +8,23 @@
 use std::net::{SocketAddr, TcpListener};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::time::Duration;
 
 use base64::Engine;
 use bitcoin::hashes::Hash as _;
-use clap::{Parser, Subcommand};
+use bitcoin::secp256k1::{PublicKey, Secp256k1, SecretKey};
+use bitcoin::{Amount, OutPoint, TxOut};
+use clap::{Args, Parser, Subcommand};
+use opencsv_bitcoin::batch_v2::{p2wpkh_script, ParticipantCommitment, Proposal};
+use opencsv_cbf::block::OutPoint as CbfOutPoint;
+use opencsv_cbf::{
+    BatchInputBirthHeights, CbfClient, CommitmentInputBirthHeights, Config as CbfConfig,
+    OutpointVerdict,
+};
 use opencsv_cli::backend::{ChainBackend, ChainSpec};
 use opencsv_cli::batch_gossip::{
-    relay_once, send_frame, MessageKind, ProtocolPhase, Session, SessionPolicy, SignedFrame,
+    relay_next_with_refresh, send_frame, MessageKind, ProtocolPhase, RelayAttempt, Session,
+    SessionPolicy, SignedFrame,
 };
 use opencsv_cli::error::{io_err, Error};
 use opencsv_cli::hexutil::{digest_from_hex, from_hex, to_hex};
@@ -194,7 +204,7 @@ enum BatchCmd {
     },
     /// Serverless batching-v2 proposal/commitment/manifest/signature gossip.
     #[command(subcommand)]
-    V2(BatchV2Cmd),
+    V2(Box<BatchV2Cmd>),
 }
 
 #[derive(Subcommand)]
@@ -211,35 +221,120 @@ enum BatchV2Cmd {
         #[arg(long)]
         height: u32,
     },
-    /// Publish a round-0 canonical proposal body.
-    Proposal {
+    /// Author, verify, reserve, and publish a round-0 proposal.
+    Propose {
         #[arg(long)]
         session: PathBuf,
+        /// Confirmed input-0 stock outpoint (`txid:vout`).
         #[arg(long)]
-        file: PathBuf,
+        stock_outpoint: String,
+        /// Exact input-0 stock value in sats.
+        #[arg(long)]
+        stock_value: u64,
+        /// File containing the 32-byte stock secret key (raw or hex).
+        #[arg(long)]
+        stock_key: PathBuf,
+        #[arg(long)]
+        participants: u8,
+        /// 32-byte proposal nonce in hex.
+        #[arg(long)]
+        nonce: String,
+        /// Number of blocks after the verified tip before expiry.
+        #[arg(long, default_value_t = 12)]
+        expiry_blocks: u32,
+        #[arg(long)]
+        target_feerate: u32,
+        #[arg(long)]
+        max_feerate: u32,
+        /// Claimed creation height used only as a bounded scan hint.
+        #[arg(long)]
+        stock_birth: u64,
+        #[command(flatten)]
+        cbf: BatchCbfArgs,
         #[arg(long = "peer")]
         peers: Vec<SocketAddr>,
     },
-    /// Publish a round-1 canonical participant commitment body.
-    Commitment {
+    /// Author, verify, reserve, and publish a participant commitment.
+    Commit {
         #[arg(long)]
         session: PathBuf,
+        /// Durable OpenCSV operation identifier (32-byte hex).
         #[arg(long)]
-        file: PathBuf,
+        operation_id: String,
+        /// 32-byte commitment nonce in hex.
+        #[arg(long)]
+        nonce: String,
+        /// Context-bound 24-byte OpenCSV payload in hex.
+        #[arg(long)]
+        payload: String,
+        /// Confirmed participant fee outpoint (`txid:vout`).
+        #[arg(long)]
+        fee_outpoint: String,
+        #[arg(long)]
+        fee_value: u64,
+        /// File containing the fee-input secret key (raw or hex).
+        #[arg(long)]
+        fee_key: PathBuf,
+        /// File containing the P2WPKH change secret key (raw or hex).
+        #[arg(long)]
+        change_key: PathBuf,
+        #[arg(long)]
+        max_charge: u64,
+        #[arg(long)]
+        stock_birth: u64,
+        #[arg(long)]
+        fee_birth: u64,
+        #[command(flatten)]
+        cbf: BatchCbfArgs,
         #[arg(long = "peer")]
         peers: Vec<SocketAddr>,
     },
-    /// Publish a round-1 source-complete canonical manifest body.
+    /// Deterministically author and publish the source-complete manifest.
     Manifest {
         #[arg(long)]
         session: PathBuf,
-        #[arg(long)]
-        file: PathBuf,
+        #[command(flatten)]
+        cbf: BatchCbfArgs,
         #[arg(long = "peer")]
         peers: Vec<SocketAddr>,
     },
-    /// Publish a round-2 verified signature-share body.
-    Signature {
+    /// Author and publish the next invariant-preserving replacement epoch.
+    Replace {
+        #[arg(long)]
+        session: PathBuf,
+        #[arg(long)]
+        feerate: u32,
+        #[command(flatten)]
+        cbf: BatchCbfArgs,
+        #[arg(long = "peer")]
+        peers: Vec<SocketAddr>,
+    },
+    /// Verify every public input, enforce the local reservation, then sign.
+    Sign {
+        #[arg(long)]
+        session: PathBuf,
+        /// Exact manifest identifier (32-byte hex).
+        #[arg(long)]
+        manifest_id: String,
+        #[arg(long)]
+        input_index: u16,
+        /// File containing this input's secret key (raw or hex).
+        #[arg(long)]
+        key: PathBuf,
+        #[arg(long)]
+        stock_birth: u64,
+        /// Comma-separated participant fee-input creation heights in
+        /// canonical manifest order.
+        #[arg(long)]
+        participant_births: String,
+        #[command(flatten)]
+        cbf: BatchCbfArgs,
+        #[arg(long = "peer")]
+        peers: Vec<SocketAddr>,
+    },
+    /// Diagnostic import of a prebuilt manifest body.
+    #[command(hide = true)]
+    ImportManifest {
         #[arg(long)]
         session: PathBuf,
         #[arg(long)]
@@ -253,6 +348,8 @@ enum BatchV2Cmd {
         session: PathBuf,
         #[arg(long)]
         listen: SocketAddr,
+        #[command(flatten)]
+        cbf: BatchCbfArgs,
         #[arg(long = "peer")]
         peers: Vec<SocketAddr>,
     },
@@ -265,11 +362,17 @@ enum BatchV2Cmd {
     Finalize {
         #[arg(long)]
         session: PathBuf,
+        /// Exact manifest to finalize; defaults to the latest epoch.
+        #[arg(long)]
+        manifest_id: Option<String>,
     },
     /// Broadcast the already persisted transaction through bitcoind.
     Broadcast {
         #[arg(long)]
         session: PathBuf,
+        /// Exact signed manifest to broadcast; defaults to the latest epoch.
+        #[arg(long)]
+        manifest_id: Option<String>,
     },
     /// Record a post-broadcast/mempool/confirmation/delivery transition.
     Mark {
@@ -282,6 +385,25 @@ enum BatchV2Cmd {
         #[arg(long)]
         evidence: String,
     },
+}
+
+#[derive(Args)]
+struct BatchCbfArgs {
+    /// Independent Bitcoin P2P peers used for header/filter agreement.
+    #[arg(long = "cbf-peer", required = true)]
+    peers: Vec<String>,
+    /// Rebuildable compact-filter/header cache directory.
+    #[arg(long)]
+    cache: PathBuf,
+    /// Per-peer connect/read/write timeout.
+    #[arg(long, default_value_t = 30)]
+    timeout_seconds: u64,
+    /// Maximum verified blocks scanned from each claimed birth height.
+    #[arg(long, default_value_t = 2016)]
+    max_blocks: u64,
+    /// Maximum age of a verifier receipt when publishing/signing.
+    #[arg(long, default_value_t = 120)]
+    receipt_max_age_seconds: u64,
 }
 
 #[derive(Subcommand)]
@@ -420,8 +542,12 @@ fn command_uses_chain(command: &Commands) -> bool {
         | Commands::Audit { .. }
         | Commands::Batch(BatchCmd::Ctx { .. })
         | Commands::Batch(BatchCmd::Anchor { .. })
-        | Commands::Batch(BatchCmd::V2(BatchV2Cmd::Broadcast { .. }))
         | Commands::Chain(_) => true,
+        Commands::Batch(BatchCmd::V2(command))
+            if matches!(command.as_ref(), BatchV2Cmd::Broadcast { .. }) =>
+        {
+            true
+        }
         #[cfg(feature = "signal")]
         Commands::Signal(SignalCmd::Listen { .. }) => true,
         _ => false,
@@ -464,6 +590,7 @@ fn run(cli: Cli) -> Result<ExitCode, Error> {
     let wallet_dir = cli.wallet_dir.clone().unwrap_or_else(default_wallet_dir);
     let wallet = Wallet::open(&wallet_dir)?;
     let spec = chain_spec(&cli, &wallet_dir)?;
+    let network = opencsv_bitcoin::Network::parse(&cli.network)?;
     if command_uses_chain(&cli.command) && backend_is_demo(&spec) {
         eprintln!("warning: DEMO CHAIN — not Bitcoin (anchors and confirmations are simulated)");
     }
@@ -657,7 +784,7 @@ fn run(cli: Cli) -> Result<ExitCode, Error> {
             eprintln!("anchor is in the mempool; it becomes verifiable once mined");
         }
         Commands::Batch(BatchCmd::V2(command)) => {
-            run_batch_v2(command, &spec)?;
+            run_batch_v2(*command, &spec, network)?;
         }
         Commands::Chain(ChainCmd::Tip) => {
             let chain = ChainBackend::open(&spec)?;
@@ -676,7 +803,11 @@ fn run(cli: Cli) -> Result<ExitCode, Error> {
     Ok(ExitCode::SUCCESS)
 }
 
-fn run_batch_v2(command: BatchV2Cmd, spec: &ChainSpec) -> Result<(), Error> {
+fn run_batch_v2(
+    command: BatchV2Cmd,
+    spec: &ChainSpec,
+    network: opencsv_bitcoin::Network,
+) -> Result<(), Error> {
     match command {
         BatchV2Cmd::Init {
             session,
@@ -701,49 +832,252 @@ fn run_batch_v2(command: BatchV2Cmd, spec: &ChainSpec) -> Result<(), Error> {
                 session_path.display()
             );
         }
-        BatchV2Cmd::Proposal {
+        BatchV2Cmd::Propose {
             session,
-            file,
+            stock_outpoint,
+            stock_value,
+            stock_key,
+            participants,
+            nonce,
+            expiry_blocks,
+            target_feerate,
+            max_feerate,
+            stock_birth,
+            cbf,
             peers,
-        } => publish_batch_body(&session, &file, MessageKind::Proposal, &peers)?,
-        BatchV2Cmd::Commitment {
+        } => {
+            let stock_key = load_secret_key(&stock_key)?;
+            let stock_outpoint = parse_outpoint(&stock_outpoint)?;
+            let nonce = parse_hex_array::<32>(&nonce, "proposal nonce")?;
+            let mut session = Session::open(&session)?;
+            let mut client = connect_batch_cbf(network, &cbf)?;
+            let max_age = Duration::from_secs(cbf.receipt_max_age_seconds);
+            refresh_batch_tip(&mut session, &mut client, max_age)?;
+            let policy = session.session_policy();
+            let expiry_height = policy
+                .current_height
+                .checked_add(expiry_blocks)
+                .ok_or_else(|| Error::Parse("proposal expiry height overflow".into()))?;
+            let proposal = Proposal::new(
+                policy.chain_id,
+                stock_outpoint,
+                stock_value,
+                PublicKey::from_secret_key(&Secp256k1::new(), &stock_key),
+                participants,
+                nonce,
+                policy.current_height,
+                expiry_height,
+                target_feerate,
+                max_feerate,
+            )
+            .map_err(batch_v2_error)?;
+            require_verified_unspent(
+                &mut client,
+                proposal.stock_outpoint(),
+                proposal.stock_value(),
+                proposal.stock_script_pubkey().as_bytes(),
+                stock_birth,
+                cbf.max_blocks,
+                "stock",
+            )?;
+            session.reserve_local_input(proposal.batch_id(), proposal.stock_outpoint())?;
+            let wire = session.publish_proposal(proposal.wire_bytes(), &stock_key)?;
+            publish_frame(&wire, &peers)?;
+        }
+        BatchV2Cmd::Commit {
             session,
-            file,
+            operation_id,
+            nonce,
+            payload,
+            fee_outpoint,
+            fee_value,
+            fee_key,
+            change_key,
+            max_charge,
+            stock_birth,
+            fee_birth,
+            cbf,
             peers,
-        } => publish_batch_body(&session, &file, MessageKind::Commitment, &peers)?,
+        } => {
+            let fee_key = load_secret_key(&fee_key)?;
+            let change_key = load_secret_key(&change_key)?;
+            let fee_outpoint = parse_outpoint(&fee_outpoint)?;
+            let operation_id = parse_hex_array::<32>(&operation_id, "operation id")?;
+            let nonce = parse_hex_array::<32>(&nonce, "commitment nonce")?;
+            let payload =
+                opencsv_core::TruncatedDigest(parse_hex_array::<24>(&payload, "OpenCSV payload")?);
+            let mut session = Session::open(&session)?;
+            let mut client = connect_batch_cbf(network, &cbf)?;
+            let max_age = Duration::from_secs(cbf.receipt_max_age_seconds);
+            refresh_batch_tip(&mut session, &mut client, max_age)?;
+            let proposal = session.proposal()?;
+            let fee_pubkey = PublicKey::from_secret_key(&Secp256k1::new(), &fee_key);
+            let change_pubkey = PublicKey::from_secret_key(&Secp256k1::new(), &change_key);
+            let commitment = ParticipantCommitment::new(
+                &proposal,
+                operation_id,
+                nonce,
+                payload,
+                fee_outpoint,
+                TxOut {
+                    value: Amount::from_sat(fee_value),
+                    script_pubkey: p2wpkh_script(fee_pubkey),
+                },
+                fee_pubkey,
+                p2wpkh_script(change_pubkey),
+                max_charge,
+            )
+            .map_err(batch_v2_error)?;
+            let verified = client
+                .verify_commitment_inputs(
+                    &proposal,
+                    &commitment,
+                    CommitmentInputBirthHeights {
+                        stock: stock_birth,
+                        fee: fee_birth,
+                    },
+                    cbf.max_blocks,
+                )
+                .map_err(cbf_error)?;
+            let reservation = session.reserve_local_input(operation_id, fee_outpoint)?;
+            let wire = session.publish_verified_commitment(
+                commitment.wire_bytes(),
+                &fee_key,
+                &verified,
+                &reservation,
+                max_age,
+            )?;
+            publish_frame(&wire, &peers)?;
+        }
         BatchV2Cmd::Manifest {
+            session,
+            cbf,
+            peers,
+        } => {
+            let mut session = Session::open(&session)?;
+            let mut client = connect_batch_cbf(network, &cbf)?;
+            refresh_batch_tip(
+                &mut session,
+                &mut client,
+                Duration::from_secs(cbf.receipt_max_age_seconds),
+            )?;
+            let wire = session.author_manifest()?;
+            publish_frame(&wire, &peers)?;
+        }
+        BatchV2Cmd::Replace {
+            session,
+            feerate,
+            cbf,
+            peers,
+        } => {
+            let mut session = Session::open(&session)?;
+            let mut client = connect_batch_cbf(network, &cbf)?;
+            refresh_batch_tip(
+                &mut session,
+                &mut client,
+                Duration::from_secs(cbf.receipt_max_age_seconds),
+            )?;
+            let wire = session.author_replacement(feerate)?;
+            publish_frame(&wire, &peers)?;
+        }
+        BatchV2Cmd::Sign {
+            session,
+            manifest_id,
+            input_index,
+            key,
+            stock_birth,
+            participant_births,
+            cbf,
+            peers,
+        } => {
+            let key = load_secret_key(&key)?;
+            let manifest_id = parse_hex_array::<32>(&manifest_id, "manifest id")?;
+            let participant_births = parse_u64_list(&participant_births, "participant births")?;
+            let mut session = Session::open(&session)?;
+            let mut client = connect_batch_cbf(network, &cbf)?;
+            let max_age = Duration::from_secs(cbf.receipt_max_age_seconds);
+            refresh_batch_tip(&mut session, &mut client, max_age)?;
+            let proposal = session.proposal()?;
+            let manifest = session.manifest(manifest_id)?;
+            let verified = client
+                .verify_batch_inputs(
+                    &proposal,
+                    &manifest,
+                    &BatchInputBirthHeights {
+                        stock: stock_birth,
+                        participants: participant_births,
+                    },
+                    cbf.max_blocks,
+                )
+                .map_err(cbf_error)?;
+            let (operation_id, outpoint) = if input_index == 0 {
+                (proposal.batch_id(), proposal.stock_outpoint())
+            } else {
+                let participant_index = usize::from(input_index) - 1;
+                let commitment =
+                    manifest
+                        .commitments()
+                        .get(participant_index)
+                        .ok_or_else(|| {
+                            Error::Parse("signature input index is outside the manifest".into())
+                        })?;
+                (commitment.operation_id(), commitment.fee_outpoint())
+            };
+            let reservation = session.local_reservation(operation_id)?;
+            if reservation.outpoint() != outpoint {
+                return Err(Error::Parse(
+                    "persisted reservation does not name the signing input".into(),
+                ));
+            }
+            let wire = session.sign_and_publish(
+                manifest_id,
+                input_index,
+                &key,
+                &verified,
+                &reservation,
+                max_age,
+            )?;
+            publish_frame(&wire, &peers)?;
+        }
+        BatchV2Cmd::ImportManifest {
             session,
             file,
             peers,
         } => publish_batch_body(&session, &file, MessageKind::Manifest, &peers)?,
-        BatchV2Cmd::Signature {
-            session,
-            file,
-            peers,
-        } => publish_batch_body(&session, &file, MessageKind::Signature, &peers)?,
         BatchV2Cmd::Relay {
             session,
             listen,
+            cbf,
             peers,
         } => {
             let listener = TcpListener::bind(listen)
                 .map_err(|error| Error::Transport(format!("batch v2 bind {listen}: {error}")))?;
             let mut session = Session::open(&session)?;
+            let mut client = connect_batch_cbf(network, &cbf)?;
+            let max_age = Duration::from_secs(cbf.receipt_max_age_seconds);
             println!(
                 "batch-v2 relay {listen} identity {} peers {}",
                 session.identity_pubkey(),
                 peers.len()
             );
             loop {
-                let report = relay_once(&listener, &mut session, &peers)?;
-                println!(
-                    "relay {:?} forwarded {} failed {}",
-                    report.outcome,
-                    report.forwarded,
-                    report.failed_peers.len()
-                );
-                for failure in report.failed_peers {
-                    eprintln!("relay delivery failed: {failure}");
+                match relay_next_with_refresh(&listener, &mut session, &peers, |session| {
+                    refresh_batch_tip(session, &mut client, max_age)
+                })? {
+                    RelayAttempt::Processed(report) => {
+                        println!(
+                            "relay {:?} forwarded {} failed {}",
+                            report.outcome,
+                            report.forwarded,
+                            report.failed_peers.len()
+                        );
+                        for failure in report.failed_peers {
+                            eprintln!("relay delivery failed: {failure}");
+                        }
+                    }
+                    RelayAttempt::Rejected { remote, reason } => {
+                        eprintln!("relay rejected {remote}: {reason}");
+                    }
                 }
             }
         }
@@ -770,18 +1104,32 @@ fn run_batch_v2(command: BatchV2Cmd, spec: &ChainSpec) -> Result<(), Error> {
                 session.identity_pubkey(),
             );
         }
-        BatchV2Cmd::Finalize { session } => {
+        BatchV2Cmd::Finalize {
+            session,
+            manifest_id,
+        } => {
             let mut session = Session::open(&session)?;
-            let transaction = session.finalize_latest()?;
+            let transaction = match manifest_id {
+                Some(manifest_id) => session
+                    .finalize_manifest(parse_hex_array::<32>(&manifest_id, "manifest id")?)?,
+                None => session.finalize_latest()?,
+            };
             println!(
                 "signed_persisted tx {} weight {}",
                 transaction.compute_txid(),
                 transaction.weight().to_wu()
             );
         }
-        BatchV2Cmd::Broadcast { session } => {
+        BatchV2Cmd::Broadcast {
+            session,
+            manifest_id,
+        } => {
             let mut session = Session::open(&session)?;
-            let transaction = session.latest_signed_transaction()?;
+            let transaction = match manifest_id {
+                Some(manifest_id) => session
+                    .signed_transaction(parse_hex_array::<32>(&manifest_id, "manifest id")?)?,
+                None => session.latest_signed_transaction()?,
+            };
             let status = session.status()?;
             if status.phase == ProtocolPhase::SignedPersisted {
                 session.mark_phase(
@@ -825,16 +1173,20 @@ fn publish_batch_body(
     let payload = std::fs::read(file).map_err(io_err(file))?;
     let mut session = Session::open(session_path)?;
     let wire = session.publish(kind, payload)?;
-    let frame = SignedFrame::from_wire(&wire)?;
+    publish_frame(&wire, peers)
+}
+
+fn publish_frame(wire: &[u8], peers: &[SocketAddr]) -> Result<(), Error> {
+    let frame = SignedFrame::from_wire(wire)?;
     let mut failures = Vec::new();
     for peer in peers {
-        if let Err(error) = send_frame(*peer, &wire) {
+        if let Err(error) = send_frame(*peer, wire) {
             failures.push(format!("{peer}: {error}"));
         }
     }
     println!(
         "published {} frame {} peers {}",
-        kind.name(),
+        frame.kind().name(),
         to_hex(&frame.id()),
         peers.len() - failures.len()
     );
@@ -846,6 +1198,141 @@ fn publish_batch_body(
             failures.join("; ")
         )))
     }
+}
+
+fn connect_batch_cbf(
+    network: opencsv_bitcoin::Network,
+    args: &BatchCbfArgs,
+) -> Result<CbfClient, Error> {
+    if args.receipt_max_age_seconds == 0 {
+        return Err(Error::Parse(
+            "CBF receipt maximum age must be at least one second".into(),
+        ));
+    }
+    CbfClient::connect(&CbfConfig {
+        network,
+        peers: args.peers.clone(),
+        cache_dir: args.cache.clone(),
+        timeout: Duration::from_secs(args.timeout_seconds),
+    })
+    .map_err(cbf_error)
+}
+
+fn refresh_batch_tip(
+    session: &mut Session,
+    client: &mut CbfClient,
+    max_age: Duration,
+) -> Result<(), Error> {
+    client.sync().map_err(cbf_error)?;
+    let receipt = client.verified_tip_receipt().map_err(cbf_error)?;
+    session.refresh_verified_tip(&receipt, max_age)
+}
+
+fn require_verified_unspent(
+    client: &mut CbfClient,
+    outpoint: OutPoint,
+    expected_value: u64,
+    expected_script: &[u8],
+    birth_height: u64,
+    max_blocks: u64,
+    role: &str,
+) -> Result<(), Error> {
+    let verdict = client
+        .verify_outpoint_unspent(
+            CbfOutPoint {
+                txid: outpoint.txid.to_byte_array(),
+                vout: outpoint.vout,
+            },
+            expected_value,
+            expected_script,
+            birth_height,
+            max_blocks,
+        )
+        .map_err(cbf_error)?;
+    match verdict {
+        OutpointVerdict::Unspent { .. } => Ok(()),
+        OutpointVerdict::Spent {
+            spend_height,
+            spending_txid,
+            ..
+        } => Err(Error::Backend(format!(
+            "{role} outpoint was spent at height {spend_height} by {}",
+            opencsv_cbf::hash::hash_to_display(&spending_txid)
+        ))),
+        OutpointVerdict::NotFound {
+            checked_through, ..
+        } => Err(Error::Backend(format!(
+            "{role} outpoint was not found through verified height {checked_through}"
+        ))),
+        OutpointVerdict::OutputMismatch { creation_height } => Err(Error::Backend(format!(
+            "{role} output at height {creation_height} has the wrong value or script"
+        ))),
+    }
+}
+
+fn load_secret_key(path: &Path) -> Result<SecretKey, Error> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(path)
+            .map_err(io_err(path))?
+            .permissions()
+            .mode();
+        if mode & 0o077 != 0 {
+            return Err(Error::Parse(format!(
+                "secret-key file {} must be mode 0600 or stricter",
+                path.display()
+            )));
+        }
+    }
+    let bytes = std::fs::read(path).map_err(io_err(path))?;
+    let key = if bytes.len() == 32 {
+        bytes
+    } else {
+        from_hex(
+            std::str::from_utf8(&bytes)
+                .map_err(|error| Error::Parse(format!("{}: key UTF-8: {error}", path.display())))?
+                .trim(),
+        )
+        .map_err(|error| Error::Parse(format!("{}: key hex: {error}", path.display())))?
+    };
+    SecretKey::from_slice(&key)
+        .map_err(|error| Error::Parse(format!("{}: secret key: {error}", path.display())))
+}
+
+fn parse_outpoint(value: &str) -> Result<OutPoint, Error> {
+    value
+        .parse()
+        .map_err(|error| Error::Parse(format!("invalid outpoint `{value}`: {error}")))
+}
+
+fn parse_hex_array<const N: usize>(value: &str, role: &str) -> Result<[u8; N], Error> {
+    let bytes = from_hex(value).map_err(|error| Error::Parse(format!("{role}: {error}")))?;
+    bytes.try_into().map_err(|bytes: Vec<u8>| {
+        Error::Parse(format!("{role} is {} bytes, expected {N}", bytes.len()))
+    })
+}
+
+fn parse_u64_list(value: &str, role: &str) -> Result<Vec<u64>, Error> {
+    if value.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+    value
+        .split(',')
+        .map(|item| {
+            item.trim()
+                .parse::<u64>()
+                .map_err(|_| Error::Parse(format!("invalid {role} entry `{}`", item.trim())))
+        })
+        .collect()
+}
+
+fn batch_v2_error(error: opencsv_bitcoin::batch_v2::ProtocolError) -> Error {
+    Error::Parse(format!("batch v2: {error}"))
+}
+
+fn cbf_error(error: opencsv_cbf::Error) -> Error {
+    Error::Backend(format!("CBF verification: {error}"))
 }
 
 /// Signal transport commands. All Signal traffic runs on a small
@@ -996,14 +1483,12 @@ fn parse_payloads(s: &str) -> Result<Vec<opencsv_core::TruncatedDigest>, Error> 
         .map(|part| {
             let bytes = from_hex(part.trim())
                 .map_err(|e| Error::Parse(format!("payload `{part}`: {e}")))?;
-            let bytes: [u8; 24] = bytes
-                .try_into()
-                .map_err(|v: Vec<u8>| {
-                    Error::Parse(format!(
-                        "payload `{part}` is {} bytes, expected 24",
-                        v.len()
-                    ))
-                })?;
+            let bytes: [u8; 24] = bytes.try_into().map_err(|v: Vec<u8>| {
+                Error::Parse(format!(
+                    "payload `{part}` is {} bytes, expected 24",
+                    v.len()
+                ))
+            })?;
             Ok(opencsv_core::TruncatedDigest(bytes))
         })
         .collect()

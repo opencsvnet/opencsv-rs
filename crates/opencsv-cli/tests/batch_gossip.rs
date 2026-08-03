@@ -8,8 +8,8 @@ use opencsv_bitcoin::batch_v2::{
     p2wpkh_script, Manifest, ParticipantCommitment, Proposal, SignatureShare,
 };
 use opencsv_cli::batch_gossip::{
-    relay_once, send_frame, IngestOutcome, MessageKind, ProtocolPhase, Session, SessionPolicy,
-    SignedFrame,
+    relay_next, relay_once, send_frame, IngestOutcome, MessageKind, ProtocolPhase, RelayAttempt,
+    RelayPolicy, Session, SessionPolicy, SignedFrame,
 };
 use opencsv_core::{binding, Digest};
 
@@ -27,6 +27,8 @@ fn outpoint(seed: u8, vout: u32) -> OutPoint {
 
 struct Fixture {
     policy: SessionPolicy,
+    stock_secret: SecretKey,
+    participant_secrets: Vec<SecretKey>,
     proposal: Proposal,
     commitments: Vec<ParticipantCommitment>,
     manifest: Manifest,
@@ -52,7 +54,7 @@ fn fixture() -> Fixture {
         20,
     )
     .unwrap();
-    let participant_secrets = [secret(5), secret(4)];
+    let participant_secrets = vec![secret(5), secret(4)];
     let commitments: Vec<_> = participant_secrets
         .iter()
         .enumerate()
@@ -101,6 +103,8 @@ fn fixture() -> Fixture {
     }
     Fixture {
         policy,
+        stock_secret,
+        participant_secrets,
         proposal,
         commitments,
         manifest,
@@ -118,7 +122,7 @@ fn complete_two_round_session_recovers_and_rejects_tampering() {
         .collect();
 
     let proposal_wire = sessions[0]
-        .publish(MessageKind::Proposal, fixture.proposal.wire_bytes())
+        .publish_proposal(fixture.proposal.wire_bytes(), &fixture.stock_secret)
         .unwrap();
     for session in sessions.iter_mut().skip(1) {
         assert_eq!(
@@ -130,10 +134,10 @@ fn complete_two_round_session_recovers_and_rejects_tampering() {
         sessions[1].ingest(&proposal_wire).unwrap(),
         IngestOutcome::Duplicate
     );
-    let same_body_other_relay = SignedFrame::sign(
-        MessageKind::Proposal,
+    let same_body_other_relay = SignedFrame::sign_proposal(
         fixture.proposal.wire_bytes(),
         &secret(77),
+        &fixture.stock_secret,
     )
     .unwrap();
     assert_eq!(
@@ -160,7 +164,10 @@ fn complete_two_round_session_recovers_and_rejects_tampering() {
     }
 
     let commitment_0 = sessions[1]
-        .publish(MessageKind::Commitment, fixture.commitments[0].wire_bytes())
+        .publish_commitment(
+            fixture.commitments[0].wire_bytes(),
+            &fixture.participant_secrets[0],
+        )
         .unwrap();
     for (index, session) in sessions.iter_mut().enumerate() {
         if index != 1 {
@@ -175,7 +182,10 @@ fn complete_two_round_session_recovers_and_rejects_tampering() {
         .is_err());
 
     let commitment_1 = sessions[2]
-        .publish(MessageKind::Commitment, fixture.commitments[1].wire_bytes())
+        .publish_commitment(
+            fixture.commitments[1].wire_bytes(),
+            &fixture.participant_secrets[1],
+        )
         .unwrap();
     for session in sessions.iter_mut().take(2) {
         assert_eq!(
@@ -271,10 +281,10 @@ fn complete_two_round_session_recovers_and_rejects_tampering() {
         },
     )
     .unwrap();
-    let external = SignedFrame::sign(
-        MessageKind::Proposal,
+    let external = SignedFrame::sign_proposal(
         fixture.proposal.wire_bytes(),
         &secret(77),
+        &fixture.stock_secret,
     )
     .unwrap();
     assert!(wrong_chain.ingest(&external.to_wire()).is_err());
@@ -302,7 +312,7 @@ fn tcp_relay_persists_before_reporting_forward_success() {
     let mut sender = Session::init(sender_root.path(), fixture.policy).unwrap();
     let receiver = Session::init(receiver_root.path(), fixture.policy).unwrap();
     let wire = sender
-        .publish(MessageKind::Proposal, fixture.proposal.wire_bytes())
+        .publish_proposal(fixture.proposal.wire_bytes(), &fixture.stock_secret)
         .unwrap();
 
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -324,4 +334,146 @@ fn tcp_relay_persists_before_reporting_forward_success() {
             .unwrap(),
         status
     );
+}
+
+#[test]
+fn malformed_connection_is_rejected_without_stopping_relay() {
+    let fixture = fixture();
+    let sender_root = tempfile::tempdir().unwrap();
+    let receiver_root = tempfile::tempdir().unwrap();
+    let mut sender = Session::init(sender_root.path(), fixture.policy).unwrap();
+    let receiver = Session::init(receiver_root.path(), fixture.policy).unwrap();
+    let valid = sender
+        .publish_proposal(fixture.proposal.wire_bytes(), &fixture.stock_secret)
+        .unwrap();
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let joined = thread::spawn(move || {
+        let mut receiver = receiver;
+        let rejected = relay_next(&listener, &mut receiver, &[]).unwrap();
+        let processed = relay_next(&listener, &mut receiver, &[]).unwrap();
+        (rejected, processed, receiver.status().unwrap())
+    });
+    send_frame(address, b"not-a-canonical-frame").unwrap();
+    send_frame(address, &valid).unwrap();
+    let (rejected, processed, status) = joined.join().unwrap();
+    assert!(matches!(rejected, RelayAttempt::Rejected { .. }));
+    assert!(matches!(
+        processed,
+        RelayAttempt::Processed(report) if report.outcome == IngestOutcome::Accepted
+    ));
+    assert_eq!(status.phase, ProtocolPhase::Proposed);
+}
+
+#[test]
+fn local_commitment_quota_and_authorized_identities_are_enforced() {
+    let fixture = fixture();
+    let root = tempfile::tempdir().unwrap();
+    let mut session = Session::init_with_relay_policy(
+        root.path(),
+        fixture.policy,
+        RelayPolicy {
+            max_commitments: 1,
+            ..RelayPolicy::default()
+        },
+    )
+    .unwrap();
+    session
+        .publish_proposal(fixture.proposal.wire_bytes(), &fixture.stock_secret)
+        .unwrap();
+    session
+        .publish_commitment(
+            fixture.commitments[0].wire_bytes(),
+            &fixture.participant_secrets[0],
+        )
+        .unwrap();
+    let error = session
+        .publish_commitment(
+            fixture.commitments[1].wire_bytes(),
+            &fixture.participant_secrets[1],
+        )
+        .unwrap_err();
+    assert!(error.to_string().contains("commitment quota"));
+    assert_eq!(
+        Session::open(root.path())
+            .unwrap()
+            .status()
+            .unwrap()
+            .commitments,
+        1
+    );
+}
+
+#[test]
+fn proposal_reannouncement_is_idempotent_but_conflict_is_rejected() {
+    let fixture = fixture();
+    let root = tempfile::tempdir().unwrap();
+    let mut session = Session::init(root.path(), fixture.policy).unwrap();
+    let first = session
+        .publish_proposal(fixture.proposal.wire_bytes(), &fixture.stock_secret)
+        .unwrap();
+    assert_eq!(session.ingest(&first).unwrap(), IngestOutcome::Duplicate);
+
+    let conflicting = Proposal::new(
+        fixture.policy.chain_id,
+        fixture.proposal.stock_outpoint(),
+        fixture.proposal.stock_value(),
+        fixture.proposal.stock_owner_pubkey(),
+        2,
+        [0x91; 32],
+        100,
+        110,
+        2,
+        20,
+    )
+    .unwrap();
+    let frame =
+        SignedFrame::sign_proposal(conflicting.wire_bytes(), &secret(92), &fixture.stock_secret)
+            .unwrap();
+    let error = session.ingest(&frame.to_wire()).unwrap_err();
+    assert!(error.to_string().contains("different proposal body"));
+}
+
+#[test]
+fn earlier_epoch_signature_blocks_sign_and_disappear_abort() {
+    let fixture = fixture();
+    let root = tempfile::tempdir().unwrap();
+    let mut session = Session::init(root.path(), fixture.policy).unwrap();
+    session
+        .publish_proposal(fixture.proposal.wire_bytes(), &fixture.stock_secret)
+        .unwrap();
+    for (index, (commitment, key)) in fixture
+        .commitments
+        .iter()
+        .zip(&fixture.participant_secrets)
+        .enumerate()
+    {
+        let frame = SignedFrame::sign_commitment(
+            &fixture.proposal,
+            commitment.wire_bytes(),
+            &secret(100 + index as u8),
+            key,
+        )
+        .unwrap();
+        session.ingest(&frame.to_wire()).unwrap();
+    }
+    session
+        .publish(MessageKind::Manifest, fixture.manifest.wire_bytes())
+        .unwrap();
+    session
+        .publish(MessageKind::Signature, fixture.shares[0].wire_bytes())
+        .unwrap();
+
+    let replacement = fixture.manifest.replacement(&fixture.proposal, 3).unwrap();
+    session
+        .publish(MessageKind::Manifest, replacement.wire_bytes())
+        .unwrap();
+    let error = session
+        .mark_phase(
+            ProtocolPhase::AbortedBeforeSignature,
+            "latest epoch unsigned but prior signature escaped",
+        )
+        .unwrap_err();
+    assert!(error.to_string().contains("illegal batch phase transition"));
 }
