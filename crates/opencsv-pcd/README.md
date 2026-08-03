@@ -91,7 +91,7 @@ call-site discipline.
   implements `opencsv-core`'s `ProofVerifier` trait — **no trait change and
   no `opencsv-core` dependency cycle** (the integration lives in this
   crate). The trait's `proof: &[u8]` blob carries a magic-prefixed,
-  version-2 postcard envelope of `(mode, full statement, batch-STARK proof)`
+  version-3 postcard envelope of `(mode, full statement, batch-STARK proof)`
   (`encode_coin_proof`); the
   adapter decodes it, checks the statement *projects* onto the driver's
   reconstructed public input
@@ -102,11 +102,12 @@ call-site discipline.
   native batch-STARK verification). The full statement must ride in the
   proof bytes because anchors carry only truncated digests and openings do
   not carry nullifiers — this is sound because the statement-table values
-  are transcript-bound. `vk` is currently ignored by this adapter.
+  are transcript-bound. `vk` must equal the frozen v3 profile tag
+  `opencsv-pcd-coin-v3-fri94`; legacy or foreign tags fail before decoding.
   Recursive predecessor keys are pinned inside every transfer/redeem
-  circuit, but the self-described *root* proof remains a separate
-  root-key allowlisting boundary (below). The proof lineage version is bound
-  inside the statement table as well as the outer envelope.
+  circuit. Registering the exact self-described *root-circuit commitments*
+  remains a separate trust-distribution boundary (below). The proof lineage
+  version is bound inside the statement table as well as the outer envelope.
 - **Acceptance test** (`tests/acceptance.rs`, `#[ignore]`d): the full
   protocol flow end-to-end — issuer keygen → mint → anchor → `accept()`
   with the real verifier → 2-in/2-out transfer → anchor → `accept()` →
@@ -142,7 +143,7 @@ point after a few recursion depths).
  nf_2(8) | out_1(8) | out_2(8)]
 ```
 
-All current proofs have transcript-bound `version = 2`. Mints: `mode = 1`,
+All current proofs have transcript-bound `version = 3`. Mints: `mode = 1`,
 nullifiers zero. Transfers: `mode = 0`, `V` and
 `mint_commit` zero. Redeems (stage 4): `mode = 2`, `V` = burned value,
 `nf_1` the coin's nullifier, `mint_commit` / `nf_2` / outputs zero. The
@@ -151,13 +152,20 @@ outputs / selected values), so they are pinned to the witness by the
 circuit's own constraints; the statement table then binds them into the
 proof (see below).
 
-**STARK config.** The stage-3 circuits prove under a custom config
-(`src/recursion_config.rs`) instead of `baby_bear()`: the benchmark FRI
-parameters (100 queries, 16 PoW bits) are far too expensive to verify
-in-circuit. `CoinFriParams::testing()` (log_blowup 2, arity 4, 2 queries,
-no PoW, final poly 2²) is **test-grade — a few bits of conjectured
-soundness, not a security claim**; production parameters must be re-chosen
-and the in-circuit verifier cost re-measured.
+**STARK config.** Proof lineage v3 freezes `CoinFriParams::production()`:
+`log_blowup = 3` (8× LDE), maximum folding arity 4,
+`log_final_poly_len = 2`, 64 queries, 16 commit-grinding bits per FRI round,
+and 16 query-grinding bits. The lookup-expanded batch shapes contain at most
+707 constraints at maximum degree 3; setup rejects drift beyond the audited
+budgets of 1024 constraints / degree 3. The Plonky3 0.6.3 proven-security
+calculator is evaluated against every proof's actual extended trace degrees.
+The calculator uses conservative `floor(log2(|BabyBear^4|)) = 123`, then
+OpenCSV subtracts 2 bits for its four soundness components and 3 bits for
+seven batch instances, publishing and enforcing a 94-bit floor. The random-words
+conjectured estimate is capped at 123 bits and is not used as the deployment
+claim. `CoinFriParams::testing()` remains explicit and is used only by the
+recursion feasibility spike. See `src/security.rs` and `BENCHMARKS.md` for
+the executable receipt and references.
 
 ## Public-input binding (stage 3)
 
@@ -326,14 +334,14 @@ limb range checks, carries and recompose-via-ALU packing.
 ## Deviations from the paper
 
 - **Issuer authorization is a PCD signature of knowledge.** A recursive
-  version-2 mint proves knowledge of the seed committed by
+  version-3 mint proves knowledge of the seed committed by
   `genesis.issuer_pk`, derives the claimed asset id from the full genesis,
   and transcript-binds the exact mint statement in the same circuit. That
   coin proof is the authorization artifact; this is not an independently
   verifiable conventional signature. The standalone stage-2 `MintProof`
   still has the public-input limitation documented below and is not a
   production authorization boundary. Legacy Ed25519 records remain
-  inspectable/exportable but cannot create version-2 mints.
+  inspectable/exportable but cannot create version-3 mints.
 - **Single-asset transfers.** All inputs/outputs of a transfer share one
   public `asset_id`. Paper §4.5 allows mixed assets with per-asset
   conservation and *hidden* transferred asset ids; that needs per-coin asset
@@ -344,11 +352,11 @@ limb range checks, carries and recompose-via-ALU packing.
 - **Consignment proof bytes carry the full statement** (stage 4). The
   paper's `x` for the accept driver is reconstructed from the anchor and
   openings, but anchors hold only 24-byte truncated digests, so
-  `CoinProofVerifier`'s magic-prefixed version-2 envelope carries
+  `CoinProofVerifier`'s magic-prefixed version-3 envelope carries
   `(mode, statement, proof)` and
   checks the statement projects onto `x` (truncation- and tag-wise) before
   verifying. Legacy unprefixed envelopes decode for inspection as version 1
-  but fail verification and cannot be recursive predecessors. Version 2 is
+  but fail verification and cannot be recursive predecessors. Version 3 is
   also the first transcript-bound statement element, so an older proof
   cannot be promoted by relabeling its outer envelope. Soundness is
   unaffected: the whole statement is transcript-bound via the statement
@@ -462,44 +470,23 @@ stage-1/2 standalone circuits remain carried-and-compared.
 cargo test -p opencsv-pcd -- --nocapture
 ```
 
-The detailed timings below are the historical pre-version-2 receipt from
-`BENCHMARKS.md`. They remain useful as a baseline, but they predate the D1
-setup cache, D3 issuer circuit, and transcript-bound 53-element statement.
-D2 will publish new cold/warm, release, and on-device measurements instead
-of relabeling these numbers:
+The D2 production-profile receipt is in `BENCHMARKS.md`. On an Apple M4,
+release proving is 0.10–0.12 s for mint, 7.8–12.2 s for recursive transfer,
+and 4.7–5.9 s for redeem (warm/cold); verification is 15–22 ms. Proofs are
+0.54–0.85 MB. The benchmark reports every proof's actual trace degrees and
+raw/union-adjusted proven-security estimate alongside timings and sizes.
+On a physical iPhone 16e (A18), the same cold sequence measured 0.181 s for
+mint, 11.253 s and 14.469 s for the two transfer shapes, and 7.283 s for
+redeem, with 18–23 ms verification. The four-step Horner packing in the
+frozen profile is required to stay below the phone's process-memory ceiling;
+the rejected candidates and kernel receipt are in `BENCHMARKS.md`.
 
-- `genesis_mint_verifies` (a): prove ≈ 1.6 s, verify ≈ 57 ms, proof ≈ 46 KB.
-- `transfer_spending_mint_outputs_verifies` (b, the money test — two
-  in-circuit predecessor verifications): prove ≈ 71 s, verify ≈ 46 ms,
-  proof ≈ 56 KB.
-- `wrong_predecessor_fails` (d): off-circuit pre-check rejects a coin the
-  predecessor never created; a predecessor whose *carried* statement is
-  tampered to pass the pre-check fails in-circuit at witness generation
-  (witness conflict on the chaining constraint).
-- `tampered_public_data_fails` (e): wrong expected statement, wrong asset,
-  wrong mode — all rejected with `NodeError::StatementMismatch` before STARK
-  verification (the statement table's bound values are compared).
-- Stage 4 (`tests/redeem.rs`): `mint_to_redeem_round_trip` (prove ≈ 35 s,
-  verify ≈ 46 ms, proof ≈ 54 KB), `wrong_osk_fails` (witness conflict at
-  proving time). `transfer_then_redeem` is `#[ignore]`d (~2 min); run it
-  with `cargo test -p opencsv-pcd --test redeem -- --ignored --nocapture`.
-- The **acceptance test** (`tests/acceptance.rs`, the project's end-to-end
-  protocol check — mint → accept → transfer → accept → double-spend
-  rejected → redeem → supply audit, all with real proofs) is `#[ignore]`d
-  (~3 min); run it with
-  `cargo test -p opencsv-pcd --test acceptance -- --ignored --nocapture`.
-- Benchmarks (`tests/bench.rs`, `#[ignore]`d; debug and release numbers):
-  see `BENCHMARKS.md`.
-- `two_hop_chain_verifies` (c) is `#[ignore]`d (~2.5 min); run it with
-  `cargo test -p opencsv-pcd --test node -- --ignored --nocapture`:
-  hop 1 (mint predecessors) prove ≈ 71 s / verify ≈ 45 ms / 56,041 B;
-  hop 2 (node predecessors) prove ≈ 69 s / verify ≈ 45 ms / 56,041 B —
-  **proof size and verification time are constant in history length**, as
-  PCD requires.
-
-Stage-1/2 tests (unchanged, ~13 s): `opening.rs` (~2.2 s), `mint.rs`
-(~2.8 s), `transfer.rs` (~7 s) — see git history for the per-test
-breakdown.
+The ignored acceptance test remains the full real-proof protocol check:
+mint → accept → transfer → accept → later double-spend rejected → redeem →
+supply audit. Run it with `cargo test -p opencsv-pcd --release --test
+acceptance -- --ignored --nocapture`. The node and redeem suites cover
+wrong predecessors, public-data tampering, issuer forgery, wrong owner
+secrets, legacy proof versions, and history-independent proof size.
 
 All negative proving tests fail with `*Error::Circuit` at witness
 generation (witness-slot conflicts on the aliased `connect` slots), never as
@@ -521,14 +508,12 @@ spike.)
 
 ## What's next
 
-1. **Production parameters:** `CoinFriParams::testing()` is test-grade (a
-   few bits of conjectured soundness); choose real FRI parameters and
-   re-measure the in-circuit verifier cost.
-2. **Root-key registry/versioning:** bind the accept adapter's `vk` argument
-   to an explicit allowlist of production root circuit identities and proof
-   versions. Recursive predecessor hard-binding is already enforced.
-3. **Paper gap carried from stage 2:** single-asset transfers (§4.5).
-4. **Shipped in stage 4:** the redeem circuit (§4.6), accept-driver
+1. **Root-circuit commitment registry:** the accept adapter already pins the
+   v3 lineage/profile tag and recursive predecessor keys are hard-bound, but
+   deployments must distribute the accepted self-described root circuit
+   commitments as shapes converge.
+2. **Paper gap carried from stage 2:** single-asset transfers (§4.5).
+3. **Shipped in stage 4:** the redeem circuit (§4.6), accept-driver
    integration with the real recursive verifier, the end-to-end acceptance
    test, and benchmarks (`BENCHMARKS.md`).
 

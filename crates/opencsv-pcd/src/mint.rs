@@ -17,7 +17,7 @@
 //! This is the issuer-authorization AIR relation used by the recursive mint
 //! circuit. Because this standalone stage-2 wrapper inherits the crate's
 //! public-input binding limitation, the production authorization artifact is
-//! the transcript-bound version-2 [`crate::CoinProof`], not [`MintProof`] in
+//! the transcript-bound version-3 [`crate::CoinProof`], not [`MintProof`] in
 //! isolation. It is not an independently verifiable conventional signature.
 //!
 //! The output commitments are recomputed in-circuit from the witness

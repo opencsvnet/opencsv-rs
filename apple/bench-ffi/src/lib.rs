@@ -11,8 +11,8 @@ use std::time::Instant;
 
 use opencsv_core::{AssetGenesis, Coin, Digest, OwnerSecret, PoseidonIssuerAuthorization};
 use opencsv_pcd::{
-    prove_coin_transfer, prove_genesis_mint, prove_redeem, verify_coin_proof, verify_redeem,
-    CoinProof,
+    proof_security_report, prove_coin_transfer, prove_genesis_mint, prove_redeem,
+    verify_coin_proof, verify_redeem, CoinProof, COIN_PROOF_PROFILE_ID,
 };
 
 const ISSUER_SECRET: [u8; 32] = [0x42; 32];
@@ -53,6 +53,24 @@ fn fmt_ms(d: std::time::Duration) -> f64 {
     d.as_secs_f64() * 1000.0
 }
 
+fn emit_partial(
+    circuit: &str,
+    prove: std::time::Duration,
+    verify: std::time::Duration,
+    proof: &CoinProof,
+) {
+    let security = proof_security_report(proof);
+    eprintln!(
+        "OPENCSV_BENCH_PARTIAL {{\"circuit\":{circuit:?},\"prove_ms\":{:.1},\"verify_ms\":{:.2},\"proof_bytes\":{},\"proven_bits\":{},\"adjusted_bits\":{},\"degree_bits\":{:?}}}",
+        fmt_ms(prove),
+        fmt_ms(verify),
+        proof_size(proof),
+        security.proven_bits,
+        security.union_adjusted_bits,
+        security.degree_bits,
+    );
+}
+
 fn run() -> Result<String, String> {
     let mut rows = String::new();
 
@@ -65,12 +83,18 @@ fn run() -> Result<String, String> {
     let mint_prove = t.elapsed();
     let t = Instant::now();
     verify_coin_proof(&mint.statement, &mint).map_err(|e| e.to_string())?;
+    let mint_verify = t.elapsed();
+    let mint_security = proof_security_report(&mint);
     rows.push_str(&format!(
-        "{{\"circuit\":\"genesis mint\",\"prove_ms\":{:.1},\"verify_ms\":{:.2},\"proof_bytes\":{}}},",
+        "{{\"circuit\":\"genesis mint\",\"prove_ms\":{:.1},\"verify_ms\":{:.2},\"proof_bytes\":{},\"proven_bits\":{},\"adjusted_bits\":{},\"degree_bits\":{:?}}},",
         fmt_ms(mint_prove),
-        fmt_ms(t.elapsed()),
-        proof_size(&mint)
+        fmt_ms(mint_verify),
+        proof_size(&mint),
+        mint_security.proven_bits,
+        mint_security.union_adjusted_bits,
+        mint_security.degree_bits,
     ));
+    emit_partial("genesis mint", mint_prove, mint_verify, &mint);
 
     // Transfer, hop 1 (2 in-circuit verifications of mint proofs).
     let inputs1 = [(coins[0], osk(0x22)), (coins[1], osk(0x44))];
@@ -81,12 +105,23 @@ fn run() -> Result<String, String> {
     let t1_prove = t.elapsed();
     let t = Instant::now();
     verify_coin_proof(&t1.statement, &t1).map_err(|e| e.to_string())?;
+    let t1_verify = t.elapsed();
+    let t1_security = proof_security_report(&t1);
     rows.push_str(&format!(
-        "{{\"circuit\":\"transfer hop 1 (2 mint predecessors)\",\"prove_ms\":{:.1},\"verify_ms\":{:.2},\"proof_bytes\":{}}},",
+        "{{\"circuit\":\"transfer hop 1 (2 mint predecessors)\",\"prove_ms\":{:.1},\"verify_ms\":{:.2},\"proof_bytes\":{},\"proven_bits\":{},\"adjusted_bits\":{},\"degree_bits\":{:?}}},",
         fmt_ms(t1_prove),
-        fmt_ms(t.elapsed()),
-        proof_size(&t1)
+        fmt_ms(t1_verify),
+        proof_size(&t1),
+        t1_security.proven_bits,
+        t1_security.union_adjusted_bits,
+        t1_security.degree_bits,
     ));
+    emit_partial(
+        "transfer hop 1 (2 mint predecessors)",
+        t1_prove,
+        t1_verify,
+        &t1,
+    );
 
     // Transfer, hop 2 (2 in-circuit verifications of node proofs).
     let inputs2 = [(outputs1[0], osk(0x66)), (outputs1[1], osk(0x88))];
@@ -97,12 +132,23 @@ fn run() -> Result<String, String> {
     let t2_prove = t.elapsed();
     let t = Instant::now();
     verify_coin_proof(&t2.statement, &t2).map_err(|e| e.to_string())?;
+    let t2_verify = t.elapsed();
+    let t2_security = proof_security_report(&t2);
     rows.push_str(&format!(
-        "{{\"circuit\":\"transfer hop 2 (2 node predecessors)\",\"prove_ms\":{:.1},\"verify_ms\":{:.2},\"proof_bytes\":{}}},",
+        "{{\"circuit\":\"transfer hop 2 (2 node predecessors)\",\"prove_ms\":{:.1},\"verify_ms\":{:.2},\"proof_bytes\":{},\"proven_bits\":{},\"adjusted_bits\":{},\"degree_bits\":{:?}}},",
         fmt_ms(t2_prove),
-        fmt_ms(t.elapsed()),
-        proof_size(&t2)
+        fmt_ms(t2_verify),
+        proof_size(&t2),
+        t2_security.proven_bits,
+        t2_security.union_adjusted_bits,
+        t2_security.degree_bits,
     ));
+    emit_partial(
+        "transfer hop 2 (2 node predecessors)",
+        t2_prove,
+        t2_verify,
+        &t2,
+    );
 
     // Redeem (1 in-circuit verification of a node predecessor).
     let t = Instant::now();
@@ -111,16 +157,28 @@ fn run() -> Result<String, String> {
     let redeem_prove = t.elapsed();
     let t = Instant::now();
     verify_redeem(&redeem.statement, &redeem).map_err(|e| e.to_string())?;
+    let redeem_verify = t.elapsed();
+    let redeem_security = proof_security_report(&redeem);
     rows.push_str(&format!(
-        "{{\"circuit\":\"redeem (1 node predecessor)\",\"prove_ms\":{:.1},\"verify_ms\":{:.2},\"proof_bytes\":{}}}",
+        "{{\"circuit\":\"redeem (1 node predecessor)\",\"prove_ms\":{:.1},\"verify_ms\":{:.2},\"proof_bytes\":{},\"proven_bits\":{},\"adjusted_bits\":{},\"degree_bits\":{:?}}}",
         fmt_ms(redeem_prove),
-        fmt_ms(t.elapsed()),
-        proof_size(&redeem)
+        fmt_ms(redeem_verify),
+        proof_size(&redeem),
+        redeem_security.proven_bits,
+        redeem_security.union_adjusted_bits,
+        redeem_security.degree_bits,
     ));
+    emit_partial(
+        "redeem (1 node predecessor)",
+        redeem_prove,
+        redeem_verify,
+        &redeem,
+    );
 
     Ok(format!(
-        "{{\"device\":\"{}\",\"results\":[{}]}}",
+        "{{\"device\":\"{}\",\"profile\":\"{}\",\"results\":[{}]}}",
         std::env::consts::ARCH,
+        COIN_PROOF_PROFILE_ID,
         rows
     ))
 }

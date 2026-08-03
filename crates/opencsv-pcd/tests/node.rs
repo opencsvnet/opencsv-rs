@@ -233,7 +233,7 @@ fn tampered_public_data_fails() {
 }
 
 /// The recursive mint AIR rejects an issuer forgery even when the native
-/// consistency check is bypassed, and version-1 lineages fail closed.
+/// consistency check is bypassed, and pre-v3 lineages fail closed.
 #[test]
 fn issuer_forgery_and_legacy_lineage_fail() {
     let coins = [coin(60, 0x22, 0x33), coin(40, 0x44, 0x55)];
@@ -269,12 +269,12 @@ fn issuer_forgery_and_legacy_lineage_fail() {
         .expect("coin proof has a statement table");
     statement_entry.public_values.drain(0..4);
     let err = verify_coin_proof(&relabeled.statement, &relabeled)
-        .expect_err("an old statement shape cannot be relabeled as version 2");
+        .expect_err("an old statement shape cannot be relabeled as version 3");
     assert!(matches!(err, NodeError::StatementMismatch));
 
     let (mint, _) = genesis();
     let legacy = CoinProof {
-        version: 1,
+        version: 2,
         mode: mint.mode,
         statement: mint.statement.clone(),
         proof: mint.proof,
@@ -283,7 +283,24 @@ fn issuer_forgery_and_legacy_lineage_fail() {
         .expect_err("legacy unauthenticated proofs must not verify");
     assert!(matches!(
         err,
-        NodeError::UnsupportedProofVersion { actual: 1 }
+        NodeError::UnsupportedProofVersion { actual: 2 }
     ));
-    assert_eq!(COIN_PROOF_VERSION, 2);
+    assert_eq!(COIN_PROOF_VERSION, 3);
+}
+
+/// Verification rejects a proof whose concrete trace growth has crossed the
+/// frozen production profile's security floor before attempting cryptography.
+#[test]
+fn oversized_trace_metadata_fails_closed() {
+    let (mut mint, _) = genesis();
+    mint.proof.proof.degree_bits[0] = 19;
+    let err = verify_coin_proof(&mint.statement, &mint)
+        .expect_err("a proof below the deployment security floor must fail closed");
+    assert!(matches!(
+        err,
+        NodeError::InsufficientProofSecurity {
+            actual: 93,
+            required: 94
+        }
+    ));
 }

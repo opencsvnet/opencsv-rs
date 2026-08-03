@@ -1,4 +1,5 @@
 import SwiftUI
+import UIKit
 
 @main
 struct OpenCsvBenchApp: App {
@@ -27,14 +28,22 @@ struct ContentView: View {
             }
         }
         .padding()
+        .task {
+            if !running {
+                runBenchmark()
+            }
+        }
     }
 
     private func runBenchmark() {
         running = true
+        UIApplication.shared.isIdleTimerDisabled = true
         DispatchQueue.global(qos: .userInitiated).async {
             var text: String
             if let ptr = opencsv_bench_run() {
-                text = pretty(String(cString: ptr))
+                let raw = String(cString: ptr)
+                print("OPENCSV_BENCH_RESULT \(raw)")
+                text = Self.pretty(raw)
                 opencsv_bench_free_string(ptr)
             } else {
                 text = "opencsv_bench_run returned null"
@@ -42,12 +51,13 @@ struct ContentView: View {
             DispatchQueue.main.async {
                 output = text
                 running = false
+                UIApplication.shared.isIdleTimerDisabled = false
             }
         }
     }
 
     /// Minimal JSON pretty-printer for display; falls back to raw text.
-    private func pretty(_ raw: String) -> String {
+    private nonisolated static func pretty(_ raw: String) -> String {
         guard let data = raw.data(using: .utf8),
               let obj = try? JSONSerialization.jsonObject(with: data),
               let pretty = try? JSONSerialization.data(

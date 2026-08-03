@@ -9,14 +9,14 @@
 //! examples (BabyBear, quartic challenge extension, Poseidon2 MMCS and
 //! challenger).
 //!
-//! **Security note:** the default parameters here are test-grade (a handful
-//! of FRI queries, no proof-of-work) so that debug-profile tests finish; they
-//! offer only a few bits of conjectured soundness. Production parameters must
-//! be re-chosen (and the in-circuit verifier cost re-measured) before any of
-//! this is relied upon.
+//! Proof lineage v3 uses [`CoinFriParams::production`], whose exact profile,
+//! lookup-expanded AIR bounds, concrete proof-degree checks, and measured
+//! costs are documented in `BENCHMARKS.md`. [`CoinFriParams::testing`] remains
+//! explicit and is used only by the recursion feasibility spike.
 
 use std::sync::{Arc, OnceLock};
 
+use p3_air::symbolic::AirLayout;
 use p3_baby_bear::{default_babybear_poseidon2_16, BabyBear, Poseidon2BabyBear};
 use p3_challenger::DuplexChallenger;
 use p3_circuit::{CircuitRunner, NonPrimitiveOpId};
@@ -92,7 +92,25 @@ pub struct CoinFriParams {
 }
 
 impl CoinFriParams {
-    /// Test-grade parameters: cheap enough to verify in-circuit in a debug
+    /// Production profile for proof lineage v3.
+    ///
+    /// The profile uses an 8x low-degree extension, 64 FRI queries, and
+    /// explicit commit/query grinding. Its security is audited against the
+    /// lookup-expanded batch AIRs; see `BENCHMARKS.md` for the measured
+    /// security and performance receipts.
+    pub const fn production() -> Self {
+        Self {
+            log_blowup: 3,
+            max_log_arity: 2,
+            cap_height: 0,
+            log_final_poly_len: 2,
+            num_queries: 64,
+            commit_proof_of_work_bits: 16,
+            query_proof_of_work_bits: 16,
+        }
+    }
+
+    /// Explicit test-grade parameters: cheap enough to verify in-circuit in a debug
     /// build, cryptographically meaningless (a few bits of conjectured
     /// soundness). See the module-level security note.
     pub const fn testing() -> Self {
@@ -268,13 +286,17 @@ const _: fn() = || {
 use p3_batch_stark::ProverData;
 use p3_circuit::Circuit;
 use p3_circuit_prover::batch_stark_prover::recompose_air_builders;
-use p3_circuit_prover::batch_stark_prover::{poseidon2_air_builders, TableProver};
+use p3_circuit_prover::batch_stark_prover::{
+    lookups_for_circuit_table_air, poseidon2_air_builders, TableProver,
+};
 use p3_circuit_prover::common::{get_airs_and_degrees_with_prep, NpoPreprocessor};
 use p3_circuit_prover::{
     BatchStarkProver, CircuitProverData, ConstraintProfile, Poseidon2Preprocessor,
     RecomposePreprocessor, TablePacking,
 };
 
+use crate::node::NodeError;
+use crate::security::{MAX_AIR_CONSTRAINT_DEGREE, MAX_BATCH_CONSTRAINTS};
 use crate::setup_cache::{CachedSetup, SetupCache, SetupIdentity};
 use crate::statement::{StatementAirBuilder, StatementPreprocessor, StatementProver};
 
@@ -305,7 +327,7 @@ pub(crate) struct RecSetup {
 pub(crate) fn setup_circuit<const N: usize>(
     circuit: Circuit<EF>,
     fri_params: &CoinFriParams,
-) -> Result<RecSetup, p3_circuit::CircuitError> {
+) -> Result<RecSetup, NodeError> {
     setup_circuit_with_verification_keys::<N>(circuit, fri_params, &[])
 }
 
@@ -318,9 +340,10 @@ pub(crate) fn setup_circuit_with_verification_keys<const N: usize>(
     circuit: Circuit<EF>,
     fri_params: &CoinFriParams,
     verification_keys: &[SetupIdentity],
-) -> Result<RecSetup, p3_circuit::CircuitError> {
+) -> Result<RecSetup, NodeError> {
     let config = CoinRecursionConfig::new(fri_params);
     let table_packing = TablePacking::new(1, 3)
+        .with_horner_pack_k(4)
         .with_fri_params(fri_params.log_final_poly_len, fri_params.log_blowup);
     let fri_identity = format!("{fri_params:?}");
     let packing_identity = format!("{table_packing:?}");
@@ -339,7 +362,7 @@ pub(crate) fn setup_circuit_with_verification_keys<const N: usize>(
 
     let circuit_prover_data = recursive_setup_cache().get_or_try_insert_with(
         identity,
-        || -> Result<RecCircuitProverData, p3_circuit::CircuitError> {
+        || -> Result<RecCircuitProverData, NodeError> {
             let npo_prep: Vec<Box<dyn NpoPreprocessor<BabyBear>>> = vec![
                 Box::new(Poseidon2Preprocessor),
                 Box::new(RecomposePreprocessor::new(true)),
@@ -357,6 +380,39 @@ pub(crate) fn setup_circuit_with_verification_keys<const N: usize>(
                     ConstraintProfile::Standard,
                 )?;
             let (airs, degrees): (Vec<_>, Vec<usize>) = airs_degrees.into_iter().unzip();
+            let lookup_gadget = LogUpGadget::new();
+            let mut total_constraints = 0;
+            let mut max_constraint_degree = 0;
+            for air in &airs {
+                let lookups =
+                    lookups_for_circuit_table_air::<CoinRecursionConfig, 4>(air, config.is_zk());
+                let (base, extension) = p3_batch_stark::symbolic::get_symbolic_constraints(
+                    air,
+                    AirLayout::from_air(air),
+                    &lookups,
+                    &lookup_gadget,
+                );
+                total_constraints += base.len() + extension.len();
+                max_constraint_degree = max_constraint_degree.max(
+                    base.iter()
+                        .map(|constraint| constraint.degree_multiple())
+                        .chain(
+                            extension
+                                .iter()
+                                .map(|constraint| constraint.degree_multiple()),
+                        )
+                        .max()
+                        .unwrap_or(0),
+                );
+            }
+            if total_constraints > MAX_BATCH_CONSTRAINTS
+                || max_constraint_degree > MAX_AIR_CONSTRAINT_DEGREE
+            {
+                return Err(NodeError::SecurityProfileDrift {
+                    constraints: total_constraints,
+                    max_degree: max_constraint_degree,
+                });
+            }
             let prover_data = ProverData::from_airs_and_degrees(&config, &airs, &degrees);
             Ok(CircuitProverData::new(
                 prover_data,

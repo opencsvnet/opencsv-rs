@@ -13,8 +13,8 @@ use std::time::Instant;
 
 use opencsv_core::{AssetGenesis, Coin, Digest, OwnerSecret, PoseidonIssuerAuthorization};
 use opencsv_pcd::{
-    prove_coin_transfer, prove_genesis_mint, prove_redeem, verify_coin_proof, verify_redeem,
-    CoinProof,
+    proof_security_report, prove_coin_transfer, prove_genesis_mint, prove_redeem,
+    verify_coin_proof, verify_redeem, CoinProof, COIN_PROOF_PROFILE_ID,
 };
 
 const ISSUER_SECRET: [u8; 32] = [0x42; 32];
@@ -56,21 +56,42 @@ struct Row {
     prove: std::time::Duration,
     verify: std::time::Duration,
     size: usize,
+    proven_bits: usize,
+    adjusted_bits: usize,
+    degree_bits: Vec<usize>,
 }
 
 fn report(rows: &[Row]) {
-    println!("\n| circuit | prove | verify | proof size |");
-    println!("|---|---|---|---|");
+    println!("\nprofile: `{COIN_PROOF_PROFILE_ID}`");
+    println!("\n| circuit | prove | verify | proof size | proven bits | union-adjusted bits | degree bits |");
+    println!("|---|---|---|---|---|---|---|");
     for r in rows {
         println!(
-            "| {} | {:.2?} | {:.2?} | {} B |",
-            r.name, r.prove, r.verify, r.size
+            "| {} | {:.2?} | {:.2?} | {} B | {} | {} | `{:?}` |",
+            r.name, r.prove, r.verify, r.size, r.proven_bits, r.adjusted_bits, r.degree_bits,
         );
     }
 }
 
-/// One measurement per circuit, single-shot (each row costs a full
-/// recursive proof; warm-up effects are dwarfed by proving time).
+fn row(
+    name: &'static str,
+    prove: std::time::Duration,
+    verify: std::time::Duration,
+    proof: &CoinProof,
+) -> Row {
+    let security = proof_security_report(proof);
+    Row {
+        name,
+        prove,
+        verify,
+        size: proof_size(proof),
+        proven_bits: security.proven_bits,
+        adjusted_bits: security.union_adjusted_bits,
+        degree_bits: security.degree_bits,
+    }
+}
+
+/// Cold and warm setup measurements for every production circuit shape.
 #[test]
 #[ignore = "benchmark: several full recursive proofs (minutes in debug)"]
 fn coin_proof_benchmarks() {
@@ -85,12 +106,15 @@ fn coin_proof_benchmarks() {
     let prove = t.elapsed();
     let t = Instant::now();
     verify_coin_proof(&mint.statement, &mint).expect("mint verification");
-    rows.push(Row {
-        name: "genesis mint",
-        prove,
-        verify: t.elapsed(),
-        size: proof_size(&mint),
-    });
+    rows.push(row("genesis mint (cold)", prove, t.elapsed(), &mint));
+
+    let t = Instant::now();
+    let warm_mint = prove_genesis_mint(&asset_genesis(), &ISSUER_SECRET, &nonce, &coins)
+        .expect("warm mint proving");
+    let prove = t.elapsed();
+    let t = Instant::now();
+    verify_coin_proof(&warm_mint.statement, &warm_mint).expect("warm mint verification");
+    rows.push(row("genesis mint (warm)", prove, t.elapsed(), &warm_mint));
 
     // Transfer, hop 1 (2 in-circuit verifications of mint proofs).
     let inputs1 = [(coins[0], osk(0x22)), (coins[1], osk(0x44))];
@@ -101,12 +125,25 @@ fn coin_proof_benchmarks() {
     let prove = t.elapsed();
     let t = Instant::now();
     verify_coin_proof(&t1.statement, &t1).expect("hop-1 verification");
-    rows.push(Row {
-        name: "transfer (2 mint predecessors)",
+    rows.push(row(
+        "transfer / mint predecessors (cold)",
         prove,
-        verify: t.elapsed(),
-        size: proof_size(&t1),
-    });
+        t.elapsed(),
+        &t1,
+    ));
+
+    let t = Instant::now();
+    let warm_t1 = prove_coin_transfer(&asset_id(), &inputs1, &outputs1, [&mint, &mint], [0, 1])
+        .expect("warm hop-1 transfer proving");
+    let prove = t.elapsed();
+    let t = Instant::now();
+    verify_coin_proof(&warm_t1.statement, &warm_t1).expect("warm hop-1 verification");
+    rows.push(row(
+        "transfer / mint predecessors (warm)",
+        prove,
+        t.elapsed(),
+        &warm_t1,
+    ));
 
     // Transfer, hop 2 (2 in-circuit verifications of node proofs — one
     // recursion level deeper).
@@ -118,12 +155,25 @@ fn coin_proof_benchmarks() {
     let prove = t.elapsed();
     let t = Instant::now();
     verify_coin_proof(&t2.statement, &t2).expect("hop-2 verification");
-    rows.push(Row {
-        name: "2-hop transfer (2 node predecessors)",
+    rows.push(row(
+        "transfer / node predecessors (cold)",
         prove,
-        verify: t.elapsed(),
-        size: proof_size(&t2),
-    });
+        t.elapsed(),
+        &t2,
+    ));
+
+    let t = Instant::now();
+    let warm_t2 = prove_coin_transfer(&asset_id(), &inputs2, &outputs2, [&t1, &t1], [0, 1])
+        .expect("warm hop-2 transfer proving");
+    let prove = t.elapsed();
+    let t = Instant::now();
+    verify_coin_proof(&warm_t2.statement, &warm_t2).expect("warm hop-2 verification");
+    rows.push(row(
+        "transfer / node predecessors (warm)",
+        prove,
+        t.elapsed(),
+        &warm_t2,
+    ));
 
     // Redeem (1 in-circuit verification of a node predecessor).
     let t = Instant::now();
@@ -132,12 +182,15 @@ fn coin_proof_benchmarks() {
     let prove = t.elapsed();
     let t = Instant::now();
     verify_redeem(&redeem.statement, &redeem).expect("redeem verification");
-    rows.push(Row {
-        name: "redeem (1 node predecessor)",
-        prove,
-        verify: t.elapsed(),
-        size: proof_size(&redeem),
-    });
+    rows.push(row("redeem (cold)", prove, t.elapsed(), &redeem));
+
+    let t = Instant::now();
+    let warm_redeem =
+        prove_redeem(&asset_id(), &(outputs2[0], osk(0x11)), &t2, 0).expect("warm redeem proving");
+    let prove = t.elapsed();
+    let t = Instant::now();
+    verify_redeem(&warm_redeem.statement, &warm_redeem).expect("warm redeem verification");
+    rows.push(row("redeem (warm)", prove, t.elapsed(), &warm_redeem));
 
     report(&rows);
 }

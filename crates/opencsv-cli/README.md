@@ -277,13 +277,14 @@ All files are bincode (serde data model) unless noted.
   chain that never saw the anchor). Demo confirmations are simulated:
   nothing advances the demo tip except `chain advance`.
 - **Mint authorization is proof-native.** `mint` passes the issuer seed and
-  genesis to the version-2 mint circuit, which proves seed control, derives
+  genesis to the version-3 mint circuit, which proves seed control, derives
   the asset id, and binds the exact statement. No standalone signature field
   is omitted from the consignment. Stored legacy Ed25519 issuer records fail
   explicitly at new-mint proving and remain read/export-only.
-- **vk binding.** The `CoinProofVerifier` adapter ignores the `vk` argument
-  and proofs self-describe their common data — see `opencsv-pcd`'s README
-  for the current vk-binding caveats.
+- **vk binding.** `CoinProofVerifier` requires the frozen v3 lineage/profile
+  tag and rejects legacy tags. Proofs still self-describe their root common
+  data; see `opencsv-pcd`'s README for the remaining root-circuit commitment
+  registration boundary.
 
 ## What a Signal transport plugs into
 

@@ -37,7 +37,7 @@ const CONSIGNMENTS_DIR: &str = "consignments";
 pub struct IssuerRecord {
     /// Poseidon-committed issuer seed. Legacy records may contain an Ed25519
     /// secret and are read/export-only because their genesis key will not
-    /// match the version-2 derivation.
+    /// match the AIR-native Poseidon derivation.
     pub isk: [u8; 32],
     /// The asset genesis whose Poseidon issuer commitment matches `isk`.
     pub genesis: AssetGenesis,

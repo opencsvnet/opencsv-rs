@@ -39,9 +39,8 @@ use opencsv_pcd::{
     encode_coin_proof, prove_coin_transfer, prove_genesis_mint, prove_redeem, CoinProofVerifier,
 };
 
-/// vk tag carried in `AcceptParams` (ignored by `CoinProofVerifier` — the
-/// circuit shapes are fixed; see the adapter docs).
-const VK: &[u8] = b"opencsv-pcd-coin-v2";
+/// Frozen production lineage/profile tag carried in `AcceptParams`.
+const VK: &[u8] = opencsv_pcd::COIN_VK_TAG;
 
 fn osk(tag: u8) -> OwnerSecret {
     OwnerSecret::from_bytes([tag; 32])
@@ -119,6 +118,20 @@ fn full_protocol_flow_with_real_proofs() {
     )
     .expect("A accepts the mint consignment");
     assert_eq!(accepted.coins, vec![coin_a1, coin_a2]);
+
+    let wrong_profile = accept(
+        &mint_consignment,
+        &chain,
+        &CoinProofVerifier,
+        &AcceptParams {
+            vk: b"opencsv-pcd-coin-v2",
+            required_confirmations: 6,
+            recipient_secrets: &[osk_a],
+            known_assets: &[],
+        },
+    )
+    .expect_err("a legacy proof-profile tag must fail closed");
+    assert_eq!(wrong_profile, RejectReason::InvalidProof);
 
     // --- 3. A → B transfer: 2-in/2-out (70 to B, 30 to B), two in-circuit
     // predecessor verifications of the mint proof.

@@ -84,6 +84,7 @@ mod node;
 mod opening;
 mod prove;
 mod recursion_config;
+mod security;
 mod setup_cache;
 #[cfg(test)]
 mod spike;
@@ -114,6 +115,10 @@ pub use node::{
 pub use opening::{
     prove_opening, prove_opening_raw, verify_opening, CoinWitness, OpeningError, OpeningProof,
     PRIVATE_ELEMS, PUBLIC_ELEMS,
+};
+pub use security::{
+    proof_security_report, ProofSecurityReport, COIN_PROOF_PROFILE_ID, COIN_VK_TAG,
+    PRODUCTION_SECURITY_TARGET_BITS,
 };
 pub use transfer::{
     prove_transfer, verify_transfer, TransferError, TransferProof, TransferStatement,

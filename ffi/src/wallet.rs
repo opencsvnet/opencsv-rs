@@ -34,9 +34,8 @@ use serde::{Deserialize, Serialize};
 use crate::hex::{from_hex_array, to_hex};
 use crate::snapshot::SnapshotChain;
 
-/// vk tag passed to the accept driver (`opencsv_pcd::CoinProofVerifier`
-/// ignores it; kept identical to `opencsv-cli`'s for consistency).
-pub const COIN_VK: &[u8] = b"opencsv-pcd-coin-v2";
+/// Frozen production lineage/profile tag passed to the accept driver.
+pub const COIN_VK: &[u8] = opencsv_pcd::COIN_VK_TAG;
 
 /// One operation's failure, as a display string for the JSON boundary.
 pub type OpError = String;

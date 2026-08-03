@@ -30,9 +30,8 @@ use crate::error::Error;
 use crate::hexutil::to_hex;
 use crate::store::{consignment_name, CoinStatus, IssuerRecord, StoredCoin, Wallet};
 
-/// vk tag passed to the accept driver. `opencsv_pcd::CoinProofVerifier`
-/// ignores it (circuit shapes are fixed — see the adapter docs).
-pub const COIN_VK: &[u8] = b"opencsv-pcd-coin-v2";
+/// Frozen production lineage/profile tag passed to the accept driver.
+pub const COIN_VK: &[u8] = opencsv_pcd::COIN_VK_TAG;
 
 /// Default confirmation depth required by [`receive`] (paper §4.7 rule 2).
 pub const DEFAULT_CONFIRMATIONS: u64 = 6;

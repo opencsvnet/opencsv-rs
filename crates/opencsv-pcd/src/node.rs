@@ -108,8 +108,8 @@ pub const NODE_INPUTS: usize = 2;
 /// Number of node outputs (created coins).
 pub const NODE_OUTPUTS: usize = 2;
 
-/// Proof lineage version carrying in-circuit issuer authorization.
-pub const COIN_PROOF_VERSION: u8 = 2;
+/// Proof lineage version carrying issuer authorization and the frozen D2 FRI profile.
+pub const COIN_PROOF_VERSION: u8 = 3;
 
 /// Statement layout, in field elements (see module docs):
 /// version (1) + mode (1) + asset_id (8) + V (3) + mint_commit (8) +
@@ -309,6 +309,22 @@ pub enum NodeError {
         /// Version carried by the proof.
         actual: u8,
     },
+    /// The concrete proof's trace degrees fall below the frozen production
+    /// security floor after conservative union-bound margins.
+    InsufficientProofSecurity {
+        /// Union-adjusted proven-security estimate.
+        actual: usize,
+        /// Minimum accepted estimate.
+        required: usize,
+    },
+    /// The lookup-expanded circuit shape exceeded the profile audited for
+    /// this proof lineage.
+    SecurityProfileDrift {
+        /// Total constraints across the batch AIRs.
+        constraints: usize,
+        /// Maximum constraint degree across the batch AIRs.
+        max_degree: usize,
+    },
     /// A predecessor's `asset_id` does not match this node's asset.
     PredecessorAssetMismatch,
     /// A predecessor's selected output commitment does not equal the consumed
@@ -360,6 +376,17 @@ impl std::fmt::Display for NodeError {
             Self::UnsupportedProofVersion { actual } => write!(
                 f,
                 "unsupported coin-proof version {actual}; expected {COIN_PROOF_VERSION}"
+            ),
+            Self::InsufficientProofSecurity { actual, required } => write!(
+                f,
+                "coin proof has {actual} union-adjusted proven security bits; {required} required"
+            ),
+            Self::SecurityProfileDrift {
+                constraints,
+                max_degree,
+            } => write!(
+                f,
+                "coin circuit exceeds frozen security shape: {constraints} constraints, degree {max_degree}"
             ),
             Self::PredecessorAssetMismatch => {
                 write!(f, "predecessor asset does not match this node's asset")
@@ -495,7 +522,7 @@ fn mint_witness_layout(private: &[ExprId]) -> MintWitness<'_> {
 /// table (no predecessor verification).
 fn build_mint_circuit() -> Result<Circuit<EF>, NodeError> {
     let mut builder = CircuitBuilder::<EF>::new();
-    crate::recursion_config::CoinRecursionConfig::new(&CoinFriParams::testing())
+    crate::recursion_config::CoinRecursionConfig::new(&CoinFriParams::production())
         .prepare_circuit_for_verification(&mut builder)?;
     builder.register_npo(StatementCircuitPlugin::<STATEMENT_ELEMS>::new());
 
@@ -536,7 +563,7 @@ fn build_mint_circuit() -> Result<Circuit<EF>, NodeError> {
         &[witness.asset_id, witness.value_total, witness.mint_nonce],
     )?;
 
-    // Statement: [version=2 | mode=1 | asset | V | mint_commit | nf = 0 ×2 | out ×2].
+    // Statement: [version=3 | mode=1 | asset | V | mint_commit | nf = 0 ×2 | out ×2].
     let mut stmt = Vec::with_capacity(STATEMENT_ELEMS);
     stmt.push(const_expr(
         &mut builder,
@@ -686,7 +713,7 @@ fn build_node_circuit(
         Err(_) => unreachable!("two predecessors verified above"),
     };
 
-    // --- statement: [version=2 | mode=0 | asset | V = 0 | mint_commit = 0 | nf ×2 | out ×2].
+    // --- statement: [version=3 | mode=0 | asset | V = 0 | mint_commit = 0 | nf ×2 | out ×2].
     let mut stmt = Vec::with_capacity(STATEMENT_ELEMS);
     stmt.push(const_expr(
         &mut builder,
@@ -936,7 +963,7 @@ fn build_redeem_circuit(
         &commitment,
     )?;
 
-    // --- statement: [version=2 | mode=2 | asset | V = v | mint_commit = 0 | nf | 0 | 0 | 0].
+    // --- statement: [version=3 | mode=2 | asset | V = v | mint_commit = 0 | nf | 0 | 0 | 0].
     let mut stmt = Vec::with_capacity(STATEMENT_ELEMS);
     stmt.push(const_expr(
         &mut builder,
@@ -961,10 +988,9 @@ fn build_redeem_circuit(
 // Proving / verifying
 // ============================================================================
 
-/// The FRI parameters used for all stage-3 proofs (test-grade; see
-/// [`crate::recursion_config`]).
+/// The frozen production FRI parameters used for all proof-lineage-v3 proofs.
 pub fn coin_fri_params() -> CoinFriParams {
-    CoinFriParams::testing()
+    CoinFriParams::production()
 }
 
 /// Build the mint circuit setup (vk side).
@@ -1034,7 +1060,7 @@ pub fn prove_genesis_mint_raw(
     let circuit_prover_data = lock_setup(&s.circuit_prover_data);
     let proof = prover.prove_all_tables(&traces, &circuit_prover_data)?;
 
-    Ok(CoinProof {
+    let coin = CoinProof {
         version: COIN_PROOF_VERSION,
         mode: NodeMode::Mint,
         statement: NodeStatement {
@@ -1045,7 +1071,9 @@ pub fn prove_genesis_mint_raw(
             output_commitments: [outputs[0].commitment(), outputs[1].commitment()],
         },
         proof,
-    })
+    };
+    crate::security::validate_proof_security(&coin)?;
+    Ok(coin)
 }
 
 /// Prove a transfer spending two coins, verifying both predecessor coin
@@ -1147,7 +1175,7 @@ pub fn prove_transfer(
     let circuit_prover_data = lock_setup(&s.circuit_prover_data);
     let proof = prover.prove_all_tables(&traces, &circuit_prover_data)?;
 
-    Ok(CoinProof {
+    let coin = CoinProof {
         version: COIN_PROOF_VERSION,
         mode: NodeMode::Transfer,
         statement: NodeStatement {
@@ -1158,7 +1186,9 @@ pub fn prove_transfer(
             output_commitments: [outputs[0].commitment(), outputs[1].commitment()],
         },
         proof,
-    })
+    };
+    crate::security::validate_proof_security(&coin)?;
+    Ok(coin)
 }
 
 /// Verify a coin proof against the expected statement: checks that the
@@ -1171,6 +1201,7 @@ pub fn verify_coin_proof(expected: &NodeStatement, coin: &CoinProof) -> Result<(
             actual: coin.version,
         });
     }
+    crate::security::validate_proof_security(coin)?;
     let pvs = coin
         .statement_public_values()
         .ok_or(NodeError::MissingStatement)?;
@@ -1269,7 +1300,7 @@ pub fn prove_redeem(
     let circuit_prover_data = lock_setup(&s.circuit_prover_data);
     let proof = prover.prove_all_tables(&traces, &circuit_prover_data)?;
 
-    Ok(CoinProof {
+    let coin = CoinProof {
         version: COIN_PROOF_VERSION,
         mode: NodeMode::Redeem,
         statement: NodeStatement {
@@ -1280,7 +1311,9 @@ pub fn prove_redeem(
             output_commitments: [Digest::from_bytes([0u8; 32]); NODE_OUTPUTS],
         },
         proof,
-    })
+    };
+    crate::security::validate_proof_security(&coin)?;
+    Ok(coin)
 }
 
 #[cfg(test)]

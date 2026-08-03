@@ -20,34 +20,39 @@ One-time Rust build (device + simulator staticlibs):
 
 ```sh
 rustup target add aarch64-apple-ios aarch64-apple-ios-sim
-cd apple/bench-ffi
-cargo build --release --target aarch64-apple-ios
-cargo build --release --target aarch64-apple-ios-sim   # optional, for Simulator
-# outputs: target/<triple>/release/libopencsv_bench_ffi.a
+DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer \
+  cargo build --release --target aarch64-apple-ios -p opencsv-bench-ffi
+# output: target/aarch64-apple-ios/release/libopencsv_bench_ffi.a
 ```
 
-Xcode setup (no project file is checked in — two minutes by hand):
+Generate the project from the checked-in XcodeGen specification:
 
-1. File → New → Project → iOS → App. Name `OpenCsvBench`, Interface: SwiftUI,
-   Language: Swift. Save anywhere (e.g. next to this `apple/` directory).
-2. Delete the template's `ContentView.swift` and app entry file; drag in
-   `OpenCsvBench/ContentView.swift`, `OpenCsvBench/opencsv-bench.h`, and
-   `OpenCsvBench/OpenCsvBench-Bridging-Header.h` from this directory.
-3. Drag `libopencsv_bench_ffi.a` into the project (check "Copy items if
-   needed", add to the app target). For the Simulator, use the
-   `aarch64-apple-ios-sim` build instead — or set both via an xcconfig.
-4. Target → Build Settings:
-   - **Objective-C Bridging Header** → path to `OpenCsvBench-Bridging-Header.h`
-     (e.g. `$(SRCROOT)/OpenCsvBench/OpenCsvBench-Bridging-Header.h`)
-   - **Enable Modules (C and Objective-C)** can stay default.
-5. Select a physical device (release build: Product → Scheme → Edit Scheme →
-   Run → Build Configuration → **Release**) and Run. Tap **Run** in the app.
+```sh
+cd apple
+xcodegen --spec project.yml
+DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer \
+  xcodebuild -project OpenCsvBench.xcodeproj -scheme OpenCsvBench \
+  -configuration Release -destination 'platform=iOS,name=An iPhone' \
+  DEVELOPMENT_TEAM="<your team id>" -allowProvisioningUpdates build
+```
 
-The screen shows JSON: per-circuit `prove_ms`, `verify_ms`, `proof_bytes`.
+Install/run from Xcode, or use `xcrun devicectl device install app` and
+`device process launch --console`. The app starts the benchmark on launch;
+the button permits another run. It logs an `OPENCSV_BENCH_PARTIAL` JSON line
+after each circuit and one `OPENCSV_BENCH_RESULT` line after the complete run,
+then displays the complete data.
+
+The app disables the iOS idle timer while a run is active and restores it on
+completion so long recursive measurements are not suspended by auto-lock.
+
+The JSON includes the frozen profile ID and, per circuit, `prove_ms`,
+`verify_ms`, `proof_bytes`, raw/adjusted proven bits, and trace degree bits.
 
 ## Notes
 
 - Debug Rust builds are ~100× slower — always `--release`.
+- The benchmark bundle is `net.opencsv.bench`; it is separate from Signal and
+  neither upgrades nor reads Signal data.
 - First build compiles the whole Plonky3 + recursion stack for iOS; expect
   several minutes.
 - If a dependency fails to build for `aarch64-apple-ios`, that's a real
