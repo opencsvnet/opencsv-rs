@@ -2160,7 +2160,7 @@ mod tests {
 
         let frame = SignedFrame::sign_parts(
             MessageKind::Proposal,
-            historical,
+            historical.clone(),
             &relay_key,
             Some(&stock_key),
         )
@@ -2175,6 +2175,14 @@ mod tests {
         )
         .unwrap();
         let error = session.ingest(&frame.to_wire()).unwrap_err();
+        assert!(error.to_string().contains("read-only"));
+        drop(session);
+
+        atomic_write(&root.path().join("proposal.bin"), &historical).unwrap();
+        let error = match Session::open(root.path()) {
+            Ok(_) => panic!("historical proposal must not survive session reconstruction"),
+            Err(error) => error,
+        };
         assert!(error.to_string().contains("read-only"));
     }
 
