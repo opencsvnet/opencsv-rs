@@ -207,11 +207,20 @@ opencsv batch v2 relay --session /path/to/session \
   --listen 127.0.0.1:29001 --peer 127.0.0.1:29002
 ```
 
-Publish each canonical body with its matching subcommand and repeat `--peer`
-for every participant. A manifest is rejected until all named source
-commitments are present; a signature is rejected unless it names the exact
-manifest, input, key, and `SIGHASH_ALL` digest. Once all shares arrive, any
-peer can run:
+Use the action commands `propose`, `commit`, `manifest`, `replace`, and `sign`;
+run `--help` on each for the full arguments. Those commands and the long-running
+`relay` require one or more `--cbf-peer` endpoints plus a rebuildable `--cache`
+directory so the session's verified tip is refreshed at each action (and after
+each relay accept). `propose`, `commit`, and `sign` additionally verify the exact
+public inputs through the PoW/header, BIP158, full-block, and merkle-check path,
+enforce a maximum-age receipt, and persist the signer-local reservation before
+publishing. Secret-key files must be raw 32-byte or hex and mode 0600 (or
+stricter). Repeat `--peer` for every C2 participant.
+
+A manifest is rejected until every source commitment is present; a signature
+is rejected unless it names the exact manifest, input, key, fresh verifier
+capability, local reservation, and `SIGHASH_ALL` digest. Once all shares
+arrive, any peer can run:
 
 ```sh
 opencsv batch v2 finalize --session /path/to/session
@@ -220,10 +229,21 @@ opencsv batch v2 mark --session /path/to/session \
   --phase confirmed --evidence 'height=<height>,block=<hash>'
 ```
 
-The session stores the final consensus transaction before broadcast and makes
-replay/restart idempotent. Relay frames are signed and bounded, but the raw TCP
-transport is not confidential; use a protected peer channel when metadata
-privacy is required. No OpenCSV-specific server is involved.
+The session stores every signed epoch's final consensus transaction before
+broadcast and makes replay/restart idempotent. Proposal and commitment relay
+frames require authorization from their committed Bitcoin keys in addition to
+the separate relay identity. Exact proposal re-announcement is idempotent;
+another proposal body in the same session is rejected. Relay limits are local
+deployment policy keyed to authorized identities, not protocol constants.
+Malformed remote frames are contained while listener/storage failures remain
+fatal. The raw TCP transport is not confidential; use a protected peer channel
+when metadata privacy is required. No OpenCSV-specific server is involved.
+
+Third parties may reorder or substitute non-signature witness-envelope items
+without changing the legacy txid. The ordered header/envelope commitment then
+fails closed (and stripping required items makes the Bitcoin script fail), so
+this is a liveness/wtxid-malleability risk rather than authorization for an
+invalid OpenCSV transition. Receivers validate the exact envelope.
 
 `--chain-id` accepts the ordinary display-order hash returned by
 `bitcoin-cli getblockhash 0`; the CLI converts it to the transaction-

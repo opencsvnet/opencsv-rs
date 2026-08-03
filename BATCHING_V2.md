@@ -1,6 +1,6 @@
 # OpenCSV batching v2 protocol and threat model (C0)
 
-Status: **frozen and implemented by C1**
+Status: **C1 transcript frozen; C2 remediation implemented and under review**
 
 Protocol version: `2`
 
@@ -73,7 +73,7 @@ semantics.
 |---|---:|---|
 | `VERSION` | `2` | Batching protocol version |
 | `MIN_PARTICIPANTS` | `1` | Smallest valid v2 batch |
-| `MAX_PARTICIPANTS` | `64` | Consensus-independent protocol/DoS cap |
+| `MAX_PARTICIPANTS` | `64` | Current C1 reference-profile/script-safety limit; not a C2 relay quota |
 | `ENVELOPE_MAGIC` | ASCII `OCS2` | First input-0 witness item |
 | `TX_VERSION` | `2` | Bitcoin transaction version |
 | `SEQUENCE` | `0xfffffffd` | Opt-in replacement, no relative lock |
@@ -83,11 +83,13 @@ semantics.
 | `MIN_CHANGE` | `546` sats | Conservative v2 change floor |
 | `MIN_STOCK_VALUE` | `546` sats | Conservative reusable-stock floor |
 
-The participant cap is intentionally below Bitcoin Core's current standard
+The current C1 reference profile is intentionally below Bitcoin Core's current standard
 P2WSH limits. At `N = 64`, input 0 has 66 witness stack items excluding the
 witness script; the standard-policy limit is 100. Its witness script is 101
 bytes and has 66 counted non-push opcodes, below the 3,600-byte and 201-opcode
-limits. These are relay-policy checks, not new consensus rules.
+limits. C2 does not promote this profile bound into a transport constant:
+deployments apply their own lower resource quotas keyed to authorized relay,
+fee-key, outpoint, operation, and payload identities.
 
 References: [Bitcoin Core P2WSH policy limits][core-policy],
 [Bitcoin Core script limits][core-script], [BIP 143 signature hashing][bip143],
@@ -212,6 +214,14 @@ the header output. Although witness arguments are not directly part of the
 BIP 143 signature digest, substituting an envelope requires finding a collision
 in `batch_commit_v2`; a mismatch MUST be rejected by OpenCSV validation.
 
+A third party can malleate non-signature witness items without changing the
+legacy txid. Stripping required items makes the Bitcoin script fail; reordering
+or substituting envelope items can remain Bitcoin-valid but fails the ordered
+header/envelope commitment check. This is a documented liveness/wtxid risk,
+not authority to create an accepted OpenCSV transition. Relays and receivers
+MUST validate the exact envelope rather than accepting Bitcoin confirmation
+alone.
+
 ## 6. Participant commitment
 
 Exactly one commitment is accepted per participant operation and per fee
@@ -257,10 +267,17 @@ already reserved input under C1 policy, and persist the reservation before
 sending the commitment. Duplicate outpoints, operation IDs, commitment IDs,
 payloads, or change scripts MUST be rejected within one manifest.
 
-A transport-level authenticated signature SHOULD cover each proposal and
-commitment, but it is not part of Bitcoin consensus and MUST NOT be confused
-with input ownership. Fee-input ownership is proven only by the round-two
-Bitcoin signature.
+C2 wraps the unchanged C1 body in a version-3 relay frame. Proposal frames
+carry an origin authorization by the stock key; commitment frames carry one by
+the fee key. That authorization binds the message kind, exact C1 body hash,
+and the separate relay public key. Replaying it into another batch or
+substituting another relay identity therefore fails. It is not part of Bitcoin
+consensus and MUST NOT be confused with input ownership: fee-input ownership
+is proven only by the round-two Bitcoin signature.
+
+An exact proposal body may be re-announced and is idempotent. A different body
+in the same initialized session is rejected even if it happens to name the
+same stock input or arrives under a valid origin key.
 
 ## 7. Canonical ordering and transaction
 
@@ -304,6 +321,20 @@ Before signing, every participant MUST verify:
 - `SIGHASH_ALL` with neither `ANYONECANPAY`, `NONE`, nor `SINGLE`.
 
 A failure rejects the manifest before releasing a signature.
+
+The reference product path represents this completed check as a
+`VerifiedBatchInputs` capability whose fields are private and whose only
+production constructor performs the authoritative CBF verification. It is
+bound to the exact `batch_id`, `manifest_id`, agreed tip hash/height, and a
+wall-clock verification time. The signer MUST enforce a configured maximum
+receipt age at the moment the signature is released; zero, stale, or
+future-dated receipts fail closed.
+
+Public-chain verification cannot prove another participant's private wallet
+lock. Each signer enforces its own durable reservation and independently
+rechecks every public outpoint. The local reservation is bound to one stable
+operation ID and exact outpoint, persists across restart, and advances to
+`signature_released` before a signature share becomes eligible for gossip.
 
 ## 8. Fees and change
 
@@ -468,7 +499,8 @@ All inputs opt in to BIP 125 replacement. A conforming replacement:
 
 There is no unilateral coordinator fee bump and no silent fallback. A withheld
 fully signed older transaction can still race a replacement, so wallets MUST
-track every signed epoch and accept whichever valid conflict confirms. BIP 125
+track and recover every signed epoch, not merely the most recent manifest, and
+accept whichever valid conflict confirms. BIP 125
 is relay policy and does not guarantee that a replacement propagates or wins.
 Reservations and signed-conflict metadata survive until the wallet's finality
 policy is met and remain recoverable across a reorg.
@@ -532,7 +564,7 @@ gossiped as such without revealing raw nullifiers.
 | Public explorer lies | Use it only as a hint; verify spend-critical state through independent node/header/block paths | Eclipse and network partition remain operational risks |
 | Bitcoin reorg | Keep reservations and operation journal through the confirmation policy; roll back state and rebroadcast/re-evaluate | Deep reorg can delay finality |
 | Crash at any state | Persist proposal, commitment, reservation, signed manifests, and final transaction before outward effects | Corrupt storage requires wallet recovery procedure |
-| Coordinator/peer flood | `N <= 64`, bounded messages, proof/UTXO checks, per-peer quotas, deadlines, and no signature before full validation | Public P2P remains DoS-exposed |
+| Coordinator/peer flood | Bounded messages and storage plus deployment-local quotas keyed to authorized relay, fee-key, outpoint, operation, and payload identities | Public P2P remains DoS-exposed |
 
 ## 14. Privacy
 
@@ -606,6 +638,32 @@ transport privacy wrap the peer connection in an authenticated encrypted or
 privacy-preserving channel. C1 `SIGHASH_ALL` input signatures—not the relay
 identity—remain the authorization for the Bitcoin transaction.
 
+The C2 frame version is `3`. Its origin-authorization signature covers the
+message kind, relay public key, and SHA-256 of the exact frozen C1 body; the
+outer relay signature also covers that origin signature. Origin authorization
+is mandatory for proposals and commitments and forbidden for manifests and
+signature shares. Invalid origin signatures are rejected before semantic
+deduplication.
+
+Relay limits are deployment-local policy, not protocol constants. The
+reference defaults are 64 authorized commitments, 16 replacement epochs, 32
+MiB of persisted frames, and a 1 MiB active event log with one bounded rotated
+file. Acceptance is additionally unique by authenticated relay identity,
+committed fee key, fee outpoint, operation ID, and payload. Startup rebuilds
+this index once from authenticated persisted frames; it does not repeatedly
+parse an unbounded directory for every incoming frame.
+
+A malformed, oversized, partial, or unauthenticated peer frame produces one
+bounded rejection receipt and the listener continues. Listener failures and
+durable-storage failures remain fatal. This distinction prevents remote input
+from stopping service while refusing to hide loss of persistence.
+
+The action-oriented CLI surface is `propose`, `commit`, `manifest`, `replace`,
+`sign`, `finalize`, and `broadcast`. `propose`, `commit`, and `sign` connect to
+configured Bitcoin P2P peers, obtain authoritative CBF receipts, enforce local
+reservations, and only then publish. Prebuilt proposal, commitment, or
+signature bodies are not a public product command.
+
 ## 17. Decision log
 
 | Decision | Accepted rationale | Superseded alternative |
@@ -619,7 +677,11 @@ identity—remain the authorization for the Bitcoin transaction.
 | Signature gossip to every participant | Removes the coordinator as the sole broadcaster | Return signatures only to coordinator |
 | Unanimous invariant-preserving replacement | Allows fee recovery without changing OpenCSV evidence | Unilateral RBF or silent fallback |
 | New magic and hash domain | Fail-closed separation from v1 | Heuristic version detection |
-| Maximum 64 participants | Bounded coordination/DoS cost with ample Bitcoin policy margin | The v1 `u8` maximum of 255 |
+| C1 reference profile currently limits participants to 64 | Keeps the frozen script/weight evidence; C2 resource limits remain configurable local policy | Treating 64 as a universal relay quota |
+| C2 wrapper instead of a C1 amendment | Binds the exact body hash and origin key while preserving every C1 byte and golden vector | Re-encoding frozen proposal/commitment bodies |
+| Typed verifier and reservation capabilities | Makes authoritative freshness and signer-local locking mandatory at publication/signing boundaries | Boolean `verified`/`reserved` flags or caller discipline |
+| All signed epochs remain recoverable | A sign-and-disappear peer cannot make an older valid conflict look safely abortable | Tracking only the latest replacement |
+| Remote parse/auth errors are contained; storage errors are fatal | Preserves Internet-facing availability without turning failed persistence into a warning | One undifferentiated best-effort relay loop |
 
 Changes to these frozen decisions require an explicit protocol amendment,
 updated vectors, threat review, and a journaled compatibility decision. Failed
