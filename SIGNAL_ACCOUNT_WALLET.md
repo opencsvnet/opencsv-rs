@@ -96,6 +96,15 @@ the database restores fee and OpenCSV reservations plus pending proof state.
 Every transaction is fully signed and committed before any socket or HTTP
 write. `resume` rebroadcasts the exact persisted bytes and is idempotent.
 
+Signal attachment delivery and Bitcoin settlement are recorded independently.
+Acknowledging a consignment while its anchor is in the mempool sets an
+idempotent receipt flag but leaves the operation in `mempool`, so the
+protocol-safe RBF window remains open. Once that transaction or its valid
+replacement confirms, the state advances directly to
+`consignment_delivered`. A delivery acknowledged after confirmation advances
+there immediately. RBF reuses the already-finalized consignment and must never
+consume or recreate its pending proof a second time.
+
 The first Bitcoin input fixes the OpenCSV context before proof generation.
 Transactions use record output 0, the unspendable BIP158 marker at output 1,
 and wallet change at output 2. Protocol-safe RBF is change-only. It preserves
@@ -126,10 +135,12 @@ This closes the selected-outpoint trust boundary, but does not itself make the
 wallet mainnet-ready. Rust now decodes and canonically re-encodes every
 consignment before verification, persistence, and SHA-256 identity, and returns
 that identity for Signal to key both verdicts and rendered payment cells.
-Signal recovery integration, use of that identity in the UI, hosted gates, and
-physical signet acceptance remain mandatory. The delivery acceptance test must
-produce two byte-distinct attachments through a sender crash/resume while
-rendering exactly one verified payment bubble.
+Signal recovery integration and canonical verdict storage are implemented on
+the isolated iOS integration branch. Hosted gates, linked-device provisioning,
+canonical conversation-level duplicate suppression, and physical signet
+acceptance remain mandatory. The delivery acceptance test must produce two
+byte-distinct attachments through a sender crash/resume while rendering exactly
+one verified payment bubble.
 
 ## Current C ABI
 

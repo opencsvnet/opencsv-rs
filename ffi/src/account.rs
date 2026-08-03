@@ -1909,7 +1909,14 @@ impl AccountWallet {
                 "delivery acknowledgement belongs to another operation",
             ));
         }
-        if operation.state == OperationState::ConsignmentDelivered.as_str() {
+        let mut receipt: Value = operation
+            .receipt_json
+            .as_deref()
+            .and_then(|encoded| serde_json::from_str(encoded).ok())
+            .unwrap_or_else(|| json!({}));
+        if operation.state == OperationState::ConsignmentDelivered.as_str()
+            || receipt["consignment_delivered"] == true
+        {
             return operation_json(&operation);
         }
         if !matches!(operation.state.as_str(), "mempool" | "confirmed") {
@@ -1918,16 +1925,26 @@ impl AccountWallet {
                 "consignment delivery starts only after transaction observation",
             ));
         }
+        let receipt_object = receipt.as_object_mut().ok_or_else(|| {
+            AccountError::new("database_corrupt", "operation receipt is not an object")
+        })?;
+        receipt_object.insert("consignment_delivered".into(), json!(true));
+        receipt_object.insert("consignment_delivered_at".into(), json!(unix_time()?));
+        // Delivery and chain settlement are independent. Keep a delivered
+        // mempool transaction fee-bumpable; it becomes the terminal
+        // consignment_delivered state only after confirmation.
+        let next_state = if operation.state == OperationState::Confirmed.as_str() {
+            OperationState::ConsignmentDelivered.as_str()
+        } else {
+            OperationState::Mempool.as_str()
+        };
         self.db.conn.execute(
-            "UPDATE opencsv_operations SET state = ?2, updated_at = ?3
+            "UPDATE opencsv_operations SET state = ?2, receipt_json = ?3,
+             updated_at = ?4
              WHERE operation_id = ?1",
-            params![
-                operation_id,
-                OperationState::ConsignmentDelivered.as_str(),
-                unix_time()?,
-            ],
+            params![operation_id, next_state, receipt.to_string(), unix_time()?,],
         )?;
-        self.operation_status(operation_id)
+        operation_json(&self.operation(operation_id)?)
     }
 
     /// Set the current Secure Backup policy state. Disabling backup freezes
@@ -2020,19 +2037,13 @@ impl AccountWallet {
                 "linked devices restore public watch state through provisioning",
             ));
         }
-        let envelope_value: Value = serde_json::from_str(checkpoint_json).map_err(|error| {
-            AccountError::new("invalid_backup_checkpoint", error.to_string())
+        let envelope_value: Value = serde_json::from_str(checkpoint_json)
+            .map_err(|error| AccountError::new("invalid_backup_checkpoint", error.to_string()))?;
+        let checkpoint_value = envelope_value.get("checkpoint").cloned().ok_or_else(|| {
+            AccountError::new("invalid_backup_checkpoint", "missing checkpoint payload")
         })?;
-        let checkpoint_value = envelope_value
-            .get("checkpoint")
-            .cloned()
-            .ok_or_else(|| {
-                AccountError::new("invalid_backup_checkpoint", "missing checkpoint payload")
-            })?;
         let envelope: BackupCheckpointEnvelope = serde_json::from_value(envelope_value)
-            .map_err(|error| {
-                AccountError::new("invalid_backup_checkpoint", error.to_string())
-            })?;
+            .map_err(|error| AccountError::new("invalid_backup_checkpoint", error.to_string()))?;
         let canonical = serde_json::to_vec(&checkpoint_value)
             .map_err(|error| AccountError::new("invalid_backup_checkpoint", error.to_string()))?;
         let actual_hash = sha256::Hash::hash(&canonical).to_string();
@@ -2104,7 +2115,10 @@ impl AccountWallet {
             decode_hex_32(&asset.terms_hash, "terms hash")?;
             decode_hex_32(&asset.asset_id, "asset id")?;
             i64::try_from(asset.nonce).map_err(|_| {
-                AccountError::new("invalid_backup_checkpoint", "asset nonce exceeds SQLite i64")
+                AccountError::new(
+                    "invalid_backup_checkpoint",
+                    "asset nonce exceeds SQLite i64",
+                )
             })?;
         }
         for operation in &envelope.checkpoint.operations {
@@ -2142,9 +2156,8 @@ impl AccountWallet {
                 ));
             }
             if let Some(snapshot) = &consignment.snapshot {
-                SnapshotChain::from_json(&snapshot.to_string()).map_err(|error| {
-                    AccountError::new("invalid_backup_checkpoint", error)
-                })?;
+                SnapshotChain::from_json(&snapshot.to_string())
+                    .map_err(|error| AccountError::new("invalid_backup_checkpoint", error))?;
             }
         }
 
@@ -2469,6 +2482,13 @@ impl AccountWallet {
         verification: &FundingVerificationReceipt,
         record: &[u8; 64],
     ) -> Result<Value, AccountError> {
+        let normalized_request: String = self.db.conn.query_row(
+            "SELECT request_json FROM opencsv_operations WHERE operation_id = ?1",
+            [operation_id],
+            |row| row.get(0),
+        )?;
+        let normalized_request: Value = serde_json::from_str(&normalized_request)
+            .map_err(|error| AccountError::new("database_corrupt", error.to_string()))?;
         let checkpoint = self.checkpoint()?;
         let checkpoint_hash = checkpoint["checkpoint_hash"]
             .as_str()
@@ -2480,6 +2500,8 @@ impl AccountWallet {
             "funding_value_sats": funding.value_sats(),
             "funding_verification": verification,
             "anchor_record_hex": hex_encode(record),
+            "asset_id": normalized_request.get("asset_id"),
+            "to_owner": normalized_request.get("to_owner"),
             "checkpoint_hash": checkpoint_hash,
             "backup_ack_required": true,
         });
@@ -2618,17 +2640,40 @@ impl AccountWallet {
             operation.state.as_str(),
             "mempool" | "confirmed" | "consignment_delivered"
         ) {
-            self.finalize_observed_operation(operation_id, txid)?;
+            let protocol_already_finalized = operation
+                .receipt_json
+                .as_deref()
+                .and_then(|encoded| serde_json::from_str::<Value>(encoded).ok())
+                .is_some_and(|receipt| receipt["delivery_ready"] == true);
+            if protocol_already_finalized {
+                // RBF changes the Bitcoin transaction but not the OpenCSV
+                // record or consignment. Do not try to finalize the already
+                // consumed in-memory proof a second time when the
+                // replacement first appears.
+                self.db.conn.execute(
+                    "UPDATE opencsv_operations SET state = ?2, updated_at = ?3
+                     WHERE operation_id = ?1",
+                    params![operation_id, OperationState::Mempool.as_str(), unix_time()?,],
+                )?;
+            } else {
+                self.finalize_observed_operation(operation_id, txid)?;
+            }
         }
         if status.confirmed && operation.state != OperationState::ConsignmentDelivered.as_str() {
+            let delivered = operation
+                .receipt_json
+                .as_deref()
+                .and_then(|encoded| serde_json::from_str::<Value>(encoded).ok())
+                .is_some_and(|receipt| receipt["consignment_delivered"] == true);
+            let confirmed_state = if delivered {
+                OperationState::ConsignmentDelivered.as_str()
+            } else {
+                OperationState::Confirmed.as_str()
+            };
             self.db.conn.execute(
                 "UPDATE opencsv_operations SET state = ?2, updated_at = ?3
                  WHERE operation_id = ?1",
-                params![
-                    operation_id,
-                    OperationState::Confirmed.as_str(),
-                    unix_time()?,
-                ],
+                params![operation_id, confirmed_state, unix_time()?,],
             )?;
         }
         let mut value = operation_json(&self.operation(operation_id)?)?;
@@ -3518,13 +3563,9 @@ mod tests {
         let key = [31u8; 32];
         let binding = [32u8; 32];
         let cfg = config(AccountRole::Primary, true);
-        let mut original = AccountWallet::open_device_bound(
-            &cfg,
-            &key,
-            &binding,
-            original_path.to_str().unwrap(),
-        )
-        .unwrap();
+        let mut original =
+            AccountWallet::open_device_bound(&cfg, &key, &binding, original_path.to_str().unwrap())
+                .unwrap();
         let asset_id = original.create_asset("USD", None).unwrap();
         let checkpoint = original.checkpoint().unwrap();
         let commitment = checkpoint["checkpoint"]["device_binding_commitment"]
@@ -3660,6 +3701,8 @@ mod tests {
         let prepared = wallet
             .mint_prepare(&json!({ "currency": "USD", "amounts": [100] }).to_string())
             .unwrap();
+        assert_eq!(prepared["asset_id"].as_str().unwrap().len(), 64);
+        assert_eq!(prepared["to_owner"].as_str().unwrap().len(), 64);
         let operation_id = prepared["operation_id"].as_str().unwrap().to_owned();
         assert!(wallet.bitcoin.is_outpoint_locked(funding));
         drop(wallet);
@@ -3979,6 +4022,72 @@ mod tests {
             reopened.operation("planned-op").unwrap().state,
             OperationState::Cancelled.as_str()
         );
+    }
+
+    #[test]
+    fn delivery_acknowledgement_preserves_mempool_fee_bump_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wallet.sqlite");
+        let mut wallet = AccountWallet::open(
+            &config(AccountRole::Primary, true),
+            &[25_u8; 32],
+            path.to_str().unwrap(),
+        )
+        .unwrap();
+
+        wallet
+            .insert_planned_operation("mempool-op", "mint", "{}", "mempool-nonce")
+            .unwrap();
+        wallet
+            .db
+            .conn
+            .execute(
+                "UPDATE opencsv_operations SET state = ?2, receipt_json = ?3
+                 WHERE operation_id = ?1",
+                params![
+                    "mempool-op",
+                    OperationState::Mempool.as_str(),
+                    json!({ "delivery_ready": true }).to_string(),
+                ],
+            )
+            .unwrap();
+        let acknowledged = wallet
+            .mark_consignment_delivered("mempool-op", "mempool-nonce")
+            .unwrap();
+        assert_eq!(acknowledged["state"], OperationState::Mempool.as_str());
+        assert_eq!(acknowledged["receipt"]["consignment_delivered"], true);
+        assert_eq!(
+            wallet
+                .mark_consignment_delivered("mempool-op", "mempool-nonce")
+                .unwrap()["state"],
+            OperationState::Mempool.as_str(),
+            "delivery acknowledgement is idempotent without closing the RBF window",
+        );
+
+        wallet
+            .insert_planned_operation("confirmed-op", "mint", "{}", "confirmed-nonce")
+            .unwrap();
+        wallet
+            .db
+            .conn
+            .execute(
+                "UPDATE opencsv_operations SET state = ?2, receipt_json = ?3
+                 WHERE operation_id = ?1",
+                params![
+                    "confirmed-op",
+                    OperationState::Confirmed.as_str(),
+                    json!({ "delivery_ready": true }).to_string(),
+                ],
+            )
+            .unwrap();
+        let terminal = wallet
+            .mark_consignment_delivered("confirmed-op", "confirmed-nonce")
+            .unwrap();
+        assert_eq!(
+            terminal["state"],
+            OperationState::ConsignmentDelivered.as_str(),
+        );
+        assert_eq!(terminal["receipt"]["consignment_delivered"], true);
     }
 
     #[test]

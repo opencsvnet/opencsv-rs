@@ -141,6 +141,27 @@ encodings of one consignment and proves their canonical bytes and IDs match.
 - Post-reservation failure cleanup and fee-bump revalidation preservation pass.
 - Equivalent consignment encodings normalize to one returned identity.
 
+## 2026-08-03 — Signal integration recovery and RBF delivery correction
+
+- Added exact Secure Backup checkpoint restore through the C ABI. Rust now
+  validates hash, network, root-derived owner, and binding commitment before
+  atomically importing assets, operation journal rows, consignments, spent
+  state, and verification snapshots into a clean account.
+- Added the normalized `asset_id` and `to_owner` to prepare receipts so Swift
+  can construct mint/transfer delivery metadata without deriving protocol
+  identities or inspecting pending proof JSON.
+- The iOS integration exposed an operation-lifecycle bug: marking a mempool
+  consignment delivered changed the sole state to `consignment_delivered`,
+  closing the only state window in which `opencsv_fee_bump` was legal. Delivery
+  is now an idempotent receipt fact while an unconfirmed operation remains
+  `mempool`; confirmation advances a delivered operation to the terminal state.
+- The same audit found that first observation of an RBF replacement tried to
+  finalize the already-finalized OpenCSV pending proof again. Refresh now
+  recognizes `delivery_ready`, preserves the existing consignment, and only
+  updates the replacement's Bitcoin observation state.
+- A regression proves mempool delivery acknowledgement is idempotent and
+  remains fee-bumpable while a confirmed acknowledgement is terminal.
+
 ## Explicit remaining gates
 
 - hosted wallet CI after publication;
