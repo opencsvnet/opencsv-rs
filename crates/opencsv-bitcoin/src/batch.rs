@@ -1,6 +1,12 @@
-//! Batch anchoring (see `opencsv-core`'s `batch` module for the v1
-//! format): one anchor transaction carrying N witness-envelope payloads
-//! under a coordinator-pre-committed OP_TRUE funding outpoint.
+//! Legacy v1 batch anchoring (see `opencsv-core`'s `batch` module): one
+//! anchor transaction carrying N witness-envelope payloads under a
+//! coordinator-pre-committed OP_TRUE funding outpoint.
+//!
+//! This implementation is retained for compatibility evidence; it is not the
+//! frozen co-funded protocol. See the repository's `BATCHING_V2.md` for the C0
+//! specification. V2 replaces this anyone-can-spend stock with signed P2WSH
+//! stock, participant fee inputs, deterministic allocation, and unanimous
+//! `SIGHASH_ALL` signing. C1 adds that path without silently reusing v1 stock.
 //!
 //! The coordinator flow mirrors the solo two-pass [`crate::BitcoinAnchorChain::anchor`]:
 //!

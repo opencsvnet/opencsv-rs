@@ -1,4 +1,11 @@
-//! Batch anchors (paper §4.7.1, amended: v1 batching format).
+//! Legacy batch anchors (paper §4.7.1, amended: v1 batching format).
+//!
+//! This module implements batching v1 for compatibility. It is not the
+//! co-funded production design. The frozen v2 protocol, transaction layout,
+//! fee allocation, two-round signing flow, migration rules, and threat model
+//! live in the repository's `BATCHING_V2.md`. C1 will add v2 alongside this
+//! reader before v1 creation is deprecated; callers MUST NOT treat the
+//! anyone-can-spend v1 funding stock below as v2 stock.
 //!
 //! One anchor transaction can carry **N transfer records**: N senders
 //! combine under an untrusted coordinator who pre-commits a funding
