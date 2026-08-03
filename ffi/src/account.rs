@@ -3094,7 +3094,10 @@ fn derive<const N: usize>(
 
 fn parse_network(name: &str) -> Result<Network, AccountError> {
     match name {
-        "mainnet" | "signet" | "regtest" => Network::from_str(name)
+        // The public account/FFI vocabulary is `mainnet`, while
+        // rust-bitcoin's `FromStr` spelling is `bitcoin`.
+        "mainnet" => Ok(Network::Bitcoin),
+        "signet" | "regtest" => Network::from_str(name)
             .map_err(|_| AccountError::new("invalid_config", format!("unknown network `{name}`"))),
         _ => Err(AccountError::new(
             "invalid_config",
@@ -4392,5 +4395,13 @@ mod tests {
         assert_eq!(after.txid, before.txid);
         assert_eq!(after.rejection_reason.as_deref(), Some("stale_chain_state"));
         assert_eq!(verifier.calls.load(Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    fn account_network_vocabulary_maps_mainnet_to_bitcoin() {
+        assert_eq!(parse_network("mainnet").unwrap(), Network::Bitcoin);
+        assert_eq!(parse_network("signet").unwrap(), Network::Signet);
+        assert_eq!(parse_network("regtest").unwrap(), Network::Regtest);
+        assert!(parse_network("bitcoin").is_err());
     }
 }
