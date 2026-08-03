@@ -1,5 +1,5 @@
 //! A hand-rolled P2P peer over `std::net::TcpStream`: version/verack
-//! handshake, `sendheaders`, and blocking request/response helpers for
+//! handshake and blocking request/response helpers for
 //! headers, compact-filter headers, filters, and blocks.
 
 use std::io::{ErrorKind, Read, Write};
@@ -9,7 +9,7 @@ use std::time::Duration;
 use crate::block::{Block, BlockHeader};
 use crate::error::Error;
 use crate::messages::{
-    self, CfHeaders, CFilter, Message, MSG_BLOCK, MSG_WITNESS_BLOCK, NODE_COMPACT_FILTERS,
+    self, CFilter, CfHeaders, Message, MSG_BLOCK, MSG_WITNESS_BLOCK, NODE_COMPACT_FILTERS,
     NODE_WITNESS,
 };
 use crate::network::Params;
@@ -37,12 +37,20 @@ pub struct Peer {
     /// counting for the persistent-client API: a reused client must not
     /// re-handshake).
     pub versions_sent: u64,
+    /// Complete P2P wire bytes sent on this connection.
+    pub wire_bytes_sent: u64,
+    /// Complete P2P wire bytes received on this connection.
+    pub wire_bytes_received: u64,
 }
 
 impl Peer {
-    /// Connect and complete the version/verack handshake, then send
-    /// `sendheaders`.
-    pub fn connect(addr: SocketAddr, params: &Params, timeout: Duration, tip_height: u64) -> Result<Self, Error> {
+    /// Connect and complete the version/verack handshake.
+    pub fn connect(
+        addr: SocketAddr,
+        params: &Params,
+        timeout: Duration,
+        tip_height: u64,
+    ) -> Result<Self, Error> {
         let stream = TcpStream::connect_timeout(&addr, timeout)
             .map_err(|e| protocol_err(format!("connect {addr}: {e}")))?;
         stream
@@ -59,8 +67,16 @@ impl Peer {
             filter_bytes_fetched: 0,
             block_bytes_fetched: 0,
             versions_sent: 0,
+            wire_bytes_sent: 0,
+            wire_bytes_received: 0,
         };
         peer.handshake(tip_height)?;
+        let required = NODE_WITNESS | NODE_COMPACT_FILTERS;
+        if peer.services & required != required {
+            return Err(protocol_err(format!(
+                "peer {addr} lacks required witness/compact-filter services"
+            )));
+        }
         Ok(peer)
     }
 
@@ -72,7 +88,7 @@ impl Peer {
     fn handshake(&mut self, tip_height: u64) -> Result<(), Error> {
         let services = NODE_WITNESS | NODE_COMPACT_FILTERS;
         let payload = messages::version_payload(services, tip_height as i32);
-        messages::write_message(&mut self.stream, self.magic, "version", &payload)?;
+        self.write_message("version", &payload)?;
         self.versions_sent += 1;
         let mut got_version = false;
         let mut got_verack = false;
@@ -83,7 +99,7 @@ impl Peer {
                     let info = messages::parse_version(&message.payload)?;
                     self.services = info.services;
                     self.start_height = info.start_height;
-                    messages::write_message(&mut self.stream, self.magic, "verack", &[])?;
+                    self.write_message("verack", &[])?;
                     got_version = true;
                 }
                 "verack" => got_verack = true,
@@ -97,7 +113,17 @@ impl Peer {
                 }
             }
         }
-        messages::write_message(&mut self.stream, self.magic, "sendheaders", &[])?;
+        // Header synchronization is explicitly polled with `getheaders`.
+        // Requesting unsolicited `headers` announcements here would make a
+        // later request consume an announcement as its response and leave the
+        // actual response queued, eventually desynchronizing the blocking
+        // request loop after new blocks arrive.
+        Ok(())
+    }
+
+    fn write_message(&mut self, command: &str, payload: &[u8]) -> Result<(), Error> {
+        let written = messages::write_message(&mut self.stream, self.magic, command, payload)?;
+        self.wire_bytes_sent += written as u64;
         Ok(())
     }
 
@@ -108,14 +134,15 @@ impl Peer {
         loop {
             let message = messages::read_message(&mut self.stream, self.magic)
                 .map_err(|e| protocol_err(format!("read from {}: {e}", self.addr)))?;
+            self.wire_bytes_received += message.wire_bytes as u64;
             match message.command.as_str() {
                 "ping" => {
-                    messages::write_message(&mut self.stream, self.magic, "pong", &message.payload)?;
+                    self.write_message("pong", &message.payload)?;
                 }
                 // Unsolicited requests we cannot serve; a light client
                 // answers with empty responses to stay polite.
                 "getheaders" | "getblocks" => {
-                    messages::write_message(&mut self.stream, self.magic, "headers", &[0])?;
+                    self.write_message("headers", &[0])?;
                 }
                 "getaddr" | "mempool" | "sendheaders" | "sendcmpct" | "feefilter" | "inv"
                 | "addr" | "wtxidrelay" | "sendaddrv2" | "pong" | "getdata" => {}
@@ -126,8 +153,13 @@ impl Peer {
 
     /// Send a request and wait for a message whose command is one of
     /// `expected`.
-    fn request(&mut self, command: &str, payload: &[u8], expected: &[&str]) -> Result<Message, Error> {
-        messages::write_message(&mut self.stream, self.magic, command, payload)?;
+    fn request(
+        &mut self,
+        command: &str,
+        payload: &[u8],
+        expected: &[&str],
+    ) -> Result<Message, Error> {
+        self.write_message(command, payload)?;
         loop {
             let message = self.next_message()?;
             if expected.contains(&message.command.as_str()) {
@@ -149,7 +181,11 @@ impl Peer {
     }
 
     /// `getcfheaders` → `cfheaders` for `start_height..=stop`.
-    pub fn get_cfheaders(&mut self, start_height: u32, stop: &[u8; 32]) -> Result<CfHeaders, Error> {
+    pub fn get_cfheaders(
+        &mut self,
+        start_height: u32,
+        stop: &[u8; 32],
+    ) -> Result<CfHeaders, Error> {
         let payload =
             messages::getcfilter_range_payload(crate::gcs::BASIC_FILTER_TYPE, start_height, stop);
         let message = self.request("getcfheaders", &payload, &["cfheaders"])?;
@@ -165,9 +201,16 @@ impl Peer {
 
     /// `getcfilters` for exactly one block (`start_height == height of
     /// stop`) → its `cfilter`.
-    pub fn get_cfilter(&mut self, start_height: u32, block_hash: &[u8; 32]) -> Result<CFilter, Error> {
-        let payload =
-            messages::getcfilter_range_payload(crate::gcs::BASIC_FILTER_TYPE, start_height, block_hash);
+    pub fn get_cfilter(
+        &mut self,
+        start_height: u32,
+        block_hash: &[u8; 32],
+    ) -> Result<CFilter, Error> {
+        let payload = messages::getcfilter_range_payload(
+            crate::gcs::BASIC_FILTER_TYPE,
+            start_height,
+            block_hash,
+        );
         let message = self.request("getcfilters", &payload, &["cfilter"])?;
         self.filter_bytes_fetched += message.payload.len() as u64;
         let parsed = messages::parse_cfilter(&message.payload)?;

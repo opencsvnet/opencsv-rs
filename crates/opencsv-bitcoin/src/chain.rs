@@ -131,22 +131,39 @@ pub fn funding_ctx(txid: &[u8; 32], vout: u32) -> [u8; 32] {
     hasher.finalize().into()
 }
 
-/// The protocol-constant marker output's script: `OP_TRUE` (quantum-clean,
-/// no EC).
-pub const MARKER_SCRIPT: [u8; 1] = [0x51];
+/// The protocol-constant marker witness script: `OP_RETURN`. The P2WSH
+/// scriptPubKey remains BIP158-visible while the witness program is
+/// provably unspendable, preventing third parties from attaching a child
+/// transaction that pins an anchor's RBF replacement.
+pub const MARKER_SCRIPT: [u8; 1] = [0x6a];
 
-/// The marker output's scriptPubKey: `OP_0 <sha256(OP_TRUE)>` (a P2WSH to
-/// [`MARKER_SCRIPT`], anyone-can-spend). Anchor transactions carry one at
-/// output index 1 so BIP158 basic filters — which exclude OP_RETURN but
-/// include ordinary scriptPubKeys — can find anchor-bearing blocks. The
-/// marker carries **zero authority**: copying it into one's own
-/// transaction is self-funded noise that only makes the copier's block
-/// marginally more interesting to anchor scanners.
+/// The current marker output's scriptPubKey:
+/// `OP_0 <sha256(OP_RETURN)>`. Anchor transactions carry one at output
+/// index 1 so BIP158 basic filters — which exclude a direct OP_RETURN
+/// scriptPubKey but include this P2WSH program — can find anchor-bearing
+/// blocks. The marker carries zero authority and cannot be spent.
 pub const MARKER_SPK: [u8; 34] = [
+    0x00, 0x20, 0x18, 0x9f, 0x40, 0x03, 0x4b, 0xe7, 0xa1, 0x99, 0xf1, 0xfa, 0x98, 0x91, 0x66, 0x8e,
+    0xe3, 0xab, 0x60, 0x49, 0xf8, 0x2d, 0x38, 0xc6, 0x8b, 0xe7, 0x0f, 0x59, 0x6e, 0xab, 0x2e, 0x18,
+    0x57, 0xb7,
+];
+
+/// Historical anyone-can-spend marker witness script (`OP_TRUE`). New
+/// anchors must not create it; scanners retain it for old anchors.
+pub const LEGACY_MARKER_SCRIPT: [u8; 1] = [0x51];
+
+/// Historical `OP_0 <sha256(OP_TRUE)>` marker scriptPubKey. New anchors
+/// use [`MARKER_SPK`]; readers accept both exact constants.
+pub const LEGACY_MARKER_SPK: [u8; 34] = [
     0x00, 0x20, 0x4a, 0xe8, 0x15, 0x72, 0xf0, 0x6e, 0x1b, 0x88, 0xfd, 0x5c, 0xed, 0x7a, 0x1a, 0x00,
     0x09, 0x45, 0x43, 0x2e, 0x83, 0xe1, 0x55, 0x1e, 0x6f, 0x72, 0x1e, 0xe9, 0xc0, 0x0b, 0x8c, 0xc3,
     0x32, 0x60,
 ];
+
+/// Whether `script_pubkey` is a current or historical OpenCSV marker.
+pub fn is_marker_spk(script_pubkey: &[u8]) -> bool {
+    script_pubkey == MARKER_SPK || script_pubkey == LEGACY_MARKER_SPK
+}
 
 /// The marker output's value in satoshis (above the P2WSH dust limit of
 /// 294, matching the conventional 546-sat dust constant).
@@ -250,9 +267,9 @@ pub struct BitcoinAnchorChain<T: Transport = HttpTransport> {
     /// (in-memory only — a fresh process learns them from the scan once
     /// they confirm).
     mempool: Vec<Entry>,
-    /// Per-scanned-block marker presence: does the block contain the
-    /// protocol-constant [`MARKER_SPK`] output (i.e. is it discoverable
-    /// by a BIP158 filter scan)?
+    /// Per-scanned-block marker presence: does the block contain the current
+    /// [`MARKER_SPK`] or exact historical marker (i.e. is it discoverable by
+    /// a BIP158 filter scan)?
     markers: std::collections::BTreeMap<u64, bool>,
     /// The batch-funding outpoints tracked by this backend, keyed by
     /// payload count (see `batch.rs`): anyone-can-spend, so the wallet
@@ -599,6 +616,7 @@ impl<T: Transport> BitcoinAnchorChain<T> {
             .and_then(Value::as_array)
             .ok_or_else(|| Error::Malformed("getblock: no `tx` array".into()))?;
         let marker_hex = to_hex(&MARKER_SPK);
+        let legacy_marker_hex = to_hex(&LEGACY_MARKER_SPK);
         let mut has_marker = false;
         for (position, tx) in txs.iter().enumerate() {
             if !has_marker {
@@ -610,7 +628,9 @@ impl<T: Transport> BitcoinAnchorChain<T> {
                             o.get("scriptPubKey")
                                 .and_then(|s| s.get("hex"))
                                 .and_then(Value::as_str)
-                                == Some(marker_hex.as_str())
+                                .is_some_and(|script| {
+                                    script == marker_hex || script == legacy_marker_hex
+                                })
                         })
                     });
             }
@@ -623,7 +643,7 @@ impl<T: Transport> BitcoinAnchorChain<T> {
     }
 
     /// Whether the block at `height` carries the protocol-constant
-    /// marker output ([`MARKER_SPK`]); `None` for blocks not (yet)
+    /// current or historical marker output; `None` for blocks not (yet)
     /// scanned.
     pub fn block_has_marker(&self, height: u64) -> Option<bool> {
         self.markers.get(&height).copied()

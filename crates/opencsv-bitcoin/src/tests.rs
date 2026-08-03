@@ -459,17 +459,27 @@ fn primitives() {
     );
 }
 
-/// The marker constant is `OP_0 <sha256(OP_TRUE)>` and its address is a
-/// valid per-network bech32 form of the same program.
+/// The current marker is an unspendable `OP_0 <sha256(OP_RETURN)>`, its
+/// address is a valid per-network bech32 form of the same program, and
+/// the historical anyone-can-spend marker remains read-only compatible.
 #[test]
 fn marker_constant_is_pinned() {
     use sha2::{Digest as _, Sha256};
+    assert_eq!(MARKER_SCRIPT, [0x6a]);
     let program: [u8; 32] = Sha256::digest(MARKER_SCRIPT).into();
     let mut expected = vec![0x00, 0x20];
     expected.extend_from_slice(&program);
     assert_eq!(MARKER_SPK.as_slice(), expected.as_slice());
     assert_eq!(MARKER_DUST_SATS, 546);
     assert_eq!(MARKER_DUST_BTC, 0.00000546);
+    assert_eq!(LEGACY_MARKER_SCRIPT, [0x51]);
+    let legacy_program: [u8; 32] = Sha256::digest(LEGACY_MARKER_SCRIPT).into();
+    let mut legacy_expected = vec![0x00, 0x20];
+    legacy_expected.extend_from_slice(&legacy_program);
+    assert_eq!(LEGACY_MARKER_SPK.as_slice(), legacy_expected.as_slice());
+    assert!(is_marker_spk(&MARKER_SPK));
+    assert!(is_marker_spk(&LEGACY_MARKER_SPK));
+    assert!(!is_marker_spk(&[]));
     for network in [Network::Mainnet, Network::Signet, Network::Regtest] {
         let address = marker_address(network);
         let hrp = match network {

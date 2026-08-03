@@ -18,7 +18,7 @@ requested, and warns on every use.
 | --- | --- | --- |
 | **bitcoind RPC** | *(default)* `--chain bitcoin` | **Real Bitcoin.** Anchors are real transactions broadcast to a real node; reads scan real blocks; confirmations are real. Hard error (never a fallback) if the node is unreachable, the auth fails, or the network mismatches. |
 | File chain | `--chain demo`, `--chain file:<path>` | Simulated L1 in a text file; `chain advance` simulates mining. Prints `DEMO CHAIN — not Bitcoin`. |
-| Anchor server | `--anchor-server http://host:port` | The file chain shared over HTTP (demo, same warning). |
+| Anchor server | `--anchor-server http://host:port` | Legacy file-chain demo shared over HTTP. It is not a production trust dependency or part of the Signal-native wallet architecture. |
 
 bitcoind backend flags (all have `OPENCSV_*` env forms):
 
@@ -54,24 +54,23 @@ How it works (see `crates/opencsv-bitcoin` for details):
   the prune horizon. On a stale tip hash (reorg) the index is truncated
   back to the start height and rebuilt.
 
-### Signet status and the one remaining manual step
+### Signet operator setup
 
-Against a synced signet node the read path is fully validated (tip,
-block-range scans, index, audits) and the wallet is broadcast-ready
-(created, unencrypted, key-backed) — but **broadcasting on signet needs
-signet coins, and public faucets require a captcha**, so the last step is
-manual:
+Use a dedicated signet wallet for each validation run. Do not assume a
+particular developer-node wallet exists, and do not spend a wallet shared by
+another agent. The repository-root `SIGNET_READINESS.md` contains the current
+dated field receipt and the remaining write-path gate.
 
 ```sh
-# 1. Create the wallet (once) and print a funding address.
-bitcoin-cli -signet createwallet opencsv            # already done on the dev node
-bitcoin-cli -signet -rpcwallet=opencsv getnewaddress
-#    → e.g. tb1qpadu8m8ys2ukkx0vxhvse2up5sk7v8sy9d24q0 (the dev node's address)
+# 1. Create an isolated wallet and print a fresh funding address.
+WALLET=opencsv-signet-acceptance
+bitcoin-cli -signet createwallet "$WALLET"
+bitcoin-cli -signet -rpcwallet="$WALLET" getnewaddress
 # 2. Send signet coins to that address from any faucet, e.g.
 #    https://signetfaucet.com or https://mempool.space/signet (web form,
 #    captcha). Wait for 1+ confirmations.
-# 3. Run the normal flow with --rpc-wallet opencsv, e.g.:
-opencsv --rpc-wallet opencsv mint --asset <hex> --to self --amounts 100,50
+# 3. Run the normal flow with the isolated wallet, e.g.:
+opencsv --rpc-wallet "$WALLET" mint --asset <hex> --to self --amounts 100,50
 ```
 
 On regtest there is no faucet problem — `chain advance` mines real blocks

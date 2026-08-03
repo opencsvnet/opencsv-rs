@@ -1,8 +1,8 @@
 # OpenCSV batching v2 protocol and threat model (C0)
 
-Status: **C1 transcript frozen; C2 remediation implemented and under review**
+Status: **C1 version-2 transcript frozen and readable; version 3 is the safe-marker creation profile; C2 remediation merged**
 
-Protocol version: `2`
+Current protocol version: `3` (historical read-only version: `2`)
 
 Date: 2026-08-02
 
@@ -12,8 +12,9 @@ are requirements on conforming implementations.
 
 The existing Rust batching implementation is batching v1. It is useful
 prototype evidence, but its coordinator-funded, anyone-can-spend funding stock
-is not the v2 protocol. V1 remains readable during migration; new batch
-creation MUST use v2 after C1 lands.
+is not the co-funded protocol. V1 remains readable during migration. The
+original C1 version-2 transcript also remains byte-for-byte readable, but new
+batch creation MUST use version 3 after the marker migration described below.
 
 C1 implementation map: `opencsv-core::batch` owns versioned envelope and
 occurrence semantics; `opencsv-bitcoin::batch_v2` owns canonical transcripts,
@@ -71,7 +72,8 @@ semantics.
 
 | Name | Value | Meaning |
 |---|---:|---|
-| `VERSION` | `2` | Batching protocol version |
+| `LEGACY_VERSION` | `2` | Frozen C1 transcript; exact historical marker; read-only |
+| `VERSION` | `3` | Current C1-compatible transcript with the safe marker |
 | `MIN_PARTICIPANTS` | `1` | Smallest valid v2 batch |
 | `MAX_PARTICIPANTS` | `64` | Current C1 reference-profile/script-safety limit; not a C2 relay quota |
 | `ENVELOPE_MAGIC` | ASCII `OCS2` | First input-0 witness item |
@@ -79,7 +81,8 @@ semantics.
 | `SEQUENCE` | `0xfffffffd` | Opt-in replacement, no relative lock |
 | `LOCK_TIME` | `0` | Initial C1 lock time |
 | `SIGHASH` | `SIGHASH_ALL` (`0x01`) | Required for every input |
-| `MARKER_VALUE` | `546` sats | Existing OpenCSV marker value |
+| `MARKER_VALUE` | `546` sats | OpenCSV marker value |
+| `MARKER_SCRIPT` | `OP_0 PUSH32(SHA256(OP_RETURN))` | BIP158-visible, unspendable marker scriptPubKey |
 | `MIN_CHANGE` | `546` sats | Conservative v2 change floor |
 | `MIN_STOCK_VALUE` | `546` sats | Conservative reusable-stock floor |
 
@@ -228,7 +231,7 @@ Exactly one commitment is accepted per participant operation and per fee
 outpoint. The canonical proposal body is:
 
 ```text
-version                 u16 = 2
+version                 u16 = 2 or 3; new writers MUST emit 3
 chain_id                [u8; 32]
 stock_outpoint          [u8; 36]
 stock_value             u64 sats
@@ -298,7 +301,7 @@ inputs:
 
 outputs:
   0       value 0, OP_RETURN <64-byte v2 batch-header record>
-  1       value 546, the existing constant OpenCSV marker scriptPubKey
+  1       value 546, the constant unspendable OpenCSV marker scriptPubKey
   2       stock_value, the exact input-0 P2WSH scriptPubKey
   3..N+2  participant P2WPKH change outputs in participant order
 ```
@@ -308,6 +311,16 @@ are no extra inputs or outputs, no merged or omitted change, and no coordinator
 output. Input 0 and protocol outputs intentionally override general-purpose
 lexicographic transaction ordering; the remaining outpoints use the same
 determinism principle as [BIP 69][bip69].
+
+Version-2 manifests used `OP_0 PUSH32(SHA256(OP_TRUE))` at output 1. That
+output was anyone-can-spend: a signet observer immediately attached a child
+transaction and pinned ordinary BIP125 replacement. Version 3 uses the
+unspendable `OP_RETURN` witness-script hash above. The proposal version selects
+exactly one marker: version 2 requires the historical script and version 3
+requires the safe script. Readers preserve every version-2 byte and golden
+vector, but version-2 manifests cannot enter a new replacement epoch and no
+new public constructor emits them. There is no heuristic or cross-version
+script fallback.
 
 Before signing, every participant MUST verify:
 
@@ -678,7 +691,8 @@ signature bodies are not a public product command.
 | Unanimous invariant-preserving replacement | Allows fee recovery without changing OpenCSV evidence | Unilateral RBF or silent fallback |
 | New magic and hash domain | Fail-closed separation from v1 | Heuristic version detection |
 | C1 reference profile currently limits participants to 64 | Keeps the frozen script/weight evidence; C2 resource limits remain configurable local policy | Treating 64 as a universal relay quota |
-| C2 wrapper instead of a C1 amendment | Binds the exact body hash and origin key while preserving every C1 byte and golden vector | Re-encoding frozen proposal/commitment bodies |
+| C2 wrapper instead of a C1 amendment | Binds the exact body hash and origin key while preserving every version-2 C1 byte and golden vector | Re-encoding frozen proposal/commitment bodies |
+| Explicit version-3 safe-marker boundary | Keeps version-2 proposal, commitment, manifest, signature, IDs, and hashes immutable while making every new marker unspendable | Silently changing the marker and golden vectors under version 2 |
 | Typed verifier and reservation capabilities | Makes authoritative freshness and signer-local locking mandatory at publication/signing boundaries | Boolean `verified`/`reserved` flags or caller discipline |
 | All signed epochs remain recoverable | A sign-and-disappear peer cannot make an older valid conflict look safely abortable | Tracking only the latest replacement |
 | Remote parse/auth errors are contained; storage errors are fatal | Preserves Internet-facing availability without turning failed persistence into a warning | One undifferentiated best-effort relay loop |

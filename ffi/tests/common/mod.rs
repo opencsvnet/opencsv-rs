@@ -37,6 +37,7 @@ fn free_port() -> u16 {
 /// the MINT/REDEEM/BATCH tag bytes for every candidate funding ctx
 /// (`Error::TagCollision` — the two-pass anchor's only redraw freedom
 /// is input order, so unlucky seeds fail ~1% of the time on regtest).
+#[allow(dead_code)] // Shared integration-test helper; not every test binary calls it.
 pub fn anchor_xfer_retry(
     chain: &mut opencsv_bitcoin::BitcoinAnchorChain,
     seed: u8,
@@ -57,6 +58,7 @@ pub fn anchor_xfer_retry(
 /// deliberate double-spend), mining a block between `TagCollision`
 /// retries so `fundrawtransaction` draws different funding inputs (the
 /// tag-collision redraw freedom is input order).
+#[allow(dead_code)] // Shared integration-test helper; not every test binary calls it.
 pub fn anchor_xfer_same_retry(
     chain: &mut opencsv_bitcoin::BitcoinAnchorChain,
     raw_nf: opencsv_core::Digest,

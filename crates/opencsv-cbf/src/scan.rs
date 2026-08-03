@@ -3,9 +3,10 @@
 //! every block.
 //!
 //! Anchor transactions carry the protocol-constant marker output
-//! ([`opencsv_bitcoin::MARKER_SPK`]) at output index 1, so BIP158 basic
-//! filters — which exclude OP_RETURN but include ordinary
-//! scriptPubKeys — match anchor-bearing blocks. [`ScanIndex::scan_sync`]
+//! ([`opencsv_bitcoin::MARKER_SPK`], plus the historical marker during
+//! migration) at output index 1, so BIP158 basic filters — which exclude
+//! direct OP_RETURN outputs but include P2WSH programs — match
+//! anchor-bearing blocks. [`ScanIndex::scan_sync`]
 //! walks the verified filters from a wallet's birth height to the tip;
 //! every match triggers an SPV block fetch (merkle-verified against the
 //! PoW-checked header chain, exactly like [`CbfClient::verify_anchor`]),
@@ -28,11 +29,15 @@
 //! binding the queried nullifier. False-positive filter matches
 //! (probability ~N/784931 per block) cost the same.
 
-use std::path::PathBuf;
+use std::fs::{File, OpenOptions};
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
-use opencsv_bitcoin::{Network, MARKER_SPK};
+use opencsv_bitcoin::{Network, LEGACY_MARKER_SPK, MARKER_SPK};
 use opencsv_core::chain::{AnchorChain, AnchorLocation, AnchorRef};
 use opencsv_core::{AnchorRecord, Digest};
+use sha2::{Digest as _, Sha256};
 
 use crate::client::CbfClient;
 use crate::error::Error;
@@ -40,7 +45,18 @@ use crate::fullscan::{anchors_in_block, ScannedAnchor};
 use crate::hash::{from_hex, hash_to_display, to_hex};
 
 /// First line of every scan-index file (format version tag).
-const MAGIC: &str = "opencsv-cbf-scan-index-v1";
+const MAGIC: &str = "opencsv-cbf-scan-index-v2";
+
+/// How [`ScanIndex::open`] initialized its rebuildable cache.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ScanLoadStatus {
+    /// No prior index existed.
+    Fresh,
+    /// A complete checksummed index was loaded.
+    Loaded,
+    /// A corrupt, partial, or incompatible index was discarded.
+    RebuildRequired,
+}
 
 /// Bandwidth accounting of [`ScanIndex::scan_sync`] runs (payload bytes
 /// fetched from peers; cache hits excluded).
@@ -69,12 +85,14 @@ pub struct ScanIndex {
     synced_tip: u64,
     occurrences: Vec<ScannedAnchor>,
     counters: ScanCounters,
+    load_status: ScanLoadStatus,
 }
 
 impl ScanIndex {
-    /// Open the index at `dir` (created on first sync). A missing or
-    /// unparseable file starts a fresh index — it is a rebuildable
-    /// cache.
+    /// Open the index at `dir` (created on first sync). A missing file
+    /// starts fresh. A corrupt, partial, or incompatible file is
+    /// discarded and reported through [`ScanIndex::load_status`]; the
+    /// index is a rebuildable cache.
     pub fn open(dir: impl Into<PathBuf>, network: Network) -> Result<Self, Error> {
         let dir = dir.into();
         let mut index = Self {
@@ -84,6 +102,7 @@ impl ScanIndex {
             synced_tip: 0,
             occurrences: Vec::new(),
             counters: ScanCounters::default(),
+            load_status: ScanLoadStatus::Fresh,
         };
         index.load()?;
         Ok(index)
@@ -99,85 +118,24 @@ impl ScanIndex {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
             Err(e) => return Err(Error::Io(e)),
         };
-        let mut lines = text.lines();
-        if lines.next().map(str::trim) != Some(MAGIC) {
-            // Unknown format: rebuild (rebuildable cache).
+        let Some(body) = verified_body(&text) else {
+            self.load_status = ScanLoadStatus::RebuildRequired;
             return Ok(());
-        }
-        for line in lines {
-            let fields: Vec<&str> = line.split_whitespace().collect();
-            let bad = || Error::Decode(format!("scan index: malformed `{line}`"));
-            match fields.as_slice() {
-                ["network", name] => {
-                    if Network::parse(name).ok() != Some(self.network) {
-                        return Err(Error::Decode(format!(
-                            "scan index is for network `{name}`, not {}",
-                            self.network.name()
-                        )));
-                    }
-                }
-                ["from", h] => self.from_height = h.parse().map_err(|_| bad())?,
-                ["tip", h] => self.synced_tip = h.parse().map_err(|_| bad())?,
-                ["occurrence", h, p, txid, ctx, record, rest @ ..] => {
-                    let txid = {
-                        let mut bytes: [u8; 32] = from_hex(txid)
-                            .map_err(|_| bad())?
-                            .try_into()
-                            .map_err(|_| bad())?;
-                        bytes.reverse();
-                        bytes
-                    };
-                    let batch = match rest {
-                        [] => None,
-                        [kind @ ("batch" | "batch1" | "batch2"), index, envelope] => {
-                            let envelope_bytes = from_hex(envelope).map_err(|_| bad())?;
-                            if envelope_bytes.len() % 24 != 0 {
-                                return Err(bad());
-                            }
-                            Some(crate::fullscan::BatchCandidate {
-                                version: if *kind == "batch2" {
-                                    opencsv_core::BatchVersion::V2
-                                } else {
-                                    opencsv_core::BatchVersion::V1
-                                },
-                                index: index.parse().map_err(|_| bad())?,
-                                envelope: envelope_bytes
-                                    .chunks_exact(24)
-                                    .map(|chunk| {
-                                        opencsv_core::TruncatedDigest(
-                                            chunk.try_into().expect("24-byte chunk"),
-                                        )
-                                    })
-                                    .collect(),
-                            })
-                        }
-                        _ => return Err(bad()),
-                    };
-                    self.occurrences.push(ScannedAnchor {
-                        location: AnchorLocation {
-                            height: h.parse().map_err(|_| bad())?,
-                            position: p.parse().map_err(|_| bad())?,
-                        },
-                        txid,
-                        record: AnchorRecord::from_bytes(
-                            &from_hex(record)
-                                .map_err(|_| bad())?
-                                .try_into()
-                                .map_err(|_| bad())?,
-                        ),
-                        ctx: from_hex(ctx).map_err(|_| bad())?.try_into().map_err(|_| bad())?,
-                        batch,
-                    });
-                }
-                _ => {}
-            }
-        }
+        };
+        let Some((from_height, synced_tip, occurrences)) = decode_body(body, self.network) else {
+            self.load_status = ScanLoadStatus::RebuildRequired;
+            return Ok(());
+        };
+        self.from_height = from_height;
+        self.synced_tip = synced_tip;
+        self.occurrences = occurrences;
+        self.load_status = ScanLoadStatus::Loaded;
         Ok(())
     }
 
     fn persist(&self) -> Result<(), Error> {
         std::fs::create_dir_all(&self.dir)?;
-        let mut out = format!(
+        let mut body = format!(
             "{MAGIC}\nnetwork {}\nfrom {}\ntip {}\n",
             self.network.name(),
             self.from_height,
@@ -193,22 +151,24 @@ impl ScanIndex {
                 to_hex(&e.record.to_bytes()),
             );
             if let Some(batch) = &e.batch {
-                let envelope: Vec<u8> = batch
-                    .envelope
-                    .iter()
-                    .flat_map(|p| *p.as_bytes())
-                    .collect();
+                let envelope: Vec<u8> = batch.envelope.iter().flat_map(|p| *p.as_bytes()).collect();
                 let kind = match batch.version {
                     opencsv_core::BatchVersion::V1 => "batch1",
                     opencsv_core::BatchVersion::V2 => "batch2",
                 };
                 line.push_str(&format!(" {kind} {} {}", batch.index, to_hex(&envelope)));
             }
-            out.push_str(&line);
-            out.push('\n');
+            body.push_str(&line);
+            body.push('\n');
         }
-        std::fs::write(self.path(), out)?;
-        Ok(())
+        let checksum = Sha256::digest(body.as_bytes());
+        let file = format!("{body}checksum {}\n", to_hex(&checksum));
+        atomic_write(&self.path(), file.as_bytes())
+    }
+
+    /// How this instance initialized its on-disk cache.
+    pub fn load_status(&self) -> ScanLoadStatus {
+        self.load_status
     }
 
     /// Sync the index from its resume point up to the client's verified
@@ -230,7 +190,9 @@ impl ScanIndex {
         let tip = client.tip_height();
         let (filters_before, blocks_before) = client.fetched_bytes();
         for height in (self.synced_tip + 1)..=tip {
-            if client.filter_matches(height, &MARKER_SPK)? {
+            let current_marker = client.filter_matches(height, &MARKER_SPK)?;
+            let legacy_marker = client.filter_matches(height, &LEGACY_MARKER_SPK)?;
+            if current_marker || legacy_marker {
                 let block_hash = client
                     .block_hash(height)
                     .ok_or_else(|| Error::Consensus(format!("no header at height {height}")))?;
@@ -263,11 +225,7 @@ impl ScanIndex {
     ) -> Option<(AnchorLocation, [u8; 32])> {
         self.occurrences
             .iter()
-            .filter(|e| {
-                e.location.height >= birth
-                    && e.location.height <= spend
-                    && e.binds(raw_nf)
-            })
+            .filter(|e| e.location.height >= birth && e.location.height <= spend && e.binds(raw_nf))
             .map(|e| (e.location, e.ctx))
             .min_by_key(|(location, _)| *location)
     }
@@ -301,6 +259,126 @@ impl ScanIndex {
                 && (e.location == anchor_ref.location || anchor_ref.location == mempool)
         })
     }
+}
+
+fn verified_body(text: &str) -> Option<&str> {
+    let text = text.strip_suffix('\n')?;
+    let (body_without_newline, checksum_line) = text.rsplit_once('\n')?;
+    let checksum = checksum_line.strip_prefix("checksum ")?;
+    let expected = from_hex(checksum).ok()?;
+    let body_len = body_without_newline.len().checked_add(1)?;
+    let body = text.get(..body_len)?;
+    (expected.as_slice() == Sha256::digest(body.as_bytes()).as_slice()).then_some(body)
+}
+
+fn decode_body(body: &str, network: Network) -> Option<(u64, u64, Vec<ScannedAnchor>)> {
+    let mut lines = body.lines();
+    if lines.next().map(str::trim) != Some(MAGIC) {
+        return None;
+    }
+    let mut saw_network = false;
+    let mut from_height: Option<u64> = None;
+    let mut synced_tip: Option<u64> = None;
+    let mut occurrences = Vec::new();
+    for line in lines {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        match fields.as_slice() {
+            ["network", name] => {
+                if saw_network || Network::parse(name).ok() != Some(network) {
+                    return None;
+                }
+                saw_network = true;
+            }
+            ["from", h] if from_height.is_none() => from_height = h.parse().ok(),
+            ["tip", h] if synced_tip.is_none() => synced_tip = h.parse().ok(),
+            ["occurrence", h, p, txid, ctx, record, rest @ ..] => {
+                let txid = {
+                    let mut bytes: [u8; 32] = from_hex(txid).ok()?.try_into().ok()?;
+                    bytes.reverse();
+                    bytes
+                };
+                let batch = match rest {
+                    [] => None,
+                    [kind @ ("batch" | "batch1" | "batch2"), index, envelope] => {
+                        let envelope_bytes = from_hex(envelope).ok()?;
+                        if envelope_bytes.len() % 24 != 0 {
+                            return None;
+                        }
+                        Some(crate::fullscan::BatchCandidate {
+                            version: if *kind == "batch2" {
+                                opencsv_core::BatchVersion::V2
+                            } else {
+                                opencsv_core::BatchVersion::V1
+                            },
+                            index: index.parse().ok()?,
+                            envelope: envelope_bytes
+                                .chunks_exact(24)
+                                .map(|chunk| {
+                                    opencsv_core::TruncatedDigest(
+                                        chunk.try_into().expect("24-byte chunk"),
+                                    )
+                                })
+                                .collect(),
+                        })
+                    }
+                    _ => return None,
+                };
+                occurrences.push(ScannedAnchor {
+                    location: AnchorLocation {
+                        height: h.parse().ok()?,
+                        position: p.parse().ok()?,
+                    },
+                    txid,
+                    record: AnchorRecord::from_bytes(&from_hex(record).ok()?.try_into().ok()?),
+                    ctx: from_hex(ctx).ok()?.try_into().ok()?,
+                    batch,
+                });
+            }
+            _ => return None,
+        }
+    }
+    let from_height = from_height?;
+    let synced_tip = synced_tip?;
+    if !saw_network
+        || (synced_tip > 0 && from_height == 0)
+        || synced_tip < from_height.saturating_sub(1)
+        || occurrences
+            .iter()
+            .any(|entry| entry.location.height < from_height || entry.location.height > synced_tip)
+        || occurrences
+            .windows(2)
+            .any(|pair| pair[0].location > pair[1].location)
+    {
+        return None;
+    }
+    Some((from_height, synced_tip, occurrences))
+}
+
+fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), Error> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| Error::Io(std::io::Error::other("scan index path has no parent")))?;
+    std::fs::create_dir_all(parent)?;
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|e| Error::Io(std::io::Error::other(e)))?
+        .as_nanos();
+    let temp = parent.join(format!(".scan-index-{}-{nonce}.tmp", std::process::id()));
+    let result: std::io::Result<()> = (|| {
+        let mut file = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&temp)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        std::fs::rename(&temp, path)?;
+        File::open(parent)?.sync_all()?;
+        Ok(())
+    })();
+    if result.is_err() && temp.exists() {
+        let _ = std::fs::remove_file(&temp);
+    }
+    result.map_err(Error::Io)
 }
 
 /// The scan index as an anchor chain: tip = synced tip, occurrences
@@ -347,5 +425,51 @@ impl AnchorChain for ScanIndex {
             .filter(|e| e.location.height <= height)
             .map(|e| (e.location, e.record))
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn checksummed_index_round_trips_and_detects_corruption() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut index = ScanIndex::open(dir.path(), Network::Signet).unwrap();
+        assert_eq!(index.load_status(), ScanLoadStatus::Fresh);
+        index.from_height = 10;
+        index.synced_tip = 20;
+        index.persist().unwrap();
+
+        let loaded = ScanIndex::open(dir.path(), Network::Signet).unwrap();
+        assert_eq!(loaded.load_status(), ScanLoadStatus::Loaded);
+        assert_eq!(loaded.synced_tip(), 20);
+
+        let path = dir.path().join("scan-index.log");
+        let mut bytes = std::fs::read(&path).unwrap();
+        let offset = bytes
+            .iter()
+            .position(|byte| *byte == b'2')
+            .expect("version byte");
+        bytes[offset] = b'1';
+        std::fs::write(path, bytes).unwrap();
+
+        let rebuilt = ScanIndex::open(dir.path(), Network::Signet).unwrap();
+        assert_eq!(rebuilt.load_status(), ScanLoadStatus::RebuildRequired);
+        assert_eq!(rebuilt.synced_tip(), 0);
+    }
+
+    #[test]
+    fn legacy_index_requires_a_rebuild() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("scan-index.log"),
+            "opencsv-cbf-scan-index-v1\nnetwork signet\nfrom 10\ntip 20\n",
+        )
+        .unwrap();
+
+        let rebuilt = ScanIndex::open(dir.path(), Network::Signet).unwrap();
+        assert_eq!(rebuilt.load_status(), ScanLoadStatus::RebuildRequired);
+        assert_eq!(rebuilt.synced_tip(), 0);
     }
 }

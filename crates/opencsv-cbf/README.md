@@ -37,8 +37,9 @@ position proves the claim false — `AnchorVerdict::NotPresent(_)`.
 `CbfClient::tip_height()` reports the verified chain tip. Headers, filter
 hashes, and fetched filters are persisted in `Config::cache_dir` — a
 rebuildable cache: deleting it only forces a resync, and cached data is
-re-validated on load (headers) or against the peer-served filter chain
-(filters) before use.
+re-validated on load (headers). Because filter hashes are not committed in
+block headers, every new connection re-fetches their complete chain from all
+peers before use; later syncs on those same connections fetch only the suffix.
 
 ## The filter layer — and an honest caveat
 
@@ -76,10 +77,12 @@ live bitcoind filters — only decode with 2-4.)
 ## The scan engine (ScanIndex): trustless exclusion by default
 
 Anchor transactions carry the protocol-constant marker output
-(`opencsv_bitcoin::MARKER_SPK` = `OP_0 <sha256(OP_TRUE)>`, 546 sats) at
+(`opencsv_bitcoin::MARKER_SPK` = `OP_0 <sha256(OP_RETURN)>`, 546 sats) at
 output index 1, so BIP158 basic filters match anchor-bearing blocks even
-though they exclude the OP_RETURN record itself. `ScanIndex` builds the
-default exclusion path on top of this:
+though they exclude the direct OP_RETURN record itself. The P2WSH marker is
+unspendable, preventing third-party child pinning; scanners also recognize the
+historical `sha256(OP_TRUE)` marker without creating it. `ScanIndex` builds
+the default exclusion path on top of this:
 
 - `scan_sync(client, from_height)` checks every block's verified filter
   for the marker spk from `from_height` to the tip, SPV-fetches
@@ -87,6 +90,9 @@ default exclusion path on top of this:
   candidate with its recomputed funding ctx in a persistent, rebuildable
   index dir. Bandwidth counters (`filters_bytes`, `blocks_bytes`,
   `blocks_fetched`) are exposed.
+- Scan-index v2 is checksummed and atomically replaced. A partial, corrupt,
+  unknown, or legacy file returns `ScanLoadStatus::RebuildRequired` and starts
+  from height zero instead of trusting a possibly incomplete occurrence set.
 - `scan_check(raw_nf, birth, spend)` answers occurrence queries
   **locally** — no network at check time; earliest occurrence wins.
 - Batch headers expand into one indexed candidate per witness payload. `OCSV`
@@ -157,8 +163,10 @@ inclusion, **not** transaction or block validity. Its security rests on:
 - **At least one honest, un-eclipsed peer.** An attacker controlling
   *all* your connections can feed you a fabricated lower-work chain.
   Mitigation implemented: the client syncs headers from **every**
-  configured peer and requires byte-identical tips (`Error::DivergentPeers`
-  otherwise); block and filter fetches fail over across peers. Connect
+  configured peer from the same validated base and requires identical tip
+  height, hash, and accumulated work (`Error::DivergentPeers` otherwise);
+  block and filter fetches fail over across peers. Peers must advertise both
+  witness and compact-filter services. Connect
   to several independent peers (`Config::peers`) — on mainnet, prefer
   peers you don't all reach through one network path.
 - **Filter-header chain agreement.** Filter headers are not committed
@@ -181,7 +189,7 @@ inclusion, **not** transaction or block validity. Its security rests on:
 - `src/gcs.rs` — BIP158 GCS/Golomb-Rice encode + match (MSB-first
   bitstream, P=19, M=784931), filter hash/header chaining.
 - `src/wire.rs`, `src/messages.rs` — varints, framing, and the P2P
-  messages (`version`/`verack`/`sendheaders`, `getheaders`/`headers`,
+  messages (`version`/`verack`, `getheaders`/`headers`,
   `getcfheaders`/`cfheaders`, `getcfilters`/`cfilter`, `getdata`,
   `ping`/`pong`).
 - `src/block.rs` — header/transaction/block parsing (segwit-aware),

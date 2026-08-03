@@ -25,10 +25,12 @@ use bitcoin::{
 use opencsv_core::{envelope_v2_encode, AnchorRecord, TruncatedDigest, MAX_BATCH_V2_PARTICIPANTS};
 use sha2::{Digest as _, Sha256};
 
-use crate::{funding_ctx, MARKER_DUST_SATS, MARKER_SPK};
+use crate::{funding_ctx, LEGACY_MARKER_SPK, MARKER_DUST_SATS, MARKER_SPK};
 
-/// Batching-v2 transcript version.
-pub const VERSION: u16 = 2;
+/// Historical batching-v2 transcript version with the spendable marker.
+pub const LEGACY_VERSION: u16 = 2;
+/// Current batching transcript version with the unspendable marker.
+pub const VERSION: u16 = 3;
 /// First eight bytes of every batching-v2 transcript message.
 pub const MESSAGE_MAGIC: [u8; 8] = *b"OCSVB2\0\0";
 /// Initial/RBF transaction version.
@@ -206,6 +208,7 @@ impl ReservationPhase {
 /// A validated proposal fixing input 0, network, membership count, and fee bounds.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Proposal {
+    version: u16,
     chain_id: [u8; 32],
     stock_outpoint: OutPoint,
     stock_value: u64,
@@ -233,7 +236,37 @@ impl Proposal {
         target_feerate_sat_vb: u32,
         max_feerate_sat_vb: u32,
     ) -> Result<Self, ProtocolError> {
+        Self::new_for_version(
+            VERSION,
+            chain_id,
+            stock_outpoint,
+            stock_value,
+            stock_owner_pubkey,
+            participant_count,
+            proposal_nonce,
+            observed_tip_height,
+            expiry_height,
+            target_feerate_sat_vb,
+            max_feerate_sat_vb,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn new_for_version(
+        version: u16,
+        chain_id: [u8; 32],
+        stock_outpoint: OutPoint,
+        stock_value: u64,
+        stock_owner_pubkey: PublicKey,
+        participant_count: u8,
+        proposal_nonce: [u8; 32],
+        observed_tip_height: u32,
+        expiry_height: u32,
+        target_feerate_sat_vb: u32,
+        max_feerate_sat_vb: u32,
+    ) -> Result<Self, ProtocolError> {
         let proposal = Self {
+            version,
             chain_id,
             stock_outpoint,
             stock_value,
@@ -264,7 +297,7 @@ impl Proposal {
         let body = wire_body(wire, PROPOSAL_KIND)?;
         let mut reader = Reader::new(body);
         let version = reader.u16()?;
-        if version != VERSION {
+        if !matches!(version, LEGACY_VERSION | VERSION) {
             return Err(ProtocolError::new(
                 RejectionReason::InvalidVersion,
                 format!("proposal version {version}"),
@@ -281,7 +314,8 @@ impl Proposal {
         let target_feerate_sat_vb = reader.u32()?;
         let max_feerate_sat_vb = reader.u32()?;
         reader.finish()?;
-        let proposal = Self::new(
+        let proposal = Self::new_for_version(
+            version,
             chain_id,
             stock_outpoint,
             stock_value,
@@ -295,6 +329,11 @@ impl Proposal {
         )?;
         require_canonical_wire(wire, &proposal.wire_bytes())?;
         Ok(proposal)
+    }
+
+    /// Canonical C1 protocol version selected by this proposal.
+    pub fn protocol_version(&self) -> u16 {
+        self.version
     }
 
     /// Input-0 OpenCSV context.
@@ -373,6 +412,12 @@ impl Proposal {
     }
 
     fn validate(&self) -> Result<(), ProtocolError> {
+        if !matches!(self.version, LEGACY_VERSION | VERSION) {
+            return Err(ProtocolError::new(
+                RejectionReason::InvalidVersion,
+                format!("proposal version {}", self.version),
+            ));
+        }
         let count = self.participant_count as usize;
         if !(1..=MAX_BATCH_V2_PARTICIPANTS).contains(&count) {
             return Err(ProtocolError::new(
@@ -409,7 +454,7 @@ impl Proposal {
 
     fn body(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(164);
-        out.extend_from_slice(&VERSION.to_le_bytes());
+        out.extend_from_slice(&self.version.to_le_bytes());
         out.extend_from_slice(&self.chain_id);
         out.extend_from_slice(&serialize(&self.stock_outpoint));
         out.extend_from_slice(&self.stock_value.to_le_bytes());
@@ -597,6 +642,17 @@ pub struct Manifest {
     unsigned_tx: Transaction,
 }
 
+fn marker_spk_for_version(version: u16) -> Result<&'static [u8; 34], ProtocolError> {
+    match version {
+        LEGACY_VERSION => Ok(&LEGACY_MARKER_SPK),
+        VERSION => Ok(&MARKER_SPK),
+        _ => Err(ProtocolError::new(
+            RejectionReason::InvalidVersion,
+            format!("proposal version {version}"),
+        )),
+    }
+}
+
 impl Manifest {
     /// Build the canonical initial manifest, sorting commitments by outpoint.
     pub fn build(
@@ -608,9 +664,26 @@ impl Manifest {
 
     fn build_at(
         proposal: &Proposal,
+        commitments: Vec<ParticipantCommitment>,
+        replacement_epoch: u32,
+        feerate_sat_vb: u32,
+    ) -> Result<Self, ProtocolError> {
+        let marker_spk = marker_spk_for_version(proposal.protocol_version())?;
+        Self::build_at_with_marker(
+            proposal,
+            commitments,
+            replacement_epoch,
+            feerate_sat_vb,
+            marker_spk,
+        )
+    }
+
+    fn build_at_with_marker(
+        proposal: &Proposal,
         mut commitments: Vec<ParticipantCommitment>,
         replacement_epoch: u32,
         feerate_sat_vb: u32,
+        marker_spk: &[u8; 34],
     ) -> Result<Self, ProtocolError> {
         proposal.validate()?;
         if commitments.len() != proposal.participant_count() {
@@ -708,7 +781,7 @@ impl Manifest {
         });
         outputs.push(TxOut {
             value: Amount::from_sat(MARKER_DUST_SATS),
-            script_pubkey: ScriptBuf::from_bytes(MARKER_SPK.to_vec()),
+            script_pubkey: ScriptBuf::from_bytes(marker_spk.to_vec()),
         });
         outputs.push(TxOut {
             value: Amount::from_sat(proposal.stock_value),
@@ -1134,6 +1207,12 @@ impl Manifest {
             return Err(ProtocolError::new(
                 RejectionReason::ReplacementViolation,
                 "replacement feerate must increase",
+            ));
+        }
+        if proposal.protocol_version() != VERSION {
+            return Err(ProtocolError::new(
+                RejectionReason::ReplacementViolation,
+                "historical version-2 manifests are read-only",
             ));
         }
         let replacement = Self::build_at(
@@ -1651,8 +1730,20 @@ mod tests {
         Vec<SecretKey>,
         SecretKey,
     ) {
+        fixture_for_version(VERSION)
+    }
+
+    fn fixture_for_version(
+        version: u16,
+    ) -> (
+        Proposal,
+        Vec<ParticipantCommitment>,
+        Vec<SecretKey>,
+        SecretKey,
+    ) {
         let stock_secret = secret(3);
-        let proposal = Proposal::new(
+        let proposal = Proposal::new_for_version(
+            version,
             [9u8; 32],
             outpoint(7, 1),
             100_000,
@@ -1702,6 +1793,38 @@ mod tests {
         assert_eq!(max_signed_weight(64).unwrap(), 28_040);
         assert!(max_signed_weight(0).is_err());
         assert!(max_signed_weight(65).is_err());
+    }
+
+    #[test]
+    fn new_manifests_use_unspendable_markers_and_legacy_remains_readable() {
+        let (proposal, commitments, _, _) = fixture();
+        let current = Manifest::build(&proposal, commitments.clone()).unwrap();
+        assert_eq!(
+            current.unsigned_tx.output[1].script_pubkey.as_bytes(),
+            MARKER_SPK
+        );
+        assert_eq!(proposal.protocol_version(), VERSION);
+
+        let (legacy_proposal, legacy_commitments, _, _) = fixture_for_version(LEGACY_VERSION);
+        let legacy = Manifest::build(&legacy_proposal, legacy_commitments.clone()).unwrap();
+        assert_eq!(legacy_proposal.protocol_version(), LEGACY_VERSION);
+        assert_eq!(
+            legacy.unsigned_tx.output[1].script_pubkey.as_bytes(),
+            LEGACY_MARKER_SPK
+        );
+        legacy.validate(&legacy_proposal).unwrap();
+        let decoded =
+            Manifest::from_wire(&legacy_proposal, legacy_commitments, &legacy.wire_bytes())
+                .unwrap();
+        assert_eq!(decoded, legacy);
+        let error = legacy.replacement(&legacy_proposal, 3).unwrap_err();
+        assert_eq!(error.reason, RejectionReason::ReplacementViolation);
+
+        let mut wrong_marker = current;
+        wrong_marker.unsigned_tx.output[1].script_pubkey =
+            ScriptBuf::from_bytes(LEGACY_MARKER_SPK.to_vec());
+        let error = wrong_marker.validate(&proposal).unwrap_err();
+        assert_eq!(error.reason, RejectionReason::ProtocolLayoutViolation);
     }
 
     #[test]
@@ -2023,25 +2146,25 @@ mod tests {
                 "proposal",
                 proposal_wire.as_slice(),
                 173,
-                "27ee90ba463dfb07874e9aa87b74d80c4bf018d5260270737edd8609ca8c0e98",
+                "e532a8d0dc8712202d5953ab7885132c48741d0a2729c2b5e65ba9c19fa37ced",
             ),
             (
                 "commitment",
                 commitment_wire.as_slice(),
                 266,
-                "2fc72ba89f1c80ad4a55f83372eccec2f5954113d48bc7d3d8c3195844cff010",
+                "72b87f9a2e8d60a1e8608bc764f5a3f0be41c21ba1fc1b86564f1310eff505e8",
             ),
             (
                 "manifest",
                 manifest_wire.as_slice(),
                 514,
-                "9c426fea03d7ec47013e932429fd379dcdfd05e95436d1ba6a407deeed580776",
+                "0af442e7ebb92bbe181b55409d4691b55bec6f16c22836e4db1ac3a45299fcab",
             ),
             (
                 "signature",
                 signature_wire.as_slice(),
                 153,
-                "ea9058cfe1a6ab94b367fa016cff89d3ff7f97a24478f09ed7e9adda50c2056e",
+                "62cc572126f85852a8df285636fb280291dc2256730483d577655ec7220625f7",
             ),
         ] {
             assert_eq!(bytes.len(), expected_len, "{name} wire length changed");
@@ -2054,17 +2177,17 @@ mod tests {
         assert_eq!(
             proposal.batch_id(),
             [
-                0x18, 0x51, 0x98, 0x60, 0xc0, 0x0a, 0xaa, 0xa4, 0xb9, 0x02, 0x0d, 0x91, 0x58, 0x2f,
-                0xef, 0xbb, 0xe7, 0xe7, 0x39, 0xf5, 0x09, 0x45, 0xd2, 0x8b, 0xe1, 0x9e, 0x0e, 0x56,
-                0xeb, 0xdf, 0x3d, 0x13,
+                0x0c, 0x8c, 0x52, 0x91, 0xb4, 0x1e, 0x0c, 0x8e, 0x10, 0xa9, 0xb5, 0x67, 0x57, 0x36,
+                0x75, 0x06, 0x2c, 0xd0, 0x11, 0x89, 0x6f, 0xc7, 0xe9, 0xec, 0xc4, 0x48, 0xc9, 0xce,
+                0x6d, 0xad, 0xca, 0xc6,
             ]
         );
         assert_eq!(
             manifest.manifest_id(),
             [
-                0xa2, 0x69, 0x19, 0x2a, 0x9b, 0x61, 0xde, 0x5d, 0x57, 0x49, 0x79, 0x07, 0x49, 0x1e,
-                0x91, 0x80, 0x66, 0xdd, 0x0b, 0x87, 0xf9, 0x8e, 0xd7, 0x86, 0xb8, 0x70, 0x4e, 0xc8,
-                0x45, 0xf8, 0x8e, 0x14,
+                0xab, 0x1b, 0xf9, 0xa5, 0x1a, 0x73, 0x14, 0xaa, 0x0c, 0xdd, 0x80, 0xa6, 0x7f, 0x63,
+                0x28, 0x7a, 0xf9, 0x87, 0x99, 0x85, 0xe9, 0x43, 0x05, 0xfe, 0x53, 0x74, 0x5b, 0x00,
+                0x2b, 0x5c, 0xce, 0xef,
             ]
         );
 
@@ -2121,6 +2244,94 @@ mod tests {
                 .unwrap_err()
                 .reason(),
             RejectionReason::ExpiredProposal
+        );
+    }
+
+    #[test]
+    fn legacy_v2_transcript_golden_vectors_are_immutable() {
+        let (proposal, commitments, _, stock_secret) = fixture_for_version(LEGACY_VERSION);
+        let proposal_wire = proposal.wire_bytes();
+        let source_commitments = commitments.clone();
+        let manifest = Manifest::build(&proposal, commitments).unwrap();
+        let stock_signature = manifest.sign_stock(&proposal, &stock_secret).unwrap();
+        let signature_wire = signature_share_wire(
+            manifest.manifest_id(),
+            0,
+            proposal.stock_owner_pubkey,
+            &stock_signature,
+        )
+        .unwrap();
+        let commitment_wire = manifest.commitments[0].wire_bytes();
+        let manifest_wire = manifest.wire_bytes();
+
+        assert_eq!(proposal.protocol_version(), LEGACY_VERSION);
+        assert_eq!(
+            manifest.unsigned_tx.output[1].script_pubkey.as_bytes(),
+            LEGACY_MARKER_SPK
+        );
+        for (name, bytes, expected_len, expected_sha256) in [
+            (
+                "proposal",
+                proposal_wire.as_slice(),
+                173,
+                "27ee90ba463dfb07874e9aa87b74d80c4bf018d5260270737edd8609ca8c0e98",
+            ),
+            (
+                "commitment",
+                commitment_wire.as_slice(),
+                266,
+                "2fc72ba89f1c80ad4a55f83372eccec2f5954113d48bc7d3d8c3195844cff010",
+            ),
+            (
+                "manifest",
+                manifest_wire.as_slice(),
+                514,
+                "9c426fea03d7ec47013e932429fd379dcdfd05e95436d1ba6a407deeed580776",
+            ),
+            (
+                "signature",
+                signature_wire.as_slice(),
+                153,
+                "ea9058cfe1a6ab94b367fa016cff89d3ff7f97a24478f09ed7e9adda50c2056e",
+            ),
+        ] {
+            assert_eq!(bytes.len(), expected_len, "legacy {name} length changed");
+            assert_eq!(
+                format!("{:x}", sha2::Sha256::digest(bytes)),
+                expected_sha256,
+                "legacy {name} golden bytes changed"
+            );
+        }
+        assert_eq!(
+            proposal.batch_id(),
+            [
+                0x18, 0x51, 0x98, 0x60, 0xc0, 0x0a, 0xaa, 0xa4, 0xb9, 0x02, 0x0d, 0x91, 0x58, 0x2f,
+                0xef, 0xbb, 0xe7, 0xe7, 0x39, 0xf5, 0x09, 0x45, 0xd2, 0x8b, 0xe1, 0x9e, 0x0e, 0x56,
+                0xeb, 0xdf, 0x3d, 0x13,
+            ]
+        );
+        assert_eq!(
+            manifest.manifest_id(),
+            [
+                0xa2, 0x69, 0x19, 0x2a, 0x9b, 0x61, 0xde, 0x5d, 0x57, 0x49, 0x79, 0x07, 0x49, 0x1e,
+                0x91, 0x80, 0x66, 0xdd, 0x0b, 0x87, 0xf9, 0x8e, 0xd7, 0x86, 0xb8, 0x70, 0x4e, 0xc8,
+                0x45, 0xf8, 0x8e, 0x14,
+            ]
+        );
+        assert_eq!(Proposal::from_wire(&proposal_wire).unwrap(), proposal);
+        assert_eq!(
+            ParticipantCommitment::from_wire(&proposal, &commitment_wire).unwrap(),
+            manifest.commitments[0]
+        );
+        assert_eq!(
+            Manifest::from_wire(&proposal, source_commitments, &manifest_wire).unwrap(),
+            manifest
+        );
+        assert_eq!(
+            SignatureShare::from_wire(&signature_wire)
+                .unwrap()
+                .manifest_id(),
+            manifest.manifest_id()
         );
     }
 

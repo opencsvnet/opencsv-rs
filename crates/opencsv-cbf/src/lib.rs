@@ -85,4 +85,4 @@ pub use fullscan::{FullScanChain, ScannedAnchor, MAX_WINDOW_BLOCKS};
 pub use opencsv_bitcoin::Network;
 pub use opencsv_core::chain::AnchorLocation;
 pub use opencsv_core::AnchorRecord;
-pub use scan::{ScanCounters, ScanIndex};
+pub use scan::{ScanCounters, ScanIndex, ScanLoadStatus};

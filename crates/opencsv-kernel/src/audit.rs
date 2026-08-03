@@ -41,6 +41,9 @@ fn seen_contains(seen: &[MintCommit], commit: &MintCommit) -> bool {
 /// once per distinct `mint_commit`; REDEEM records with a matching asset
 /// subtract; everything else is ignored. Fails with
 /// [`SupplyError::NegativeSupply`] if redemptions exceed mints.
+// Keep the Aeneas-compatible by-value match and explicit condition rather
+// than introducing a match guard solely to satisfy this style lint.
+#[allow(clippy::collapsible_match)]
 pub fn supply(
     anchors: &[(Location, Record)],
     asset_id: &AssetId24,

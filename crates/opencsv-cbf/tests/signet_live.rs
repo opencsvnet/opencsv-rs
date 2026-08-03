@@ -2,30 +2,35 @@
 //! full header sync from genesis through (far more than) two
 //! difficulty-retarget boundaries against a real synced signet node,
 //! then a bounded `scan_sync` past the boundary. Skipped when no signet
-//! node is listening on 127.0.0.1:38333 (override with
-//! `OPENCSV_SIGNET_PEER`).
+//! compact-filter peers are explicitly supplied through the
+//! comma-separated `OPENCSV_SIGNET_PEERS` variable. Two peers are
+//! required so this test exercises independent agreement.
 
-use std::net::TcpStream;
 use std::time::{Duration, Instant};
 
 use opencsv_cbf::{CbfClient, Config, Network, ScanIndex};
 
-fn signet_peer() -> Option<String> {
-    let peer = std::env::var("OPENCSV_SIGNET_PEER").unwrap_or_else(|_| "127.0.0.1:38333".into());
-    TcpStream::connect_timeout(
-        &peer
-            .parse()
-            .unwrap_or_else(|_| "127.0.0.1:38333".parse().unwrap()),
-        Duration::from_secs(2),
-    )
-    .ok()
-    .map(|_| peer)
+fn signet_peers() -> Option<Vec<String>> {
+    let peers: Vec<String> = std::env::var("OPENCSV_SIGNET_PEERS")
+        .ok()?
+        .split(',')
+        .map(str::trim)
+        .filter(|peer| !peer.is_empty())
+        .map(str::to_owned)
+        .collect();
+    assert!(
+        peers.len() >= 2,
+        "OPENCSV_SIGNET_PEERS must name at least two peers"
+    );
+    Some(peers)
 }
 
 #[test]
 fn signet_sync_through_retarget_boundaries() {
-    let Some(peer) = signet_peer() else {
-        eprintln!("skipping signet_sync_through_retarget_boundaries: no signet node on 127.0.0.1:38333");
+    let Some(peers) = signet_peers() else {
+        eprintln!(
+            "skipping signet_sync_through_retarget_boundaries: OPENCSV_SIGNET_PEERS is unset"
+        );
         return;
     };
     let tmp = tempfile::tempdir().unwrap();
@@ -35,12 +40,13 @@ fn signet_sync_through_retarget_boundaries() {
     // difficulty-rule fix.
     let mut client = CbfClient::connect(&Config {
         network: Network::Signet,
-        peers: vec![peer],
+        peers,
         cache_dir: tmp.path().join("cbf"),
         timeout: Duration::from_secs(60),
     })
     .expect("signet header sync must succeed through retarget boundaries");
     let tip = client.tip_height();
+    assert!(client.connected_peer_count() >= 2);
     assert!(
         tip > 2 * 2016,
         "must have passed two retarget boundaries: tip {tip}"

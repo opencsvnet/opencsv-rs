@@ -59,6 +59,7 @@
 
 use crate::anchor::AnchorRecord;
 use crate::digest::{Digest, TruncatedDigest, TRUNCATED_DIGEST_BYTES};
+use crate::field::{bytes_to_felts, hash_felts};
 
 /// The magic tag of a batch witness envelope (first witness item).
 pub const WITNESS_MAGIC: [u8; 4] = *b"OCSV";
@@ -249,7 +250,7 @@ pub fn versioned_envelope_occurrence(
     {
         return None;
     }
-    let bound = binding(raw_nf, ctx).to_anchor();
+    let bound = crate::anchor::binding(raw_nf, ctx).to_anchor();
     envelope
         .iter()
         .position(|payload| *payload == bound)

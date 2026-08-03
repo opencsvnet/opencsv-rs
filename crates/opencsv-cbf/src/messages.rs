@@ -1,5 +1,5 @@
 //! P2P message framing (24-byte header + payload) and the message
-//! payloads the client speaks: `version`/`verack`/`sendheaders`,
+//! payloads the client speaks: `version`/`verack`,
 //! `ping`/`pong`, `getheaders`/`headers`, `getcfheaders`/`cfheaders`,
 //! `getcfilters`/`cfilter`, and `getdata` for block fetch.
 
@@ -30,6 +30,8 @@ pub struct Message {
     pub command: String,
     /// Raw payload.
     pub payload: Vec<u8>,
+    /// Complete wire size: 24-byte header plus payload.
+    pub wire_bytes: usize,
 }
 
 fn protocol_err(what: impl std::fmt::Display) -> Error {
@@ -56,13 +58,12 @@ pub fn read_message(reader: &mut impl Read, magic: u32) -> Result<Message, Error
     reader.read_exact(&mut header)?;
     let mut cursor = Cursor::new(&header);
     if cursor.read_u32()? != magic {
-        return Err(protocol_err("wrong network magic (peer on another network?)"));
+        return Err(protocol_err(
+            "wrong network magic (peer on another network?)",
+        ));
     }
     let command_bytes = cursor.read_bytes(12)?;
-    let end = command_bytes
-        .iter()
-        .position(|&b| b == 0)
-        .unwrap_or(12);
+    let end = command_bytes.iter().position(|&b| b == 0).unwrap_or(12);
     let command = std::str::from_utf8(&command_bytes[..end])
         .map_err(|_| protocol_err("non-UTF8 command"))?
         .to_string();
@@ -79,14 +80,24 @@ pub fn read_message(reader: &mut impl Read, magic: u32) -> Result<Message, Error
     if sha256d(&payload)[..4] != checksum {
         return Err(protocol_err(format!("bad checksum on `{command}`")));
     }
-    Ok(Message { command, payload })
+    Ok(Message {
+        command,
+        payload,
+        wire_bytes: 24 + length,
+    })
 }
 
 /// Write one framed message.
-pub fn write_message(writer: &mut impl Write, magic: u32, command: &str, payload: &[u8]) -> Result<(), Error> {
-    writer.write_all(&frame(magic, command, payload))?;
+pub fn write_message(
+    writer: &mut impl Write,
+    magic: u32,
+    command: &str,
+    payload: &[u8],
+) -> Result<usize, Error> {
+    let message = frame(magic, command, payload);
+    writer.write_all(&message)?;
     writer.flush()?;
-    Ok(())
+    Ok(message.len())
 }
 
 /// Build a `version` payload.
@@ -94,11 +105,13 @@ pub fn version_payload(our_services: u64, start_height: i32) -> Vec<u8> {
     let mut out = Vec::new();
     out.extend_from_slice(&PROTOCOL_VERSION.to_le_bytes());
     out.extend_from_slice(&our_services.to_le_bytes());
-    out.extend_from_slice(&std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
-        .to_le_bytes());
+    out.extend_from_slice(
+        &std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0)
+            .to_le_bytes(),
+    );
     // addr_recv + addr_from: empty (services 0, ::, port 0).
     for _ in 0..2 {
         out.extend_from_slice(&0u64.to_le_bytes());
@@ -170,7 +183,9 @@ pub fn parse_headers(payload: &[u8]) -> Result<Vec<BlockHeader>, Error> {
     let mut cursor = Cursor::new(payload);
     let count = cursor.read_varint()?;
     if count > 2000 {
-        return Err(protocol_err(format!("headers message with {count} entries")));
+        return Err(protocol_err(format!(
+            "headers message with {count} entries"
+        )));
     }
     let mut headers = Vec::with_capacity(count as usize);
     for _ in 0..count {
@@ -185,7 +200,11 @@ pub fn parse_headers(payload: &[u8]) -> Result<Vec<BlockHeader>, Error> {
 
 /// Build a `getcfheaders` or `getcfilters` payload (identical layout):
 /// filter type, start height (LE u32), stop hash.
-pub fn getcfilter_range_payload(filter_type: u8, start_height: u32, stop_hash: &[u8; 32]) -> Vec<u8> {
+pub fn getcfilter_range_payload(
+    filter_type: u8,
+    start_height: u32,
+    stop_hash: &[u8; 32],
+) -> Vec<u8> {
     let mut out = Vec::with_capacity(37);
     out.push(filter_type);
     out.extend_from_slice(&start_height.to_le_bytes());
@@ -208,7 +227,9 @@ pub fn parse_cfheaders(payload: &[u8]) -> Result<CfHeaders, Error> {
     let mut cursor = Cursor::new(payload);
     let filter_type = cursor.read_u8()?;
     if filter_type != crate::gcs::BASIC_FILTER_TYPE {
-        return Err(protocol_err(format!("unexpected filter type {filter_type}")));
+        return Err(protocol_err(format!(
+            "unexpected filter type {filter_type}"
+        )));
     }
     let stop_hash = cursor.read_hash()?;
     let previous_filter_header = cursor.read_hash()?;
@@ -240,7 +261,9 @@ pub fn parse_cfilter(payload: &[u8]) -> Result<CFilter, Error> {
     let mut cursor = Cursor::new(payload);
     let filter_type = cursor.read_u8()?;
     if filter_type != crate::gcs::BASIC_FILTER_TYPE {
-        return Err(protocol_err(format!("unexpected filter type {filter_type}")));
+        return Err(protocol_err(format!(
+            "unexpected filter type {filter_type}"
+        )));
     }
     let block_hash = cursor.read_hash()?;
     let filter_bytes = cursor.read_varbytes()?.to_vec();
