@@ -180,6 +180,57 @@ pub struct AccountConfig {
     pub watch_owner: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BackupCheckpointEnvelope {
+    checkpoint: BackupCheckpointPayload,
+    checkpoint_hash: String,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct BackupCheckpointPayload {
+    version: u32,
+    network: String,
+    root_fingerprint: String,
+    device_binding_commitment: Option<String>,
+    owners: Vec<String>,
+    assets: Vec<BackupAsset>,
+    operations: Vec<BackupOperation>,
+    consignments: Vec<BackupConsignment>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct BackupAsset {
+    asset_index: u32,
+    currency: String,
+    terms_hash: String,
+    nonce: u64,
+    asset_id: String,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct BackupOperation {
+    operation_id: String,
+    kind: String,
+    state: String,
+    request: Value,
+    pending_json: Option<String>,
+    delivery_nonce: String,
+    txid: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct BackupConsignment {
+    consignment_id: String,
+    consignment_base64: String,
+    spent_state: Value,
+    snapshot: Option<Value>,
+}
+
 #[derive(Clone, Debug)]
 struct FundingVerificationRequest {
     outpoint: OutPoint,
@@ -1926,8 +1977,12 @@ impl AccountWallet {
             &self.db.conn,
             "SELECT json_object('consignment_id', consignment_id,
                                 'consignment_base64', consignment_base64,
-                                'spent_state', json(spent_state_json))
-             FROM opencsv_consignments ORDER BY created_at",
+                                'spent_state', json(spent_state_json),
+                                'snapshot', CASE WHEN snapshot_json IS NULL
+                                                 THEN NULL ELSE json(snapshot_json) END)
+             FROM opencsv_consignments
+             LEFT JOIN opencsv_consignment_snapshots USING(consignment_id)
+             ORDER BY created_at",
         )?;
         let owners = self
             .protocol
@@ -1951,6 +2006,223 @@ impl AccountWallet {
             "checkpoint": payload,
             "checkpoint_hash": sha256::Hash::hash(&canonical).to_string(),
         }))
+    }
+
+    /// Import the exact compact state recovered by Signal Secure Backup.
+    /// The account root must already have opened this clean database and the
+    /// public device-binding commitment must match the checkpoint. A restored
+    /// phone remains read/export-only: importing state never manufactures or
+    /// replaces the non-migratable device binding.
+    pub fn restore_checkpoint(&mut self, checkpoint_json: &str) -> Result<Value, AccountError> {
+        if self.config.role != AccountRole::Primary {
+            return Err(AccountError::new(
+                "primary_required",
+                "linked devices restore public watch state through provisioning",
+            ));
+        }
+        let envelope_value: Value = serde_json::from_str(checkpoint_json).map_err(|error| {
+            AccountError::new("invalid_backup_checkpoint", error.to_string())
+        })?;
+        let checkpoint_value = envelope_value
+            .get("checkpoint")
+            .cloned()
+            .ok_or_else(|| {
+                AccountError::new("invalid_backup_checkpoint", "missing checkpoint payload")
+            })?;
+        let envelope: BackupCheckpointEnvelope = serde_json::from_value(envelope_value)
+            .map_err(|error| {
+                AccountError::new("invalid_backup_checkpoint", error.to_string())
+            })?;
+        let canonical = serde_json::to_vec(&checkpoint_value)
+            .map_err(|error| AccountError::new("invalid_backup_checkpoint", error.to_string()))?;
+        let actual_hash = sha256::Hash::hash(&canonical).to_string();
+        if actual_hash != envelope.checkpoint_hash {
+            return Err(AccountError::new(
+                "backup_checkpoint_hash_mismatch",
+                "Secure Backup checkpoint hash does not match its payload",
+            ));
+        }
+        if envelope.checkpoint.version != CHECKPOINT_VERSION {
+            return Err(AccountError::new(
+                "backup_version_mismatch",
+                format!("expected checkpoint version {CHECKPOINT_VERSION}"),
+            ));
+        }
+        if envelope.checkpoint.network != self.config.network {
+            return Err(AccountError::new(
+                "backup_network_mismatch",
+                "Secure Backup checkpoint belongs to another Bitcoin network",
+            ));
+        }
+        if envelope.checkpoint.root_fingerprint != self.root_fingerprint {
+            return Err(AccountError::new(
+                "account_key_mismatch",
+                "Secure Backup checkpoint belongs to another account root",
+            ));
+        }
+        if envelope.checkpoint.device_binding_commitment != self.device_binding_commitment {
+            return Err(AccountError::new(
+                "device_binding_mismatch",
+                "Secure Backup checkpoint names a different device binding",
+            ));
+        }
+        let expected_owners = self
+            .protocol
+            .as_ref()
+            .map(MemWallet::owners)
+            .unwrap_or_default();
+        if envelope.checkpoint.owners != expected_owners {
+            return Err(AccountError::new(
+                "account_key_mismatch",
+                "Secure Backup owner identity does not derive from this account root",
+            ));
+        }
+        if let Some(existing) = self.db.meta("restored_checkpoint_hash")? {
+            if existing == actual_hash {
+                return self.status();
+            }
+            return Err(AccountError::new(
+                "conflicting_backup_checkpoint",
+                "a different Secure Backup checkpoint was already imported",
+            ));
+        }
+        let occupied: i64 = self.db.conn.query_row(
+            "SELECT (SELECT COUNT(*) FROM opencsv_assets)
+                  + (SELECT COUNT(*) FROM opencsv_operations)
+                  + (SELECT COUNT(*) FROM opencsv_consignments)",
+            [],
+            |row| row.get(0),
+        )?;
+        if occupied != 0 {
+            return Err(AccountError::new(
+                "restore_requires_clean_database",
+                "refusing to merge a Secure Backup checkpoint into existing wallet state",
+            ));
+        }
+
+        for asset in &envelope.checkpoint.assets {
+            decode_hex_32(&asset.terms_hash, "terms hash")?;
+            decode_hex_32(&asset.asset_id, "asset id")?;
+            i64::try_from(asset.nonce).map_err(|_| {
+                AccountError::new("invalid_backup_checkpoint", "asset nonce exceeds SQLite i64")
+            })?;
+        }
+        for operation in &envelope.checkpoint.operations {
+            if !matches!(
+                operation.state.as_str(),
+                "planned"
+                    | "fee_reserved"
+                    | "proof_ready"
+                    | "signed_persisted"
+                    | "broadcast_unobserved"
+                    | "broadcast"
+                    | "mempool"
+                    | "confirmed"
+                    | "consignment_delivered"
+                    | "rejected"
+                    | "cancelled"
+            ) {
+                return Err(AccountError::new(
+                    "invalid_backup_checkpoint",
+                    format!("unknown operation state {}", operation.state),
+                ));
+            }
+        }
+        for consignment in &envelope.checkpoint.consignments {
+            let blob = base64::engine::general_purpose::STANDARD
+                .decode(&consignment.consignment_base64)
+                .map_err(|error| {
+                    AccountError::new("invalid_backup_checkpoint", error.to_string())
+                })?;
+            let (_, canonical_id) = canonical_consignment_identity(&blob)?;
+            if canonical_id != consignment.consignment_id {
+                return Err(AccountError::new(
+                    "invalid_backup_checkpoint",
+                    "consignment identity does not match canonical bytes",
+                ));
+            }
+            if let Some(snapshot) = &consignment.snapshot {
+                SnapshotChain::from_json(&snapshot.to_string()).map_err(|error| {
+                    AccountError::new("invalid_backup_checkpoint", error)
+                })?;
+            }
+        }
+
+        self.db.conn.execute_batch("BEGIN IMMEDIATE")?;
+        let imported = (|| -> Result<(), AccountError> {
+            let now = unix_time()?;
+            for asset in &envelope.checkpoint.assets {
+                self.db.conn.execute(
+                    "INSERT INTO opencsv_assets(
+                         asset_index, currency, terms_hash, nonce, asset_id
+                     ) VALUES(?1, ?2, ?3, ?4, ?5)",
+                    params![
+                        asset.asset_index,
+                        asset.currency,
+                        asset.terms_hash,
+                        i64::try_from(asset.nonce).map_err(|_| AccountError::new(
+                            "invalid_backup_checkpoint",
+                            "asset nonce exceeds SQLite i64",
+                        ))?,
+                        asset.asset_id,
+                    ],
+                )?;
+            }
+            for operation in &envelope.checkpoint.operations {
+                self.db.conn.execute(
+                    "INSERT INTO opencsv_operations(
+                         operation_id, kind, state, request_json, pending_json,
+                         txid, delivery_nonce, created_at, updated_at
+                     ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8)",
+                    params![
+                        operation.operation_id,
+                        operation.kind,
+                        operation.state,
+                        operation.request.to_string(),
+                        operation.pending_json,
+                        operation.txid,
+                        operation.delivery_nonce,
+                        now,
+                    ],
+                )?;
+            }
+            for consignment in &envelope.checkpoint.consignments {
+                self.db.conn.execute(
+                    "INSERT INTO opencsv_consignments(
+                         consignment_id, consignment_base64, spent_state_json, created_at
+                     ) VALUES(?1, ?2, ?3, ?4)",
+                    params![
+                        consignment.consignment_id,
+                        consignment.consignment_base64,
+                        consignment.spent_state.to_string(),
+                        now,
+                    ],
+                )?;
+                if let Some(snapshot) = &consignment.snapshot {
+                    self.db.conn.execute(
+                        "INSERT INTO opencsv_consignment_snapshots(
+                             consignment_id, snapshot_json
+                         ) VALUES(?1, ?2)",
+                        params![consignment.consignment_id, snapshot.to_string()],
+                    )?;
+                }
+            }
+            self.db.set_meta("backup_verified", "1")?;
+            self.db
+                .set_meta("backup_checkpoint_version", &CHECKPOINT_VERSION.to_string())?;
+            self.db.set_meta("restored_checkpoint_hash", &actual_hash)?;
+            self.restore_issuers()?;
+            self.restore_consignment_state()?;
+            Ok(())
+        })();
+        match imported {
+            Ok(()) => self.db.conn.execute_batch("COMMIT")?,
+            Err(error) => {
+                let _ = self.db.conn.execute_batch("ROLLBACK");
+                return Err(error);
+            }
+        }
+        self.status()
     }
 
     fn require_write_enabled(&self) -> Result<(), AccountError> {
@@ -3235,6 +3507,63 @@ mod tests {
                 .unwrap_err()
                 .code,
             "device_binding_mismatch"
+        );
+    }
+
+    #[test]
+    fn clean_restore_imports_exact_checkpoint_but_remains_read_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let original_path = dir.path().join("original.sqlite");
+        let restored_path = dir.path().join("restored.sqlite");
+        let key = [31u8; 32];
+        let binding = [32u8; 32];
+        let cfg = config(AccountRole::Primary, true);
+        let mut original = AccountWallet::open_device_bound(
+            &cfg,
+            &key,
+            &binding,
+            original_path.to_str().unwrap(),
+        )
+        .unwrap();
+        let asset_id = original.create_asset("USD", None).unwrap();
+        let checkpoint = original.checkpoint().unwrap();
+        let commitment = checkpoint["checkpoint"]["device_binding_commitment"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        drop(original);
+
+        let mut restored_config: Value = serde_json::from_str(&cfg).unwrap();
+        restored_config["backup_verified"] = json!(false);
+        restored_config["expected_device_binding_commitment"] = json!(commitment);
+        let mut restored = AccountWallet::open_device_bound(
+            &restored_config.to_string(),
+            &key,
+            &[],
+            restored_path.to_str().unwrap(),
+        )
+        .unwrap();
+        let status = restored
+            .restore_checkpoint(&checkpoint.to_string())
+            .unwrap();
+        assert_eq!(status["device_binding"]["status"], "mismatch_read_only");
+        assert_eq!(status["write_enabled"], false);
+        assert_eq!(
+            restored.checkpoint().unwrap()["checkpoint"]["assets"][0]["asset_id"],
+            asset_id
+        );
+        // Identical replay is idempotent; a byte-tampered hash is rejected.
+        restored
+            .restore_checkpoint(&checkpoint.to_string())
+            .unwrap();
+        let mut tampered = checkpoint;
+        tampered["checkpoint_hash"] = json!("00");
+        assert_eq!(
+            restored
+                .restore_checkpoint(&tampered.to_string())
+                .unwrap_err()
+                .code,
+            "backup_checkpoint_hash_mismatch"
         );
     }
 

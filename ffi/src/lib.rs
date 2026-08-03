@@ -333,6 +333,26 @@ pub extern "C" fn opencsv_account_checkpoint(handle: u64) -> *mut c_char {
     guarded(|| with_account(handle, |account| account.checkpoint()))
 }
 
+/// Restore the exact compact checkpoint recovered by Signal Secure Backup.
+/// This is accepted only into a clean primary account opened with the same
+/// root/network/public device-binding commitment. It does not re-arm writes.
+///
+/// # Safety
+/// `checkpoint_json` must be a valid NUL-terminated UTF-8 string.
+#[no_mangle]
+pub unsafe extern "C" fn opencsv_account_restore_checkpoint(
+    handle: u64,
+    checkpoint_json: *const c_char,
+) -> *mut c_char {
+    guarded(|| {
+        let checkpoint = match unsafe { in_str(checkpoint_json, "checkpoint_json") } {
+            Ok(value) => value,
+            Err(error) => return err(error),
+        };
+        with_account(handle, |account| account.restore_checkpoint(checkpoint))
+    })
+}
+
 /// Credit a received consignment through the unified account wallet.
 ///
 /// # Safety

@@ -8,6 +8,13 @@
 # packaging: one static library per platform slice, shared C headers.
 set -eu
 
+# Rust and native dependencies must agree with the consuming Signal target.
+# Without this, rustc/cc inherit the build host's current SDK version and the
+# resulting archive is stamped (for example) iOS 26.5, which Xcode correctly
+# rejects under warnings-as-errors when Signal links it for iOS 15.
+IPHONEOS_DEPLOYMENT_TARGET="${IPHONEOS_DEPLOYMENT_TARGET:-15.0}"
+export IPHONEOS_DEPLOYMENT_TARGET
+
 repo_root="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
 out_dir="${1:-$repo_root/apple}"
 mkdir -p "$out_dir"

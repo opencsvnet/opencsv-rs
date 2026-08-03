@@ -71,6 +71,16 @@ operation may be signed only after Signal acknowledges the exact checkpoint
 hash. Disabling backup preserves status and receive access but freezes new
 writes.
 
+On a clean restore, Signal opens the account with the recovered root, an empty
+device-binding buffer, and the checkpoint's public binding commitment, then
+calls `opencsv_account_restore_checkpoint`. Rust verifies the checkpoint hash,
+network, root-derived owner, and binding commitment before atomically importing
+asset metadata, operation identifiers, consignments, spent state, and any
+available verification snapshots. Import is idempotent for the same hash and
+refuses both conflicting checkpoints and non-clean databases. It never re-arms
+the restored phone: the absent `ThisDeviceOnly` binding keeps every Bitcoin
+write frozen until an explicit recovery/rekey flow exists.
+
 ## Operation lifecycle
 
 The durable state machine is:
@@ -126,7 +136,7 @@ rendering exactly one verified payment bubble.
 The action-oriented surface is:
 
 - `opencsv_account_open/close/status/sync`
-- `opencsv_account_set_backup_state/checkpoint`
+- `opencsv_account_set_backup_state/checkpoint/restore_checkpoint`
 - `opencsv_account_verify_consignment/scan_verify/cross_check`
 - `opencsv_mint_prepare` and `opencsv_transfer_prepare`
 - `opencsv_operation_ack_backup`

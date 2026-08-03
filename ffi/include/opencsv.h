@@ -45,6 +45,8 @@ char *opencsv_account_sync(uint64_t handle);
 char *opencsv_account_set_backup_state(uint64_t handle, bool verified,
                                        uint32_t checkpoint_version);
 char *opencsv_account_checkpoint(uint64_t handle);
+char *opencsv_account_restore_checkpoint(uint64_t handle,
+                                         const char *checkpoint_json);
 char *opencsv_account_verify_consignment(uint64_t handle,
                                          const uint8_t *blob,
                                          size_t blob_len,
