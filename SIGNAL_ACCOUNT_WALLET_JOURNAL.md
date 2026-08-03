@@ -131,7 +131,7 @@ encodings of one consignment and proves their canonical bytes and IDs match.
 
 ## Validation receipt
 
-- Warnings-denied `opencsv-ffi --all-targets`: 28 passed, 0 failed.
+- Warnings-denied `opencsv-ffi --all-targets`: 29 passed, 0 failed.
 - Warnings-denied `opencsv-bitcoin --lib`: 31 passed, 0 failed.
 - `opencsv-ffi --all-targets --no-deps` Clippy with `-D warnings`: passed.
 - Device-clone read-only enforcement passes.

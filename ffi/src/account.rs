@@ -954,7 +954,11 @@ impl AccountWallet {
                     },
                 }))
             }
-            Err(reason) => Ok(json!({ "status": "rejected", "reason": reason })),
+            Err(reason) => Ok(json!({
+                "status": "rejected",
+                "consignment_id": consignment_id,
+                "reason": reason,
+            })),
         }
     }
 
