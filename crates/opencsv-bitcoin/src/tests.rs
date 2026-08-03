@@ -144,6 +144,31 @@ fn batch_broadcast_is_exact_and_idempotent() {
     );
 }
 
+/// Transport/auth/node failures from the idempotency probe are not evidence
+/// that a transaction is absent from the mempool and must fail closed.
+#[test]
+fn batch_broadcast_does_not_mask_mempool_probe_errors() {
+    let tmp = tempfile::tempdir().unwrap();
+    let transaction = Transaction {
+        version: transaction::Version::TWO,
+        lock_time: absolute::LockTime::ZERO,
+        input: Vec::new(),
+        output: Vec::new(),
+    };
+    let transport = ScriptTransport::new();
+    let requests = transport.requests();
+    transport
+        .reply("getblockchaininfo", blockchaininfo("regtest", 100))
+        .reply("getblockcount", json!(100))
+        .rpc_error("getmempoolentry", -28, "Loading block index");
+    let config = test_config(tmp.path().join("index.log"), Network::Regtest, Some(101));
+    let chain = BitcoinAnchorChain::with_transport(RpcClient::new(transport), &config).unwrap();
+
+    let error = chain.broadcast_transaction(&transaction).unwrap_err();
+    assert!(matches!(error, Error::Rpc { code: -28, .. }));
+    assert_eq!(requests.lock().unwrap().len(), 3);
+}
+
 /// The two-pass anchor construction: funding-input selection, ctx
 /// derivation from vin[0], tag-collision retry via input reorder, and the
 /// real payload replacing the dummy — all against canned RPC replies.

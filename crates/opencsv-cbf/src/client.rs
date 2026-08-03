@@ -9,7 +9,7 @@ use opencsv_bitcoin::{funding_ctx, Network};
 use opencsv_core::chain::AnchorLocation;
 use opencsv_core::AnchorRecord;
 
-use crate::block::{anchor_script, op_return_payload, Block};
+use crate::block::{anchor_script, op_return_payload, Block, OutPoint};
 use crate::chain::{FilterHeaderChain, HeaderChain};
 use crate::error::Error;
 use crate::gcs::{filter_key, GcsFilter, BASIC_FILTER_M, BASIC_FILTER_P};
@@ -94,6 +94,94 @@ pub enum AnchorVerdict {
         /// Required confirmations.
         required: u64,
     },
+}
+
+/// Independently verified state of one expected transaction output.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OutpointVerdict {
+    /// The creating transaction/output was found and no later verified block
+    /// in the checked range spends it.
+    Unspent {
+        /// Block containing the creating transaction.
+        creation_height: u64,
+        /// Verified header/filter tip through which spends were checked.
+        checked_through: u64,
+        /// Number of filters that matched the expected script and therefore
+        /// caused a full, merkle-verified block download.
+        matched_blocks: u64,
+    },
+    /// A later verified block spends the expected output.
+    Spent {
+        /// Block containing the creating transaction.
+        creation_height: u64,
+        /// Block containing the spending transaction.
+        spend_height: u64,
+        /// Transaction id of the spender, internal byte order.
+        spending_txid: [u8; 32],
+    },
+    /// The expected creating transaction/output was not found in the checked
+    /// range. This is fail-closed: the accelerator claim is not trusted.
+    NotFound {
+        /// First checked block.
+        checked_from: u64,
+        /// Last checked block.
+        checked_through: u64,
+    },
+    /// The transaction id and output index exist, but the value or script does
+    /// not match the caller-provided expected output.
+    OutputMismatch {
+        /// Block containing the mismatching output.
+        creation_height: u64,
+    },
+}
+
+enum OutpointBlockObservation {
+    Continue,
+    Spent {
+        creation_height: u64,
+        spending_txid: [u8; 32],
+    },
+    OutputMismatch,
+    SpendBeforeCreation,
+}
+
+fn inspect_outpoint_block(
+    block: &Block,
+    height: u64,
+    outpoint: OutPoint,
+    expected_value: u64,
+    expected_script: &[u8],
+    creation_height: &mut Option<u64>,
+) -> OutpointBlockObservation {
+    for transaction in &block.txs {
+        let txid = transaction.txid();
+        if txid == outpoint.txid {
+            let output = transaction.outputs.get(outpoint.vout as usize);
+            match output {
+                Some(output)
+                    if output.value == expected_value
+                        && output.script_pubkey == expected_script =>
+                {
+                    *creation_height = Some(height);
+                }
+                _ => return OutpointBlockObservation::OutputMismatch,
+            }
+        }
+        if transaction
+            .inputs
+            .iter()
+            .any(|input| input.prev == outpoint)
+        {
+            return match *creation_height {
+                Some(creation_height) => OutpointBlockObservation::Spent {
+                    creation_height,
+                    spending_txid: txid,
+                },
+                None => OutpointBlockObservation::SpendBeforeCreation,
+            };
+        }
+    }
+    OutpointBlockObservation::Continue
 }
 
 /// A BIP157/158 compact-block-filter light client for trustless point
@@ -292,10 +380,110 @@ impl CbfClient {
     /// by the scan engine's accounting.
     pub fn fetched_bytes(&self) -> (u64, u64) {
         self.peers.iter().fold((0, 0), |(f, b), peer| {
-            (
-                f + peer.filter_bytes_fetched,
-                b + peer.block_bytes_fetched,
-            )
+            (f + peer.filter_bytes_fetched, b + peer.block_bytes_fetched)
+        })
+    }
+
+    /// Verify that an expected output exists and remains unspent through the
+    /// current independently agreed tip.
+    ///
+    /// BIP158 basic filters contain ordinary output scripts and the scripts of
+    /// spent prevouts. The method checks the expected script in every filter
+    /// from `birth_height` through the verified tip, downloads every matching
+    /// full block, verifies its merkle root against the PoW-checked header, and
+    /// inspects exact transaction outpoints. The creating output must be found
+    /// with the expected value/script and no later input may spend it.
+    ///
+    /// `max_blocks` bounds hostile or accidentally ancient requests. A
+    /// reported creation height is only a search hint: the output is accepted
+    /// only when the exact transaction/output is found in a verified block.
+    pub fn verify_outpoint_unspent(
+        &mut self,
+        outpoint: OutPoint,
+        expected_value: u64,
+        expected_script: &[u8],
+        birth_height: u64,
+        max_blocks: u64,
+    ) -> Result<OutpointVerdict, Error> {
+        if birth_height == 0 {
+            return Err(Error::InvalidInput(
+                "outpoint birth height cannot be the mempool sentinel".into(),
+            ));
+        }
+        let tip = self.tip_height();
+        if birth_height > tip {
+            return Err(Error::InvalidInput(format!(
+                "outpoint birth height {birth_height} is above verified tip {tip}"
+            )));
+        }
+        let block_count = tip - birth_height + 1;
+        if max_blocks == 0 || block_count > max_blocks {
+            return Err(Error::InvalidInput(format!(
+                "outpoint revalidation window of {block_count} blocks exceeds limit {max_blocks}"
+            )));
+        }
+
+        let mut creation_height = None;
+        let mut matched_blocks = 0u64;
+        for height in birth_height..=tip {
+            if !self.filter_matches(height, expected_script)? {
+                continue;
+            }
+            matched_blocks += 1;
+            let block_hash = self
+                .chain
+                .hash_at(height)
+                .expect("height is within the verified tip");
+            let block = self.fetch_block(&block_hash)?;
+            if block.compute_merkle_root() != block.header.merkle_root {
+                return Err(Error::Consensus(format!(
+                    "block {} merkle root does not match its header",
+                    crate::hash::hash_to_display(&block_hash)
+                )));
+            }
+            match inspect_outpoint_block(
+                &block,
+                height,
+                outpoint,
+                expected_value,
+                expected_script,
+                &mut creation_height,
+            ) {
+                OutpointBlockObservation::Continue => {}
+                OutpointBlockObservation::OutputMismatch => {
+                    return Ok(OutpointVerdict::OutputMismatch {
+                        creation_height: height,
+                    });
+                }
+                OutpointBlockObservation::SpendBeforeCreation => {
+                    return Ok(OutpointVerdict::NotFound {
+                        checked_from: birth_height,
+                        checked_through: height,
+                    });
+                }
+                OutpointBlockObservation::Spent {
+                    creation_height,
+                    spending_txid,
+                } => {
+                    return Ok(OutpointVerdict::Spent {
+                        creation_height,
+                        spend_height: height,
+                        spending_txid,
+                    });
+                }
+            }
+        }
+
+        Ok(match creation_height {
+            Some(creation_height) => OutpointVerdict::Unspent {
+                creation_height,
+                checked_through: tip,
+                matched_blocks,
+            },
+            None => OutpointVerdict::NotFound {
+                checked_from: birth_height,
+                checked_through: tip,
+            },
         })
     }
 
@@ -341,8 +529,7 @@ impl CbfClient {
     ) -> Result<AnchorVerdict, Error> {
         if location.height == 0 {
             return Err(Error::InvalidInput(
-                "height 0 is the mempool sentinel / genesis: anchors live in mined blocks"
-                    .into(),
+                "height 0 is the mempool sentinel / genesis: anchors live in mined blocks".into(),
             ));
         }
         let tip = self.tip_height();
@@ -395,9 +582,10 @@ impl CbfClient {
         if !carries_record {
             return Ok(AnchorVerdict::NotPresent(NotPresentReason::RecordNotInTx));
         }
-        let funding_input = tx.inputs.first().ok_or_else(|| {
-            Error::Protocol("anchor transaction has no inputs".into())
-        })?;
+        let funding_input = tx
+            .inputs
+            .first()
+            .ok_or_else(|| Error::Protocol("anchor transaction has no inputs".into()))?;
         if tx.is_coinbase() {
             return Ok(AnchorVerdict::NotPresent(NotPresentReason::RecordNotInTx));
         }
@@ -431,4 +619,124 @@ fn resolve(peer: &str, default_port: u16) -> Result<SocketAddr, Error> {
         .to_socket_addrs()?
         .next()
         .ok_or_else(|| Error::Protocol(format!("cannot resolve `{peer}`")))
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::block::{BlockHeader, Transaction, TxIn, TxOut};
+
+    use super::*;
+
+    fn transaction(inputs: Vec<OutPoint>, outputs: Vec<(u64, Vec<u8>)>) -> Transaction {
+        Transaction {
+            version: 2,
+            inputs: inputs
+                .into_iter()
+                .map(|prev| TxIn {
+                    prev,
+                    script_sig: Vec::new(),
+                    sequence: 0xffff_fffd,
+                })
+                .collect(),
+            outputs: outputs
+                .into_iter()
+                .map(|(value, script_pubkey)| TxOut {
+                    value,
+                    script_pubkey,
+                })
+                .collect(),
+            lock_time: 0,
+            witnesses: Vec::new(),
+        }
+    }
+
+    fn block(transactions: Vec<Transaction>) -> Block {
+        let mut block = Block {
+            header: BlockHeader {
+                version: 1,
+                prev_block: [0u8; 32],
+                merkle_root: [0u8; 32],
+                time: 0,
+                bits: 0,
+                nonce: 0,
+            },
+            txs: transactions,
+        };
+        block.header.merkle_root = block.compute_merkle_root();
+        block
+    }
+
+    #[test]
+    fn exact_output_then_spend_is_detected() {
+        let script = vec![0x00, 0x14, 7, 7, 7];
+        let creation = transaction(
+            vec![OutPoint {
+                txid: [1u8; 32],
+                vout: 0,
+            }],
+            vec![(50_000, script.clone())],
+        );
+        let outpoint = OutPoint {
+            txid: creation.txid(),
+            vout: 0,
+        };
+        let mut creation_height = None;
+        assert!(matches!(
+            inspect_outpoint_block(
+                &block(vec![creation]),
+                100,
+                outpoint,
+                50_000,
+                &script,
+                &mut creation_height,
+            ),
+            OutpointBlockObservation::Continue
+        ));
+        assert_eq!(creation_height, Some(100));
+
+        let spending = transaction(vec![outpoint], vec![(49_000, vec![0x51])]);
+        let spending_txid = spending.txid();
+        assert!(matches!(
+            inspect_outpoint_block(
+                &block(vec![spending]),
+                101,
+                outpoint,
+                50_000,
+                &script,
+                &mut creation_height,
+            ),
+            OutpointBlockObservation::Spent {
+                creation_height: 100,
+                spending_txid: found,
+            } if found == spending_txid
+        ));
+    }
+
+    #[test]
+    fn value_or_script_mismatch_fails_closed() {
+        let creation = transaction(
+            vec![OutPoint {
+                txid: [2u8; 32],
+                vout: 1,
+            }],
+            vec![(25_000, vec![0x51])],
+        );
+        let outpoint = OutPoint {
+            txid: creation.txid(),
+            vout: 0,
+        };
+        let mut creation_height = None;
+        assert!(matches!(
+            inspect_outpoint_block(
+                &block(vec![creation]),
+                50,
+                outpoint,
+                25_001,
+                &[0x51],
+                &mut creation_height,
+            ),
+            OutpointBlockObservation::OutputMismatch
+        ));
+        assert_eq!(creation_height, None);
+    }
 }

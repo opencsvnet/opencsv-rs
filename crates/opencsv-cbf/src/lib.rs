@@ -60,6 +60,7 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod batch;
 pub mod block;
 pub mod chain;
 pub mod client;
@@ -74,10 +75,14 @@ pub mod scan;
 pub mod siphash;
 pub mod wire;
 
-pub use client::{AnchorVerdict, CbfClient, Config, NotPresentReason};
-pub use fullscan::{FullScanChain, ScannedAnchor, MAX_WINDOW_BLOCKS};
-pub use scan::{ScanCounters, ScanIndex};
+pub use batch::{
+    BatchInputBirthHeights, CommitmentInputBirthHeights, VerifiedBatchInputs,
+    VerifiedBatchOutpoint, VerifiedChainTip, VerifiedCommitmentInputs,
+};
+pub use client::{AnchorVerdict, CbfClient, Config, NotPresentReason, OutpointVerdict};
 pub use error::Error;
+pub use fullscan::{FullScanChain, ScannedAnchor, MAX_WINDOW_BLOCKS};
 pub use opencsv_bitcoin::Network;
 pub use opencsv_core::chain::AnchorLocation;
 pub use opencsv_core::AnchorRecord;
+pub use scan::{ScanCounters, ScanIndex};

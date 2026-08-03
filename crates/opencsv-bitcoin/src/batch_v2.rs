@@ -305,6 +305,31 @@ impl Proposal {
         )
     }
 
+    /// Input-0 stock outpoint fixed by this proposal.
+    pub fn stock_outpoint(&self) -> OutPoint {
+        self.stock_outpoint
+    }
+
+    /// Exact value of the reusable input-0 stock output.
+    pub fn stock_value(&self) -> u64 {
+        self.stock_value
+    }
+
+    /// Bitcoin network/genesis identifier committed by this proposal.
+    pub fn chain_id(&self) -> [u8; 32] {
+        self.chain_id
+    }
+
+    /// Height observed by the proposal author.
+    pub fn observed_tip_height(&self) -> u32 {
+        self.observed_tip_height
+    }
+
+    /// First height at which this proposal is no longer signable.
+    pub fn expiry_height(&self) -> u32 {
+        self.expiry_height
+    }
+
     /// Count-specific signed stock witness script.
     pub fn stock_witness_script(&self) -> ScriptBuf {
         stock_witness_script(self.stock_owner_pubkey, self.participant_count as usize)
@@ -496,6 +521,21 @@ impl ParticipantCommitment {
         self.fee_outpoint
     }
 
+    /// Exact output value and script committed for the participant fee input.
+    pub fn fee_prevout(&self) -> &TxOut {
+        &self.fee_prevout
+    }
+
+    /// P2WPKH public key controlling the participant fee input.
+    pub fn fee_pubkey(&self) -> PublicKey {
+        self.fee_pubkey
+    }
+
+    /// Durable wallet operation identifier committed by this participant.
+    pub fn operation_id(&self) -> [u8; 32] {
+        self.operation_id
+    }
+
     fn validate(&self, proposal: &Proposal) -> Result<(), ProtocolError> {
         if self.batch_id != proposal.batch_id()
             || self.fee_outpoint.is_null()
@@ -504,6 +544,12 @@ impl ParticipantCommitment {
             return Err(ProtocolError::new(
                 RejectionReason::InvalidCommitment,
                 "batch id, outpoint, or maximum charge is invalid",
+            ));
+        }
+        if self.fee_outpoint == proposal.stock_outpoint {
+            return Err(ProtocolError::new(
+                RejectionReason::ConflictingOperation,
+                "participant fee outpoint duplicates input-0 stock",
             ));
         }
         if self.fee_prevout.script_pubkey != p2wpkh_script(self.fee_pubkey) {
@@ -863,6 +909,11 @@ impl Manifest {
             .iter()
             .map(ParticipantCommitment::commitment_id)
             .collect()
+    }
+
+    /// Canonically ordered source commitments selected by this manifest.
+    pub fn commitments(&self) -> &[ParticipantCommitment] {
+        &self.commitments
     }
 
     /// Canonically ordered participant signing key at `index`.
@@ -1794,6 +1845,29 @@ mod tests {
                 .reason(),
             RejectionReason::InvalidSignature
         );
+    }
+
+    #[test]
+    fn participant_fee_input_cannot_duplicate_stock_input() {
+        let (proposal, _, _, _) = fixture();
+        let fee_secret = secret(41);
+        let fee_pubkey = public(&fee_secret);
+        let error = ParticipantCommitment::new(
+            &proposal,
+            [0x41; 32],
+            [0x42; 32],
+            binding(&Digest::from_bytes([0x43; 32]), &proposal.context()).to_anchor(),
+            proposal.stock_outpoint(),
+            TxOut {
+                value: Amount::from_sat(20_000),
+                script_pubkey: p2wpkh_script(fee_pubkey),
+            },
+            fee_pubkey,
+            p2wpkh_script(public(&secret(42))),
+            10_000,
+        )
+        .unwrap_err();
+        assert_eq!(error.reason(), RejectionReason::ConflictingOperation);
     }
 
     #[test]

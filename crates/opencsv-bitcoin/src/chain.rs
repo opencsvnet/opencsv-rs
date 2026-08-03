@@ -372,12 +372,10 @@ impl<T: Transport> BitcoinAnchorChain<T> {
     /// the session journal advances.
     pub fn broadcast_transaction(&self, transaction: &Transaction) -> Result<String, Error> {
         let expected = transaction.compute_txid().to_string();
-        if self
-            .client
-            .call("getmempoolentry", json!([expected]))
-            .is_ok()
-        {
-            return Ok(expected);
+        match self.client.call("getmempoolentry", json!([expected])) {
+            Ok(_) => return Ok(expected),
+            Err(Error::Rpc { code: -5, .. }) => {}
+            Err(error) => return Err(error),
         }
         let raw = bitcoin::consensus::encode::serialize(transaction);
         let txid = match self

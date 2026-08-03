@@ -9,8 +9,8 @@ license.workspace = true
 opencsv-core = { path = "../opencsv-core" }
 opencsv-bitcoin = { path = "../opencsv-bitcoin" }
 sha2 = "0.10"
+bitcoin = "0.32"
 
 [dev-dependencies]
-bitcoin = "0.32"
 serde_json = { version = "1", features = ["arbitrary_precision"] }
 tempfile = "3"
