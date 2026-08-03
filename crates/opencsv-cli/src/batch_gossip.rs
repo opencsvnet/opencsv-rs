@@ -11,13 +11,13 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bitcoin::consensus::encode::{deserialize, serialize};
 use bitcoin::secp256k1::{ecdsa::Signature, Message, PublicKey, Secp256k1, SecretKey};
 use bitcoin::Transaction;
 use opencsv_bitcoin::batch_v2::{
-    Manifest, ParticipantCommitment, Proposal, ReservationPhase, SignatureShare,
+    Manifest, ParticipantCommitment, Proposal, ReservationPhase, SignatureShare, VERSION,
 };
 use opencsv_cbf::{VerifiedBatchInputs, VerifiedChainTip, VerifiedCommitmentInputs};
 use rand::RngExt;
@@ -150,6 +150,7 @@ impl SignedFrame {
         stock_key: &SecretKey,
     ) -> Result<Self, Error> {
         let proposal = Proposal::from_wire(&payload).map_err(batch_error)?;
+        require_live_proposal(&proposal)?;
         require_origin_key(stock_key, proposal.stock_owner_pubkey(), "stock")?;
         Self::sign_parts(MessageKind::Proposal, payload, identity, Some(stock_key))
     }
@@ -936,6 +937,7 @@ impl Session {
         let expected_key = match frame.kind {
             MessageKind::Proposal => {
                 let proposal = Proposal::from_wire(&frame.payload).map_err(batch_error)?;
+                require_live_proposal(&proposal)?;
                 proposal.stock_owner_pubkey()
             }
             MessageKind::Commitment => {
@@ -1319,6 +1321,7 @@ impl Session {
         }
         let wire = read_limited(&path, MAX_PAYLOAD_BYTES)?;
         let proposal = Proposal::from_wire(&wire).map_err(batch_error)?;
+        require_live_proposal(&proposal)?;
         proposal
             .validate_at(self.policy.chain_id, self.policy.current_height)
             .map_err(batch_error)?;
@@ -1548,21 +1551,17 @@ fn process_stream(
     session: &mut Session,
     peers: &[SocketAddr],
 ) -> Result<RelayReport, Error> {
-    stream
-        .set_read_timeout(Some(CONNECT_TIMEOUT))
-        .map_err(|error| protocol_error(format!("set read timeout: {error}")))?;
+    let deadline = Instant::now()
+        .checked_add(CONNECT_TIMEOUT)
+        .ok_or_else(|| protocol_error("relay read deadline overflow"))?;
     let mut length = [0u8; 4];
-    stream
-        .read_exact(&mut length)
-        .map_err(|error| protocol_error(format!("read frame length: {error}")))?;
+    read_exact_before(&mut stream, &mut length, deadline, "frame length")?;
     let length = u32::from_le_bytes(length) as usize;
     if length > MAX_FRAME_BYTES {
         return Err(protocol_error("incoming frame exceeds relay bound"));
     }
     let mut wire = vec![0u8; length];
-    stream
-        .read_exact(&mut wire)
-        .map_err(|error| protocol_error(format!("read frame: {error}")))?;
+    read_exact_before(&mut stream, &mut wire, deadline, "frame")?;
     let outcome = session.ingest(&wire)?;
     let mut forwarded = 0;
     let mut failed_peers = Vec::new();
@@ -1594,6 +1593,40 @@ fn bounded_one_line(message: &str, limit: usize) -> String {
         });
     }
     output
+}
+
+fn read_exact_before(
+    stream: &mut TcpStream,
+    mut output: &mut [u8],
+    deadline: Instant,
+    role: &str,
+) -> Result<(), Error> {
+    while !output.is_empty() {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(protocol_error(format!("incoming {role} exceeded deadline")));
+        }
+        stream
+            .set_read_timeout(Some(remaining))
+            .map_err(|error| protocol_error(format!("set {role} timeout: {error}")))?;
+        match stream.read(output) {
+            Ok(0) => return Err(protocol_error(format!("incoming {role} ended early"))),
+            Ok(read) => output = &mut output[read..],
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                return Err(protocol_error(format!("incoming {role} exceeded deadline")));
+            }
+            Err(error) => {
+                return Err(protocol_error(format!("read incoming {role}: {error}")));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn frame_digest(
@@ -1652,6 +1685,15 @@ fn require_origin_key(
         return Err(protocol_error(format!(
             "{role} origin key does not match the C1 body"
         )));
+    }
+    Ok(())
+}
+
+fn require_live_proposal(proposal: &Proposal) -> Result<(), Error> {
+    if proposal.protocol_version() != VERSION {
+        return Err(protocol_error(
+            "historical C1 version-2 proposal is read-only and cannot enter a live C2 session",
+        ));
     }
     Ok(())
 }
@@ -1764,10 +1806,10 @@ fn rebuild_session_index(
 ) -> Result<RebuiltSessionIndex, Error> {
     let proposal_path = root.join("proposal.bin");
     let proposal = if proposal_path.exists() {
-        Some(
-            Proposal::from_wire(&read_limited(&proposal_path, MAX_PAYLOAD_BYTES)?)
-                .map_err(batch_error)?,
-        )
+        let proposal = Proposal::from_wire(&read_limited(&proposal_path, MAX_PAYLOAD_BYTES)?)
+            .map_err(batch_error)?;
+        require_live_proposal(&proposal)?;
+        Some(proposal)
     } else {
         None
     };
@@ -2100,6 +2142,68 @@ mod tests {
         };
         assert!(session.ingest(&substituted.to_wire()).is_err());
         assert!(SignedFrame::sign_proposal(first.wire_bytes(), &relay_key, &secret(6)).is_err());
+    }
+
+    #[test]
+    fn historical_v2_proposal_cannot_enter_live_relay() {
+        let stock_key = secret(7);
+        let relay_key = secret(8);
+        let current = proposal(10, &stock_key);
+        let mut historical = current.wire_bytes();
+        historical[13..15]
+            .copy_from_slice(&opencsv_bitcoin::batch_v2::LEGACY_VERSION.to_le_bytes());
+        assert_eq!(
+            Proposal::from_wire(&historical).unwrap().protocol_version(),
+            opencsv_bitcoin::batch_v2::LEGACY_VERSION
+        );
+        assert!(SignedFrame::sign_proposal(historical.clone(), &relay_key, &stock_key).is_err());
+
+        let frame = SignedFrame::sign_parts(
+            MessageKind::Proposal,
+            historical,
+            &relay_key,
+            Some(&stock_key),
+        )
+        .unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let mut session = Session::init(
+            root.path(),
+            SessionPolicy {
+                chain_id: [9; 32],
+                current_height: 100,
+            },
+        )
+        .unwrap();
+        let error = session.ingest(&frame.to_wire()).unwrap_err();
+        assert!(error.to_string().contains("read-only"));
+    }
+
+    #[test]
+    fn partial_frame_has_one_absolute_read_deadline() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let client = std::thread::spawn(move || {
+            let mut stream = TcpStream::connect(address).unwrap();
+            for byte in [1u8, 2, 3, 4] {
+                if stream.write_all(&[byte]).is_err() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(150));
+            }
+        });
+        let (mut stream, _) = listener.accept().unwrap();
+        let started = Instant::now();
+        let mut length = [0u8; 4];
+        let error = read_exact_before(
+            &mut stream,
+            &mut length,
+            started + Duration::from_millis(200),
+            "test frame",
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("deadline"));
+        assert!(started.elapsed() < Duration::from_secs(1));
+        client.join().unwrap();
     }
 
     #[test]

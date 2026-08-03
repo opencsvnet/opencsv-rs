@@ -272,11 +272,14 @@ payloads, or change scripts MUST be rejected within one manifest.
 
 C2 wraps the unchanged C1 body in a version-3 relay frame. Proposal frames
 carry an origin authorization by the stock key; commitment frames carry one by
-the fee key. That authorization binds the message kind, exact C1 body hash,
-and the separate relay public key. Replaying it into another batch or
-substituting another relay identity therefore fails. It is not part of Bitcoin
-consensus and MUST NOT be confused with input ownership: fee-input ownership
-is proven only by the round-two Bitcoin signature.
+the fee key. That authorization always binds the message kind and exact C1
+body hash. The reference TCP/CLI transport profile also binds the separate
+relay public key; another authenticated transport MUST bind the authorized C1
+body to its own authenticated sender and operation context. Replaying an
+authorization into another batch or substituting another authenticated sender
+therefore fails. This authorization is not part of Bitcoin consensus and MUST
+NOT be confused with input ownership: fee-input ownership is proven only by
+the round-two Bitcoin signature.
 
 An exact proposal body may be re-announced and is idempotent. A different body
 in the same initialized session is rejected even if it happens to name the
@@ -656,7 +659,15 @@ message kind, relay public key, and SHA-256 of the exact frozen C1 body; the
 outer relay signature also covers that origin signature. Origin authorization
 is mandatory for proposals and commitments and forbidden for manifests and
 signature shares. Invalid origin signatures are rejected before semantic
-deduplication.
+deduplication. This relay-key construction is the reference TCP/CLI transport
+profile, not a universal protocol identity: a Signal adapter MUST instead bind
+the same stock/fee-key-authorized C1 body to the authenticated Signal sender
+and operation context.
+
+Only the current C1 version (`3`) may enter a live C2 session. Version-2
+proposals remain byte-for-byte readable for historical inspection but MUST NOT
+be accepted for signing, relaying, session reconstruction, or broadcast. This
+prevents the historical spendable marker from re-entering a live workflow.
 
 Relay limits are deployment-local policy, not protocol constants. The
 reference defaults are 64 authorized commitments, 16 replacement epochs, 32
@@ -667,9 +678,10 @@ this index once from authenticated persisted frames; it does not repeatedly
 parse an unbounded directory for every incoming frame.
 
 A malformed, oversized, partial, or unauthenticated peer frame produces one
-bounded rejection receipt and the listener continues. Listener failures and
-durable-storage failures remain fatal. This distinction prevents remote input
-from stopping service while refusing to hide loss of persistence.
+bounded rejection receipt and the listener continues. Prefix and body reads
+share one absolute per-frame deadline; progress does not reset it. Listener
+failures and durable-storage failures remain fatal. This distinction prevents
+remote input from stopping service while refusing to hide loss of persistence.
 
 The action-oriented CLI surface is `propose`, `commit`, `manifest`, `replace`,
 `sign`, `finalize`, and `broadcast`. `propose`, `commit`, and `sign` connect to
@@ -696,6 +708,9 @@ signature bodies are not a public product command.
 | Typed verifier and reservation capabilities | Makes authoritative freshness and signer-local locking mandatory at publication/signing boundaries | Boolean `verified`/`reserved` flags or caller discipline |
 | All signed epochs remain recoverable | A sign-and-disappear peer cannot make an older valid conflict look safely abortable | Tracking only the latest replacement |
 | Remote parse/auth errors are contained; storage errors are fatal | Preserves Internet-facing availability without turning failed persistence into a warning | One undifferentiated best-effort relay loop |
+| Current-version-only live relay admission | Prevents the historical version-2 spendable marker from being revived while preserving its offline transcript bytes | Accepting any readable proposal version into a live session |
+| One absolute frame-read deadline | Bounds a partial peer even when it drips progress before each socket timeout | Resetting the full timeout on every read |
+| Transport-specific authenticated sender binding | Preserves stock/fee-key authorization over exact C1 bytes while letting TCP and Signal use their native authenticated identities | Treating the CLI relay public key as a universal protocol identity |
 
 Changes to these frozen decisions require an explicit protocol amendment,
 updated vectors, threat review, and a journaled compatibility decision. Failed

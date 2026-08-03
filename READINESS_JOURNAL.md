@@ -103,3 +103,23 @@ Core's filter index still reported `synced: true` briefly while its
 `getcfheaders` range it cannot yet serve, so the client correctly timed out.
 The readiness helper now requires both `synced: true` and exact index/tip
 height equality before starting the P2P request.
+
+## 2026-08-03 — C2 adversarial relay audit
+
+The post-remediation audit found that historical version-2 proposal bytes were
+correctly preserved and replacement-blocked but could still be admitted into a
+manually assembled live relay session. That would let the old spendable marker
+re-enter a new workflow. Live signing, relay admission, reopening, and index
+reconstruction now require the current C1 version; version 2 remains offline
+and read-only.
+
+The listener also used a fresh socket timeout for each successful partial
+read. A peer could drip bytes and retain the single reference listener longer
+than the advertised bound. Prefix and body reads now share one absolute
+deadline. The rejected alternative was treating per-read progress as evidence
+of a healthy frame because it does not bound total resource occupancy.
+
+Finally, the CLI relay public key is recorded as a reference TCP transport
+profile, not a universal protocol identity. Signal integration must bind the
+stock/fee-key-authorized C1 body to Signal's authenticated sender and operation
+context rather than copying the CLI identity layer.
