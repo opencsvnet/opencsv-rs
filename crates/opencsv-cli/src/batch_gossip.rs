@@ -2192,6 +2192,7 @@ mod tests {
         let address = listener.local_addr().unwrap();
         let client = std::thread::spawn(move || {
             let mut stream = TcpStream::connect(address).unwrap();
+            stream.write_all(&4u32.to_le_bytes()).unwrap();
             for byte in [1u8, 2, 3, 4] {
                 if stream.write_all(&[byte]).is_err() {
                     break;
@@ -2201,14 +2202,12 @@ mod tests {
         });
         let (mut stream, _) = listener.accept().unwrap();
         let started = Instant::now();
+        let deadline = started + Duration::from_millis(200);
         let mut length = [0u8; 4];
-        let error = read_exact_before(
-            &mut stream,
-            &mut length,
-            started + Duration::from_millis(200),
-            "test frame",
-        )
-        .unwrap_err();
+        read_exact_before(&mut stream, &mut length, deadline, "test frame length").unwrap();
+        assert_eq!(u32::from_le_bytes(length), 4);
+        let mut body = [0u8; 4];
+        let error = read_exact_before(&mut stream, &mut body, deadline, "test frame").unwrap_err();
         assert!(error.to_string().contains("deadline"));
         assert!(started.elapsed() < Duration::from_secs(1));
         client.join().unwrap();
