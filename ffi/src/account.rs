@@ -1463,21 +1463,135 @@ impl AccountWallet {
                     .map_err(|error| {
                         AccountError::new("database_corrupt", format!("signed tx: {error}"))
                     })?;
+                let mut receipt: Value = operation
+                    .receipt_json
+                    .as_deref()
+                    .and_then(|encoded| serde_json::from_str(encoded).ok())
+                    .unwrap_or_else(|| json!({}));
+                if let Some(value) = self.reconcile_confirmed_replacement(
+                    operation_id,
+                    tx.compute_txid(),
+                    &mut receipt,
+                )? {
+                    return Ok(value);
+                }
                 let relay = relay_transaction(
                     self.bitcoin.network(),
                     &self.config.peers,
                     &tx,
                     Duration::from_secs(8),
                 );
-                if relay.submitted_count() == 0 {
-                    let client =
-                        esplora_client::Builder::new(&self.config.esplora_url).build_blocking();
-                    let _ = client.broadcast(&tx);
+                let client =
+                    esplora_client::Builder::new(&self.config.esplora_url).build_blocking();
+                let observed = client
+                    .get_tx(&tx.compute_txid())
+                    .map_err(|error| AccountError::new("sync_failed", error.to_string()))?;
+                let fallback_used = if observed.is_none() {
+                    if let Err(error) = client.broadcast(&tx) {
+                        if let Some(value) = self.reconcile_confirmed_replacement(
+                            operation_id,
+                            tx.compute_txid(),
+                            &mut receipt,
+                        )? {
+                            return Ok(value);
+                        }
+                        return Err(AccountError::new(
+                            "broadcast_unobserved",
+                            format!("signed transaction preserved for resume: {error}"),
+                        ));
+                    }
+                    true
+                } else {
+                    false
+                };
+                if let Some(object) = receipt.as_object_mut() {
+                    object.insert(
+                        "resume_p2p_submissions".into(),
+                        json!(relay.submitted_count()),
+                    );
+                    object.insert("resume_generic_relay_fallback".into(), json!(fallback_used));
                 }
+                self.db.conn.execute(
+                    "UPDATE opencsv_operations SET receipt_json = ?2,
+                     updated_at = ?3 WHERE operation_id = ?1",
+                    params![operation_id, receipt.to_string(), unix_time()?],
+                )?;
                 self.refresh_operation(operation_id)
             }
             _ => self.operation_status(operation_id),
         }
+    }
+
+    fn reconcile_confirmed_replacement(
+        &mut self,
+        operation_id: &str,
+        replacement_txid: Txid,
+        receipt: &mut Value,
+    ) -> Result<Option<Value>, AccountError> {
+        let Some(replaced) = receipt
+            .get("replaces")
+            .and_then(Value::as_str)
+            .and_then(|value| value.parse::<Txid>().ok())
+        else {
+            return Ok(None);
+        };
+        let client = esplora_client::Builder::new(&self.config.esplora_url).build_blocking();
+        let status = client
+            .get_tx_status(&replaced)
+            .map_err(|error| AccountError::new("sync_failed", error.to_string()))?;
+        if !status.confirmed {
+            return Ok(None);
+        }
+        let original = match self.bitcoin.get_tx(replaced) {
+            Some(transaction) => transaction.tx_node.tx.as_ref().clone(),
+            None => client
+                .get_tx(&replaced)
+                .map_err(|error| AccountError::new("sync_failed", error.to_string()))?
+                .ok_or_else(|| {
+                    AccountError::new(
+                        "database_corrupt",
+                        "confirmed pre-replacement transaction bytes are unavailable",
+                    )
+                })?,
+        };
+        if original.compute_txid() != replaced {
+            return Err(AccountError::new(
+                "database_corrupt",
+                "confirmed pre-replacement transaction has the wrong txid",
+            ));
+        }
+        let original_hex = hex_encode(&serialize(&original));
+        if let Some(object) = receipt.as_object_mut() {
+            object.insert(
+                "fee_bump_outcome".into(),
+                json!("original_confirmed_before_replacement_observed"),
+            );
+            object.insert(
+                "failed_replacement_txid".into(),
+                json!(replacement_txid.to_string()),
+            );
+            object.insert("txid".into(), json!(replaced.to_string()));
+        }
+        self.db.conn.execute(
+            "UPDATE opencsv_operations SET state = ?2, signed_tx_hex = ?3,
+             txid = ?4, receipt_json = ?5, rejection_reason = NULL,
+             updated_at = ?6 WHERE operation_id = ?1",
+            params![
+                operation_id,
+                OperationState::Confirmed.as_str(),
+                original_hex,
+                replaced.to_string(),
+                receipt.to_string(),
+                unix_time()?,
+            ],
+        )?;
+        let mut value = operation_json(&self.operation(operation_id)?)?;
+        if let Some(object) = value.as_object_mut() {
+            object.insert("confirmed".into(), json!(true));
+            object.insert("block_height".into(), json!(status.block_height));
+            object.insert("observed_via".into(), json!(self.config.esplora_url));
+        }
+        Ok(Some(value))
     }
 
     /// Cancel an operation before broadcast and release its fee UTXO.
@@ -1632,18 +1746,30 @@ impl AccountWallet {
             .map_err(|reason| AccountError::new(reason.code(), reason.to_string()))?;
         let replacement_txid = replacement.compute_txid();
         let replacement_hex = hex_encode(&serialize(&replacement));
-        let receipt = json!({
-            "operation_id": operation_id,
-            "replaces": original_txid.to_string(),
-            "txid": replacement_txid.to_string(),
-            "target_sat_per_vb": target_sat_per_vb,
-            "fee_increment_sats": validation.fee_increment_sats,
-            "replacement_change_sats": validation.replacement_change_sats,
-            "funding_verification": verification,
-            "record_vout": 0,
-            "marker_vout": 1,
-            "change_vout": 2,
-        });
+        let mut receipt: Value = operation
+            .receipt_json
+            .as_deref()
+            .and_then(|encoded| serde_json::from_str(encoded).ok())
+            .unwrap_or_else(|| json!({}));
+        let receipt_object = receipt.as_object_mut().ok_or_else(|| {
+            AccountError::new("database_corrupt", "operation receipt is not an object")
+        })?;
+        receipt_object.insert("operation_id".into(), json!(operation_id));
+        receipt_object.insert("replaces".into(), json!(original_txid.to_string()));
+        receipt_object.insert("txid".into(), json!(replacement_txid.to_string()));
+        receipt_object.insert("target_sat_per_vb".into(), json!(target_sat_per_vb));
+        receipt_object.insert(
+            "fee_increment_sats".into(),
+            json!(validation.fee_increment_sats),
+        );
+        receipt_object.insert(
+            "replacement_change_sats".into(),
+            json!(validation.replacement_change_sats),
+        );
+        receipt_object.insert("funding_verification".into(), json!(verification));
+        receipt_object.insert("record_vout".into(), json!(0));
+        receipt_object.insert("marker_vout".into(), json!(1));
+        receipt_object.insert("change_vout".into(), json!(2));
         self.db.conn.execute(
             "UPDATE opencsv_operations SET state = ?2, signed_tx_hex = ?3,
              txid = ?4, receipt_json = ?5, updated_at = ?6
@@ -1671,7 +1797,19 @@ impl AccountWallet {
             &replacement,
             Duration::from_secs(8),
         );
-        if relay.submitted_count() == 0 {
+        let p2p_submissions = relay.submitted_count();
+        let relay_peers: Vec<Value> = relay
+            .peers
+            .iter()
+            .map(|peer| {
+                json!({
+                    "peer": peer.peer,
+                    "submitted": peer.submitted,
+                    "error": peer.error,
+                })
+            })
+            .collect();
+        let generic_relay_fallback = if p2p_submissions == 0 {
             let client = esplora_client::Builder::new(&self.config.esplora_url).build_blocking();
             client.broadcast(&replacement).map_err(|error| {
                 AccountError::new(
@@ -1679,13 +1817,26 @@ impl AccountWallet {
                     format!("replacement persisted for resume: {error}"),
                 )
             })?;
+            true
+        } else {
+            false
+        };
+        if let Some(object) = receipt.as_object_mut() {
+            object.insert("p2p_submissions".into(), json!(p2p_submissions));
+            object.insert("p2p_peers".into(), json!(relay_peers));
+            object.insert(
+                "generic_relay_fallback".into(),
+                json!(generic_relay_fallback),
+            );
         }
         self.db.conn.execute(
-            "UPDATE opencsv_operations SET state = ?2, updated_at = ?3
+            "UPDATE opencsv_operations SET state = ?2, receipt_json = ?3,
+             updated_at = ?4
              WHERE operation_id = ?1",
             params![
                 operation_id,
                 OperationState::BroadcastUnobserved.as_str(),
+                receipt.to_string(),
                 unix_time()?,
             ],
         )?;
@@ -2725,8 +2876,11 @@ fn decode_hex_32(value: &str, what: &str) -> Result<[u8; 32], AccountError> {
 mod tests {
     use super::*;
     use std::collections::VecDeque;
+    use std::io::{Read as _, Write as _};
+    use std::net::TcpListener;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
+    use std::thread;
 
     use bdk_wallet::bitcoin::absolute;
     use bdk_wallet::bitcoin::block::{Header, Version};
@@ -2822,6 +2976,35 @@ mod tests {
             "backup_verified": backup_verified,
         }))
         .unwrap()
+    }
+
+    fn confirmed_status_server(block_height: u32) -> (String, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 2048];
+            let length = stream.read(&mut request).unwrap();
+            let request = std::str::from_utf8(&request[..length]).unwrap();
+            assert!(request.starts_with("GET /tx/"));
+            assert!(request.contains("/status HTTP/1.1"));
+            let body = json!({
+                "confirmed": true,
+                "block_height": block_height,
+                "block_hash": "0000000000000000000000000000000000000000000000000000000000000000",
+                "block_time": 1,
+            })
+            .to_string();
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body,
+            )
+            .unwrap();
+            stream.flush().unwrap();
+        });
+        (format!("http://{address}"), server)
     }
 
     fn fund(wallet: &mut AccountWallet, value_sats: u64) -> OutPoint {
@@ -3548,6 +3731,75 @@ mod tests {
                 .as_deref(),
             Some(replacement_hex.as_str())
         );
+    }
+
+    #[test]
+    fn confirmed_original_wins_a_persisted_replacement_race() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wallet.sqlite");
+        let (url, server) = confirmed_status_server(123);
+        let mut wallet = AccountWallet::open(
+            &config_with_url(AccountRole::Primary, true, &url),
+            &[13_u8; 32],
+            path.to_str().unwrap(),
+        )
+        .unwrap();
+        let original_txid = fund(&mut wallet, 50_000).txid;
+        let replacement = Transaction {
+            version: transaction::Version::TWO,
+            lock_time: absolute::LockTime::ZERO,
+            input: Vec::new(),
+            output: Vec::new(),
+        };
+        let replacement_txid = replacement.compute_txid();
+        let operation_id = "replacement-race";
+        wallet
+            .insert_planned_operation(operation_id, "mint", "{}", "delivery")
+            .unwrap();
+        wallet
+            .db
+            .conn
+            .execute(
+                "UPDATE opencsv_operations SET state = ?2, signed_tx_hex = ?3,
+                 txid = ?4, receipt_json = ?5 WHERE operation_id = ?1",
+                params![
+                    operation_id,
+                    OperationState::SignedPersisted.as_str(),
+                    hex_encode(&serialize(&replacement)),
+                    replacement_txid.to_string(),
+                    json!({
+                        "replaces": original_txid.to_string(),
+                        "txid": replacement_txid.to_string(),
+                    })
+                    .to_string(),
+                ],
+            )
+            .unwrap();
+
+        let receipt = wallet.resume_operation(operation_id).unwrap();
+        assert_eq!(receipt["state"], OperationState::Confirmed.as_str());
+        assert_eq!(receipt["confirmed"], true);
+        assert_eq!(receipt["block_height"], 123);
+        assert_eq!(receipt["txid"], original_txid.to_string());
+        assert_eq!(
+            receipt["receipt"]["failed_replacement_txid"],
+            replacement_txid.to_string()
+        );
+        assert_eq!(
+            receipt["receipt"]["fee_bump_outcome"],
+            "original_confirmed_before_replacement_observed"
+        );
+        let restored = wallet.operation(operation_id).unwrap();
+        let restored_tx: Transaction = deserialize(
+            &hex_decode(
+                restored.signed_tx_hex.as_deref().unwrap(),
+                "restored original",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(restored_tx.compute_txid(), original_txid);
+        server.join().unwrap();
     }
 
     #[test]

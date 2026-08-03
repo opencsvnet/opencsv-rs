@@ -28,7 +28,7 @@ or transaction receipt. Owner approval is required where stated.
 - [ ] New anchors use only the unspendable `sha256(OP_RETURN)` marker; scanners
   read protocol-v2's historical `sha256(OP_TRUE)` marker without recreating
   or replacing it; new batch creation emits protocol version 3.
-- [ ] Solo fee replacement passes `validate_solo_anchor_replacement` before
+- [x] Solo fee replacement passes `validate_solo_anchor_replacement` before
   signing and broadcast; no generic wallet `bumpfee` path is reachable.
 - [ ] Both default and `--no-default-features` CLI configurations pass with
   warnings denied.
@@ -37,14 +37,14 @@ or transaction receipt. Owner approval is required where stated.
 
 ## Network and recovery gates
 
-- [ ] Two or more diverse compact-filter peers independently agree on signet
+- [x] Two or more diverse compact-filter peers independently agree on signet
   header tip/hash/work and the complete filter-hash chain.
-- [ ] Cold, restart, same-session, bandwidth, scan, and cache-recovery receipts
+- [x] Cold, restart, same-session, bandwidth, scan, and cache-recovery receipts
   are attached and match `SIGNET_READINESS.md` or a newer dated run.
-- [ ] A dedicated signet wallet completes anchor, mempool, confirmation,
+- [x] A dedicated signet wallet completes anchor, mempool, confirmation,
   restart recovery, and a confirmed protocol-safe RBF that preserves non-dust
   change without touching another agent's wallet.
-- [ ] Fee and marker tables are regenerated from the executable model at the
+- [x] Fee and marker tables are regenerated from the executable model at the
   release-time feerate policy.
 - [ ] `SECURITY_REVIEW.md` residual risks have owners or explicit accepted-risk
   decisions.

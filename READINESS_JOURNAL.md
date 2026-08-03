@@ -123,3 +123,44 @@ Finally, the CLI relay public key is recorded as a reference TCP transport
 profile, not a universal protocol identity. Signal integration must bind the
 stock/fee-key-authorized C1 body to Signal's authenticated sender and operation
 context rather than copying the CLI identity layer.
+
+## 2026-08-03 — backup acknowledgement kept separate in live driver
+
+The first acceptance-driver draft acknowledged the operation checkpoint inside
+`prepare-mint`. Review rejected that shortcut because a successful function
+call is not evidence that Signal Secure Backup durably accepted the bytes. The
+driver now emits the prepared checkpoint and requires a separate `ack-backup`
+action. Its `OPENCSV_BACKUP_VERIFIED=1` setting is labeled as an operator test
+attestation only; production Secure Backup evidence remains an iOS-phase gate.
+
+## 2026-08-03 — socket write is not mempool acceptance
+
+The live Rust-owned anchor was written successfully to two public P2P peers,
+but neither write produced timely public mempool evidence. Local Core
+`testmempoolaccept` accepted the exact persisted bytes. The resume path had
+only used its generic Esplora fallback when every P2P socket write failed, so
+an unobserved successful write could leave a valid transaction stranded. It
+now checks read-side observation after the direct retry and uses the allowed
+generic relay fallback only when the transaction is still absent. The receipt
+records both the resume submission count and whether that fallback was used.
+
+## 2026-08-03 — confirmation won the first replacement race
+
+The first Rust-owned RBF candidate was valid and persisted, but its original
+anchor confirmed at height 316077 while authoritative re-verification was in
+progress. The relay correctly rejected the conflicting replacement. The
+journal had already pointed at the replacement and had replaced rather than
+extended the original consignment receipt. The corrected path now preserves
+the original receipt and, on resume, restores a confirmed original with an
+explicit losing-replacement receipt. A deterministic test reproduces the
+recovery without relying on timing.
+
+## 2026-08-03 — protocol-safe account RBF accepted on signet
+
+The second run spent confirmed Rust-owned change. Initial transaction
+`ae709301…2b6c` entered mempool with record, safe marker, and change at outputs
+0/1/2. Replacement `0f74a2ea…0e17` kept those protected invariants, increased
+the fee by 910 sats to 5 sat/vB, retained 7,542 sats of change, and confirmed
+at height 316079. Separate process invocations reopened the SQLite journal at
+every state boundary. Generic Bitcoin send and raw-transaction APIs were never
+introduced.

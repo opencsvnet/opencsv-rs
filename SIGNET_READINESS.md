@@ -127,13 +127,71 @@ transactions confirmed. The two minted consignments remain separate evidence
 files; they were not falsely credited to the CLI wallet merely because their
 anchors confirmed.
 
-## Remaining write-path acceptance
+## Rust-owned account acceptance driver
 
-Funding provenance, mint/anchor, public mempool observation, confirmation,
-safe-marker migration, and restart/reopen receipts are complete. A fresh
-protocol-safe replacement constructed by the Rust-owned wallet, validated
-before signing, persisted before broadcast, observed in mempool, and confirmed
-with its change output intact is still required. The generic Core result above
-is a negative receipt, not acceptance. The isolated wallet is now empty, so a
-new run also needs fresh signet sats. No mainnet broadcast is authorized by
-this document.
+`ffi/examples/signet_account_acceptance.rs` exercises the same action-oriented
+account boundary exposed to Signal without accepting caller-selected keys,
+inputs, change addresses, raw transactions, or arbitrary Bitcoin recipients.
+It requires a fresh 32-byte account root and device-binding stand-in through
+environment variables and never prints them. `OPENCSV_BACKUP_VERIFIED=1` is an
+explicit test-operator attestation; it is not evidence of Signal Secure Backup
+integration, which remains part of the final iOS phase.
+`OPENCSV_SIGNET_RELAY_PEERS` and `OPENCSV_SIGNET_VERIFICATION_PEERS` are
+separate lists: a local full node can improve relay observability without being
+misrepresented as a compact-filter verifier.
+
+Command shape:
+
+```sh
+export OPENCSV_ACCOUNT_ROOT_HEX=<fresh-32-byte-hex>
+export OPENCSV_DEVICE_BINDING_HEX=<fresh-32-byte-hex>
+export OPENCSV_BACKUP_VERIFIED=1
+db=<isolated-path>/account.sqlite
+
+cargo run --locked -p opencsv-ffi --example signet_account_acceptance -- "$db" sync
+cargo run --locked -p opencsv-ffi --example signet_account_acceptance -- "$db" status
+cargo run --locked -p opencsv-ffi --example signet_account_acceptance -- "$db" prepare-mint TST 1
+cargo run --locked -p opencsv-ffi --example signet_account_acceptance -- "$db" ack-backup <operation-id> <checkpoint-hash>
+cargo run --locked -p opencsv-ffi --example signet_account_acceptance -- "$db" sign <operation-id> 1
+cargo run --locked -p opencsv-ffi --example signet_account_acceptance -- "$db" operation <operation-id>
+cargo run --locked -p opencsv-ffi --example signet_account_acceptance -- "$db" bump <operation-id> 5
+cargo run --locked -p opencsv-ffi --example signet_account_acceptance -- "$db" resume <operation-id>
+```
+
+The preparation receipt and its exact checkpoint must be durably captured
+before the separate acknowledgement command. Killing the driver between any
+two commands gives a real process-restart boundary over the same SQLite
+database.
+
+## Final Rust-owned write-path receipt
+
+The faucet funded the fresh account in two transactions: 1,000 sats at
+`b01f4485…9e20` and 10,000 sats at `6c667295…704b`. Both confirmed at height
+316075. The wallet selected only the larger outpoint and independently proved
+its exact value and script from verified blocks before proof generation and
+again before signing.
+
+The first live operation exposed an ordinary but previously unreconciled race.
+Initial anchor `d4b8b4cd…feff` was valid, directly submitted to two public P2P
+peers, observed in mempool after the generic fallback, and then confirmed at
+height 316077 while a replacement was being verified. The persisted candidate
+`349301c8…50f9` never became valid for relay after that confirmation. The
+corrected resume path restored the confirmed original transaction and recorded
+`original_confirmed_before_replacement_observed` instead of stranding the
+operation on the losing replacement.
+
+The confirmed 9,226-sat change then funded a clean second operation:
+
+| Receipt | Result |
+|---|---|
+| Funding | `d4b8b4cd…feff:2`, 9,226 sats, independently verified through height 316077. |
+| Initial anchor | `ae709301…2b6c`, 228-sat fee at 1 sat/vB, record/marker/change at outputs 0/1/2, 8,452-sat change. It was observed in mempool; the superseded transaction is no longer returned by the transaction endpoint. |
+| Protocol-safe replacement | `0f74a2ea…0e17`, same funding input, record, marker, change script, and output positions; fee increased by 910 sats to 1,138 sats total at 5 sat/vB; non-dust change remained 7,542 sats. |
+| Relay and recovery | Three direct P2P writes on the replacement, followed by the generic relay fallback only after independent read-side observation remained absent. Separate processes reopened after proof preparation, signing, replacement persistence, mempool observation, and confirmation. |
+| Confirmation | Replacement confirmed at height 316079; post-restart sync reached height 316080 and recovered 7,542 sats of replacement change plus the untouched 1,000-sat faucet output. |
+
+The account generated and persisted each mint consignment, but this driver did
+not falsely self-credit it without the recipient-side confirmed chain snapshot.
+Looping a self-mint or received Signal attachment through that verification
+path remains part of the final iOS acceptance phase. No mainnet broadcast is
+authorized by this document.

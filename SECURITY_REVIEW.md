@@ -16,7 +16,9 @@ independent third-party audit and not mainnet approval.
 | SR-03 | Critical | The scan index placed `tip` before occurrence rows and used a truncating write without a checksum. A crash could preserve a high tip while losing later occurrence evidence, causing exclusion checks to skip the lost range. Unknown lines were also ignored. | Scan index v2 uses a SHA-256 checksum, strict complete decoding, range/order validation, a uniquely named temporary file, file sync, atomic rename, and parent-directory sync. Corrupt, partial, and v1 files explicitly return `RebuildRequired` and start at height zero. Unit tests corrupt a persisted index and verify rebuild behavior. |
 | SR-04 | Medium | Peers were accepted after handshake without checking witness and compact-filter service bits, deferring an incompatible-peer failure into synchronization. | Handshake now requires both `NODE_WITNESS` and `NODE_COMPACT_FILTERS`. The readiness command requires at least two successfully connected peers. |
 | SR-05 | Critical | The historical P2WSH marker committed to `OP_TRUE`, so any observer could spend its 546 sats and attach a non-replaceable child. External signet transaction `157e3246…b1b7` did exactly that to `e985c098…ead1`; it pinned the parent and both later confirmed in block 316031. | Protocol version 3 anchors commit to `OP_RETURN` inside P2WSH (`0020189f…57b7`), retaining BIP158 visibility while making the witness program unspendable. Version 2 retains its exact historical bytes for read-only migration but cannot be newly constructed or replaced. Unit, scanner, batching, and live signet receipts cover the transition. |
-| SR-06 | High | Bitcoin Core's generic `bumpfee` is not OpenCSV-aware. On signet it replaced `db85bcbb…1e60` with `c21073b1…6b1c`, preserved record/marker, but removed change output 2 and spent all 3,086 sats as fee. | `validate_solo_anchor_replacement` now rejects any removal/reordering of the record, current marker, or non-dust change; funding inputs, context-defining order, scripts, version, lock time, and RBF sequence are fixed. It exposes stable rejection codes and has a regression for the observed Core-shaped removal. Generic wallet fee-bump APIs are prohibited. A fresh live protocol-safe replacement remains a release gate. |
+| SR-06 | High | Bitcoin Core's generic `bumpfee` is not OpenCSV-aware. On signet it replaced `db85bcbb…1e60` with `c21073b1…6b1c`, preserved record/marker, but removed change output 2 and spent all 3,086 sats as fee. | `AccountWallet::fee_bump` now performs authoritative funding re-verification, builds from the journaled transaction, validates every protected invariant before signing, persists the signed replacement before relay, and preserves the original consignment receipt. Live replacement `0f74a2ea…0e17` increased the fee by 910 sats, retained 7,542 sats of change, and confirmed at height 316079. Generic wallet fee-bump APIs remain prohibited. |
+| SR-07 | High | A successful Bitcoin P2P socket write was initially treated as sufficient reason not to use the allowed generic fallback, even when no independent mempool read could observe the transaction. | Direct relay remains first. On a later resumable attempt the wallet checks independent read-side observation and uses the configured generic relay only while the persisted transaction remains absent. Receipts distinguish P2P submission count from fallback use. The final replacement reached public mempool through this path. |
+| SR-08 | High | The original anchor can confirm while an RBF candidate is being independently re-verified. The single-operation journal could otherwise remain pointed at a now-invalid replacement and lose the original receipt. | Replacement receipts now extend rather than replace the original receipt. Resume detects a confirmed replaced transaction, restores its exact bytes/txid, and records the losing replacement. The first live run reproduced this race at height 316077; a deterministic unit test covers recovery. |
 
 ## Reviewed invariants
 
@@ -39,8 +41,8 @@ independent third-party audit and not mainnet approval.
   cross-peer filter-hash chain.
 - The pure solo-anchor replacement validator permits change reduction only; it
   rejects context, record, marker, output count/order, change-destination, and
-  dust mutations. The final wallet must make this validator mandatory before
-  signing or broadcast.
+  dust mutations. The action-oriented account wallet makes this validator
+  mandatory before signing or broadcast.
 
 ## Residual risks and mainnet blockers
 
@@ -70,11 +72,13 @@ independent third-party audit and not mainnet approval.
   remains readable, but its spendable output can be child-pinned and must not
   be recreated. Existing historical transactions cannot be retroactively
   repaired.
-- The protocol-safe replacement validator is present, but the current CLI has
-  no action-oriented Rust fee-bump operation that constructs, signs, journals,
-  and broadcasts only a validated replacement. The confirmed failed signet
-  `bumpfee` receipt proves generic Core replacement is not an acceptable
-  substitute. This remains a release and Signal-wallet gate.
+- Direct P2P submission is deliberately not an acknowledgement protocol. The
+  wallet requires independent read-side observation and may use the configured
+  generic relay fallback from its resumable, wallet-signed operation path.
+- A self-mint is not credited merely because its anchor confirms. The final
+  Signal flow must supply the confirmed recipient-side chain snapshot through
+  the same consignment verifier used for received attachments.
 - Mainnet broadcast, release publication, and iOS rollout remain blocked on an
-  independent review, reproducible receipts, owner approval, and the physical
-  signet acceptance sequence.
+  independent review, reproducible release receipts, owner approval, and the
+  physical iPhone acceptance sequence. The owner has deferred the independent
+  adversarial review; it has not been recorded as passed.
