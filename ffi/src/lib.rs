@@ -421,14 +421,22 @@ pub unsafe extern "C" fn opencsv_account_cross_check(
     })
 }
 
-/// Prepare an OpenCSV mint and reserve its Bitcoin fee input. The request
-/// contains asset/amount/owner data only; no Bitcoin key, UTXO, change
-/// address, or coin-selection result is accepted.
+/// Ensure this primary account has the fixed, test-only OpenCSV USD Preview
+/// definition. The caller supplies no instrument terms. This is unavailable
+/// on mainnet and does not issue units or spend Bitcoin.
+#[no_mangle]
+pub extern "C" fn opencsv_preview_usd_ensure(handle: u64) -> *mut c_char {
+    guarded(|| with_account(handle, AccountWallet::preview_usd_ensure))
+}
+
+/// Prepare issuance for an existing exact instrument id and reserve its
+/// Bitcoin fee input. No unit code, terms, Bitcoin key, UTXO, change address,
+/// or coin-selection result is accepted.
 ///
 /// # Safety
 /// `request_json` must be a valid NUL-terminated UTF-8 string.
 #[no_mangle]
-pub unsafe extern "C" fn opencsv_mint_prepare(
+pub unsafe extern "C" fn opencsv_issuance_prepare(
     handle: u64,
     request_json: *const c_char,
 ) -> *mut c_char {
@@ -439,6 +447,19 @@ pub unsafe extern "C" fn opencsv_mint_prepare(
         };
         with_account(handle, |account| account.mint_prepare(request))
     })
+}
+
+/// Compatibility symbol for native clients built against the earlier name.
+/// The request is still the strict issuance shape and cannot create assets.
+///
+/// # Safety
+/// `request_json` must be a valid NUL-terminated UTF-8 string.
+#[no_mangle]
+pub unsafe extern "C" fn opencsv_mint_prepare(
+    handle: u64,
+    request_json: *const c_char,
+) -> *mut c_char {
+    unsafe { opencsv_issuance_prepare(handle, request_json) }
 }
 
 /// Prepare an OpenCSV transfer and reserve its Bitcoin fee input. The strict

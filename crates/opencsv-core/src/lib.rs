@@ -51,14 +51,15 @@
 pub mod accept;
 pub mod anchor;
 pub mod asset;
-pub mod batch;
 pub mod audit;
+pub mod batch;
 pub mod chain;
 pub mod coin;
 pub mod consignment;
 pub mod crosscheck;
 pub mod digest;
 pub mod field;
+pub mod instrument;
 pub mod issuer;
 mod kernel;
 
@@ -73,10 +74,15 @@ pub use batch::{
     WITNESS_MAGIC_V2,
 };
 pub use chain::{AnchorChain, AnchorLocation, AnchorRef, MockAnchorChain};
-pub use crosscheck::{CrossCheckError, CrossCheckedChain};
 pub use coin::{Coin, Commitment, Nullifier, Owner, OwnerSecret};
 pub use consignment::{CoinOpening, Consignment};
+pub use crosscheck::{CrossCheckError, CrossCheckedChain};
 pub use digest::{Digest, TruncatedDigest};
+pub use instrument::{
+    preview_usd_terms, InstrumentError, InstrumentManifestV1, InstrumentTermsV1,
+    INSTRUMENT_TERMS_VERSION, MAX_INSTRUMENT_DECIMALS, PREVIEW_USD_DECIMALS,
+    PREVIEW_USD_DISPLAY_NAME, PREVIEW_USD_ISSUER_NAME, PREVIEW_USD_TERMS_URI,
+};
 #[allow(deprecated)]
 pub use issuer::{
     mint_signing_message, Ed25519IssuerSignature, IssuerSignature, PoseidonIssuerAuthorization,

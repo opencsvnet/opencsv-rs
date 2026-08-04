@@ -36,7 +36,10 @@ use opencsv_cbf::block::OutPoint as CbfOutPoint;
 use opencsv_cbf::{CbfClient, Config as CbfConfig, OutpointVerdict};
 use opencsv_core::chain::AnchorRef;
 use opencsv_core::consignment::Consignment;
-use opencsv_core::{AssetId, OwnerSecret};
+use opencsv_core::{
+    preview_usd_terms, AssetGenesis, AssetId, InstrumentManifestV1, InstrumentTermsV1, OwnerSecret,
+    PoseidonIssuerAuthorization,
+};
 use rand::RngExt as _;
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde::{Deserialize, Serialize};
@@ -196,6 +199,8 @@ struct BackupCheckpointPayload {
     device_binding_commitment: Option<String>,
     owners: Vec<String>,
     assets: Vec<BackupAsset>,
+    #[serde(default)]
+    instrument_manifests: Vec<InstrumentManifestV1>,
     operations: Vec<BackupOperation>,
     consignments: Vec<BackupConsignment>,
 }
@@ -220,6 +225,14 @@ struct BackupOperation {
     pending_json: Option<String>,
     delivery_nonce: String,
     txid: Option<String>,
+    #[serde(default)]
+    receipt_json: Option<String>,
+    #[serde(default)]
+    rejection_reason: Option<String>,
+    #[serde(default)]
+    checkpoint_hash: Option<String>,
+    #[serde(default)]
+    backup_acked: i64,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -396,16 +409,18 @@ impl OperationState {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct MintRequest {
-    #[serde(default)]
-    asset_id: Option<String>,
-    #[serde(default)]
-    currency: Option<String>,
-    #[serde(default)]
-    terms_hash: Option<String>,
+struct IssuanceRequest {
+    asset_id: String,
     #[serde(default)]
     to_owner: Option<String>,
     amounts: Vec<u64>,
+}
+
+#[cfg(test)]
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct InstrumentCreateRequest {
+    terms: InstrumentTermsV1,
 }
 
 #[derive(Debug, Deserialize)]
@@ -495,6 +510,12 @@ impl SqlitePersister {
                  terms_hash TEXT NOT NULL,
                  nonce INTEGER NOT NULL,
                  asset_id TEXT NOT NULL UNIQUE
+             ) STRICT;
+             CREATE TABLE IF NOT EXISTS opencsv_instrument_manifests (
+                 asset_id TEXT PRIMARY KEY,
+                 manifest_json TEXT NOT NULL,
+                 created_at INTEGER NOT NULL,
+                 FOREIGN KEY(asset_id) REFERENCES opencsv_assets(asset_id)
              ) STRICT;
              CREATE TABLE IF NOT EXISTS opencsv_operations (
                  operation_id TEXT PRIMARY KEY,
@@ -883,6 +904,7 @@ impl AccountWallet {
             .as_ref()
             .map(MemWallet::balance)
             .unwrap_or_default();
+        let instruments = self.instrument_records()?;
         let owners = self
             .protocol
             .as_ref()
@@ -895,6 +917,7 @@ impl AccountWallet {
             "network": self.config.network,
             "owners": owners,
             "assets": protocol_balances,
+            "instruments": instruments,
             "fee_reserve": {
                 "confirmed_sats": balance.confirmed.to_sat(),
                 "trusted_pending_sats": balance.trusted_pending.to_sat(),
@@ -1043,12 +1066,94 @@ impl AccountWallet {
         })
     }
 
-    /// Prepare an issuer-authorized mint. Fee selection, change derivation,
-    /// and the OpenCSV proof all remain inside Rust.
+    /// Ensure the one fixed, test-only USD preview instrument exists for this
+    /// issuer account. The FFI accepts no caller-supplied terms, unit code, or
+    /// backing claim. A newly created definition freezes writes until its
+    /// checkpoint is secured by Signal Backup.
+    pub fn preview_usd_ensure(&mut self) -> Result<Value, AccountError> {
+        self.require_write_enabled()?;
+        let terms = preview_usd_terms(&self.config.network)
+            .map_err(|error| AccountError::new("preview_usd_unavailable", error.to_string()))?;
+
+        let mut statement = self.db.conn.prepare(
+            "SELECT asset_id, manifest_json FROM opencsv_instrument_manifests ORDER BY created_at",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        for row in rows {
+            let (asset_id, encoded) = row?;
+            let manifest: InstrumentManifestV1 =
+                serde_json::from_str(&encoded).map_err(|error| {
+                    AccountError::new("database_corrupt", format!("instrument manifest: {error}"))
+                })?;
+            if manifest.terms == terms {
+                let checkpoint = self.checkpoint()?;
+                return Ok(json!({
+                    "asset_id": asset_id,
+                    "manifest": manifest,
+                    "checkpoint_hash": checkpoint["checkpoint_hash"],
+                    "backup_required": false,
+                }));
+            }
+        }
+        drop(statement);
+
+        let (asset_id, manifest) = self.create_instrument(terms)?;
+        self.db.set_meta("backup_verified", "0")?;
+        let checkpoint = self.checkpoint()?;
+        Ok(json!({
+            "asset_id": asset_id,
+            "manifest": manifest,
+            "checkpoint_hash": checkpoint["checkpoint_hash"],
+            "backup_required": true,
+        }))
+    }
+
+    /// Test-only arbitrary manifest constructor. Production FFI deliberately
+    /// exposes only [`Self::preview_usd_ensure`].
+    #[cfg(test)]
+    pub fn instrument_create(&mut self, request_json: &str) -> Result<Value, AccountError> {
+        self.require_write_enabled()?;
+        let request: InstrumentCreateRequest =
+            serde_json::from_str(request_json).map_err(|error| {
+                AccountError::new(
+                    "invalid_instrument_definition",
+                    format!("instrument request: {error}"),
+                )
+            })?;
+        request.terms.validate().map_err(|error| {
+            AccountError::new("invalid_instrument_definition", error.to_string())
+        })?;
+        if request.terms.network != self.config.network {
+            return Err(AccountError::new(
+                "instrument_network_mismatch",
+                format!(
+                    "instrument definition is for {}, wallet is {}",
+                    request.terms.network, self.config.network
+                ),
+            ));
+        }
+        let (asset_id, manifest) = self.create_instrument(request.terms)?;
+        // The definition is durable, but writes stay frozen until Signal
+        // Secure Backup acknowledges the checkpoint containing it.
+        self.db.set_meta("backup_verified", "0")?;
+        let checkpoint = self.checkpoint()?;
+        Ok(json!({
+            "asset_id": asset_id,
+            "manifest": manifest,
+            "checkpoint_hash": checkpoint["checkpoint_hash"],
+            "backup_required": true,
+        }))
+    }
+
+    /// Prepare issuer-authorized issuance for an existing exact asset id.
+    /// Fee selection, change derivation, and the OpenCSV proof all remain
+    /// inside Rust. Asset definition is intentionally a separate action.
     pub fn mint_prepare(&mut self, request_json: &str) -> Result<Value, AccountError> {
         self.require_write_enabled()?;
-        let request: MintRequest = serde_json::from_str(request_json).map_err(|error| {
-            AccountError::new("invalid_request", format!("mint request: {error}"))
+        let request: IssuanceRequest = serde_json::from_str(request_json).map_err(|error| {
+            AccountError::new("invalid_request", format!("issuance request: {error}"))
         })?;
         if request.amounts.is_empty() || request.amounts.len() > 2 {
             return Err(AccountError::new(
@@ -1060,6 +1165,13 @@ impl AccountWallet {
             return Err(AccountError::new(
                 "invalid_request",
                 "mint outputs must be positive",
+            ));
+        }
+        let asset_id = request.asset_id;
+        if !self.is_manifested_instrument(&asset_id)? {
+            return Err(AccountError::new(
+                "instrument_definition_required",
+                "issuance requires an existing v1 instrument manifest; prototype assets are read-only",
             ));
         }
 
@@ -1082,27 +1194,6 @@ impl AccountWallet {
         };
         let ctx = funding_context(funding.outpoint);
 
-        let asset_id = match request.asset_id {
-            Some(asset_id) => asset_id,
-            None => {
-                let currency = match request.currency.as_deref() {
-                    Some(currency) => currency,
-                    None => {
-                        return self.fail_prebroadcast(
-                            &operation_id,
-                            AccountError::new(
-                                "invalid_request",
-                                "new mint requires a 3-byte currency code",
-                            ),
-                        );
-                    }
-                };
-                match self.create_asset(currency, request.terms_hash.as_deref()) {
-                    Ok(asset_id) => asset_id,
-                    Err(error) => return self.fail_prebroadcast(&operation_id, error),
-                }
-            }
-        };
         let (to_owner, proved) = {
             let protocol = match self.primary_protocol_mut() {
                 Ok(protocol) => protocol,
@@ -1533,23 +1624,22 @@ impl AccountWallet {
                 );
                 let client =
                     esplora_client::Builder::new(&self.config.esplora_url).build_blocking();
-                let fallback_used =
-                    match relay_via_esplora_if_unobserved(&client, &tx) {
-                        Ok(used) => used,
-                        Err(error) => {
-                            if let Some(value) = self.reconcile_confirmed_replacement(
-                                operation_id,
-                                tx.compute_txid(),
-                                &mut receipt,
-                            )? {
-                                return Ok(value);
-                            }
-                            return Err(AccountError::new(
-                                "broadcast_unobserved",
-                                format!("signed transaction preserved for resume: {error}"),
-                            ));
+                let fallback_used = match relay_via_esplora_if_unobserved(&client, &tx) {
+                    Ok(used) => used,
+                    Err(error) => {
+                        if let Some(value) = self.reconcile_confirmed_replacement(
+                            operation_id,
+                            tx.compute_txid(),
+                            &mut receipt,
+                        )? {
+                            return Ok(value);
                         }
-                    };
+                        return Err(AccountError::new(
+                            "broadcast_unobserved",
+                            format!("signed transaction preserved for resume: {error}"),
+                        ));
+                    }
+                };
                 if let Some(object) = receipt.as_object_mut() {
                     object.insert(
                         "resume_p2p_submissions".into(),
@@ -1971,13 +2061,21 @@ impl AccountWallet {
                                 'asset_id', asset_id)
              FROM opencsv_assets ORDER BY asset_index",
         )?;
+        let instrument_manifests = query_json_rows(
+            &self.db.conn,
+            "SELECT json(manifest_json)
+             FROM opencsv_instrument_manifests ORDER BY created_at",
+        )?;
         let operations = query_json_rows(
             &self.db.conn,
             "SELECT json_object('operation_id', operation_id, 'kind', kind,
                                 'state', state, 'request', json(request_json),
                                 'pending_json', pending_json,
                                 'delivery_nonce', delivery_nonce,
-                                'txid', txid)
+                                'txid', txid, 'receipt_json', receipt_json,
+                                'rejection_reason', rejection_reason,
+                                'checkpoint_hash', checkpoint_hash,
+                                'backup_acked', backup_acked)
              FROM opencsv_operations
              WHERE state NOT IN ('cancelled') ORDER BY created_at",
         )?;
@@ -2005,6 +2103,7 @@ impl AccountWallet {
             "device_binding_commitment": self.device_binding_commitment,
             "owners": owners,
             "assets": assets,
+            "instrument_manifests": instrument_manifests,
             "operations": operations,
             "consignments": consignments,
         });
@@ -2090,6 +2189,7 @@ impl AccountWallet {
         }
         let occupied: i64 = self.db.conn.query_row(
             "SELECT (SELECT COUNT(*) FROM opencsv_assets)
+                  + (SELECT COUNT(*) FROM opencsv_instrument_manifests)
                   + (SELECT COUNT(*) FROM opencsv_operations)
                   + (SELECT COUNT(*) FROM opencsv_consignments)",
             [],
@@ -2111,6 +2211,42 @@ impl AccountWallet {
                     "asset nonce exceeds SQLite i64",
                 )
             })?;
+        }
+        for manifest in &envelope.checkpoint.instrument_manifests {
+            manifest.validate().map_err(|error| {
+                AccountError::new(
+                    "invalid_backup_checkpoint",
+                    format!("instrument manifest: {error}"),
+                )
+            })?;
+            if manifest.terms.network != envelope.checkpoint.network {
+                return Err(AccountError::new(
+                    "invalid_backup_checkpoint",
+                    "instrument manifest belongs to another network",
+                ));
+            }
+            let asset_id = hex_encode(manifest.genesis.asset_id().as_bytes());
+            let terms_hash = hex_encode(manifest.genesis.terms_hash.as_bytes());
+            let matching_asset = envelope
+                .checkpoint
+                .assets
+                .iter()
+                .find(|asset| asset.asset_id == asset_id)
+                .ok_or_else(|| {
+                    AccountError::new(
+                        "invalid_backup_checkpoint",
+                        "instrument manifest has no matching asset genesis",
+                    )
+                })?;
+            if matching_asset.currency != manifest.terms.unit_code
+                || matching_asset.terms_hash != terms_hash
+                || matching_asset.nonce != manifest.genesis.nonce
+            {
+                return Err(AccountError::new(
+                    "invalid_backup_checkpoint",
+                    "instrument manifest disagrees with its checkpoint asset",
+                ));
+            }
         }
         for operation in &envelope.checkpoint.operations {
             if !matches!(
@@ -2172,12 +2308,27 @@ impl AccountWallet {
                     ],
                 )?;
             }
+            for manifest in &envelope.checkpoint.instrument_manifests {
+                let asset_id = hex_encode(manifest.genesis.asset_id().as_bytes());
+                let manifest_json = serde_json::to_string(manifest).map_err(|error| {
+                    AccountError::new("invalid_backup_checkpoint", error.to_string())
+                })?;
+                self.db.conn.execute(
+                    "INSERT INTO opencsv_instrument_manifests(
+                         asset_id, manifest_json, created_at
+                     ) VALUES(?1, ?2, ?3)",
+                    params![asset_id, manifest_json, now],
+                )?;
+            }
             for operation in &envelope.checkpoint.operations {
                 self.db.conn.execute(
                     "INSERT INTO opencsv_operations(
                          operation_id, kind, state, request_json, pending_json,
-                         txid, delivery_nonce, created_at, updated_at
-                     ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8)",
+                         txid, receipt_json, rejection_reason, delivery_nonce,
+                         checkpoint_hash, backup_acked, created_at, updated_at
+                     ) VALUES(
+                         ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?12
+                     )",
                     params![
                         operation.operation_id,
                         operation.kind,
@@ -2185,7 +2336,11 @@ impl AccountWallet {
                         operation.request.to_string(),
                         operation.pending_json,
                         operation.txid,
+                        operation.receipt_json,
+                        operation.rejection_reason,
                         operation.delivery_nonce,
+                        operation.checkpoint_hash,
+                        operation.backup_acked,
                         now,
                     ],
                 )?;
@@ -2387,21 +2542,13 @@ impl AccountWallet {
         Ok(())
     }
 
-    fn create_asset(
+    fn create_instrument(
         &mut self,
-        currency: &str,
-        terms_hash: Option<&str>,
-    ) -> Result<String, AccountError> {
-        if currency.len() != 3 {
-            return Err(AccountError::new(
-                "invalid_request",
-                "currency must be exactly three UTF-8 bytes",
-            ));
-        }
-        let terms = match terms_hash {
-            Some(value) => decode_hex_32(value, "terms hash")?,
-            None => [0u8; 32],
-        };
+        terms: InstrumentTermsV1,
+    ) -> Result<(String, InstrumentManifestV1), AccountError> {
+        let terms_hash = terms.terms_hash().map_err(|error| {
+            AccountError::new("invalid_instrument_definition", error.to_string())
+        })?;
         let next_index: u32 = self.db.conn.query_row(
             "SELECT COALESCE(MAX(asset_index) + 1, 0) FROM opencsv_assets",
             [],
@@ -2416,25 +2563,116 @@ impl AccountWallet {
             &next_index.to_be_bytes(),
         )?;
         let nonce = u64::from(next_index) + 1;
+        let currency = terms.unit_code.clone();
+        let genesis = AssetGenesis {
+            issuer_pk: PoseidonIssuerAuthorization::public_key(&seed),
+            currency_code: currency.as_bytes().try_into().map_err(|_| {
+                AccountError::new(
+                    "invalid_instrument_definition",
+                    "unit code must be three bytes",
+                )
+            })?,
+            terms_hash,
+            nonce,
+        };
+        let manifest = InstrumentManifestV1 { terms, genesis };
+        manifest.validate().map_err(|error| {
+            AccountError::new("invalid_instrument_definition", error.to_string())
+        })?;
+        let expected_asset_id = hex_encode(manifest.genesis.asset_id().as_bytes());
         let asset_id = self
             .primary_protocol_mut()?
-            .init_issuer_from_seed(currency, seed, nonce, terms)
+            .init_issuer_from_seed(&currency, seed, nonce, *terms_hash.as_bytes())
             .map_err(|error| AccountError::new("invalid_request", error))?;
-        self.db.conn.execute(
+        if asset_id != expected_asset_id {
+            return Err(AccountError::new(
+                "database_error",
+                "derived issuer genesis disagrees with instrument manifest",
+            ));
+        }
+        let manifest_json = serde_json::to_string(&manifest).map_err(|error| {
+            AccountError::new(
+                "database_error",
+                format!("encode instrument manifest: {error}"),
+            )
+        })?;
+        let transaction = self
+            .db
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute(
             "INSERT INTO opencsv_assets(
                  asset_index, currency, terms_hash, nonce, asset_id
              ) VALUES(?1, ?2, ?3, ?4, ?5)",
             params![
                 next_index,
                 currency,
-                hex_encode(&terms),
+                hex_encode(terms_hash.as_bytes()),
                 i64::try_from(nonce).map_err(|_| {
                     AccountError::new("database_error", "asset nonce exceeds SQLite range")
                 })?,
                 asset_id,
             ],
         )?;
-        Ok(asset_id)
+        transaction.execute(
+            "INSERT INTO opencsv_instrument_manifests(asset_id, manifest_json, created_at)
+             VALUES(?1, ?2, ?3)",
+            params![asset_id, manifest_json, unix_time()?],
+        )?;
+        transaction.commit()?;
+        Ok((asset_id, manifest))
+    }
+
+    fn is_manifested_instrument(&self, asset_id: &str) -> Result<bool, AccountError> {
+        Ok(self
+            .db
+            .conn
+            .query_row(
+                "SELECT 1 FROM opencsv_instrument_manifests WHERE asset_id = ?1",
+                [asset_id],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some())
+    }
+
+    fn instrument_records(&self) -> Result<Vec<Value>, AccountError> {
+        let mut statement = self.db.conn.prepare(
+            "SELECT a.asset_id, m.manifest_json
+             FROM opencsv_assets a
+             LEFT JOIN opencsv_instrument_manifests m USING(asset_id)
+             ORDER BY a.asset_index",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+        })?;
+        let mut records = Vec::new();
+        for row in rows {
+            let (asset_id, manifest_json) = row?;
+            let manifest = manifest_json
+                .map(|encoded| serde_json::from_str::<InstrumentManifestV1>(&encoded))
+                .transpose()
+                .map_err(|error| {
+                    AccountError::new("database_corrupt", format!("instrument manifest: {error}"))
+                })?;
+            let profile = match &manifest {
+                Some(manifest)
+                    if preview_usd_terms(&self.config.network)
+                        .is_ok_and(|terms| manifest.terms == terms) =>
+                {
+                    "usd_preview_v1"
+                }
+                Some(_) => "unsupported_custom",
+                None => "legacy_prototype",
+            };
+            records.push(json!({
+                "asset_id": asset_id,
+                "trust_state": if manifest.is_some() { "reviewed" } else { "prototype" },
+                "profile": profile,
+                "manifest": manifest,
+            }));
+        }
+        Ok(records)
     }
 
     fn mark_proof_ready(
@@ -3304,6 +3542,41 @@ mod tests {
         .unwrap()
     }
 
+    fn test_instrument_request(unit_code: &str) -> String {
+        json!({
+            "terms": {
+                "version": 1,
+                "network": "signet",
+                "display_name": format!("OpenCSV {unit_code} test claim"),
+                "unit_code": unit_code,
+                "decimals": 2,
+                "issuer_name": "OpenCSV test issuer",
+                "terms_uri": format!("https://opencsv.net/test-terms/{unit_code}"),
+                "redemption_summary": "Test-only units with no monetary value.",
+                "test_only": true
+            }
+        })
+        .to_string()
+    }
+
+    fn create_test_instrument(wallet: &mut AccountWallet, unit_code: &str) -> String {
+        let created = wallet
+            .instrument_create(&test_instrument_request(unit_code))
+            .unwrap();
+        assert_eq!(created["backup_required"], true);
+        wallet.set_backup_state(true, CHECKPOINT_VERSION).unwrap();
+        created["asset_id"].as_str().unwrap().to_owned()
+    }
+
+    fn prepare_test_issuance(
+        wallet: &mut AccountWallet,
+        unit_code: &str,
+        amounts: &[u64],
+    ) -> Result<Value, AccountError> {
+        let asset_id = create_test_instrument(wallet, unit_code);
+        wallet.mint_prepare(&json!({ "asset_id": asset_id, "amounts": amounts }).to_string())
+    }
+
     fn confirmed_status_server(block_height: u32) -> (String, thread::JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
@@ -3626,7 +3899,7 @@ mod tests {
         let mut original =
             AccountWallet::open_device_bound(&cfg, &key, &binding, original_path.to_str().unwrap())
                 .unwrap();
-        let asset_id = original.create_asset("USD", None).unwrap();
+        let asset_id = create_test_instrument(&mut original, "TCR");
         let checkpoint = original.checkpoint().unwrap();
         let commitment = checkpoint["checkpoint"]["device_binding_commitment"]
             .as_str()
@@ -3746,6 +4019,214 @@ mod tests {
     }
 
     #[test]
+    fn ticker_only_mint_cannot_create_an_asset() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut wallet = AccountWallet::open(
+            &config(AccountRole::Primary, true),
+            &[31u8; 32],
+            dir.path().join("wallet.sqlite").to_str().unwrap(),
+        )
+        .unwrap();
+        let error = wallet
+            .mint_prepare(&json!({ "currency": "USD", "amounts": [100] }).to_string())
+            .unwrap_err();
+        assert_eq!(error.code, "invalid_request");
+        let asset_count: u32 = wallet
+            .db
+            .conn
+            .query_row("SELECT COUNT(*) FROM opencsv_assets", [], |row| row.get(0))
+            .unwrap();
+        let operation_count: u32 = wallet
+            .db
+            .conn
+            .query_row("SELECT COUNT(*) FROM opencsv_operations", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(asset_count, 0);
+        assert_eq!(operation_count, 0);
+    }
+
+    #[test]
+    fn preview_usd_is_fixed_idempotent_and_requires_fresh_backup() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut wallet = AccountWallet::open(
+            &config(AccountRole::Primary, true),
+            &[32u8; 32],
+            dir.path().join("wallet.sqlite").to_str().unwrap(),
+        )
+        .unwrap();
+        let created = wallet.preview_usd_ensure().unwrap();
+        assert_eq!(created["backup_required"], true);
+        assert_eq!(
+            created["manifest"]["terms"]["display_name"],
+            "OpenCSV USD Preview"
+        );
+        assert_eq!(created["manifest"]["terms"]["unit_code"], "USD");
+        assert_eq!(created["manifest"]["terms"]["decimals"], 6);
+        assert_eq!(created["manifest"]["terms"]["test_only"], true);
+        assert_eq!(wallet.status().unwrap()["write_enabled"], false);
+        assert_eq!(
+            wallet.status().unwrap()["instruments"][0]["trust_state"],
+            "reviewed"
+        );
+        assert_eq!(
+            wallet.status().unwrap()["instruments"][0]["profile"],
+            "usd_preview_v1"
+        );
+
+        let error = wallet
+            .mint_prepare(
+                &json!({
+                    "asset_id": created["asset_id"],
+                    "amounts": [1]
+                })
+                .to_string(),
+            )
+            .unwrap_err();
+        assert_eq!(error.code, "backup_required");
+        wallet.set_backup_state(true, CHECKPOINT_VERSION).unwrap();
+        assert_eq!(wallet.status().unwrap()["write_enabled"], true);
+
+        let repeated = wallet.preview_usd_ensure().unwrap();
+        assert_eq!(repeated["asset_id"], created["asset_id"]);
+        assert_eq!(repeated["backup_required"], false);
+        assert_eq!(wallet.status().unwrap()["write_enabled"], true);
+        let asset_count: u32 = wallet
+            .db
+            .conn
+            .query_row("SELECT COUNT(*) FROM opencsv_assets", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(asset_count, 1);
+    }
+
+    #[test]
+    fn mainnet_account_opens_but_preview_usd_is_unavailable() {
+        let dir = tempfile::tempdir().unwrap();
+        let mainnet_config = json!({
+            "version": 1,
+            "network": "mainnet",
+            "esplora_url": "https://mempool.space/api",
+            "role": "primary",
+            "backup_verified": true,
+        })
+        .to_string();
+        let mut wallet = AccountWallet::open(
+            &mainnet_config,
+            &[37u8; 32],
+            dir.path().join("wallet.sqlite").to_str().unwrap(),
+        )
+        .unwrap();
+        let error = wallet.preview_usd_ensure().unwrap_err();
+        assert_eq!(error.code, "preview_usd_unavailable");
+        assert_eq!(
+            wallet.status().unwrap()["assets"].as_array().unwrap().len(),
+            0
+        );
+    }
+
+    #[test]
+    fn checkpoint_restore_preserves_manifest_but_never_arms_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = [33u8; 32];
+        let binding = [34u8; 32];
+        let cfg = config(AccountRole::Primary, true);
+        let mut original = AccountWallet::open_device_bound(
+            &cfg,
+            &key,
+            &binding,
+            dir.path().join("original.sqlite").to_str().unwrap(),
+        )
+        .unwrap();
+        let created = original
+            .instrument_create(&test_instrument_request("TRS"))
+            .unwrap();
+        let checkpoint = original.checkpoint().unwrap();
+        let checkpoint_json = checkpoint.to_string();
+        let commitment = original.status().unwrap()["device_binding"]["commitment"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        drop(original);
+
+        let mut recovery_config: Value = serde_json::from_str(&cfg).unwrap();
+        recovery_config["expected_device_binding_commitment"] = json!(commitment);
+        let mut restored = AccountWallet::open_device_bound(
+            &recovery_config.to_string(),
+            &key,
+            &[],
+            dir.path().join("restored.sqlite").to_str().unwrap(),
+        )
+        .unwrap();
+        let status = restored.restore_checkpoint(&checkpoint_json).unwrap();
+        assert_eq!(status["write_enabled"], false);
+        assert_eq!(status["device_binding"]["status"], "mismatch_read_only");
+        assert_eq!(status["instruments"][0]["asset_id"], created["asset_id"]);
+        assert_eq!(
+            status["instruments"][0]["manifest"]["terms"]["unit_code"],
+            "TRS"
+        );
+        assert_eq!(
+            restored
+                .mint_prepare(
+                    &json!({ "asset_id": created["asset_id"], "amounts": [1] }).to_string(),
+                )
+                .unwrap_err()
+                .code,
+            "device_binding_mismatch"
+        );
+    }
+
+    #[test]
+    fn checkpoint_restore_rejects_tampering_before_writing() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = [35u8; 32];
+        let binding = [36u8; 32];
+        let cfg = config(AccountRole::Primary, true);
+        let mut original = AccountWallet::open_device_bound(
+            &cfg,
+            &key,
+            &binding,
+            dir.path().join("original.sqlite").to_str().unwrap(),
+        )
+        .unwrap();
+        original
+            .instrument_create(&test_instrument_request("TRJ"))
+            .unwrap();
+        let mut checkpoint = original.checkpoint().unwrap();
+        let commitment = original.status().unwrap()["device_binding"]["commitment"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        checkpoint["checkpoint"]["instrument_manifests"][0]["terms"]["issuer_name"] =
+            json!("dishonest replacement");
+        drop(original);
+
+        let mut recovery_config: Value = serde_json::from_str(&cfg).unwrap();
+        recovery_config["expected_device_binding_commitment"] = json!(commitment);
+        let mut restored = AccountWallet::open_device_bound(
+            &recovery_config.to_string(),
+            &key,
+            &[],
+            dir.path().join("restored.sqlite").to_str().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            restored
+                .restore_checkpoint(&checkpoint.to_string())
+                .unwrap_err()
+                .code,
+            "backup_checkpoint_hash_mismatch"
+        );
+        let count: i64 = restored
+            .db
+            .conn
+            .query_row("SELECT COUNT(*) FROM opencsv_assets", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[test]
     fn proof_ready_operation_survives_reopen_and_can_cancel() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("wallet.sqlite");
@@ -3758,9 +4239,7 @@ mod tests {
         .unwrap();
         allow_funding_verification(&mut wallet);
         let funding = fund(&mut wallet, 50_000);
-        let prepared = wallet
-            .mint_prepare(&json!({ "currency": "USD", "amounts": [100] }).to_string())
-            .unwrap();
+        let prepared = prepare_test_issuance(&mut wallet, "TPR", &[100]).unwrap();
         assert_eq!(prepared["asset_id"].as_str().unwrap().len(), 64);
         assert_eq!(prepared["to_owner"].as_str().unwrap().len(), 64);
         let operation_id = prepared["operation_id"].as_str().unwrap().to_owned();
@@ -3791,9 +4270,7 @@ mod tests {
         .unwrap();
         allow_funding_verification(&mut wallet);
         let funding = fund(&mut wallet, 50_000);
-        let prepared = wallet
-            .mint_prepare(&json!({ "currency": "EUR", "amounts": [25] }).to_string())
-            .unwrap();
+        let prepared = prepare_test_issuance(&mut wallet, "TEU", &[25]).unwrap();
         let operation_id = prepared["operation_id"].as_str().unwrap();
         wallet
             .acknowledge_operation_backup(
@@ -3841,8 +4318,9 @@ mod tests {
             )],
         );
 
+        let asset_id = create_test_instrument(&mut wallet, "TCA");
         let error = wallet
-            .mint_prepare(&json!({ "currency": "CAD", "amounts": [10] }).to_string())
+            .mint_prepare(&json!({ "asset_id": asset_id, "amounts": [10] }).to_string())
             .unwrap_err();
         assert_eq!(error.code, "stale_chain_state");
         assert_eq!(verifier.calls.load(Ordering::SeqCst), 1);
@@ -3891,9 +4369,7 @@ mod tests {
                 ),
             ],
         );
-        let prepared = wallet
-            .mint_prepare(&json!({ "currency": "GBP", "amounts": [10] }).to_string())
-            .unwrap();
+        let prepared = prepare_test_issuance(&mut wallet, "TGB", &[10]).unwrap();
         let operation_id = prepared["operation_id"].as_str().unwrap();
         wallet
             .acknowledge_operation_backup(
@@ -3933,6 +4409,7 @@ mod tests {
         let larger = fund(&mut first, 60_000);
         let smaller = fund(&mut first, 50_000);
         assert_ne!(larger, smaller);
+        let asset_id = create_test_instrument(&mut first, "TCN");
         let mut second = AccountWallet::open(
             &config(AccountRole::Primary, true),
             &key,
@@ -3950,10 +4427,10 @@ mod tests {
         allow_funding_verification(&mut second);
 
         let first_prepared = first
-            .mint_prepare(&json!({ "currency": "USD", "amounts": [10] }).to_string())
+            .mint_prepare(&json!({ "asset_id": asset_id, "amounts": [10] }).to_string())
             .unwrap();
         let second_prepared = second
-            .mint_prepare(&json!({ "currency": "EUR", "amounts": [10] }).to_string())
+            .mint_prepare(&json!({ "asset_id": asset_id, "amounts": [10] }).to_string())
             .unwrap();
         assert_eq!(
             first_prepared["funding_outpoint"],
@@ -4004,9 +4481,7 @@ mod tests {
             .insert_planned_operation("reserved-op", "mint", "{}", "reserved-delivery")
             .unwrap();
         let reserved = wallet.reserve_fee_utxo("reserved-op").unwrap().outpoint;
-        let prepared = wallet
-            .mint_prepare(&json!({ "currency": "CHF", "amounts": [10] }).to_string())
-            .unwrap();
+        let prepared = prepare_test_issuance(&mut wallet, "TCH", &[10]).unwrap();
         let proof_operation = prepared["operation_id"].as_str().unwrap().to_owned();
         let proof_outpoint =
             operation_outpoint(&wallet.operation(&proof_operation).unwrap()).unwrap();
@@ -4163,9 +4638,7 @@ mod tests {
         .unwrap();
         allow_funding_verification(&mut wallet);
         fund(&mut wallet, 100_000);
-        let prepared = wallet
-            .mint_prepare(&json!({ "currency": "JPY", "amounts": [10] }).to_string())
-            .unwrap();
+        let prepared = prepare_test_issuance(&mut wallet, "TJP", &[10]).unwrap();
         let operation_id = prepared["operation_id"].as_str().unwrap().to_owned();
         wallet
             .acknowledge_operation_backup(
@@ -4314,10 +4787,13 @@ mod tests {
         allow_funding_verification(&mut wallet);
         let funding = fund(&mut wallet, 100_000);
 
+        let asset_id = create_test_instrument(&mut wallet, "TPF");
         let error = wallet
-            .mint_prepare(&json!({ "currency": "US", "amounts": [10] }).to_string())
+            .mint_prepare(
+                &json!({ "asset_id": asset_id, "to_owner": "bad", "amounts": [10] }).to_string(),
+            )
             .unwrap_err();
-        assert_eq!(error.code, "invalid_request");
+        assert_eq!(error.code, "invalid_proof_request");
         assert!(!wallet.bitcoin.is_outpoint_locked(funding));
         let reservations: u32 = wallet
             .db
@@ -4340,7 +4816,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(state, OperationState::Cancelled.as_str());
-        assert_eq!(reason.as_deref(), Some("invalid_request"));
+        assert_eq!(reason.as_deref(), Some("invalid_proof_request"));
     }
 
     #[test]
@@ -4366,9 +4842,7 @@ mod tests {
             ],
         );
         fund(&mut wallet, 100_000);
-        let prepared = wallet
-            .mint_prepare(&json!({ "currency": "SEK", "amounts": [10] }).to_string())
-            .unwrap();
+        let prepared = prepare_test_issuance(&mut wallet, "TSE", &[10]).unwrap();
         let operation_id = prepared["operation_id"].as_str().unwrap().to_owned();
         wallet
             .acknowledge_operation_backup(
