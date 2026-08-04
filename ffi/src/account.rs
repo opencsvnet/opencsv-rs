@@ -36,7 +36,7 @@ use opencsv_cbf::block::OutPoint as CbfOutPoint;
 use opencsv_cbf::{CbfClient, Config as CbfConfig, OutpointVerdict};
 use opencsv_core::chain::AnchorRef;
 use opencsv_core::consignment::Consignment;
-#[cfg(test)]
+#[cfg(any(test, feature = "issuer-tools"))]
 use opencsv_core::{AssetGenesis, InstrumentTermsV1, PoseidonIssuerAuthorization};
 use opencsv_core::{AssetId, InstrumentManifestV1, OwnerSecret};
 use rand::RngExt as _;
@@ -423,7 +423,7 @@ impl OperationState {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "issuer-tools"))]
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct IssuanceRequest {
@@ -433,7 +433,7 @@ struct IssuanceRequest {
     amounts: Vec<u64>,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "issuer-tools"))]
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct InstrumentCreateRequest {
@@ -638,7 +638,7 @@ pub struct AccountWallet {
     bitcoin: PersistedWallet<SqlitePersister>,
     db: SqlitePersister,
     protocol: Option<MemWallet>,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "issuer-tools"))]
     issuer_root: Option<Zeroizing<[u8; 32]>>,
     root_fingerprint: String,
     device_binding_commitment: Option<String>,
@@ -868,16 +868,16 @@ impl AccountWallet {
             bitcoin,
             db,
             protocol,
-            #[cfg(test)]
+            #[cfg(any(test, feature = "issuer-tools"))]
             issuer_root,
             root_fingerprint,
             device_binding_commitment,
             device_binding_valid,
             pending_by_operation: HashMap::new(),
         };
-        #[cfg(not(test))]
+        #[cfg(not(any(test, feature = "issuer-tools")))]
         drop(issuer_root);
-        #[cfg(test)]
+        #[cfg(any(test, feature = "issuer-tools"))]
         account.restore_issuers()?;
         account.restore_consignment_state()?;
         account.restore_fee_reservations()?;
@@ -1090,9 +1090,9 @@ impl AccountWallet {
         })
     }
 
-    /// Test-only arbitrary manifest constructor. Signal's production FFI has
-    /// no asset-definition or issuance action.
-    #[cfg(test)]
+    /// Opt-in issuer-tool manifest constructor. Signal's production FFI has no
+    /// asset-definition or issuance action and never enables this feature.
+    #[cfg(any(test, feature = "issuer-tools"))]
     pub fn instrument_create(&mut self, request_json: &str) -> Result<Value, AccountError> {
         self.require_write_enabled()?;
         let request: InstrumentCreateRequest =
@@ -1129,9 +1129,9 @@ impl AccountWallet {
 
     /// Prepare issuer-authorized issuance for an existing exact asset id.
     /// Fee selection, change derivation, and the OpenCSV proof all remain
-    /// inside Rust. This helper exists only for account-wallet tests; issuer
-    /// production tooling is deliberately separate from Signal's FFI.
-    #[cfg(test)]
+    /// inside Rust. This helper exists for account-wallet tests and the
+    /// explicitly featured issuer harness, separate from Signal's FFI.
+    #[cfg(any(test, feature = "issuer-tools"))]
     pub fn mint_prepare(&mut self, request_json: &str) -> Result<Value, AccountError> {
         self.require_write_enabled()?;
         let request: IssuanceRequest = serde_json::from_str(request_json).map_err(|error| {
@@ -2352,7 +2352,7 @@ impl AccountWallet {
             self.db
                 .set_meta("backup_checkpoint_version", &CHECKPOINT_VERSION.to_string())?;
             self.db.set_meta("restored_checkpoint_hash", &actual_hash)?;
-            #[cfg(test)]
+            #[cfg(any(test, feature = "issuer-tools"))]
             self.restore_issuers()?;
             self.restore_consignment_state()?;
             Ok(())
@@ -2525,7 +2525,7 @@ impl AccountWallet {
         Ok(())
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "issuer-tools"))]
     fn create_instrument(
         &mut self,
         terms: InstrumentTermsV1,
@@ -2607,7 +2607,7 @@ impl AccountWallet {
         Ok((asset_id, manifest))
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "issuer-tools"))]
     fn is_manifested_instrument(&self, asset_id: &str) -> Result<bool, AccountError> {
         Ok(self
             .db
@@ -3018,7 +3018,7 @@ impl AccountWallet {
         Ok(asset_ids)
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "issuer-tools"))]
     fn restore_issuers(&mut self) -> Result<(), AccountError> {
         let (Some(protocol), Some(issuer_root)) =
             (self.protocol.as_mut(), self.issuer_root.as_ref())

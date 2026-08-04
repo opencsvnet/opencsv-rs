@@ -1,10 +1,14 @@
 //! Reproducible live-signet driver for the Rust-owned account wallet.
 //!
-//! This example exposes only the action-oriented product boundary. It cannot
+//! This explicitly featured issuer example exposes only the action-oriented
+//! reference boundary. It cannot
 //! select a Bitcoin input/change address or send arbitrary Bitcoin. Supply a
 //! fresh 32-byte account root and non-migratable-device stand-in through
 //! `OPENCSV_ACCOUNT_ROOT_HEX` and `OPENCSV_DEVICE_BINDING_HEX`; neither value
 //! is printed or stored outside the account database.
+//!
+//! Build with `--features issuer-tools`. Signal's default/CocoaPods build does
+//! not enable that feature and its C ABI has no asset-definition or mint call.
 
 use std::env;
 use std::error::Error;

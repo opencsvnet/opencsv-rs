@@ -8,6 +8,16 @@ license.workspace = true
 [lib]
 crate-type = ["staticlib", "rlib"]
 
+[features]
+default = []
+# Privileged issuer/reference tooling. Signal's CocoaPods build does not enable
+# this feature, and the C ABI intentionally exposes no corresponding symbols.
+issuer-tools = []
+
+[[example]]
+name = "signet_account_acceptance"
+required-features = ["issuer-tools"]
+
 [dependencies]
 opencsv-core = { path = "../crates/opencsv-core" }
 opencsv-pcd = { path = "../crates/opencsv-pcd" }
