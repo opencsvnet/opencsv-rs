@@ -6,11 +6,12 @@
 
 use std::fmt;
 use std::fs;
+use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 #[cfg(unix)]
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
 use clap::{Args, Parser, Subcommand};
 use opencsv_ffi::account::{AccountError, AccountWallet};
@@ -76,8 +77,12 @@ enum InstrumentCommand {
 
 #[derive(Subcommand)]
 enum BackupCommand {
-    /// Print the complete versioned checkpoint to stdout as JSON.
-    Export,
+    /// Export the complete versioned checkpoint as JSON.
+    Export {
+        /// Create an owner-only checkpoint file instead of printing secrets to stdout.
+        #[arg(long)]
+        output: Option<PathBuf>,
+    },
     /// Confirm that the exact current checkpoint was stored durably elsewhere.
     Acknowledge {
         #[arg(long)]
@@ -220,7 +225,13 @@ fn run(cli: Cli) -> Result<Value, CliError> {
                 .instrument_create(&request.to_string())
                 .map_err(Into::into)
         }
-        Command::Backup(BackupCommand::Export) => wallet.checkpoint().map_err(Into::into),
+        Command::Backup(BackupCommand::Export { output }) => {
+            let checkpoint = wallet.checkpoint()?;
+            match output {
+                Some(path) => write_checkpoint(&path, &checkpoint),
+                None => Ok(checkpoint),
+            }
+        }
         Command::Backup(BackupCommand::Acknowledge { checkpoint_hash }) => wallet
             .acknowledge_checkpoint_backup(&checkpoint_hash)
             .map_err(Into::into),
@@ -288,6 +299,57 @@ fn read_json(path: &Path, reason: &'static str) -> Result<Value, CliError> {
             format!("{} is not valid JSON: {error}", path.display()),
         )
     })
+}
+
+fn write_checkpoint(path: &Path, checkpoint: &Value) -> Result<Value, CliError> {
+    let checkpoint_hash = checkpoint
+        .get("checkpoint_hash")
+        .and_then(Value::as_str)
+        .ok_or_else(|| CliError::new("checkpoint_encode_failed", "checkpoint has no hash"))?;
+    let mut encoded = serde_json::to_vec_pretty(checkpoint)
+        .map_err(|error| CliError::new("checkpoint_encode_failed", error.to_string()))?;
+    encoded.push(b'\n');
+
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let mut file = options.open(path).map_err(|error| {
+        if error.kind() == ErrorKind::AlreadyExists {
+            CliError::new(
+                "checkpoint_output_exists",
+                format!("refusing to overwrite {}", path.display()),
+            )
+        } else {
+            CliError::new(
+                "checkpoint_write_failed",
+                format!("could not create {}: {error}", path.display()),
+            )
+        }
+    })?;
+    if let Err(error) = file.write_all(&encoded).and_then(|()| file.sync_all()) {
+        drop(file);
+        let _ = fs::remove_file(path);
+        return Err(CliError::new(
+            "checkpoint_write_failed",
+            format!("could not durably write {}: {error}", path.display()),
+        ));
+    }
+    if let Some(parent) = path.parent() {
+        fs::File::open(parent)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|error| {
+                CliError::new(
+                    "checkpoint_write_failed",
+                    format!("could not sync {}: {error}", parent.display()),
+                )
+            })?;
+    }
+    Ok(json!({
+        "checkpoint_hash": checkpoint_hash,
+        "output": path.display().to_string(),
+        "bytes": encoded.len(),
+    }))
 }
 
 fn read_secret(path: &Path, label: &'static str) -> Result<Zeroizing<[u8; 32]>, CliError> {
@@ -414,5 +476,30 @@ mod tests {
             "secret_separation_required"
         );
         validate_secret_separation(&[9_u8; 32], &[10_u8; 32]).unwrap();
+    }
+
+    #[test]
+    fn checkpoint_output_is_owner_only_and_never_overwritten() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("checkpoint.json");
+        let checkpoint = json!({ "checkpoint_hash": "exact-hash", "version": 1 });
+
+        let receipt = write_checkpoint(&path, &checkpoint).unwrap();
+        assert_eq!(receipt["checkpoint_hash"], "exact-hash");
+        assert_eq!(receipt["output"], path.to_string_lossy().as_ref());
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "{\n  \"checkpoint_hash\": \"exact-hash\",\n  \"version\": 1\n}\n"
+        );
+        #[cfg(unix)]
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+
+        assert_eq!(
+            write_checkpoint(&path, &checkpoint).unwrap_err().reason,
+            "checkpoint_output_exists"
+        );
     }
 }
