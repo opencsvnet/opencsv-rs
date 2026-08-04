@@ -70,7 +70,7 @@ fn usage() -> ! {
     eprintln!(
         "usage: signet_account_acceptance <database> \
          status|sync|prepare-mint|ack-backup|sign|bump|operation|resume [arguments]\n\
-         prepare-mint [CURRENCY] [AMOUNT]\n\
+         prepare-mint <ASSET_ID> [AMOUNT]\n\
          ack-backup <OPERATION_ID> <CHECKPOINT_HASH>\n\
          sign <OPERATION_ID> <SAT_PER_VB>\n\
          bump <OPERATION_ID> <SAT_PER_VB>\n\
@@ -93,7 +93,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         "status" => print_json(wallet.status()?),
         "sync" => print_json(wallet.sync()?),
         "prepare-mint" => {
-            let currency = arguments.get(3).map(String::as_str).unwrap_or("TST");
+            let asset_id = arguments.get(3).unwrap_or_else(|| usage());
             let amount = arguments
                 .get(4)
                 .map(|value| value.parse::<u64>())
@@ -101,7 +101,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                 .unwrap_or(1);
             print_json(
                 wallet.mint_prepare(
-                    &json!({ "currency": currency, "amounts": [amount] }).to_string(),
+                    &json!({ "asset_id": asset_id, "amounts": [amount] }).to_string(),
                 )?,
             )
         }

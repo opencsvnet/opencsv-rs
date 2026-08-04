@@ -12,7 +12,12 @@ crate-type = ["staticlib", "rlib"]
 default = []
 # Privileged issuer/reference tooling. Signal's CocoaPods build does not enable
 # this feature, and the C ABI intentionally exposes no corresponding symbols.
-issuer-tools = []
+issuer-tools = ["dep:clap"]
+
+[[bin]]
+name = "opencsv-issuer"
+path = "src/bin/opencsv-issuer.rs"
+required-features = ["issuer-tools"]
 
 [[example]]
 name = "signet_account_acceptance"
@@ -34,6 +39,7 @@ hkdf = "=0.12.4"
 sha2 = "=0.10.9"
 rusqlite = "=0.38.0"
 zeroize = "=1.9.0"
+clap = { version = "4", features = ["derive", "env"], optional = true }
 
 [dev-dependencies]
 tempfile = "3"

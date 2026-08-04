@@ -65,16 +65,27 @@ issuer, terms, redemption statement, network, and exact asset id.
 
 Definition and issuance occur outside Signal:
 
-1. A privileged issuer tool creates and validates an instrument definition.
+1. The opt-in headless `opencsv-issuer` tool creates and validates an
+   instrument definition from committed terms.
 2. Review the derived issuer fingerprint, terms hash, and asset id.
-3. Publish the exact public manifest through the reviewed wallet policy.
-4. Keep the issuer key outside Signal and its Secure Backup.
-5. Issue units from the separate issuer workflow against the exact asset id.
+3. Export and durably store the exact issuer checkpoint before acknowledging
+   it; the tool refuses stale checkpoint hashes.
+4. Publish the exact public manifest through the reviewed wallet policy.
+5. Keep the issuer root and device binding outside Signal and its Secure
+   Backup.
+6. Prepare issuance against the exact asset id, back up that operation's
+   checkpoint, then sign and broadcast from the resumable issuer journal.
 
 Signal's production FFI exposes no definition, issuer-key, or mint-preparation
 call. It accepts public reviewed manifests in `usd_issuers`, validates their
 network/genesis/terms binding and unique asset ids, and returns each as a
 `trusted_usd_v1` tranche with deterministic priority.
+
+`opencsv-issuer` is not part of the C ABI or default feature set. Its commands
+emit JSON, read secrets only from explicit files, and expose no ticker-only
+mint shortcut. Running the binary does not authorize issuance for an existing
+instrument: the mint PCD still requires the seed committed by that exact
+manifest's genesis.
 
 Normal sends select one issuer tranche that can cover the amount and disclose
 that issuer at review. V1 must reject rather than silently split across issuer

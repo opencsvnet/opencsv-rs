@@ -174,3 +174,24 @@ encodings of one consignment and proves their canonical bytes and IDs match.
 These open items prevent a mainnet-readiness claim. No PR, merge, release,
 mainnet broadcast, upstream submission, or destructive device action is part
 of this journal entry.
+
+## 2026-08-04 — issuance moved to an opt-in headless operator
+
+Removing issuer controls from Signal did not remove protocol issuance. The
+issuer-only account methods are now exposed through a dedicated
+`opencsv-issuer` binary behind the non-default `issuer-tools` feature. Signal's
+C ABI and CocoaPods build still contain no definition or mint action.
+
+The operator reads the account root and device binding from files, never CLI
+values, and emits JSON for automation. It creates exact manifests from terms,
+prepares mints only by exact asset id, exports checkpoints, requires exact-hash
+backup acknowledgements, and exposes durable broadcast/resume/cancel/fee-bump
+operations. The earlier signet acceptance example's stale ticker-based mint
+request was corrected to require an asset id.
+
+This preserves the important distinction between protocol validity and wallet
+trust. Anyone may run the open-source executable, but they cannot mint an
+existing issuer's asset without the committed issuer seed, and Signal will not
+recognize an arbitrary new `USD` ticker as reviewed USD. No Tether issuer is
+claimed or configured without Tether-controlled authority and an authenticated
+manifest.

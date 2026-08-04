@@ -2097,6 +2097,32 @@ impl AccountWallet {
         }))
     }
 
+    /// Confirm that the exact current issuer checkpoint has been stored by an
+    /// external backup system. This is available only to the opt-in headless
+    /// issuer tooling; Signal uses its native Secure Backup acknowledgement.
+    #[cfg(any(test, feature = "issuer-tools"))]
+    pub fn acknowledge_checkpoint_backup(
+        &mut self,
+        checkpoint_hash: &str,
+    ) -> Result<Value, AccountError> {
+        let checkpoint = self.checkpoint()?;
+        let current_hash = checkpoint["checkpoint_hash"].as_str().ok_or_else(|| {
+            AccountError::new("checkpoint_failed", "current checkpoint has no hash")
+        })?;
+        if checkpoint_hash != current_hash {
+            return Err(AccountError::new(
+                "backup_checkpoint_mismatch",
+                "external backup acknowledged a stale or different issuer checkpoint",
+            ));
+        }
+        self.set_backup_state(true, CHECKPOINT_VERSION)?;
+        Ok(json!({
+            "backup_verified": true,
+            "checkpoint_hash": current_hash,
+            "write_enabled": self.write_enabled()?,
+        }))
+    }
+
     /// Import the exact compact state recovered by Signal Secure Backup.
     /// The account root must already have opened this clean database and the
     /// public device-binding commitment must match the checkpoint. A restored
@@ -4119,6 +4145,37 @@ mod tests {
             .unwrap();
         assert_eq!(asset_count, 0);
         assert_eq!(operation_count, 0);
+    }
+
+    #[test]
+    fn issuer_backup_acknowledges_only_the_exact_current_checkpoint() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut wallet = AccountWallet::open(
+            &config(AccountRole::Primary, true),
+            &[39u8; 32],
+            dir.path().join("wallet.sqlite").to_str().unwrap(),
+        )
+        .unwrap();
+        wallet
+            .instrument_create(&test_instrument_request("USD"))
+            .unwrap();
+        assert_eq!(wallet.status().unwrap()["backup_verified"], false);
+        assert_eq!(
+            wallet
+                .acknowledge_checkpoint_backup(&hex_encode(&[0u8; 32]))
+                .unwrap_err()
+                .code,
+            "backup_checkpoint_mismatch"
+        );
+
+        let checkpoint = wallet.checkpoint().unwrap();
+        let checkpoint_hash = checkpoint["checkpoint_hash"].as_str().unwrap();
+        let receipt = wallet
+            .acknowledge_checkpoint_backup(checkpoint_hash)
+            .unwrap();
+        assert_eq!(receipt["backup_verified"], true);
+        assert_eq!(receipt["checkpoint_hash"], checkpoint_hash);
+        assert_eq!(wallet.status().unwrap()["write_enabled"], true);
     }
 
     #[test]

@@ -2585,6 +2585,7 @@ dependencies = [
  "base64 0.22.1",
  "bdk_esplora",
  "bdk_wallet",
+ "clap",
  "hkdf 0.12.4",
  "opencsv-bitcoin",
  "opencsv-cbf",

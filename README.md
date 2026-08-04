@@ -13,6 +13,7 @@ crates/opencsv-pcd/     # AIR-native recursive proof engine (Plonky3 + Plonky3-r
 crates/opencsv-cli/     # `opencsv` text wallet: keygen/mint/send/receive/redeem/balance/audit
 crates/opencsv-bitcoin/ # real bitcoind-RPC anchor backend (OP_RETURN anchors, block scanning)
 crates/opencsv-signal/  # Signal transport via presage (linked device, consignments as attachments)
+ffi/                    # owner-only Signal C ABI; opt-in `opencsv-issuer` operator binary
 ```
 
 ## Status
@@ -68,6 +69,7 @@ wallet fee-bump APIs are not protocol-safe.
 
 ```sh
 cargo build --locked --release -p opencsv-cli  # needs protoc for Signal
+cargo build --locked --release -p opencsv-ffi --features issuer-tools --bin opencsv-issuer
 cargo test --locked --workspace               # slow proving tests are #[ignore]d
 ./scripts/reproducible-build.sh --verify dist/reproducible
 ```

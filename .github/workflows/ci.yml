@@ -27,6 +27,8 @@ jobs:
       - name: Check opt-in issuer tooling
         env:
           RUSTFLAGS: -D warnings
-        run: cargo check --locked -p opencsv-ffi --features issuer-tools --example signet_account_acceptance
+        run: |
+          cargo test --locked -p opencsv-ffi --features issuer-tools --bin opencsv-issuer
+          cargo check --locked -p opencsv-ffi --features issuer-tools --bin opencsv-issuer --example signet_account_acceptance
       - name: Verify reproducible reference binaries
         run: ./scripts/reproducible-build.sh --verify dist/reproducible

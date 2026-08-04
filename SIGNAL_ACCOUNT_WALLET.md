@@ -20,6 +20,15 @@ exports no asset-definition or mint-preparation action. Issuer keys belong to
 separate privileged issuer tooling and never enter the Signal account root or
 Secure Backup.
 
+The opt-in `opencsv-issuer` binary is that headless operator boundary. It is
+compiled only with the `issuer-tools` feature, reads issuer roots from files
+rather than command-line values, and returns JSON suitable for automation. It
+can create an exact public manifest, prepare issuer-authorized mints, export
+and acknowledge checkpoints, and advance durable operations through
+sign/broadcast, resume, cancellation, and protocol-safe fee bump. Possession
+of this executable alone conveys no authority: mint proofs require the issuer
+seed derived by the account that created the exact asset id.
+
 Temporary root and derivation buffers are zeroized. The primary wallet keeps
 the derived signing state required while the account is open. A linked device
 passes no account root and opens with public descriptors and owner identity;
@@ -177,3 +186,41 @@ read/export-only.
 
 The legacy in-memory FFI remains temporarily available for compatibility while
 Signal migrates. It is not the target wallet architecture.
+
+## Headless issuer CLI
+
+Build the operator binary explicitly; the default library and Signal CocoaPods
+build do not include it:
+
+```sh
+cargo build --locked --release -p opencsv-ffi \
+  --features issuer-tools --bin opencsv-issuer
+```
+
+Every invocation requires an account config, SQLite database, 32-byte account
+root file, and distinct 32-byte device-binding file. Secret files may contain
+raw bytes or 64 lowercase/uppercase hex characters. They are never printed or
+accepted as command-line values. The same four parameters may be supplied by
+the `OPENCSV_ISSUER_CONFIG`, `OPENCSV_ISSUER_DATABASE`,
+`OPENCSV_ISSUER_ACCOUNT_ROOT_FILE`, and
+`OPENCSV_ISSUER_DEVICE_BINDING_FILE` environment variables.
+
+The lifecycle is intentionally two-stage:
+
+1. `instrument create --terms terms.json` creates the exact manifest and
+   freezes writes until its returned checkpoint is backed up.
+2. `backup export` emits the current checkpoint; `backup acknowledge
+   --checkpoint-hash HASH` accepts only its exact current hash.
+3. `mint prepare --asset-id ID --amount BASE_UNITS` accepts an exact id, never
+   a ticker shortcut, and returns an operation id plus checkpoint hash.
+4. `operation acknowledge-backup --operation-id ID --checkpoint-hash HASH`
+   gates signing on the prepared checkpoint.
+5. `operation broadcast --operation-id ID --sat-per-vb RATE` signs, persists,
+   and attempts direct P2P broadcast. `operation status`, `resume`, `cancel`,
+   and `fee-bump` expose the durable recovery path.
+
+Signal consumes only public manifests selected through its reviewed
+`usd_issuers` policy. An unrelated operator may create another instrument, but
+that does not make it a trusted Signal USD issuer. A future Tether instrument
+requires Tether-controlled authority and an independently authenticated exact
+manifest; its name is never inferred from the `USD` ticker.
