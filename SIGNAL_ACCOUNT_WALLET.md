@@ -13,8 +13,12 @@ Both enter `opencsv_account_open` as byte buffers, never JSON. Rust derives
 distinct branches from the account root for:
 
 - the BIP84 Bitcoin fee wallet;
-- the OpenCSV owner;
-- the issuer root and each account-created asset.
+- the OpenCSV owner.
+
+Signal is not an issuer. The production C boundary retains no issuer seed and
+exports no asset-definition or mint-preparation action. Issuer keys belong to
+separate privileged issuer tooling and never enter the Signal account root or
+Secure Backup.
 
 Temporary root and derivation buffers are zeroized. The primary wallet keeps
 the derived signing state required while the account is open. A linked device
@@ -25,7 +29,7 @@ Rust commits the account root and device binding together. That public
 commitment is stored in SQLite, returned with status, and included in every
 Secure Backup checkpoint. A restored database or clean-database checkpoint
 whose commitment does not match the current device binding opens
-read/export-only: mint, transfer, sign, and fee bump fail with
+read/export-only: transfer, sign, and fee bump fail with
 `device_binding_mismatch`. The host must carry the checkpoint commitment on a
 clean restore. Fresh setup must create the root and binding atomically. If a
 root already exists but its non-migratable binding is missing after an OS
@@ -58,7 +62,8 @@ runtime used by the Signal dependency graph.
 
 The same database stores:
 
-- derived issuer metadata, but not the account root;
+- trusted public issuer manifests and legacy prototype metadata, but no issuer
+  secret or account root;
 - protocol consignments and verified chain snapshots;
 - Bitcoin UTXO reservations;
 - pending proofs and normalized action requests;
@@ -149,12 +154,19 @@ The action-oriented surface is:
 - `opencsv_account_open/close/status/sync`
 - `opencsv_account_set_backup_state/checkpoint/restore_checkpoint`
 - `opencsv_account_verify_consignment/scan_verify/cross_check`
-- `opencsv_mint_prepare` and `opencsv_transfer_prepare`
+- `opencsv_transfer_prepare`
 - `opencsv_operation_ack_backup`
 - `opencsv_operation_sign_and_broadcast`
 - `opencsv_operation_status/resume/cancel`
 - `opencsv_fee_bump`
 - `opencsv_operation_mark_delivered`
+
+The account config may contain reviewed public `usd_issuers` manifests. Rust
+validates each exact genesis/terms pair, network, `USD` unit code, and unique
+asset id. Status groups those issuer-specific identities under the
+`trusted_usd_v1` product profile with deterministic priority, while preserving
+the issuer name and asset id for review and receipts. Unknown or legacy assets
+remain visible but are not promoted by their ticker.
 
 `opencsv_account_open` takes the public config, account-root bytes,
 device-binding bytes, and database path. The config may include

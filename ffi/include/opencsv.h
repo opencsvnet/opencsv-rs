@@ -55,15 +55,8 @@ char *opencsv_account_scan_verify(uint64_t handle,
                                   const char *consignment_hex);
 char *opencsv_account_cross_check(uint64_t handle,
                                   const char *request_json);
-/* Ensure the fixed test-only OpenCSV USD Preview definition exists. No
- * caller-selected terms are accepted; unavailable on mainnet. */
-char *opencsv_preview_usd_ensure(uint64_t handle);
-/* Issuance request_json is exactly
- * {"asset_id":"<hex>","to_owner":"<hex>"|null,"amounts":[N,...]}.
- * Asset creation is a separate instrument-definition operation. */
-char *opencsv_issuance_prepare(uint64_t handle, const char *request_json);
-/* Compatibility symbol with the same strict issuance request. */
-char *opencsv_mint_prepare(uint64_t handle, const char *request_json);
+/* Signal is an owner wallet, not an issuer. This production header exposes
+ * no asset-definition, issuer-key, or mint-preparation API. */
 /* request_json is exactly
  * {"asset_id":"<hex>","to_owner":"<hex>","amount":N}; Rust selects the
  * OpenCSV coins, Bitcoin inputs, and change. */

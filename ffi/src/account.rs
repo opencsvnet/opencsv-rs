@@ -6,7 +6,7 @@
 //! the only component that derives wallet keys from it. Linked devices open
 //! with public descriptors and never receive signing material.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
@@ -36,10 +36,9 @@ use opencsv_cbf::block::OutPoint as CbfOutPoint;
 use opencsv_cbf::{CbfClient, Config as CbfConfig, OutpointVerdict};
 use opencsv_core::chain::AnchorRef;
 use opencsv_core::consignment::Consignment;
-use opencsv_core::{
-    preview_usd_terms, AssetGenesis, AssetId, InstrumentManifestV1, InstrumentTermsV1, OwnerSecret,
-    PoseidonIssuerAuthorization,
-};
+#[cfg(test)]
+use opencsv_core::{AssetGenesis, InstrumentTermsV1, PoseidonIssuerAuthorization};
+use opencsv_core::{AssetId, InstrumentManifestV1, OwnerSecret};
 use rand::RngExt as _;
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde::{Deserialize, Serialize};
@@ -129,6 +128,19 @@ fn default_max_verification_blocks() -> u64 {
     DEFAULT_MAX_VERIFICATION_BLOCKS
 }
 
+/// One exact issuer-specific USD instrument trusted by the Signal product.
+/// Trust comes from the reviewed app configuration, never from the `USD`
+/// display code alone.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UsdIssuerPolicy {
+    /// Full terms/genesis manifest whose asset id is admitted as USD.
+    pub manifest: InstrumentManifestV1,
+    /// Lower values are preferred when one issuer balance can cover a send.
+    #[serde(default)]
+    pub priority: u32,
+}
+
 /// Account configuration supplied by Signal. It contains no secret key.
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -181,6 +193,10 @@ pub struct AccountConfig {
     /// Public OpenCSV owner identity supplied to linked devices.
     #[serde(default)]
     pub watch_owner: Option<String>,
+    /// Reviewed issuer-specific instruments grouped under Signal's one USD
+    /// product. This list contains public manifests only, never issuer keys.
+    #[serde(default)]
+    pub usd_issuers: Vec<UsdIssuerPolicy>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -407,6 +423,7 @@ impl OperationState {
     }
 }
 
+#[cfg(test)]
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct IssuanceRequest {
@@ -621,6 +638,7 @@ pub struct AccountWallet {
     bitcoin: PersistedWallet<SqlitePersister>,
     db: SqlitePersister,
     protocol: Option<MemWallet>,
+    #[cfg(test)]
     issuer_root: Option<Zeroizing<[u8; 32]>>,
     root_fingerprint: String,
     device_binding_commitment: Option<String>,
@@ -647,6 +665,7 @@ impl AccountWallet {
         }
         let network = parse_network(&config.network)?;
         validate_esplora_url(&config.esplora_url)?;
+        validate_usd_issuer_policy(&config)?;
 
         let (
             external,
@@ -849,12 +868,16 @@ impl AccountWallet {
             bitcoin,
             db,
             protocol,
+            #[cfg(test)]
             issuer_root,
             root_fingerprint,
             device_binding_commitment,
             device_binding_valid,
             pending_by_operation: HashMap::new(),
         };
+        #[cfg(not(test))]
+        drop(issuer_root);
+        #[cfg(test)]
         account.restore_issuers()?;
         account.restore_consignment_state()?;
         account.restore_fee_reservations()?;
@@ -933,6 +956,7 @@ impl AccountWallet {
             },
             "backup_verified": self.backup_verified()?,
             "write_enabled": self.write_enabled()?,
+            "issuance_enabled": false,
             "device_binding": {
                 "status": match self.config.role {
                     AccountRole::Linked => "not_applicable",
@@ -1066,52 +1090,8 @@ impl AccountWallet {
         })
     }
 
-    /// Ensure the one fixed, test-only USD preview instrument exists for this
-    /// issuer account. The FFI accepts no caller-supplied terms, unit code, or
-    /// backing claim. A newly created definition freezes writes until its
-    /// checkpoint is secured by Signal Backup.
-    pub fn preview_usd_ensure(&mut self) -> Result<Value, AccountError> {
-        self.require_write_enabled()?;
-        let terms = preview_usd_terms(&self.config.network)
-            .map_err(|error| AccountError::new("preview_usd_unavailable", error.to_string()))?;
-
-        let mut statement = self.db.conn.prepare(
-            "SELECT asset_id, manifest_json FROM opencsv_instrument_manifests ORDER BY created_at",
-        )?;
-        let rows = statement.query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-        })?;
-        for row in rows {
-            let (asset_id, encoded) = row?;
-            let manifest: InstrumentManifestV1 =
-                serde_json::from_str(&encoded).map_err(|error| {
-                    AccountError::new("database_corrupt", format!("instrument manifest: {error}"))
-                })?;
-            if manifest.terms == terms {
-                let checkpoint = self.checkpoint()?;
-                return Ok(json!({
-                    "asset_id": asset_id,
-                    "manifest": manifest,
-                    "checkpoint_hash": checkpoint["checkpoint_hash"],
-                    "backup_required": false,
-                }));
-            }
-        }
-        drop(statement);
-
-        let (asset_id, manifest) = self.create_instrument(terms)?;
-        self.db.set_meta("backup_verified", "0")?;
-        let checkpoint = self.checkpoint()?;
-        Ok(json!({
-            "asset_id": asset_id,
-            "manifest": manifest,
-            "checkpoint_hash": checkpoint["checkpoint_hash"],
-            "backup_required": true,
-        }))
-    }
-
-    /// Test-only arbitrary manifest constructor. Production FFI deliberately
-    /// exposes only [`Self::preview_usd_ensure`].
+    /// Test-only arbitrary manifest constructor. Signal's production FFI has
+    /// no asset-definition or issuance action.
     #[cfg(test)]
     pub fn instrument_create(&mut self, request_json: &str) -> Result<Value, AccountError> {
         self.require_write_enabled()?;
@@ -1149,7 +1129,9 @@ impl AccountWallet {
 
     /// Prepare issuer-authorized issuance for an existing exact asset id.
     /// Fee selection, change derivation, and the OpenCSV proof all remain
-    /// inside Rust. Asset definition is intentionally a separate action.
+    /// inside Rust. This helper exists only for account-wallet tests; issuer
+    /// production tooling is deliberately separate from Signal's FFI.
+    #[cfg(test)]
     pub fn mint_prepare(&mut self, request_json: &str) -> Result<Value, AccountError> {
         self.require_write_enabled()?;
         let request: IssuanceRequest = serde_json::from_str(request_json).map_err(|error| {
@@ -2370,6 +2352,7 @@ impl AccountWallet {
             self.db
                 .set_meta("backup_checkpoint_version", &CHECKPOINT_VERSION.to_string())?;
             self.db.set_meta("restored_checkpoint_hash", &actual_hash)?;
+            #[cfg(test)]
             self.restore_issuers()?;
             self.restore_consignment_state()?;
             Ok(())
@@ -2542,6 +2525,7 @@ impl AccountWallet {
         Ok(())
     }
 
+    #[cfg(test)]
     fn create_instrument(
         &mut self,
         terms: InstrumentTermsV1,
@@ -2623,6 +2607,7 @@ impl AccountWallet {
         Ok((asset_id, manifest))
     }
 
+    #[cfg(test)]
     fn is_manifested_instrument(&self, asset_id: &str) -> Result<bool, AccountError> {
         Ok(self
             .db
@@ -2637,6 +2622,27 @@ impl AccountWallet {
     }
 
     fn instrument_records(&self) -> Result<Vec<Value>, AccountError> {
+        let mut configured = self.config.usd_issuers.iter().collect::<Vec<_>>();
+        configured.sort_by_key(|issuer| {
+            (
+                issuer.priority,
+                hex_encode(issuer.manifest.genesis.asset_id().as_bytes()),
+            )
+        });
+        let mut configured_ids = HashSet::new();
+        let mut records = Vec::new();
+        for issuer in configured {
+            let asset_id = hex_encode(issuer.manifest.genesis.asset_id().as_bytes());
+            configured_ids.insert(asset_id.clone());
+            records.push(json!({
+                "asset_id": asset_id,
+                "trust_state": "trusted_configuration",
+                "profile": "trusted_usd_v1",
+                "issuer_priority": issuer.priority,
+                "manifest": issuer.manifest,
+            }));
+        }
+
         let mut statement = self.db.conn.prepare(
             "SELECT a.asset_id, m.manifest_json
              FROM opencsv_assets a
@@ -2646,9 +2652,11 @@ impl AccountWallet {
         let rows = statement.query_map([], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
         })?;
-        let mut records = Vec::new();
         for row in rows {
             let (asset_id, manifest_json) = row?;
+            if configured_ids.contains(&asset_id) {
+                continue;
+            }
             let manifest = manifest_json
                 .map(|encoded| serde_json::from_str::<InstrumentManifestV1>(&encoded))
                 .transpose()
@@ -2656,19 +2664,14 @@ impl AccountWallet {
                     AccountError::new("database_corrupt", format!("instrument manifest: {error}"))
                 })?;
             let profile = match &manifest {
-                Some(manifest)
-                    if preview_usd_terms(&self.config.network)
-                        .is_ok_and(|terms| manifest.terms == terms) =>
-                {
-                    "usd_preview_v1"
-                }
-                Some(_) => "unsupported_custom",
+                Some(_) => "untrusted_manifest",
                 None => "legacy_prototype",
             };
             records.push(json!({
                 "asset_id": asset_id,
-                "trust_state": if manifest.is_some() { "reviewed" } else { "prototype" },
+                "trust_state": if manifest.is_some() { "untrusted" } else { "prototype" },
                 "profile": profile,
+                "issuer_priority": null,
                 "manifest": manifest,
             }));
         }
@@ -2996,7 +2999,8 @@ impl AccountWallet {
     }
 
     fn known_asset_ids(&self) -> Result<Vec<AssetId>, AccountError> {
-        self.protocol
+        let mut asset_ids = self
+            .protocol
             .as_ref()
             .map(MemWallet::known_asset_ids)
             .ok_or_else(|| {
@@ -3004,9 +3008,17 @@ impl AccountWallet {
                     "primary_required",
                     "linked device cannot credit private OpenCSV ownership",
                 )
-            })
+            })?;
+        for issuer in &self.config.usd_issuers {
+            let asset_id = issuer.manifest.genesis.asset_id();
+            if !asset_ids.contains(&asset_id) {
+                asset_ids.push(asset_id);
+            }
+        }
+        Ok(asset_ids)
     }
 
+    #[cfg(test)]
     fn restore_issuers(&mut self) -> Result<(), AccountError> {
         let (Some(protocol), Some(issuer_root)) =
             (self.protocol.as_mut(), self.issuer_root.as_ref())
@@ -3370,6 +3382,35 @@ fn validate_esplora_url(url: &str) -> Result<(), AccountError> {
     }
 }
 
+fn validate_usd_issuer_policy(config: &AccountConfig) -> Result<(), AccountError> {
+    let mut asset_ids = HashSet::new();
+    for issuer in &config.usd_issuers {
+        issuer.manifest.validate().map_err(|error| {
+            AccountError::new("invalid_config", format!("USD issuer manifest: {error}"))
+        })?;
+        if issuer.manifest.terms.network != config.network {
+            return Err(AccountError::new(
+                "invalid_config",
+                "USD issuer manifest belongs to another network",
+            ));
+        }
+        if issuer.manifest.terms.unit_code != "USD" {
+            return Err(AccountError::new(
+                "invalid_config",
+                "USD issuer policy accepts only manifests with unit code USD",
+            ));
+        }
+        let asset_id = hex_encode(issuer.manifest.genesis.asset_id().as_bytes());
+        if !asset_ids.insert(asset_id) {
+            return Err(AccountError::new(
+                "invalid_config",
+                "USD issuer policy contains a duplicate asset id",
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn unix_time() -> Result<i64, AccountError> {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -3557,6 +3598,39 @@ mod tests {
             }
         })
         .to_string()
+    }
+
+    fn test_usd_issuer_policy(seed_byte: u8, issuer_name: &str, priority: u32) -> Value {
+        let terms = InstrumentTermsV1 {
+            version: 1,
+            network: "signet".into(),
+            display_name: format!("{issuer_name} test USD"),
+            unit_code: "USD".into(),
+            decimals: 6,
+            issuer_name: issuer_name.into(),
+            terms_uri: format!(
+                "https://opencsv.net/test-terms/usd-{}",
+                issuer_name.to_ascii_lowercase().replace(' ', "-")
+            ),
+            redemption_summary: "Test-only issuer claim with no monetary value.".into(),
+            test_only: true,
+        };
+        let genesis = AssetGenesis {
+            issuer_pk: PoseidonIssuerAuthorization::public_key(&[seed_byte; 32]),
+            currency_code: *b"USD",
+            terms_hash: terms.terms_hash().unwrap(),
+            nonce: u64::from(seed_byte) + 1,
+        };
+        json!({
+            "manifest": InstrumentManifestV1 { terms, genesis },
+            "priority": priority,
+        })
+    }
+
+    fn config_with_usd_issuers(issuers: Vec<Value>) -> String {
+        let mut value: Value = serde_json::from_str(&config(AccountRole::Primary, true)).unwrap();
+        value["usd_issuers"] = Value::Array(issuers);
+        value.to_string()
     }
 
     fn create_test_instrument(wallet: &mut AccountWallet, unit_code: &str) -> String {
@@ -4048,81 +4122,59 @@ mod tests {
     }
 
     #[test]
-    fn preview_usd_is_fixed_idempotent_and_requires_fresh_backup() {
+    fn configured_usd_issuers_share_one_product_but_keep_exact_identities() {
         let dir = tempfile::tempdir().unwrap();
+        let first = test_usd_issuer_policy(41, "OpenCSV test issuer", 20);
+        let second = test_usd_issuer_policy(42, "Tether test issuer", 10);
+        let first_manifest =
+            serde_json::from_value::<InstrumentManifestV1>(first["manifest"].clone()).unwrap();
+        let second_manifest =
+            serde_json::from_value::<InstrumentManifestV1>(second["manifest"].clone()).unwrap();
+        let first_id = hex_encode(first_manifest.genesis.asset_id().as_bytes());
+        let second_id = hex_encode(second_manifest.genesis.asset_id().as_bytes());
+        assert_ne!(first_id, second_id);
+
         let mut wallet = AccountWallet::open(
-            &config(AccountRole::Primary, true),
+            &config_with_usd_issuers(vec![first, second]),
             &[32u8; 32],
             dir.path().join("wallet.sqlite").to_str().unwrap(),
         )
         .unwrap();
-        let created = wallet.preview_usd_ensure().unwrap();
-        assert_eq!(created["backup_required"], true);
-        assert_eq!(
-            created["manifest"]["terms"]["display_name"],
-            "OpenCSV USD Preview"
-        );
-        assert_eq!(created["manifest"]["terms"]["unit_code"], "USD");
-        assert_eq!(created["manifest"]["terms"]["decimals"], 6);
-        assert_eq!(created["manifest"]["terms"]["test_only"], true);
-        assert_eq!(wallet.status().unwrap()["write_enabled"], false);
-        assert_eq!(
-            wallet.status().unwrap()["instruments"][0]["trust_state"],
-            "reviewed"
-        );
-        assert_eq!(
-            wallet.status().unwrap()["instruments"][0]["profile"],
-            "usd_preview_v1"
-        );
-
-        let error = wallet
-            .mint_prepare(
-                &json!({
-                    "asset_id": created["asset_id"],
-                    "amounts": [1]
-                })
-                .to_string(),
-            )
-            .unwrap_err();
-        assert_eq!(error.code, "backup_required");
-        wallet.set_backup_state(true, CHECKPOINT_VERSION).unwrap();
-        assert_eq!(wallet.status().unwrap()["write_enabled"], true);
-
-        let repeated = wallet.preview_usd_ensure().unwrap();
-        assert_eq!(repeated["asset_id"], created["asset_id"]);
-        assert_eq!(repeated["backup_required"], false);
-        assert_eq!(wallet.status().unwrap()["write_enabled"], true);
-        let asset_count: u32 = wallet
-            .db
-            .conn
-            .query_row("SELECT COUNT(*) FROM opencsv_assets", [], |row| row.get(0))
-            .unwrap();
-        assert_eq!(asset_count, 1);
+        let status = wallet.status().unwrap();
+        assert_eq!(status["issuance_enabled"], false);
+        assert_eq!(status["assets"].as_array().unwrap().len(), 0);
+        assert_eq!(status["instruments"].as_array().unwrap().len(), 2);
+        assert_eq!(status["instruments"][0]["asset_id"], second_id);
+        assert_eq!(status["instruments"][0]["profile"], "trusted_usd_v1");
+        assert_eq!(status["instruments"][0]["issuer_priority"], 10);
+        assert_eq!(status["instruments"][1]["asset_id"], first_id);
+        assert_eq!(status["instruments"][1]["profile"], "trusted_usd_v1");
     }
 
     #[test]
-    fn mainnet_account_opens_but_preview_usd_is_unavailable() {
+    fn usd_issuer_policy_rejects_ticker_only_trust_and_duplicate_ids() {
         let dir = tempfile::tempdir().unwrap();
-        let mainnet_config = json!({
-            "version": 1,
-            "network": "mainnet",
-            "esplora_url": "https://mempool.space/api",
-            "role": "primary",
-            "backup_verified": true,
-        })
-        .to_string();
-        let mut wallet = AccountWallet::open(
-            &mainnet_config,
+        let issuer = test_usd_issuer_policy(43, "OpenCSV test issuer", 10);
+        let duplicate = issuer.clone();
+        let error = AccountWallet::open(
+            &config_with_usd_issuers(vec![issuer, duplicate]),
             &[37u8; 32],
-            dir.path().join("wallet.sqlite").to_str().unwrap(),
+            dir.path().join("duplicate.sqlite").to_str().unwrap(),
         )
+        .err()
         .unwrap();
-        let error = wallet.preview_usd_ensure().unwrap_err();
-        assert_eq!(error.code, "preview_usd_unavailable");
-        assert_eq!(
-            wallet.status().unwrap()["assets"].as_array().unwrap().len(),
-            0
-        );
+        assert_eq!(error.code, "invalid_config");
+
+        let mut wrong_unit = test_usd_issuer_policy(44, "OpenCSV test issuer", 10);
+        wrong_unit["manifest"]["terms"]["unit_code"] = json!("EUR");
+        let error = AccountWallet::open(
+            &config_with_usd_issuers(vec![wrong_unit]),
+            &[38u8; 32],
+            dir.path().join("wrong-unit.sqlite").to_str().unwrap(),
+        )
+        .err()
+        .unwrap();
+        assert_eq!(error.code, "invalid_config");
     }
 
     #[test]
