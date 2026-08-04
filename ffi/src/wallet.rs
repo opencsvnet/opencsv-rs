@@ -91,6 +91,10 @@ struct IssuerRecord {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum CoinStatus {
     Unspent,
+    /// Its exact zero-confirmation parent disappeared or changed. This is
+    /// neither spendable nor destroyed: a later settled verification of the
+    /// same consignment may restore it to `Unspent`.
+    Frozen,
     Spent,
 }
 
@@ -1000,7 +1004,15 @@ impl MemWallet {
             };
             // Redelivery must not resurrect a coin we have spent since.
             if let Some(existing) = self.coins.iter().find(|c| c.id() == stored.id()) {
-                stored.status = existing.status;
+                stored.status = if unconfirmed_anchor.is_none()
+                    && existing.status == CoinStatus::Frozen
+                {
+                    // A normal settled replay is the only path that may thaw
+                    // a coin whose provisional parent disappeared.
+                    CoinStatus::Unspent
+                } else {
+                    existing.status
+                };
                 // A weaker provisional replay cannot downgrade a coin that
                 // already met settlement policy. The normal settled path
                 // does promote an unconfirmed coin by clearing its parent.
@@ -1040,6 +1052,19 @@ impl MemWallet {
             .get(&pending_id)
             .map(|pending| pending.unconfirmed_dependencies.clone())
             .ok_or_else(|| format!("no pending transaction {pending_id}"))
+    }
+
+    /// Remove every coin created by `anchor_txid` from balance and selection
+    /// immediately. Persistence is owned by the account finality table; this
+    /// keeps the already-open wallet consistent with that durable state.
+    pub fn freeze_unconfirmed_anchor(&mut self, anchor_txid: &str) {
+        for stored in &mut self.coins {
+            if stored.status == CoinStatus::Unspent
+                && stored.unconfirmed_anchor.as_deref() == Some(anchor_txid)
+            {
+                stored.status = CoinStatus::Frozen;
+            }
+        }
     }
 
     /// Mark coins spent by id (host-side replay of persisted spend state).
@@ -1344,5 +1369,23 @@ mod tests {
                 .unwrap(),
             vec!["parent-txid"]
         );
+    }
+
+    #[test]
+    fn frozen_unconfirmed_coin_leaves_balance_and_selection() {
+        let mut wallet = MemWallet::from_owner_seed([7u8; 32]);
+        let asset_id = Digest::from_bytes([9u8; 32]);
+        store_coin(&mut wallet, asset_id, 7, 1);
+        store_coin(&mut wallet, asset_id, 5, 2);
+        for stored in &mut wallet.coins {
+            stored.unconfirmed_anchor = Some("parent-txid".into());
+        }
+
+        assert_eq!(wallet.balance()[0].amount, 12);
+        wallet.freeze_unconfirmed_anchor("parent-txid");
+        assert!(wallet.balance().is_empty());
+        assert!(wallet
+            .select_transfer_inputs(&to_hex(asset_id.as_bytes()), 9)
+            .is_err());
     }
 }

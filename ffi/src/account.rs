@@ -1110,13 +1110,17 @@ impl AccountWallet {
         let client = esplora_client::Builder::new(&self.config.esplora_url).build_blocking();
         let transaction = client
             .get_tx(&anchor_txid)
-            .map_err(|error| AccountError::new("mempool_observation_failed", error.to_string()))?
-            .ok_or_else(|| {
-                AccountError::new(
-                    "unconfirmed_anchor_missing",
-                    format!("unconfirmed anchor {anchor_txid} is not currently observed"),
-                )
-            })?;
+            .map_err(|error| AccountError::new("mempool_observation_failed", error.to_string()))?;
+        let Some(transaction) = transaction else {
+            self.freeze_unconfirmed_dependency(
+                &anchor_txid.to_string(),
+                "exact parent transaction is no longer observed",
+            )?;
+            return Err(AccountError::new(
+                "unconfirmed_anchor_missing",
+                format!("unconfirmed anchor {anchor_txid} is not currently observed"),
+            ));
+        };
         let provisional_snapshot = snapshot_with_unconfirmed_anchor(
             confirmed_snapshot_json,
             &consignment,
@@ -2991,7 +2995,7 @@ impl AccountWallet {
     }
 
     fn reobserve_unconfirmed_dependencies(
-        &self,
+        &mut self,
         dependencies: &[String],
     ) -> Result<(), AccountError> {
         if dependencies.is_empty() {
@@ -3013,12 +3017,9 @@ impl AccountWallet {
             })?;
             let now = unix_time()?;
             if observed.is_none() {
-                self.db.conn.execute(
-                    "UPDATE opencsv_consignment_finality
-                     SET finality = 'frozen', last_checked_at = ?2,
-                         last_error = 'exact parent transaction is no longer observed'
-                     WHERE anchor_txid = ?1 AND finality != 'settled'",
-                    params![dependency, now],
+                self.freeze_unconfirmed_dependency(
+                    dependency,
+                    "exact parent transaction is no longer observed",
                 )?;
                 return Err(AccountError::new(
                     "unconfirmed_dependency_changed",
@@ -3033,6 +3034,23 @@ impl AccountWallet {
                  WHERE anchor_txid = ?1 AND finality = 'unconfirmed'",
                 params![dependency, now],
             )?;
+        }
+        Ok(())
+    }
+
+    fn freeze_unconfirmed_dependency(
+        &mut self,
+        dependency: &str,
+        reason: &str,
+    ) -> Result<(), AccountError> {
+        self.db.conn.execute(
+            "UPDATE opencsv_consignment_finality
+             SET finality = 'frozen', last_checked_at = ?2, last_error = ?3
+             WHERE anchor_txid = ?1 AND finality != 'settled'",
+            params![dependency, unix_time()?, reason],
+        )?;
+        if let Some(protocol) = self.protocol.as_mut() {
+            protocol.freeze_unconfirmed_anchor(dependency);
         }
         Ok(())
     }
