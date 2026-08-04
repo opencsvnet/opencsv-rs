@@ -215,3 +215,53 @@ upgrade. A newly registered simulator must be upgraded only with that signed,
 entitlement-compatible path. The acceptance runbook records the container
 identifiers before and after installation and treats any logical app/group
 state change as a failed in-place upgrade.
+
+## 2026-08-04 — live signet issuance exposed a checkpoint self-reference
+
+The first live headless mint preparation used the debug prover and took about
+13 minutes. Its proof was valid, but its advertised checkpoint hash was not:
+storing that hash and the receipt changed the very checkpoint being hashed.
+The operation was cancelled before signing or broadcast and its fee outpoint
+was released. The mismatching export is retained privately as forensic
+evidence; it was never acknowledged as a valid backup.
+
+The accepted fix defines the backup checkpoint over canonical operation state:
+operation `checkpoint_hash` and `backup_acked` fields are normalized and the
+receipt's derived checkpoint field is excluded. Mint preparation now stores
+the final receipt before hashing. Acknowledgement independently recomputes the
+current checkpoint and rejects the supplied hash if any wallet state changed
+after export. Two regressions prove that a prepared checkpoint equals the
+immediate export and remains stable across acknowledgement, and that a stale
+checkpoint is rejected after a later state change.
+
+The corrected release-prover preparation created operation
+`2059c43e4bdc23fb6d180223546af2cb` for exactly 100 preview USD base units
+(`100000000` at six decimals), asset
+`1d58a8145eedac17efe66371293eb472a4c68554141cc14380360e6eb720b507`, and
+recipient owner
+`ff17c90b2e7c511f8d64734e07833502d6a82308d0c5ba0ca862f61ebd48c124`.
+The exact exported and acknowledged checkpoint is
+`77f94dc96d1610da4c7775a86fbbcb576ff0b72edadcf9346a04e75c06f524ef`.
+
+After that acknowledgement, Rust signed and persisted the transaction before
+submitting it to both configured signet peers. Transaction
+`eb5571a6c2b5e916546dc5a099ef0047e47b8a03d1554c25845142491421c22c`
+uses 455 sats at 2 sat/vB with record vout 0, marker vout 1, and change vout 2.
+The generic relay also observed it. The canonical 536,508-byte consignment has
+SHA-256 identity
+`16d16cde8b9fda972bf5b56abda706399907d4259987251a1d1ddd09f36fdd68`.
+
+Signal Desktop delivered that one file to the freshly registered simulator
+account as a normal 537 KB attachment. The simulator downloaded it intact.
+At the time of this entry the transaction is still in the signet mempool, so
+the simulator correctly shows 0 USD and has not persisted a credit. This is a
+transport receipt and a fail-closed pre-confirmation receipt, not yet a
+completed payment acceptance receipt. The activation sweep will be rerun only
+after the anchor reaches the required confirmation depth.
+
+Focused warnings-denied validation after the checkpoint repair:
+
+- account-wallet tests: 29 passed, 0 failed (one unrelated test filtered);
+- headless issuer CLI tests: 4 passed, 0 failed;
+- `rustfmt --edition 2021 --check ffi/src/account.rs`: passed;
+- `git diff --check`: passed.

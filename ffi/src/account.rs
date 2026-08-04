@@ -1333,6 +1333,18 @@ impl AccountWallet {
                 "Secure Backup acknowledged a stale or different checkpoint",
             ));
         }
+        let current_checkpoint = self.checkpoint()?;
+        let current_hash = current_checkpoint["checkpoint_hash"]
+            .as_str()
+            .ok_or_else(|| {
+                AccountError::new("checkpoint_failed", "current checkpoint has no hash")
+            })?;
+        if current_hash != checkpoint_hash {
+            return Err(AccountError::new(
+                "backup_checkpoint_mismatch",
+                "wallet state changed after the prepared checkpoint was emitted",
+            ));
+        }
         self.db.conn.execute(
             "UPDATE opencsv_operations
              SET backup_acked = 1, updated_at = ?2 WHERE operation_id = ?1",
@@ -2048,7 +2060,7 @@ impl AccountWallet {
             "SELECT json(manifest_json)
              FROM opencsv_instrument_manifests ORDER BY created_at",
         )?;
-        let operations = query_json_rows(
+        let mut operations = query_json_rows(
             &self.db.conn,
             "SELECT json_object('operation_id', operation_id, 'kind', kind,
                                 'state', state, 'request', json(request_json),
@@ -2061,6 +2073,26 @@ impl AccountWallet {
              FROM opencsv_operations
              WHERE state NOT IN ('cancelled') ORDER BY created_at",
         )?;
+        // Backup acknowledgement metadata cannot be part of the checkpoint it
+        // acknowledges. Likewise, the receipt's copy of checkpoint_hash is a
+        // presentation field, not compact recovery state. Canonicalizing those
+        // self-references makes the checkpoint emitted by prepare exportable
+        // byte-for-byte both before and after acknowledgement.
+        for operation in &mut operations {
+            let Some(object) = operation.as_object_mut() else {
+                continue;
+            };
+            object.insert("checkpoint_hash".into(), Value::Null);
+            object.insert("backup_acked".into(), json!(0));
+            if let Some(Value::String(encoded)) = object.get_mut("receipt_json") {
+                if let Ok(mut receipt) = serde_json::from_str::<Value>(encoded) {
+                    if let Some(receipt) = receipt.as_object_mut() {
+                        receipt.remove("checkpoint_hash");
+                    }
+                    *encoded = receipt.to_string();
+                }
+            }
+        }
         let consignments = query_json_rows(
             &self.db.conn,
             "SELECT json_object('consignment_id', consignment_id,
@@ -2747,11 +2779,7 @@ impl AccountWallet {
         )?;
         let normalized_request: Value = serde_json::from_str(&normalized_request)
             .map_err(|error| AccountError::new("database_corrupt", error.to_string()))?;
-        let checkpoint = self.checkpoint()?;
-        let checkpoint_hash = checkpoint["checkpoint_hash"]
-            .as_str()
-            .ok_or_else(|| AccountError::new("checkpoint_failed", "missing checkpoint hash"))?;
-        let receipt = json!({
+        let mut receipt = json!({
             "operation_id": operation_id,
             "state": OperationState::ProofReady.as_str(),
             "funding_outpoint": funding.outpoint.to_string(),
@@ -2760,9 +2788,19 @@ impl AccountWallet {
             "anchor_record_hex": hex_encode(record),
             "asset_id": normalized_request.get("asset_id"),
             "to_owner": normalized_request.get("to_owner"),
-            "checkpoint_hash": checkpoint_hash,
             "backup_ack_required": true,
         });
+        self.db.conn.execute(
+            "UPDATE opencsv_operations SET checkpoint_hash = NULL,
+             backup_acked = 0, receipt_json = ?2, updated_at = ?3
+             WHERE operation_id = ?1",
+            params![operation_id, receipt.to_string(), unix_time()?],
+        )?;
+        let checkpoint = self.checkpoint()?;
+        let checkpoint_hash = checkpoint["checkpoint_hash"]
+            .as_str()
+            .ok_or_else(|| AccountError::new("checkpoint_failed", "missing checkpoint hash"))?;
+        receipt["checkpoint_hash"] = json!(checkpoint_hash);
         self.db.conn.execute(
             "UPDATE opencsv_operations SET checkpoint_hash = ?2, receipt_json = ?3,
              updated_at = ?4
@@ -4366,6 +4404,64 @@ mod tests {
         let cancelled = reopened.cancel_operation(&operation_id).unwrap();
         assert_eq!(cancelled["state"], "cancelled");
         assert!(!reopened.bitcoin.is_outpoint_locked(funding));
+    }
+
+    #[test]
+    fn prepared_checkpoint_is_exportable_and_stable_across_acknowledgement() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut wallet = AccountWallet::open(
+            &config(AccountRole::Primary, true),
+            &[40u8; 32],
+            dir.path().join("wallet.sqlite").to_str().unwrap(),
+        )
+        .unwrap();
+        allow_funding_verification(&mut wallet);
+        fund(&mut wallet, 50_000);
+
+        let prepared = prepare_test_issuance(&mut wallet, "TCP", &[100]).unwrap();
+        let operation_id = prepared["operation_id"].as_str().unwrap();
+        let prepared_hash = prepared["checkpoint_hash"].as_str().unwrap();
+        assert_eq!(
+            wallet.checkpoint().unwrap()["checkpoint_hash"],
+            prepared_hash
+        );
+
+        let acknowledged = wallet
+            .acknowledge_operation_backup(operation_id, prepared_hash)
+            .unwrap();
+        assert_eq!(acknowledged["backup_acked"], true);
+        assert_eq!(
+            wallet.checkpoint().unwrap()["checkpoint_hash"],
+            prepared_hash
+        );
+    }
+
+    #[test]
+    fn operation_backup_rejects_a_checkpoint_after_wallet_state_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut wallet = AccountWallet::open(
+            &config(AccountRole::Primary, true),
+            &[41u8; 32],
+            dir.path().join("wallet.sqlite").to_str().unwrap(),
+        )
+        .unwrap();
+        allow_funding_verification(&mut wallet);
+        fund(&mut wallet, 50_000);
+
+        let prepared = prepare_test_issuance(&mut wallet, "TCS", &[100]).unwrap();
+        wallet
+            .insert_planned_operation("later-operation", "transfer", "{}", "later-delivery-nonce")
+            .unwrap();
+        assert_eq!(
+            wallet
+                .acknowledge_operation_backup(
+                    prepared["operation_id"].as_str().unwrap(),
+                    prepared["checkpoint_hash"].as_str().unwrap(),
+                )
+                .unwrap_err()
+                .code,
+            "backup_checkpoint_mismatch"
+        );
     }
 
     #[test]
