@@ -195,3 +195,23 @@ existing issuer's asset without the committed issuer seed, and Signal will not
 recognize an arbitrary new `USD` ticker as reviewed USD. No Tether issuer is
 claimed or configured without Tether-controlled authority and an authenticated
 manifest.
+
+## 2026-08-04 — simulator upgrade receipt and failed unsigned-install path
+
+The first attempt to install the reviewed signet-USD build used
+`CODE_SIGNING_ALLOWED=NO`. The source compiled, but the resulting simulator app
+had no effective application-group entitlement. Signal failed closed during
+launch, as it should. Installing that entitlement-incompatible bundle also
+caused CoreSimulator to replace its simulator-only app and group containers;
+the temporary Signal registration and test wallet could not be recovered.
+The physical iPhone, source worktrees, issuer checkpoint, and all mainnet state
+were untouched.
+
+The accepted simulator procedure is now: build with the default local ad-hoc
+signature, verify that the generated simulated entitlements contain both
+Signal application groups and the expected keychain group, and only then use
+`simctl install`. Never use an unsigned build for an in-place Signal acceptance
+upgrade. A newly registered simulator must be upgraded only with that signed,
+entitlement-compatible path. The acceptance runbook records the container
+identifiers before and after installation and treats any logical app/group
+state change as a failed in-place upgrade.
