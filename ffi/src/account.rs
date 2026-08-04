@@ -1900,18 +1900,11 @@ impl AccountWallet {
         receipt_object.insert("record_vout".into(), json!(0));
         receipt_object.insert("marker_vout".into(), json!(1));
         receipt_object.insert("change_vout".into(), json!(2));
-        self.db.conn.execute(
-            "UPDATE opencsv_operations SET state = ?2, signed_tx_hex = ?3,
-             txid = ?4, receipt_json = ?5, updated_at = ?6
-             WHERE operation_id = ?1",
-            params![
-                operation_id,
-                OperationState::SignedPersisted.as_str(),
-                replacement_hex,
-                replacement_txid.to_string(),
-                receipt.to_string(),
-                unix_time()?,
-            ],
+        self.persist_signed_replacement(
+            operation_id,
+            &replacement_hex,
+            replacement_txid,
+            &mut receipt,
         )?;
         let now = u64::try_from(unix_time()?)
             .map_err(|_| AccountError::new("clock_error", "negative timestamp"))?;
@@ -2942,10 +2935,11 @@ impl AccountWallet {
                 .and_then(|encoded| serde_json::from_str::<Value>(encoded).ok())
                 .is_some_and(|receipt| receipt["delivery_ready"] == true);
             if protocol_already_finalized {
-                // RBF changes the Bitcoin transaction but not the OpenCSV
-                // record or consignment. Do not try to finalize the already
-                // consumed in-memory proof a second time when the
-                // replacement first appears.
+                // An operation is finalized only against the exact txid in
+                // its consignment. A fee replacement clears delivery_ready
+                // before reaching this path, so the replacement is finalized
+                // into fresh canonical bytes below. Reaching this branch
+                // means this exact transaction already owns its consignment.
                 self.db.conn.execute(
                     "UPDATE opencsv_operations SET state = ?2, updated_at = ?3
                      WHERE operation_id = ?1",
@@ -3025,6 +3019,7 @@ impl AccountWallet {
             object.insert("consignment_id".into(), json!(consignment_id));
             object.insert("consignment_base64".into(), json!(consignment_base64));
             object.insert("delivery_ready".into(), json!(true));
+            object.remove("replacement_delivery_required");
         }
         transaction.execute(
             "UPDATE opencsv_operations SET state = ?2, receipt_json = ?3,
@@ -3032,6 +3027,108 @@ impl AccountWallet {
             params![
                 operation_id,
                 OperationState::Mempool.as_str(),
+                receipt.to_string(),
+                now,
+            ],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Persist a signed RBF replacement and invalidate any consignment that
+    /// named the replaced txid. `Consignment::anchor_ref` commits to the
+    /// exact Bitcoin transaction, so carrying the old bytes forward would
+    /// strand the receiver at `AnchorNotFound` even though the replacement
+    /// preserved every protected OpenCSV output.
+    ///
+    /// The durable pending export is imported before the database moves back
+    /// to `signed_persisted`. A crash after the transaction commits restores
+    /// the same export through `restore_pending_operations`, allowing the
+    /// replacement to be finalized exactly once it is independently
+    /// observed.
+    fn persist_signed_replacement(
+        &mut self,
+        operation_id: &str,
+        replacement_hex: &str,
+        replacement_txid: Txid,
+        receipt: &mut Value,
+    ) -> Result<(), AccountError> {
+        if !self.pending_by_operation.contains_key(operation_id) {
+            let pending_json = self
+                .db
+                .conn
+                .query_row(
+                    "SELECT pending_json FROM opencsv_operations WHERE operation_id = ?1",
+                    [operation_id],
+                    |row| row.get::<_, Option<String>>(0),
+                )
+                .optional()?
+                .flatten()
+                .ok_or_else(|| {
+                    AccountError::new(
+                        "operation_not_resumable",
+                        "fee replacement has no durable pending proof export",
+                    )
+                })?;
+            let pending_id = self
+                .primary_protocol_mut()?
+                .import_pending(&pending_json)
+                .map_err(|error| AccountError::new("operation_not_resumable", error))?;
+            self.pending_by_operation
+                .insert(operation_id.to_owned(), pending_id);
+        }
+
+        let receipt_object = receipt.as_object_mut().ok_or_else(|| {
+            AccountError::new("database_corrupt", "operation receipt is not an object")
+        })?;
+        let stale_consignment_id = receipt_object
+            .remove("consignment_id")
+            .and_then(|value| value.as_str().map(str::to_owned));
+        receipt_object.remove("consignment_base64");
+        receipt_object.remove("delivery_ready");
+        receipt_object.remove("consignment_delivered");
+        receipt_object.remove("consignment_delivered_at");
+        receipt_object.insert("replacement_delivery_required".into(), json!(true));
+        if let Some(stale_id) = &stale_consignment_id {
+            let superseded = receipt_object
+                .entry("superseded_consignment_ids")
+                .or_insert_with(|| json!([]))
+                .as_array_mut()
+                .ok_or_else(|| {
+                    AccountError::new(
+                        "database_corrupt",
+                        "superseded consignment list is not an array",
+                    )
+                })?;
+            if !superseded
+                .iter()
+                .any(|value| value.as_str() == Some(stale_id))
+            {
+                superseded.push(json!(stale_id));
+            }
+        }
+
+        let now = unix_time()?;
+        let transaction = self.db.conn.transaction()?;
+        if let Some(stale_id) = stale_consignment_id {
+            transaction.execute(
+                "DELETE FROM opencsv_consignment_snapshots WHERE consignment_id = ?1",
+                [&stale_id],
+            )?;
+            transaction.execute(
+                "DELETE FROM opencsv_consignments WHERE consignment_id = ?1",
+                [&stale_id],
+            )?;
+        }
+        transaction.execute(
+            "UPDATE opencsv_operations SET state = ?2, signed_tx_hex = ?3,
+             txid = ?4, receipt_json = ?5, updated_at = ?6
+             WHERE operation_id = ?1",
+            params![
+                operation_id,
+                OperationState::SignedPersisted.as_str(),
+                replacement_hex,
+                replacement_txid.to_string(),
                 receipt.to_string(),
                 now,
             ],
@@ -4828,6 +4925,123 @@ mod tests {
             OperationState::ConsignmentDelivered.as_str(),
         );
         assert_eq!(terminal["receipt"]["consignment_delivered"], true);
+    }
+
+    #[test]
+    fn fee_replacement_regenerates_exact_txid_consignment() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut wallet = AccountWallet::open(
+            &config(AccountRole::Primary, true),
+            &[49u8; 32],
+            dir.path().join("wallet.sqlite").to_str().unwrap(),
+        )
+        .unwrap();
+        allow_funding_verification(&mut wallet);
+        fund(&mut wallet, 100_000);
+        let prepared = prepare_test_issuance(&mut wallet, "TRB", &[10]).unwrap();
+        let operation_id = prepared["operation_id"].as_str().unwrap().to_owned();
+
+        let original_txid = Txid::from_byte_array([21u8; 32]);
+        wallet
+            .finalize_observed_operation(&operation_id, original_txid)
+            .unwrap();
+        let original = wallet.operation(&operation_id).unwrap();
+        let delivery_nonce = original.delivery_nonce.clone();
+        let original_receipt: Value =
+            serde_json::from_str(original.receipt_json.as_deref().unwrap()).unwrap();
+        let original_consignment_id = original_receipt["consignment_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert_eq!(
+            Consignment::from_bytes(
+                &base64::engine::general_purpose::STANDARD
+                    .decode(original_receipt["consignment_base64"].as_str().unwrap())
+                    .unwrap(),
+            )
+            .unwrap()
+            .anchor_ref
+            .txid,
+            original_txid.to_byte_array(),
+        );
+        wallet
+            .mark_consignment_delivered(&operation_id, &delivery_nonce)
+            .unwrap();
+
+        let replacement_txid = Txid::from_byte_array([22u8; 32]);
+        let mut replacement_receipt: Value = serde_json::from_str(
+            wallet
+                .operation(&operation_id)
+                .unwrap()
+                .receipt_json
+                .as_deref()
+                .unwrap(),
+        )
+        .unwrap();
+        replacement_receipt["replaces"] = json!(original_txid.to_string());
+        replacement_receipt["txid"] = json!(replacement_txid.to_string());
+        wallet
+            .persist_signed_replacement(
+                &operation_id,
+                "00",
+                replacement_txid,
+                &mut replacement_receipt,
+            )
+            .unwrap();
+
+        let replacement_pending = wallet.operation(&operation_id).unwrap();
+        assert_eq!(
+            replacement_pending.state,
+            OperationState::SignedPersisted.as_str(),
+        );
+        assert!(wallet.pending_by_operation.contains_key(&operation_id));
+        let replacement_pending_receipt: Value =
+            serde_json::from_str(replacement_pending.receipt_json.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            replacement_pending_receipt["replacement_delivery_required"],
+            true,
+        );
+        assert!(replacement_pending_receipt.get("delivery_ready").is_none());
+        assert!(replacement_pending_receipt
+            .get("consignment_delivered")
+            .is_none());
+        assert_eq!(
+            replacement_pending_receipt["superseded_consignment_ids"],
+            json!([original_consignment_id]),
+        );
+        let old_count: i64 = wallet
+            .db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM opencsv_consignments WHERE consignment_id = ?1",
+                [&original_consignment_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(old_count, 0);
+
+        wallet
+            .finalize_observed_operation(&operation_id, replacement_txid)
+            .unwrap();
+        let finalized = wallet.operation(&operation_id).unwrap();
+        let finalized_receipt: Value =
+            serde_json::from_str(finalized.receipt_json.as_deref().unwrap()).unwrap();
+        let replacement_blob = base64::engine::general_purpose::STANDARD
+            .decode(finalized_receipt["consignment_base64"].as_str().unwrap())
+            .unwrap();
+        let replacement_consignment = Consignment::from_bytes(&replacement_blob).unwrap();
+        assert_eq!(
+            replacement_consignment.anchor_ref.txid,
+            replacement_txid.to_byte_array(),
+        );
+        assert_ne!(
+            finalized_receipt["consignment_id"],
+            json!(original_consignment_id),
+        );
+        assert_eq!(finalized_receipt["delivery_ready"], true);
+        assert!(finalized_receipt
+            .get("replacement_delivery_required")
+            .is_none());
     }
 
     #[test]
