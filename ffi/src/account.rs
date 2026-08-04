@@ -47,7 +47,11 @@ use sha2::Sha256;
 use zeroize::Zeroizing;
 
 use crate::wallet::MemWallet;
-use crate::{crosscheck, scan, snapshot::SnapshotChain};
+use crate::{
+    crosscheck,
+    scan,
+    snapshot::{Snapshot, SnapshotChain, SnapshotEntry},
+};
 
 const SCHEMA_VERSION: u32 = 1;
 const CHECKPOINT_VERSION: u32 = 1;
@@ -258,6 +262,10 @@ struct BackupConsignment {
     consignment_base64: String,
     spent_state: Value,
     snapshot: Option<Value>,
+    #[serde(default)]
+    finality: Option<String>,
+    #[serde(default)]
+    anchor_txid: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -563,6 +571,15 @@ impl SqlitePersister {
              CREATE TABLE IF NOT EXISTS opencsv_consignment_snapshots (
                  consignment_id TEXT PRIMARY KEY,
                  snapshot_json TEXT NOT NULL,
+                 FOREIGN KEY(consignment_id) REFERENCES opencsv_consignments(consignment_id)
+             ) STRICT;
+             CREATE TABLE IF NOT EXISTS opencsv_consignment_finality (
+                 consignment_id TEXT PRIMARY KEY,
+                 anchor_txid TEXT NOT NULL,
+                 finality TEXT NOT NULL CHECK(finality IN ('unconfirmed', 'settled', 'frozen')),
+                 observed_at INTEGER NOT NULL,
+                 last_checked_at INTEGER NOT NULL,
+                 last_error TEXT,
                  FOREIGN KEY(consignment_id) REFERENCES opencsv_consignments(consignment_id)
              ) STRICT;
              CREATE TABLE IF NOT EXISTS opencsv_utxo_reservations (
@@ -1013,6 +1030,7 @@ impl AccountWallet {
         snapshot_json: &str,
     ) -> Result<Value, AccountError> {
         let (canonical_blob, consignment_id) = canonical_consignment_identity(blob)?;
+        let anchor_txid = consignment_anchor_txid(&canonical_blob)?;
         let chain = SnapshotChain::from_json(snapshot_json)
             .map_err(|error| AccountError::new("invalid_chain_view", error))?;
         let required_confirmations = u64::from(self.config.required_confirmations);
@@ -1041,8 +1059,23 @@ impl AccountWallet {
                          snapshot_json = excluded.snapshot_json",
                     params![consignment_id, snapshot_json],
                 )?;
+                let now = unix_time()?;
+                self.db.conn.execute(
+                    "INSERT INTO opencsv_consignment_finality(
+                         consignment_id, anchor_txid, finality, observed_at,
+                         last_checked_at, last_error
+                     ) VALUES(?1, ?2, 'settled', ?3, ?3, NULL)
+                     ON CONFLICT(consignment_id) DO UPDATE SET
+                         anchor_txid = excluded.anchor_txid,
+                         finality = 'settled',
+                         last_checked_at = excluded.last_checked_at,
+                         last_error = NULL",
+                    params![consignment_id, anchor_txid, now],
+                )?;
                 Ok(json!({
                     "status": "verified",
+                    "finality": "settled",
+                    "spendable": true,
                     "consignment_id": consignment_id,
                     "credits": verified.credits,
                     "coins": verified.coins,
@@ -1054,6 +1087,111 @@ impl AccountWallet {
             }
             Err(reason) => Ok(json!({
                 "status": "rejected",
+                "consignment_id": consignment_id,
+                "reason": reason,
+            })),
+        }
+    }
+
+    /// Credit a fully proof-verified consignment whose exact anchor
+    /// transaction is independently observable through the configured
+    /// generic Esplora accelerator but has not met settlement depth yet.
+    /// The resulting coins are selectable, with the exact parent txid
+    /// carried into every child operation and rechecked before signing.
+    pub fn verify_consignment_unconfirmed(
+        &mut self,
+        blob: &[u8],
+        confirmed_snapshot_json: &str,
+    ) -> Result<Value, AccountError> {
+        let (canonical_blob, consignment_id) = canonical_consignment_identity(blob)?;
+        let consignment = Consignment::from_bytes(&canonical_blob)
+            .map_err(|error| AccountError::new("invalid_consignment", error.to_string()))?;
+        let anchor_txid = Txid::from_byte_array(consignment.anchor_ref.txid);
+        let client = esplora_client::Builder::new(&self.config.esplora_url).build_blocking();
+        let transaction = client
+            .get_tx(&anchor_txid)
+            .map_err(|error| AccountError::new("mempool_observation_failed", error.to_string()))?
+            .ok_or_else(|| {
+                AccountError::new(
+                    "unconfirmed_anchor_missing",
+                    format!("unconfirmed anchor {anchor_txid} is not currently observed"),
+                )
+            })?;
+        let provisional_snapshot = snapshot_with_unconfirmed_anchor(
+            confirmed_snapshot_json,
+            &consignment,
+            &transaction,
+        )?;
+        let provisional_snapshot_json = serde_json::to_string(&provisional_snapshot)
+            .map_err(|error| AccountError::new("invalid_chain_view", error.to_string()))?;
+        let chain = SnapshotChain::from_snapshot(&provisional_snapshot)
+            .map_err(|error| AccountError::new("invalid_chain_view", error))?;
+        let verdict = self
+            .primary_protocol_mut()?
+            .verify_unconfirmed(&canonical_blob, &chain, &anchor_txid.to_string())
+            .map_err(|error| AccountError::new("invalid_consignment", error))?;
+        match verdict {
+            Ok(verified) => {
+                let now = unix_time()?;
+                let db_tx = self
+                    .db
+                    .conn
+                    .transaction_with_behavior(TransactionBehavior::Immediate)?;
+                db_tx.execute(
+                    "INSERT INTO opencsv_consignments(
+                         consignment_id, consignment_base64, spent_state_json, created_at
+                     ) VALUES(?1, ?2, '{}', ?3)
+                     ON CONFLICT(consignment_id) DO UPDATE SET
+                         consignment_base64 = excluded.consignment_base64",
+                    params![
+                        consignment_id,
+                        base64::engine::general_purpose::STANDARD.encode(&canonical_blob),
+                        now,
+                    ],
+                )?;
+                db_tx.execute(
+                    "INSERT INTO opencsv_consignment_snapshots(consignment_id, snapshot_json)
+                     VALUES(?1, ?2)
+                     ON CONFLICT(consignment_id) DO UPDATE SET
+                         snapshot_json = excluded.snapshot_json",
+                    params![consignment_id, provisional_snapshot_json],
+                )?;
+                db_tx.execute(
+                    "INSERT INTO opencsv_consignment_finality(
+                         consignment_id, anchor_txid, finality, observed_at,
+                         last_checked_at, last_error
+                     ) VALUES(?1, ?2, 'unconfirmed', ?3, ?3, NULL)
+                     ON CONFLICT(consignment_id) DO UPDATE SET
+                         anchor_txid = excluded.anchor_txid,
+                         finality = CASE
+                             WHEN opencsv_consignment_finality.finality = 'settled' THEN 'settled'
+                             ELSE 'unconfirmed'
+                         END,
+                         last_checked_at = excluded.last_checked_at,
+                         last_error = NULL",
+                    params![consignment_id, anchor_txid.to_string(), now],
+                )?;
+                db_tx.commit()?;
+                Ok(json!({
+                    "status": "verified",
+                    "finality": "unconfirmed",
+                    "spendable": true,
+                    "risk": "zero_confirmation_replacement_or_conflict",
+                    "consignment_id": consignment_id,
+                    "credits": verified.credits,
+                    "coins": verified.coins,
+                    "anchor": {
+                        "height": verified.height,
+                        "position": verified.position,
+                    },
+                    "anchor_txid": anchor_txid.to_string(),
+                    "observed_via": self.config.esplora_url,
+                }))
+            }
+            Err(reason) => Ok(json!({
+                "status": "rejected",
+                "finality": "unconfirmed",
+                "spendable": false,
                 "consignment_id": consignment_id,
                 "reason": reason,
             })),
@@ -1276,6 +1414,14 @@ impl AccountWallet {
                 }
             }
         };
+        if let Err(error) =
+            self.reobserve_unconfirmed_dependencies(&proved.unconfirmed_dependencies)
+        {
+            if let Ok(protocol) = self.primary_protocol_mut() {
+                protocol.cancel_pending(proved.pending_id);
+            }
+            return self.fail_prebroadcast(&operation_id, error);
+        }
         self.pending_by_operation
             .insert(operation_id.clone(), proved.pending_id);
         let record = match self.primary_protocol_mut().and_then(|protocol| {
@@ -1415,6 +1561,14 @@ impl AccountWallet {
             .pending_by_operation
             .get(operation_id)
             .ok_or_else(|| AccountError::new("operation_not_resumable", "missing pending proof"))?;
+        let unconfirmed_dependencies = self
+            .primary_protocol_mut()?
+            .pending_unconfirmed_dependencies(pending_id)
+            .map_err(|error| AccountError::new("operation_not_resumable", error))?;
+        if let Err(error) = self.reobserve_unconfirmed_dependencies(&unconfirmed_dependencies) {
+            self.reject_operation(operation_id, error.code)?;
+            return Err(error);
+        }
         let ctx = funding_context(outpoint);
         let record = self
             .primary_protocol_mut()?
@@ -2092,9 +2246,12 @@ impl AccountWallet {
                                 'consignment_base64', consignment_base64,
                                 'spent_state', json(spent_state_json),
                                 'snapshot', CASE WHEN snapshot_json IS NULL
-                                                 THEN NULL ELSE json(snapshot_json) END)
+                                                 THEN NULL ELSE json(snapshot_json) END,
+                                'finality', finality,
+                                'anchor_txid', anchor_txid)
              FROM opencsv_consignments
              LEFT JOIN opencsv_consignment_snapshots USING(consignment_id)
+             LEFT JOIN opencsv_consignment_finality USING(consignment_id)
              ORDER BY created_at",
         )?;
         let owners = self
@@ -2319,6 +2476,20 @@ impl AccountWallet {
                 SnapshotChain::from_json(&snapshot.to_string())
                     .map_err(|error| AccountError::new("invalid_backup_checkpoint", error))?;
             }
+            if let Some(finality) = consignment.finality.as_deref() {
+                if !matches!(finality, "unconfirmed" | "settled" | "frozen") {
+                    return Err(AccountError::new(
+                        "invalid_backup_checkpoint",
+                        format!("unknown consignment finality {finality}"),
+                    ));
+                }
+                if consignment.anchor_txid.is_none() {
+                    return Err(AccountError::new(
+                        "invalid_backup_checkpoint",
+                        "consignment finality is missing its anchor txid",
+                    ));
+                }
+            }
         }
 
         self.db.conn.execute_batch("BEGIN IMMEDIATE")?;
@@ -2396,6 +2567,17 @@ impl AccountWallet {
                              consignment_id, snapshot_json
                          ) VALUES(?1, ?2)",
                         params![consignment.consignment_id, snapshot.to_string()],
+                    )?;
+                }
+                if let (Some(finality), Some(anchor_txid)) =
+                    (&consignment.finality, &consignment.anchor_txid)
+                {
+                    self.db.conn.execute(
+                        "INSERT INTO opencsv_consignment_finality(
+                             consignment_id, anchor_txid, finality, observed_at,
+                             last_checked_at, last_error
+                         ) VALUES(?1, ?2, ?3, ?4, ?4, NULL)",
+                        params![consignment.consignment_id, anchor_txid, finality, now],
                     )?;
                 }
             }
@@ -2806,6 +2988,53 @@ impl AccountWallet {
             ],
         )?;
         Ok(receipt)
+    }
+
+    fn reobserve_unconfirmed_dependencies(
+        &self,
+        dependencies: &[String],
+    ) -> Result<(), AccountError> {
+        if dependencies.is_empty() {
+            return Ok(());
+        }
+        let client = esplora_client::Builder::new(&self.config.esplora_url).build_blocking();
+        for dependency in dependencies {
+            let txid = dependency.parse::<Txid>().map_err(|error| {
+                AccountError::new(
+                    "database_corrupt",
+                    format!("invalid unconfirmed dependency {dependency}: {error}"),
+                )
+            })?;
+            let observed = client.get_tx(&txid).map_err(|error| {
+                AccountError::new(
+                    "unconfirmed_dependency_unavailable",
+                    format!("could not re-observe parent {dependency}: {error}"),
+                )
+            })?;
+            let now = unix_time()?;
+            if observed.is_none() {
+                self.db.conn.execute(
+                    "UPDATE opencsv_consignment_finality
+                     SET finality = 'frozen', last_checked_at = ?2,
+                         last_error = 'exact parent transaction is no longer observed'
+                     WHERE anchor_txid = ?1 AND finality != 'settled'",
+                    params![dependency, now],
+                )?;
+                return Err(AccountError::new(
+                    "unconfirmed_dependency_changed",
+                    format!(
+                        "zero-confirmation parent {dependency} disappeared or was replaced; dependent signing is frozen"
+                    ),
+                ));
+            }
+            self.db.conn.execute(
+                "UPDATE opencsv_consignment_finality
+                 SET last_checked_at = ?2, last_error = NULL
+                 WHERE anchor_txid = ?1 AND finality = 'unconfirmed'",
+                params![dependency, now],
+            )?;
+        }
+        Ok(())
     }
 
     fn reject_operation(&self, operation_id: &str, reason: &str) -> Result<(), AccountError> {
@@ -3227,9 +3456,11 @@ impl AccountWallet {
             return Ok(());
         };
         let mut statement = self.db.conn.prepare(
-            "SELECT c.consignment_base64, c.spent_state_json, s.snapshot_json
+            "SELECT c.consignment_base64, c.spent_state_json, s.snapshot_json,
+                    COALESCE(f.finality, 'settled'), f.anchor_txid
              FROM opencsv_consignments c
              JOIN opencsv_consignment_snapshots s USING(consignment_id)
+             LEFT JOIN opencsv_consignment_finality f USING(consignment_id)
              ORDER BY c.created_at",
         )?;
         let rows = statement.query_map([], |row| {
@@ -3237,20 +3468,34 @@ impl AccountWallet {
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
                 row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, Option<String>>(4)?,
             ))
         })?;
         let mut spent = Vec::new();
         for row in rows {
-            let (encoded, spent_state, snapshot) = row?;
+            let (encoded, spent_state, snapshot, finality, anchor_txid) = row?;
+            if finality == "frozen" {
+                continue;
+            }
             let blob = base64::engine::general_purpose::STANDARD
                 .decode(encoded)
                 .map_err(|error| AccountError::new("database_corrupt", error.to_string()))?;
             let chain = SnapshotChain::from_json(&snapshot)
                 .map_err(|error| AccountError::new("database_corrupt", error))?;
-            match protocol
-                .verify(&blob, &chain, u64::from(self.config.required_confirmations))
-                .map_err(|error| AccountError::new("database_corrupt", error))?
-            {
+            let verdict = if finality == "unconfirmed" {
+                let anchor_txid = anchor_txid.ok_or_else(|| {
+                    AccountError::new(
+                        "database_corrupt",
+                        "unconfirmed consignment has no anchor txid",
+                    )
+                })?;
+                protocol.verify_unconfirmed(&blob, &chain, &anchor_txid)
+            } else {
+                protocol.verify(&blob, &chain, u64::from(self.config.required_confirmations))
+            }
+            .map_err(|error| AccountError::new("database_corrupt", error))?;
+            match verdict {
                 Ok(_) => {}
                 Err(reason) => {
                     return Err(AccountError::new(
@@ -3488,6 +3733,83 @@ fn canonical_consignment_identity(blob: &[u8]) -> Result<(Vec<u8>, String), Acco
     let canonical = consignment.to_bytes();
     let identity = sha256::Hash::hash(&canonical).to_string();
     Ok((canonical, identity))
+}
+
+fn consignment_anchor_txid(blob: &[u8]) -> Result<String, AccountError> {
+    let consignment = Consignment::from_bytes(blob)
+        .map_err(|error| AccountError::new("invalid_consignment", error.to_string()))?;
+    Ok(Txid::from_byte_array(consignment.anchor_ref.txid).to_string())
+}
+
+/// Merge one exact, locally validated mempool transaction into a confirmed
+/// chain snapshot. Mempool location is deliberately the `(0, 0)` sentinel:
+/// SnapshotChain assigns it zero confirmations and excludes it from
+/// canonical first-occurrence ordering, matching BitcoinAnchorChain.
+fn snapshot_with_unconfirmed_anchor(
+    confirmed_snapshot_json: &str,
+    consignment: &Consignment,
+    transaction: &Transaction,
+) -> Result<Snapshot, AccountError> {
+    if consignment.anchor_ref.location != MEMPOOL_LOCATION {
+        return Err(AccountError::new(
+            "invalid_consignment",
+            "zero-confirmation credit requires the mempool anchor sentinel",
+        ));
+    }
+    let expected_txid = Txid::from_byte_array(consignment.anchor_ref.txid);
+    if transaction.compute_txid() != expected_txid {
+        return Err(AccountError::new(
+            "unconfirmed_anchor_mismatch",
+            format!(
+                "accelerator returned {}, expected {expected_txid}",
+                transaction.compute_txid()
+            ),
+        ));
+    }
+    let funding = transaction
+        .input
+        .first()
+        .ok_or_else(|| {
+            AccountError::new(
+                "protocol_layout_violation",
+                "unconfirmed anchor has no funding input",
+            )
+        })?
+        .previous_output;
+    let script = transaction
+        .output
+        .first()
+        .ok_or_else(|| {
+            AccountError::new(
+                "protocol_layout_violation",
+                "unconfirmed anchor has no record output",
+            )
+        })?
+        .script_pubkey
+        .as_bytes();
+    let record: [u8; 64] = script
+        .strip_prefix(&[0x6a, 0x40])
+        .and_then(|payload| payload.try_into().ok())
+        .ok_or_else(|| {
+            AccountError::new(
+                "protocol_layout_violation",
+                "unconfirmed anchor output 0 is not one canonical 64-byte OP_RETURN",
+            )
+        })?;
+    validate_initial_anchor(transaction, funding, &record)?;
+
+    let mut snapshot: Snapshot = serde_json::from_str(confirmed_snapshot_json)
+        .map_err(|error| AccountError::new("invalid_chain_view", error.to_string()))?;
+    let txid_hex = hex_encode(&consignment.anchor_ref.txid);
+    snapshot.entries.retain(|entry| entry.txid != txid_hex);
+    snapshot.entries.push(SnapshotEntry {
+        height: MEMPOOL_LOCATION.height,
+        position: MEMPOOL_LOCATION.position,
+        txid: txid_hex,
+        ctx: hex_encode(&funding_context(funding)),
+        record: hex_encode(&record),
+    });
+    Ok(snapshot)
 }
 
 fn derive<const N: usize>(
@@ -3993,6 +4315,74 @@ mod tests {
         let (normalized_bytes, normalized_id) = canonical_consignment_identity(&overlong).unwrap();
         assert_eq!(normalized_bytes, canonical_bytes);
         assert_eq!(normalized_id, canonical_id);
+    }
+
+    #[test]
+    fn provisional_snapshot_accepts_only_exact_canonical_anchor_layout() {
+        let funding = OutPoint::new(Txid::from_byte_array([3u8; 32]), 1);
+        let record = [7u8; 64];
+        let transaction = Transaction {
+            version: transaction::Version::TWO,
+            lock_time: absolute::LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: funding,
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                witness: Witness::new(),
+            }],
+            output: vec![
+                TxOut {
+                    value: Amount::ZERO,
+                    script_pubkey: ScriptBuf::new_op_return(
+                        PushBytesBuf::try_from(record.to_vec()).unwrap(),
+                    ),
+                },
+                TxOut {
+                    value: Amount::from_sat(MARKER_DUST_SATS),
+                    script_pubkey: ScriptBuf::from_bytes(MARKER_SPK.to_vec()),
+                },
+                TxOut {
+                    value: Amount::from_sat(1_000),
+                    script_pubkey: ScriptBuf::from_bytes(
+                        [vec![0x00, 0x14], vec![9u8; 20]].concat(),
+                    ),
+                },
+            ],
+        };
+        let consignment = Consignment {
+            coin_openings: Vec::new(),
+            nullifiers: Vec::new(),
+            proof: Vec::new(),
+            anchor_ref: AnchorRef {
+                txid: transaction.compute_txid().to_byte_array(),
+                location: MEMPOOL_LOCATION,
+            },
+            aux: None,
+        };
+        let snapshot = snapshot_with_unconfirmed_anchor(
+            r#"{"tip_height":100,"entries":[]}"#,
+            &consignment,
+            &transaction,
+        )
+        .unwrap();
+        let chain = SnapshotChain::from_snapshot(&snapshot).unwrap();
+        assert_eq!(
+            opencsv_core::chain::AnchorChain::confirmations_at(&chain, 0),
+            0
+        );
+
+        let mut mutated = transaction.clone();
+        mutated.output.swap(0, 1);
+        let error = snapshot_with_unconfirmed_anchor(
+            r#"{"tip_height":100,"entries":[]}"#,
+            &consignment,
+            &mutated,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error.code,
+            "unconfirmed_anchor_mismatch" | "protocol_layout_violation"
+        ));
     }
 
     #[test]

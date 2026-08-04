@@ -384,6 +384,43 @@ pub unsafe extern "C" fn opencsv_account_verify_consignment(
     })
 }
 
+/// Credit a fully verified consignment after observing its exact anchor
+/// transaction, without waiting for confirmation depth. The confirmed
+/// snapshot still supplies authoritative settled history; Rust adds and
+/// validates only the referenced mempool transaction. Credited coins carry
+/// a durable parent dependency that is rechecked before child signing.
+///
+/// # Safety
+/// `blob` must be valid for `blob_len` bytes and `snapshot_json` must be a
+/// valid NUL-terminated UTF-8 string.
+#[no_mangle]
+pub unsafe extern "C" fn opencsv_account_verify_consignment_unconfirmed(
+    handle: u64,
+    blob: *const u8,
+    blob_len: usize,
+    snapshot_json: *const c_char,
+) -> *mut c_char {
+    guarded(|| {
+        if blob_len == 0 {
+            return out(json!({
+                "error": "consignment is empty",
+                "reason": "invalid_consignment",
+            }));
+        }
+        let blob = match unsafe { in_bytes(blob, blob_len, "blob") } {
+            Ok(value) => value,
+            Err(error) => return err(error),
+        };
+        let snapshot = match unsafe { in_str(snapshot_json, "snapshot_json") } {
+            Ok(value) => value,
+            Err(error) => return err(error),
+        };
+        with_account(handle, |account| {
+            account.verify_consignment_unconfirmed(blob, snapshot)
+        })
+    })
+}
+
 /// Read-only consignment decision against the locally verified BIP158 scan.
 ///
 /// # Safety

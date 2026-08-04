@@ -142,8 +142,13 @@ impl AnchorChain for SnapshotChain {
     }
 
     fn nullifier_occurrences(&self, raw_nf: &Digest) -> Vec<AnchorLocation> {
+        // Confirmed anchors have canonical order; mempool transactions do
+        // not. Match BitcoinAnchorChain: the provisional transaction is
+        // checked for exact binding separately, while only settled history
+        // can establish an earlier authoritative occurrence.
         self.entries
             .iter()
+            .filter(|e| e.location != MEMPOOL_LOCATION)
             .filter(|e| e.record.well_formed(&e.ctx, raw_nf))
             .map(|e| e.location)
             .collect()
@@ -152,9 +157,17 @@ impl AnchorChain for SnapshotChain {
     fn anchors_up_to(&self, height: u64) -> Vec<(AnchorLocation, AnchorRecord)> {
         self.entries
             .iter()
-            .filter(|e| e.location.height <= height)
+            .filter(|e| e.location != MEMPOOL_LOCATION && e.location.height <= height)
             .map(|e| (e.location, e.record))
             .collect()
+    }
+
+    fn confirmations_at(&self, height: u64) -> u64 {
+        if height == MEMPOOL_LOCATION.height || height > self.tip_height {
+            0
+        } else {
+            self.tip_height - height + 1
+        }
     }
 }
 

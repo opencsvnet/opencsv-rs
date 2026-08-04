@@ -103,6 +103,11 @@ struct StoredCoin {
     proof: Vec<u8>,
     /// Which output of the creating proof's statement this coin is.
     selector: usize,
+    /// Exact unconfirmed Bitcoin anchor this coin depends on. `None` means
+    /// the creating consignment met the account's settlement policy. The
+    /// account layer re-observes every dependency before it lets a child
+    /// transaction sign.
+    unconfirmed_anchor: Option<String>,
 }
 
 impl StoredCoin {
@@ -159,6 +164,10 @@ struct Pending {
     aux: Option<AssetGenesis>,
     /// Coin ids consumed by this transaction, marked spent at finalize.
     spent_ids: Vec<String>,
+    /// Exact zero-confirmation parent anchors selected by this operation.
+    /// Persisted with the proof so crash recovery cannot shed the safety
+    /// check before signing.
+    unconfirmed_dependencies: Vec<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -220,6 +229,8 @@ pub struct PendingExport {
     proof_base64: String,
     aux: Option<GenesisJson>,
     spent_ids: Vec<String>,
+    #[serde(default)]
+    unconfirmed_dependencies: Vec<String>,
 }
 
 fn shape_to_json(shape: &RecordShape) -> ShapeJson {
@@ -326,6 +337,12 @@ pub struct CoinJson {
     pub value: u64,
     /// `true` if the coin is spendable.
     pub unspent: bool,
+    /// `settled` or `unconfirmed`. Both may be selected, but unconfirmed
+    /// coins carry a parent transaction dependency that is rechecked before
+    /// signing.
+    pub finality: &'static str,
+    /// Exact parent txid while `finality == "unconfirmed"`.
+    pub anchor_txid: Option<String>,
 }
 
 fn genesis_to_json(g: &AssetGenesis) -> GenesisJson {
@@ -378,6 +395,8 @@ pub struct Proved {
     pub ctx: [u8; 32],
     /// Coin ids this transaction will consume (empty for mints).
     pub spends: Vec<String>,
+    /// Exact unconfirmed parent transaction ids this proof consumes.
+    pub unconfirmed_dependencies: Vec<String>,
 }
 
 /// Successful verification outcome.
@@ -603,6 +622,7 @@ impl MemWallet {
                 proof: encode_coin_proof(&proof),
                 aux: Some(issuer.genesis),
                 spent_ids: Vec::new(),
+                unconfirmed_dependencies: Vec::new(),
             },
             record,
             random_ctx(),
@@ -630,6 +650,12 @@ impl MemWallet {
             .map(|p| self.find_coin(p).cloned())
             .collect::<Result<_, _>>()?;
         let ids: Vec<String> = stored.iter().map(StoredCoin::id).collect();
+        let mut unconfirmed_dependencies: Vec<String> = stored
+            .iter()
+            .filter_map(|coin| coin.unconfirmed_anchor.clone())
+            .collect();
+        unconfirmed_dependencies.sort();
+        unconfirmed_dependencies.dedup();
         let mut inputs = Vec::with_capacity(NODE_INPUTS);
         for s in &stored {
             if s.status == CoinStatus::Spent {
@@ -702,6 +728,7 @@ impl MemWallet {
                 proof: encode_coin_proof(&proof),
                 aux,
                 spent_ids: ids,
+                unconfirmed_dependencies,
             },
             record,
             ctx,
@@ -761,6 +788,7 @@ impl MemWallet {
                 proof: encode_coin_proof(&proof),
                 aux: None,
                 spent_ids: vec![stored.id()],
+                unconfirmed_dependencies: stored.unconfirmed_anchor.into_iter().collect(),
             },
             record,
             ctx,
@@ -841,6 +869,7 @@ impl MemWallet {
             proof_base64: base64::engine::general_purpose::STANDARD.encode(&pending.proof),
             aux: pending.aux.as_ref().map(genesis_to_json),
             spent_ids: pending.spent_ids.clone(),
+            unconfirmed_dependencies: pending.unconfirmed_dependencies.clone(),
         };
         serde_json::to_string(&export).map_err(|e| e.to_string())
     }
@@ -876,6 +905,7 @@ impl MemWallet {
                 .map_err(|e| format!("proof base64: {e}"))?,
             aux: export.aux.as_ref().map(genesis_from_json).transpose()?,
             spent_ids: export.spent_ids,
+            unconfirmed_dependencies: export.unconfirmed_dependencies,
         };
         let pending_id = self.next_pending;
         self.next_pending += 1;
@@ -910,6 +940,29 @@ impl MemWallet {
         chain: &SnapshotChain,
         required_confirmations: u64,
     ) -> Result<Result<Verified, String>, OpError> {
+        self.verify_with_provenance(blob, chain, required_confirmations, None)
+    }
+
+    /// Verify and credit a consignment whose exact anchor is currently only
+    /// observed in a mempool. This is a separate capability from settled
+    /// acceptance: callers must keep re-observing `anchor_txid` until the
+    /// normal confirmation policy promotes the consignment.
+    pub fn verify_unconfirmed(
+        &mut self,
+        blob: &[u8],
+        chain: &SnapshotChain,
+        anchor_txid: &str,
+    ) -> Result<Result<Verified, String>, OpError> {
+        self.verify_with_provenance(blob, chain, 0, Some(anchor_txid))
+    }
+
+    fn verify_with_provenance(
+        &mut self,
+        blob: &[u8],
+        chain: &SnapshotChain,
+        required_confirmations: u64,
+        unconfirmed_anchor: Option<&str>,
+    ) -> Result<Result<Verified, String>, OpError> {
         let consignment = Consignment::from_bytes(blob).map_err(|e| e.to_string())?;
         let known_assets: Vec<AssetId> = self.assets.iter().map(AssetGenesis::asset_id).collect();
         let accepted = match accept(
@@ -943,10 +996,17 @@ impl MemWallet {
                 status: CoinStatus::Unspent,
                 proof: consignment.proof.clone(),
                 selector,
+                unconfirmed_anchor: unconfirmed_anchor.map(str::to_owned),
             };
             // Redelivery must not resurrect a coin we have spent since.
             if let Some(existing) = self.coins.iter().find(|c| c.id() == stored.id()) {
                 stored.status = existing.status;
+                // A weaker provisional replay cannot downgrade a coin that
+                // already met settlement policy. The normal settled path
+                // does promote an unconfirmed coin by clearing its parent.
+                if existing.unconfirmed_anchor.is_none() {
+                    stored.unconfirmed_anchor = None;
+                }
             }
             coin_views.push(self.coin_json(&stored));
             match self.coins.iter_mut().find(|c| c.id() == stored.id()) {
@@ -971,6 +1031,17 @@ impl MemWallet {
         }))
     }
 
+    /// Unconfirmed parent anchors carried by one imported/proved operation.
+    pub fn pending_unconfirmed_dependencies(
+        &self,
+        pending_id: u64,
+    ) -> Result<Vec<String>, OpError> {
+        self.pending
+            .get(&pending_id)
+            .map(|pending| pending.unconfirmed_dependencies.clone())
+            .ok_or_else(|| format!("no pending transaction {pending_id}"))
+    }
+
     /// Mark coins spent by id (host-side replay of persisted spend state).
     pub fn mark_spent(&mut self, coin_ids: &[String]) -> Result<(), OpError> {
         for id in coin_ids {
@@ -986,12 +1057,14 @@ impl MemWallet {
         let pending_id = self.next_pending;
         self.next_pending += 1;
         let spends = pending.spent_ids.clone();
+        let unconfirmed_dependencies = pending.unconfirmed_dependencies.clone();
         self.pending.insert(pending_id, pending);
         Proved {
             pending_id,
             anchor_record: record.to_bytes(),
             ctx,
             spends,
+            unconfirmed_dependencies,
         }
     }
 
@@ -1050,6 +1123,12 @@ impl MemWallet {
             currency: self.currency_of(&stored.coin.asset_id),
             value: stored.coin.value,
             unspent: stored.status == CoinStatus::Unspent,
+            finality: if stored.unconfirmed_anchor.is_some() {
+                "unconfirmed"
+            } else {
+                "settled"
+            },
+            anchor_txid: stored.unconfirmed_anchor.clone(),
         }
     }
 
@@ -1196,6 +1275,7 @@ mod tests {
             status: CoinStatus::Unspent,
             proof: Vec::new(),
             selector: 0,
+            unconfirmed_anchor: None,
         });
     }
 
@@ -1229,9 +1309,40 @@ mod tests {
                 proof: Vec::new(),
                 aux: None,
                 spent_ids: selected,
+                unconfirmed_dependencies: Vec::new(),
             },
         );
         assert!(wallet.select_transfer_inputs(&asset_hex, 9).is_err());
         assert!(wallet.select_transfer_inputs(&asset_hex, 0).is_err());
+    }
+
+    #[test]
+    fn pending_export_preserves_unconfirmed_parent_dependencies() {
+        let mut wallet = MemWallet::from_owner_seed([7u8; 32]);
+        wallet.pending.insert(
+            1,
+            Pending {
+                shape: RecordShape::Fixed(AnchorRecord::xfer(
+                    &[Digest::from_bytes([1u8; 32])],
+                    &[0u8; 32],
+                )),
+                openings: Vec::new(),
+                nullifiers: Vec::new(),
+                proof: Vec::new(),
+                aux: None,
+                spent_ids: vec!["coin".into()],
+                unconfirmed_dependencies: vec!["parent-txid".into()],
+            },
+        );
+
+        let exported = wallet.export_pending(1).unwrap();
+        let mut restored = MemWallet::from_owner_seed([7u8; 32]);
+        let pending_id = restored.import_pending(&exported).unwrap();
+        assert_eq!(
+            restored
+                .pending_unconfirmed_dependencies(pending_id)
+                .unwrap(),
+            vec!["parent-txid"]
+        );
     }
 }

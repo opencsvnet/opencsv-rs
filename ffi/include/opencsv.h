@@ -51,6 +51,11 @@ char *opencsv_account_verify_consignment(uint64_t handle,
                                          const uint8_t *blob,
                                          size_t blob_len,
                                          const char *snapshot_json);
+char *opencsv_account_verify_consignment_unconfirmed(
+    uint64_t handle,
+    const uint8_t *blob,
+    size_t blob_len,
+    const char *snapshot_json);
 char *opencsv_account_scan_verify(uint64_t handle,
                                   const char *consignment_hex);
 char *opencsv_account_cross_check(uint64_t handle,
