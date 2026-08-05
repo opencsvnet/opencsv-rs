@@ -206,9 +206,10 @@ fn two_hop_chain_verifies() {
 /// (d) Negative: a transfer whose claimed predecessor does not actually
 /// contain the consumed input coin must fail at proving time.
 ///
-/// The off-circuit pre-check rejects the obvious mismatch; tampering the
-/// predecessor's *carried* statement (so the pre-check passes but the proof's
-/// bound statement still disagrees) fails in-circuit with a witness conflict.
+/// The off-circuit ownership pre-check rejects the obvious mismatch; tampering
+/// the predecessor's *carried* statement (so that check passes while the
+/// proof's transcript-bound statement still disagrees) fails closed at the
+/// statement-verification boundary before recursive witness construction.
 #[test]
 fn wrong_predecessor_fails() {
     let (mint, coins) = genesis();
@@ -224,9 +225,9 @@ fn wrong_predecessor_fails() {
     println!("wrong predecessor rejected with: {err}");
     assert!(matches!(err, NodeError::PredecessorOutputMismatch));
 
-    // In-circuit path: tamper the predecessor's *carried* statement so the
-    // pre-check passes; the statement table in the proof still binds the real
-    // outputs, so the chaining constraint conflicts at witness generation.
+    // Proof-binding path: tamper the predecessor's *carried* statement so the
+    // ownership pre-check passes. Verification against the transcript-bound
+    // statement rejects it before recursive witness construction.
     let mut tampered_mint = CoinProof {
         version: mint.version,
         mode: mint.mode,
@@ -241,11 +242,11 @@ fn wrong_predecessor_fails() {
         [&tampered_mint, &tampered_mint],
         [0, 1],
     ) {
-        Ok(_) => panic!("a tampered predecessor statement must fail in-circuit"),
+        Ok(_) => panic!("a tampered predecessor statement must fail closed"),
         Err(e) => e,
     };
     println!("tampered predecessor statement rejected with: {err}");
-    assert!(matches!(err, NodeError::Circuit(_)));
+    assert!(matches!(err, NodeError::StatementMismatch));
 }
 
 /// (e) Negative: tampered public data / wrong mode fails verification.
