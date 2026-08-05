@@ -29,9 +29,12 @@ rule, resolved from node data → supply audit from chain data. (Earlier,
 consignment delivery via production Signal.) Numbers:
 
 - constant-size coin proofs and history-independent verification — the PCD
-  property, measured under the frozen proof-lineage-v3 production profile
+  property, measured under the frozen proof-lineage-v3 production profile;
+  proof-lineage v4 retains that FRI profile and adds an explicit
+  one-input/two-output forwarding circuit
 - 7.8–12.2 s proving per transfer hop on an Apple M4 (release, warm/cold),
-  21–22 ms verification, 0.84–0.85 MB proofs
+  21–22 ms verification, 0.84–0.85 MB proofs; the v4 one-input shape measures
+  4.803–5.809 s proving (warm/cold), 19–20 ms verification, and 788,068 B
 - a 94-bit conservative, union-adjusted proven-security floor for the
   largest current recursive shapes; proofs fail closed below that floor
 - see `crates/opencsv-pcd/BENCHMARKS.md`
@@ -39,7 +42,9 @@ consignment delivery via production Signal.) Numbers:
 Known gaps are documented in `crates/opencsv-pcd/README.md` (single-asset
 transfers and explicit root-circuit commitment registration).
 Issuer authorization and recursive predecessor keys are bound in-circuit;
-proof envelopes, FRI parameters, and accept tags are fail-closed at version 3.
+proof envelopes, FRI parameters, and accept tags are fail-closed at version 4.
+Authenticated v3 proofs remain accepted only as an explicit compatibility
+lineage and recursive predecessor; v1/v2 and foreign versions remain rejected.
 
 The frozen co-funded batching protocol and threat model is
 [`BATCHING_V2.md`](BATCHING_V2.md). C1 is implemented in

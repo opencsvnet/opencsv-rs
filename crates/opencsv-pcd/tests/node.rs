@@ -8,8 +8,9 @@ use std::time::Instant;
 
 use opencsv_core::{AssetGenesis, Coin, Digest, OwnerSecret, PoseidonIssuerAuthorization};
 use opencsv_pcd::{
-    prove_coin_transfer, prove_genesis_mint, prove_genesis_mint_raw, verify_coin_proof, CoinProof,
-    NodeError, NodeMode, NodeStatement, COIN_PROOF_VERSION,
+    proof_security_report, prove_coin_transfer, prove_genesis_mint, prove_genesis_mint_raw,
+    prove_one_input_transfer, verify_coin_proof, CoinProof, NodeError, NodeMode, NodeStatement,
+    COIN_PROOF_VERSION, LEGACY_COIN_PROOF_VERSION,
 };
 
 const ISSUER_SECRET: [u8; 32] = [0x42; 32];
@@ -94,6 +95,66 @@ fn transfer_spending_mint_outputs_verifies() {
     let t = Instant::now();
     verify_coin_proof(&transfer.statement, &transfer).expect("transfer verification");
     println!("verify_coin_proof (transfer): {:?}", t.elapsed());
+}
+
+/// A received single coin can be forwarded without inventing a duplicate
+/// padding input. The second nullifier slot is explicitly zero in v4.
+#[test]
+fn one_input_transfer_spending_mint_output_verifies() {
+    let started = Instant::now();
+    let (mint, coins) = genesis();
+    println!("one-input predecessor mint: {:?}", started.elapsed());
+    let input = (coins[0], osk(0x22));
+    let outputs = [coin(45, 0x66, 0x77), coin(15, 0x22, 0x99)];
+
+    let started = Instant::now();
+    let transfer = prove_one_input_transfer(&asset_id(), &input, &outputs, &mint, 0)
+        .expect("one-input transfer proving");
+    println!("one-input transfer prove: {:?}", started.elapsed());
+    println!("one-input proof size: {} bytes", proof_size(&transfer));
+    let security = proof_security_report(&transfer);
+    println!(
+        "one-input security: proven={} adjusted={} degrees={:?}",
+        security.proven_bits, security.union_adjusted_bits, security.degree_bits
+    );
+    assert_eq!(transfer.version, COIN_PROOF_VERSION);
+    assert_eq!(
+        transfer.statement.nullifiers[0],
+        input.0.nullifier(&input.1)
+    );
+    assert_eq!(
+        transfer.statement.nullifiers[1],
+        Digest::from_bytes([0u8; 32])
+    );
+    let started = Instant::now();
+    verify_coin_proof(&transfer.statement, &transfer).expect("one-input transfer verification");
+    println!("one-input transfer verify: {:?}", started.elapsed());
+}
+
+#[test]
+#[ignore = "release benchmark: two recursive one-input proofs"]
+fn one_input_transfer_cold_warm_benchmark() {
+    let (mint, coins) = genesis();
+    let input = (coins[0], osk(0x22));
+    let outputs = [coin(45, 0x66, 0x77), coin(15, 0x22, 0x99)];
+
+    for label in ["cold", "warm"] {
+        let started = Instant::now();
+        let transfer = prove_one_input_transfer(&asset_id(), &input, &outputs, &mint, 0)
+            .expect("one-input transfer proving");
+        let proving = started.elapsed();
+        let started = Instant::now();
+        verify_coin_proof(&transfer.statement, &transfer).expect("one-input transfer verification");
+        let verification = started.elapsed();
+        let security = proof_security_report(&transfer);
+        println!(
+            "one-input {label}: prove={proving:?} verify={verification:?} size={} proven={} adjusted={} degrees={:?}",
+            proof_size(&transfer),
+            security.proven_bits,
+            security.union_adjusted_bits,
+            security.degree_bits
+        );
+    }
 }
 
 /// (c) Two-hop chain: mint → transfer₁ → transfer₂. Verification time and
@@ -269,7 +330,7 @@ fn issuer_forgery_and_legacy_lineage_fail() {
         .expect("coin proof has a statement table");
     statement_entry.public_values.drain(0..4);
     let err = verify_coin_proof(&relabeled.statement, &relabeled)
-        .expect_err("an old statement shape cannot be relabeled as version 3");
+        .expect_err("an old statement shape cannot be relabeled as version 4");
     assert!(matches!(err, NodeError::StatementMismatch));
 
     let (mint, _) = genesis();
@@ -285,7 +346,8 @@ fn issuer_forgery_and_legacy_lineage_fail() {
         err,
         NodeError::UnsupportedProofVersion { actual: 2 }
     ));
-    assert_eq!(COIN_PROOF_VERSION, 3);
+    assert_eq!(LEGACY_COIN_PROOF_VERSION, 3);
+    assert_eq!(COIN_PROOF_VERSION, 4);
 }
 
 /// Verification rejects a proof whose concrete trace growth has crossed the

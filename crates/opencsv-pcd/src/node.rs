@@ -1,6 +1,6 @@
 //! Stage 3: PCD recursion — the "coin proof" node circuit (paper §4.5 item 4).
 //!
-//! # Architecture (two circuits — see below for why not one)
+//! # Architecture (fixed shapes — see below for why not one)
 //!
 //! - **Mint circuit** (genesis): the stage-2 mint predicate plus a statement
 //!   table ([`crate::statement`]). No predecessor verification.
@@ -11,6 +11,10 @@
 //!   A predecessor may be a mint proof or another node proof — the verifier
 //!   sub-circuits are shape-driven, so both work, and every ancestor's
 //!   statement is bound through the same statement-table channel.
+//! - **One-input transfer circuit (v4)**: the same transfer predicate with
+//!   one predecessor verifier, exact input/output conservation, and a zero
+//!   second nullifier slot. It creates recipient and optional change outputs
+//!   without inventing a padding input.
 //!
 //! # Why not one unified circuit with a mode selector
 //!
@@ -24,9 +28,9 @@
 //! mode) still needs the void circuit's table metadata to match the unified
 //! circuit's exactly — strictly more machinery than simply keeping the
 //! stage-2 mint circuit as the base case (the task's fallback (i)). We
-//! therefore ship two circuits; the statement layout and the statement-table
-//! binding are shared, so the vk *set* is just `{mint_vk, node_vk(per
-//! predecessor-shape variant)}`.
+//! therefore ship fixed circuit shapes; the statement layout and the
+//! statement-table binding are shared, so the vk set remains explicit and
+//! versioned.
 //!
 //! # Chaining (paper §4.5 item 4)
 //!
@@ -108,8 +112,10 @@ pub const NODE_INPUTS: usize = 2;
 /// Number of node outputs (created coins).
 pub const NODE_OUTPUTS: usize = 2;
 
-/// Proof lineage version carrying issuer authorization and the frozen D2 FRI profile.
-pub const COIN_PROOF_VERSION: u8 = 3;
+/// Legacy proof lineage retained as an explicitly authenticated predecessor.
+pub const LEGACY_COIN_PROOF_VERSION: u8 = 3;
+/// Current proof lineage adding one-input/two-output transfers.
+pub const COIN_PROOF_VERSION: u8 = 4;
 
 /// Statement layout, in field elements (see module docs):
 /// version (1) + mode (1) + asset_id (8) + V (3) + mint_commit (8) +
@@ -135,6 +141,13 @@ pub const NODE_PRIVATE_ELEMS: usize = DIGEST_ELEMS
     + NODE_OUTPUTS * (VALUE_LIMBS + 2 * DIGEST_ELEMS)
     + NODE_INPUTS; // 108
 
+/// Private witness elements of a one-input transfer: asset id (8), one input
+/// (30), two outputs (38), and one predecessor selector.
+pub const ONE_INPUT_PRIVATE_ELEMS: usize = DIGEST_ELEMS
+    + (VALUE_LIMBS + 2 * DIGEST_ELEMS + crate::hash::OSK_ELEMS)
+    + NODE_OUTPUTS * (VALUE_LIMBS + 2 * DIGEST_ELEMS)
+    + 1; // 77
+
 /// Private witness elements of the mint circuit: asset_id (8) + V (3) +
 /// mint_nonce (8) + issuer authorization (23) + per output
 /// (v 3 + owner 8 + r 8).
@@ -153,7 +166,7 @@ pub const REDEEM_PRIVATE_ELEMS: usize =
 pub enum NodeMode {
     /// Genesis mint (no predecessors).
     Mint,
-    /// Transfer spending two coins.
+    /// Transfer spending one or two coins.
     Transfer,
     /// Redeem (burn) of one coin (paper §4.6).
     Redeem,
@@ -178,8 +191,13 @@ impl NodeStatement {
     /// Encode as the statement table's instance public values (`4` base
     /// coefficients per statement element, higher coefficients zero).
     pub fn to_public_values(&self, mode: NodeMode) -> Vec<BabyBear> {
+        self.to_public_values_for_version(COIN_PROOF_VERSION, mode)
+    }
+
+    /// Encode for one explicitly selected, supported proof lineage.
+    pub fn to_public_values_for_version(&self, version: u8, mode: NodeMode) -> Vec<BabyBear> {
         let mut elems = Vec::with_capacity(STATEMENT_ELEMS);
-        elems.push(BabyBear::new(COIN_PROOF_VERSION as u32));
+        elems.push(BabyBear::new(version as u32));
         elems.push(match mode {
             NodeMode::Mint => BabyBear::ONE,
             NodeMode::Transfer => BabyBear::ZERO,
@@ -202,6 +220,10 @@ impl NodeStatement {
         }
         out
     }
+}
+
+fn proof_version_is_supported(version: u8) -> bool {
+    matches!(version, LEGACY_COIN_PROOF_VERSION | COIN_PROOF_VERSION)
 }
 
 /// A proof-carrying-data coin proof: a batch-STARK proof of the mint circuit
@@ -378,7 +400,7 @@ impl std::fmt::Display for NodeError {
             Self::ValueOverflow => write!(f, "mint output values overflow u64"),
             Self::UnsupportedProofVersion { actual } => write!(
                 f,
-                "unsupported coin-proof version {actual}; expected {COIN_PROOF_VERSION}"
+                "unsupported coin-proof version {actual}; supported versions are {LEGACY_COIN_PROOF_VERSION} and {COIN_PROOF_VERSION}"
             ),
             Self::InsufficientProofSecurity { actual, required } => write!(
                 f,
@@ -523,7 +545,7 @@ fn mint_witness_layout(private: &[ExprId]) -> MintWitness<'_> {
 
 /// Build the mint circuit: the stage-2 mint predicate plus the statement
 /// table (no predecessor verification).
-fn build_mint_circuit() -> Result<Circuit<EF>, NodeError> {
+fn build_mint_circuit(version: u8) -> Result<Circuit<EF>, NodeError> {
     let mut builder = CircuitBuilder::<EF>::new();
     crate::recursion_config::CoinRecursionConfig::new(&CoinFriParams::production())
         .prepare_circuit_for_verification(&mut builder)?;
@@ -566,12 +588,9 @@ fn build_mint_circuit() -> Result<Circuit<EF>, NodeError> {
         &[witness.asset_id, witness.value_total, witness.mint_nonce],
     )?;
 
-    // Statement: [version=3 | mode=1 | asset | V | mint_commit | nf = 0 ×2 | out ×2].
+    // Statement: [version | mode=1 | asset | V | mint_commit | nf = 0 ×2 | out ×2].
     let mut stmt = Vec::with_capacity(STATEMENT_ELEMS);
-    stmt.push(const_expr(
-        &mut builder,
-        BabyBear::new(COIN_PROOF_VERSION as u32),
-    ));
+    stmt.push(const_expr(&mut builder, BabyBear::new(version as u32)));
     stmt.push(const_expr(&mut builder, BabyBear::ONE));
     stmt.extend_from_slice(witness.asset_id);
     stmt.extend_from_slice(witness.value_total);
@@ -716,7 +735,7 @@ fn build_node_circuit(
         Err(_) => unreachable!("two predecessors verified above"),
     };
 
-    // --- statement: [version=3 | mode=0 | asset | V = 0 | mint_commit = 0 | nf ×2 | out ×2].
+    // --- statement: [version=4 | mode=0 | asset | V = 0 | mint_commit = 0 | nf ×2 | out ×2].
     let mut stmt = Vec::with_capacity(STATEMENT_ELEMS);
     stmt.push(const_expr(
         &mut builder,
@@ -736,6 +755,94 @@ fn build_node_circuit(
     push_statement_op(&mut builder, stmt)?;
 
     Ok((builder.build()?, preds))
+}
+
+/// Build the v4 one-input transfer circuit. The public statement retains the
+/// two-nullifier layout; slot 0 carries the real nullifier and slot 1 is
+/// constrained to zero, so the wire width remains stable without pretending
+/// a padding coin exists.
+fn build_one_input_transfer_circuit(
+    config: &CoinRecursionConfig,
+    predecessor: &CoinProof,
+) -> Result<(Circuit<EF>, PredVerifier), NodeError> {
+    let mut builder = CircuitBuilder::<EF>::new();
+    config.prepare_circuit_for_verification(&mut builder)?;
+    builder.register_npo(StatementCircuitPlugin::<STATEMENT_ELEMS>::new());
+
+    let private = builder.alloc_private_inputs(ONE_INPUT_PRIVATE_ELEMS, "one_input_node_witness");
+    const IN_ELEMS: usize = VALUE_LIMBS + 2 * DIGEST_ELEMS + crate::hash::OSK_ELEMS;
+    const OUT_ELEMS: usize = VALUE_LIMBS + 2 * DIGEST_ELEMS;
+    let asset_id = &private[..DIGEST_ELEMS];
+    let input_base = DIGEST_ELEMS;
+    let value = &private[input_base..input_base + VALUE_LIMBS];
+    let owner = &private[input_base + VALUE_LIMBS..input_base + VALUE_LIMBS + DIGEST_ELEMS];
+    let randomness = &private
+        [input_base + VALUE_LIMBS + DIGEST_ELEMS..input_base + VALUE_LIMBS + 2 * DIGEST_ELEMS];
+    let osk = &private[input_base + VALUE_LIMBS + 2 * DIGEST_ELEMS..input_base + IN_ELEMS];
+    let output_base = input_base + IN_ELEMS;
+    let outputs: [(&[ExprId], &[ExprId], &[ExprId]); NODE_OUTPUTS] = std::array::from_fn(|index| {
+        let start = output_base + index * OUT_ELEMS;
+        (
+            &private[start..start + VALUE_LIMBS],
+            &private[start + VALUE_LIMBS..start + VALUE_LIMBS + DIGEST_ELEMS],
+            &private[start + VALUE_LIMBS + DIGEST_ELEMS..start + OUT_ELEMS],
+        )
+    });
+    let selector = private[output_base + NODE_OUTPUTS * OUT_ELEMS];
+
+    let input_value: [ExprId; VALUE_LIMBS] = value.try_into().expect("v has 3 limbs");
+    range_check_value(&mut builder, &input_value)?;
+    let input_commitment = coin_commitment_base(&mut builder, asset_id, value, owner, randomness)?;
+    let recomputed_owner = hash_felts_limbs(&mut builder, "", &[osk])?;
+    connect_digest(&mut builder, recomputed_owner, owner)?;
+    let nullifier = hash_felts_base(&mut builder, "null", &[osk, &input_commitment])?;
+
+    let mut output_values = [[ExprId::ZERO; VALUE_LIMBS]; NODE_OUTPUTS];
+    let mut output_commitments = [[ExprId::ZERO; DIGEST_ELEMS]; NODE_OUTPUTS];
+    for (index, output_value) in output_values.iter_mut().enumerate() {
+        let (value, owner, randomness) = outputs[index];
+        *output_value = value.try_into().expect("v has 3 limbs");
+        range_check_value(&mut builder, output_value)?;
+        output_commitments[index] =
+            coin_commitment_base(&mut builder, asset_id, value, owner, randomness)?;
+    }
+    let zero_value = [ExprId::ZERO; VALUE_LIMBS];
+    enforce_sum_eq(
+        &mut builder,
+        [&input_value, &zero_value],
+        [&output_values[0], &output_values[1]],
+    )?;
+
+    let predecessor_verifier = chain_predecessor(
+        config,
+        &mut builder,
+        &LogUpGadget::new(),
+        predecessor,
+        asset_id,
+        selector,
+        &input_commitment,
+    )?;
+
+    let mut statement = Vec::with_capacity(STATEMENT_ELEMS);
+    statement.push(const_expr(
+        &mut builder,
+        BabyBear::new(COIN_PROOF_VERSION as u32),
+    ));
+    statement.push(ExprId::ZERO);
+    statement.extend_from_slice(asset_id);
+    for _ in 0..VALUE_LIMBS + DIGEST_ELEMS {
+        statement.push(ExprId::ZERO);
+    }
+    statement.extend_from_slice(&nullifier);
+    for _ in 0..DIGEST_ELEMS {
+        statement.push(ExprId::ZERO);
+    }
+    for commitment in &output_commitments {
+        statement.extend_from_slice(commitment);
+    }
+    push_statement_op(&mut builder, statement)?;
+
+    Ok((builder.build()?, predecessor_verifier))
 }
 
 // ============================================================================
@@ -826,10 +933,20 @@ fn chain_predecessor(
     selector: ExprId,
     commitment: &[ExprId; DIGEST_ELEMS],
 ) -> Result<PredVerifier, NodeError> {
-    if pred.version != COIN_PROOF_VERSION {
+    if !proof_version_is_supported(pred.version) {
         return Err(NodeError::UnsupportedProofVersion {
             actual: pred.version,
         });
+    }
+    let carried_statement = pred
+        .statement_public_values()
+        .ok_or(NodeError::MissingStatement)?;
+    if carried_statement
+        != pred
+            .statement
+            .to_public_values_for_version(pred.version, pred.mode)
+    {
+        return Err(NodeError::StatementMismatch);
     }
     let stmt_instance = pred
         .proof
@@ -966,7 +1083,7 @@ fn build_redeem_circuit(
         &commitment,
     )?;
 
-    // --- statement: [version=3 | mode=2 | asset | V = v | mint_commit = 0 | nf | 0 | 0 | 0].
+    // --- statement: [version=4 | mode=2 | asset | V = v | mint_commit = 0 | nf | 0 | 0 | 0].
     let mut stmt = Vec::with_capacity(STATEMENT_ELEMS);
     stmt.push(const_expr(
         &mut builder,
@@ -991,15 +1108,15 @@ fn build_redeem_circuit(
 // Proving / verifying
 // ============================================================================
 
-/// The frozen production FRI parameters used for all proof-lineage-v3 proofs.
+/// The frozen production FRI parameters used for authenticated v3/v4 proofs.
 pub fn coin_fri_params() -> CoinFriParams {
     CoinFriParams::production()
 }
 
 /// Build the mint circuit setup (vk side).
-fn mint_setup() -> Result<RecSetup, NodeError> {
+fn mint_setup(version: u8) -> Result<RecSetup, NodeError> {
     Ok(setup_circuit::<STATEMENT_ELEMS>(
-        build_mint_circuit()?,
+        build_mint_circuit(version)?,
         &coin_fri_params(),
     )?)
 }
@@ -1029,6 +1146,27 @@ pub fn prove_genesis_mint_raw(
     mint_nonce: &Digest,
     outputs: &[Coin; NODE_OUTPUTS],
 ) -> Result<CoinProof, NodeError> {
+    prove_genesis_mint_raw_for_version(
+        COIN_PROOF_VERSION,
+        asset_id,
+        genesis,
+        issuer_secret,
+        mint_nonce,
+        outputs,
+    )
+}
+
+fn prove_genesis_mint_raw_for_version(
+    version: u8,
+    asset_id: &AssetId,
+    genesis: &AssetGenesis,
+    issuer_secret: &[u8; 32],
+    mint_nonce: &Digest,
+    outputs: &[Coin; NODE_OUTPUTS],
+) -> Result<CoinProof, NodeError> {
+    if !proof_version_is_supported(version) {
+        return Err(NodeError::UnsupportedProofVersion { actual: version });
+    }
     if outputs.iter().any(|c| c.asset_id != *asset_id) {
         return Err(NodeError::AssetMismatch);
     }
@@ -1053,7 +1191,7 @@ pub fn prove_genesis_mint_raw(
         private_values.extend(c.randomness.to_elems().iter().map(|&x| EF::from(x)));
     }
 
-    let s = mint_setup()?;
+    let s = mint_setup(version)?;
     let mut runner = s.circuit.runner();
     runner.set_public_inputs(&[])?;
     runner.set_private_inputs(&private_values)?;
@@ -1064,7 +1202,7 @@ pub fn prove_genesis_mint_raw(
     let proof = prover.prove_all_tables(&traces, &circuit_prover_data)?;
 
     let coin = CoinProof {
-        version: COIN_PROOF_VERSION,
+        version,
         mode: NodeMode::Mint,
         statement: NodeStatement {
             asset_id: *asset_id,
@@ -1200,12 +1338,126 @@ pub fn prove_transfer(
     Ok(coin)
 }
 
+/// Prove a v4 transfer spending one predecessor coin and creating two
+/// outputs (recipient and optional change). The second public nullifier slot
+/// is zero padding, cryptographically bound by the statement table.
+pub fn prove_one_input_transfer(
+    asset_id: &AssetId,
+    input: &(Coin, OwnerSecret),
+    outputs: &[Coin; NODE_OUTPUTS],
+    predecessor: &CoinProof,
+    selector: usize,
+) -> Result<CoinProof, NodeError> {
+    let (coin, osk) = input;
+    if coin.asset_id != *asset_id || outputs.iter().any(|output| output.asset_id != *asset_id) {
+        return Err(NodeError::AssetMismatch);
+    }
+    if predecessor.statement.asset_id != *asset_id {
+        return Err(NodeError::PredecessorAssetMismatch);
+    }
+    if selector >= NODE_OUTPUTS
+        || predecessor.statement.output_commitments[selector] != coin.commitment()
+    {
+        return Err(NodeError::PredecessorOutputMismatch);
+    }
+    let nullifier = coin.nullifier(osk);
+
+    let config = CoinRecursionConfig::new(&coin_fri_params());
+    let (circuit, pred) = build_one_input_transfer_circuit(&config, predecessor)?;
+    let verification_keys = [verification_key_identity(predecessor)];
+    let setup = setup_circuit_with_verification_keys::<STATEMENT_ELEMS>(
+        circuit,
+        &coin_fri_params(),
+        &verification_keys,
+    )?;
+
+    let mut private_values = Vec::with_capacity(ONE_INPUT_PRIVATE_ELEMS);
+    private_values.extend(asset_id.to_elems().iter().map(|&value| EF::from(value)));
+    private_values.extend(
+        u64_to_felts(coin.value)
+            .iter()
+            .map(|&value| EF::from(value)),
+    );
+    private_values.extend(coin.owner.to_elems().iter().map(|&value| EF::from(value)));
+    private_values.extend(
+        coin.randomness
+            .to_elems()
+            .iter()
+            .map(|&value| EF::from(value)),
+    );
+    private_values.extend(
+        crate::hash::osk_felts(osk)
+            .iter()
+            .map(|&value| EF::from(value)),
+    );
+    for output in outputs {
+        private_values.extend(
+            u64_to_felts(output.value)
+                .iter()
+                .map(|&value| EF::from(value)),
+        );
+        private_values.extend(output.owner.to_elems().iter().map(|&value| EF::from(value)));
+        private_values.extend(
+            output
+                .randomness
+                .to_elems()
+                .iter()
+                .map(|&value| EF::from(value)),
+        );
+    }
+    private_values.push(EF::from(BabyBear::new(selector as u32)));
+
+    let statement_values = predecessor
+        .statement_public_values()
+        .ok_or(NodeError::MissingStatement)?;
+    let mut table_values: Vec<Vec<BabyBear>> = vec![Vec::new(); pred.stmt_instance];
+    table_values.push(statement_values.to_vec());
+    let public_values = pred.verifier_inputs.pack_public_values(
+        &table_values,
+        &predecessor.proof.proof,
+        &predecessor.proof.stark_common,
+    );
+    private_values.extend(
+        pred.verifier_inputs
+            .pack_private_values(&predecessor.proof.proof),
+    );
+
+    let mut runner = setup.circuit.runner();
+    runner.set_public_inputs(&public_values)?;
+    runner.set_private_inputs(&private_values)?;
+    CoinRecursionConfig::set_fri_private_data(
+        &mut runner,
+        &pred.op_ids,
+        &predecessor.proof.proof.opening_proof,
+    )
+    .map_err(NodeError::FriPrivateData)?;
+    let traces = runner.run()?;
+
+    let prover = new_prover::<STATEMENT_ELEMS>(&setup.config, setup.table_packing.clone(), true);
+    let circuit_prover_data = lock_setup(&setup.circuit_prover_data);
+    let proof = prover.prove_all_tables(&traces, &circuit_prover_data)?;
+    let result = CoinProof {
+        version: COIN_PROOF_VERSION,
+        mode: NodeMode::Transfer,
+        statement: NodeStatement {
+            asset_id: *asset_id,
+            value: 0,
+            mint_commit: Digest::from_bytes([0u8; 32]),
+            nullifiers: [nullifier, Digest::from_bytes([0u8; 32])],
+            output_commitments: [outputs[0].commitment(), outputs[1].commitment()],
+        },
+        proof,
+    };
+    crate::security::validate_proof_security(&result)?;
+    Ok(result)
+}
+
 /// Verify a coin proof against the expected statement: checks that the
 /// statement table's instance public values inside the proof equal
 /// `expected` (this is the cryptographically bound channel — see module
 /// docs), then natively verifies the batch-STARK proof.
 pub fn verify_coin_proof(expected: &NodeStatement, coin: &CoinProof) -> Result<(), NodeError> {
-    if coin.version != COIN_PROOF_VERSION {
+    if !proof_version_is_supported(coin.version) {
         return Err(NodeError::UnsupportedProofVersion {
             actual: coin.version,
         });
@@ -1214,7 +1466,7 @@ pub fn verify_coin_proof(expected: &NodeStatement, coin: &CoinProof) -> Result<(
     let pvs = coin
         .statement_public_values()
         .ok_or(NodeError::MissingStatement)?;
-    if pvs != expected.to_public_values(coin.mode) {
+    if pvs != expected.to_public_values_for_version(coin.version, coin.mode) {
         return Err(NodeError::StatementMismatch);
     }
     let config = CoinRecursionConfig::new(&coin_fri_params());
@@ -1328,6 +1580,7 @@ pub fn prove_redeem(
 #[cfg(test)]
 mod verification_key_binding_tests {
     use super::*;
+    use opencsv_core::PoseidonIssuerAuthorization;
     use p3_field::BasedVectorSpace;
 
     fn run_key_binding(actual: EF, expected: EF) -> Result<(), NodeError> {
@@ -1343,6 +1596,42 @@ mod verification_key_binding_tests {
         runner.set_public_inputs(&[actual])?;
         runner.run()?;
         Ok(())
+    }
+
+    fn authenticated_v3_mint() -> (AssetId, OwnerSecret, [Coin; 2], CoinProof) {
+        let issuer_secret = [0x42; 32];
+        let genesis = AssetGenesis {
+            issuer_pk: PoseidonIssuerAuthorization::public_key(&issuer_secret),
+            currency_code: *b"USD",
+            terms_hash: Digest::from_bytes([0x74; 32]),
+            nonce: 1,
+        };
+        let asset_id = genesis.asset_id();
+        let owner = OwnerSecret::from_bytes([0x22; 32]);
+        let minted = [
+            Coin {
+                asset_id,
+                value: 60,
+                owner: owner.owner(),
+                randomness: Digest::from_bytes([0x33; 32]),
+            },
+            Coin {
+                asset_id,
+                value: 40,
+                owner: owner.owner(),
+                randomness: Digest::from_bytes([0x44; 32]),
+            },
+        ];
+        let proof = prove_genesis_mint_raw_for_version(
+            LEGACY_COIN_PROOF_VERSION,
+            &asset_id,
+            &genesis,
+            &issuer_secret,
+            &Digest::from_bytes([0xaa; 32]),
+            &minted,
+        )
+        .expect("authenticated v3 mint proving");
+        (asset_id, owner, minted, proof)
     }
 
     #[test]
@@ -1369,6 +1658,43 @@ mod verification_key_binding_tests {
         let error = run_key_binding(non_base, EF::ONE)
             .expect_err("predecessor key elements must be base-field embedded");
         assert!(matches!(error, NodeError::Circuit(_)));
+    }
+
+    #[test]
+    fn authenticated_v3_proof_cannot_be_relabelled_v4() {
+        let (_, _, _, mut legacy) = authenticated_v3_mint();
+        verify_coin_proof(&legacy.statement, &legacy).expect("v3 root verification");
+        legacy.version = COIN_PROOF_VERSION;
+        let error = verify_coin_proof(&legacy.statement, &legacy)
+            .expect_err("outer-version relabel must not rewrite the bound statement version");
+        assert!(matches!(error, NodeError::StatementMismatch));
+    }
+
+    #[test]
+    #[ignore = "slow compatibility receipt: v3 mint plus v4 recursive transfer"]
+    fn authenticated_v3_predecessor_feeds_v4_one_input_transfer() {
+        let (asset_id, owner, minted, legacy) = authenticated_v3_mint();
+        verify_coin_proof(&legacy.statement, &legacy).expect("v3 root verification");
+
+        let outputs = [
+            Coin {
+                asset_id,
+                value: 45,
+                owner: OwnerSecret::from_bytes([0x55; 32]).owner(),
+                randomness: Digest::from_bytes([0x66; 32]),
+            },
+            Coin {
+                asset_id,
+                value: 15,
+                owner: owner.owner(),
+                randomness: Digest::from_bytes([0x77; 32]),
+            },
+        ];
+        let current =
+            prove_one_input_transfer(&asset_id, &(minted[0], owner), &outputs, &legacy, 0)
+                .expect("v4 transfer proving from v3 predecessor");
+        assert_eq!(current.version, COIN_PROOF_VERSION);
+        verify_coin_proof(&current.statement, &current).expect("v4 root verification");
     }
 }
 

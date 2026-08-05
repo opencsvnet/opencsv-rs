@@ -1,4 +1,4 @@
-//! Security accounting for the frozen proof-lineage-v3 FRI profile.
+//! Security accounting for the frozen authenticated v3/v4 FRI profile.
 //!
 //! The Plonky3 calculator reports a per-instance round-by-round bound. A
 //! coin proof batches several AIR instances, so this module additionally
@@ -8,14 +8,17 @@
 
 use p3_uni_stark::{ConjecturedSecurity, ProvenSecurity, StarkSecurityParams};
 
-use crate::node::{CoinProof, NodeError};
+use crate::node::{CoinProof, NodeError, LEGACY_COIN_PROOF_VERSION};
 use crate::recursion_config::CoinFriParams;
 
-/// Stable identifier for the exact proof-lineage-v3 production profile.
+/// Stable identifier for the current proof-lineage-v4 production profile.
 pub const COIN_PROOF_PROFILE_ID: &str =
+    "opencsv-pcd-v4-babybear4-fri-b3-a4-q64-cpow16-qpow16-final4-pack1x3-horner4";
+/// Stable identifier for the authenticated legacy-v3 compatibility profile.
+pub const LEGACY_COIN_PROOF_PROFILE_ID: &str =
     "opencsv-pcd-v3-babybear4-fri-b3-a4-q64-cpow16-qpow16-final4-pack1x3-horner4";
-/// Accept-driver tag for the only enabled production lineage/profile.
-pub const COIN_VK_TAG: &[u8] = b"opencsv-pcd-coin-v3-fri94";
+/// Accept-driver tag for the v4 verifier with explicit v3 compatibility.
+pub const COIN_VK_TAG: &[u8] = b"opencsv-pcd-coin-v4-with-v3-fri94";
 
 /// Conservative floor(log2(|BabyBear^4|)).
 const CHALLENGE_FIELD_BITS: usize = 123;
@@ -91,7 +94,11 @@ pub fn proof_security_report(proof: &CoinProof) -> ProofSecurityReport {
         .unwrap_or(0);
     let union_bound_bits = COMPONENT_UNION_BITS + ceil_log2(degree_bits.len());
     ProofSecurityReport {
-        profile_id: COIN_PROOF_PROFILE_ID,
+        profile_id: if proof.version == LEGACY_COIN_PROOF_VERSION {
+            LEGACY_COIN_PROOF_PROFILE_ID
+        } else {
+            COIN_PROOF_PROFILE_ID
+        },
         conjectured_bits,
         proven_bits,
         union_bound_bits,

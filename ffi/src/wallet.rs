@@ -634,20 +634,30 @@ impl MemWallet {
         ))
     }
 
-    /// Spend exactly [`NODE_INPUTS`] coins (paper §4.5). `amounts[0]` pays
+    /// Spend one or [`NODE_INPUTS`] coins (paper §4.5). `amounts[0]` pays
     /// `to`; an optional `amounts[1]` returns change to this wallet's first
-    /// owner key. Amounts must sum to the input total (conservation).
+    /// owner key. Amounts must sum to the input total (conservation). One-input
+    /// transfers use the explicit v4 circuit; two-input transfers retain the
+    /// established circuit shape.
     pub fn prove_transfer(
         &mut self,
         coin_ids: &[String],
         to_owner_hex: &str,
         amounts: &[u64],
     ) -> Result<Proved, OpError> {
-        if coin_ids.len() != NODE_INPUTS {
+        if !(1..=NODE_INPUTS).contains(&coin_ids.len()) {
             return Err(format!(
-                "expected exactly {NODE_INPUTS} input coin ids, got {}",
+                "expected 1–{NODE_INPUTS} input coin ids, got {}",
                 coin_ids.len()
             ));
+        }
+        if coin_ids
+            .iter()
+            .collect::<std::collections::HashSet<_>>()
+            .len()
+            != coin_ids.len()
+        {
+            return Err("duplicate transfer input coin id".into());
         }
         let to = parse_digest(to_owner_hex, "owner")?;
         let stored: Vec<StoredCoin> = coin_ids
@@ -696,15 +706,25 @@ impl MemWallet {
                     .ok_or_else(|| format!("stored proof for coin {} does not decode", s.id()))
             })
             .collect::<Result<_, _>>()?;
-        let inputs: [(Coin, OwnerSecret); NODE_INPUTS] =
-            inputs.try_into().expect("length checked above");
-        let proof = opencsv_pcd::prove_coin_transfer(
-            &asset_id,
-            &inputs,
-            &outputs,
-            [&predecessors[0], &predecessors[1]],
-            [stored[0].selector, stored[1].selector],
-        )
+        let proof = if inputs.len() == 1 {
+            opencsv_pcd::prove_one_input_transfer(
+                &asset_id,
+                &inputs[0],
+                &outputs,
+                &predecessors[0],
+                stored[0].selector,
+            )
+        } else {
+            let inputs: [(Coin, OwnerSecret); NODE_INPUTS] =
+                inputs.try_into().expect("length checked above");
+            opencsv_pcd::prove_coin_transfer(
+                &asset_id,
+                &inputs,
+                &outputs,
+                [&predecessors[0], &predecessors[1]],
+                [stored[0].selector, stored[1].selector],
+            )
+        }
         .map_err(|e| e.to_string())?;
 
         // The raw nullifiers travel only in the consignment; the anchor
@@ -744,9 +764,9 @@ impl MemWallet {
     ///
     /// The host names only the asset, recipient, and amount. Coin selection
     /// stays inside Rust so Signal cannot accidentally reuse a coin, choose a
-    /// different asset, or construct change. The current circuit consumes
-    /// exactly two coins; selection minimizes change and then breaks ties by
-    /// coin id for deterministic crash/retry behavior.
+    /// different asset, or construct change. Selection considers one- and
+    /// two-coin spends, minimizes change, then input count, then coin id for
+    /// deterministic crash/retry behavior.
     pub fn prove_transfer_amount(
         &mut self,
         asset_id_hex: &str,
@@ -1287,7 +1307,18 @@ impl MemWallet {
             .collect();
         eligible.sort_by(|left, right| left.0.cmp(&right.0));
 
-        let mut selected: Option<(u64, String, String)> = None;
+        let mut selected: Option<(u64, usize, Vec<String>, u64)> = None;
+        for (id, value) in &eligible {
+            if *value < amount {
+                continue;
+            }
+            let candidate = (*value - amount, 1usize, vec![id.clone()], *value);
+            if selected.as_ref().is_none_or(|current| {
+                (candidate.0, candidate.1, &candidate.2) < (current.0, current.1, &current.2)
+            }) {
+                selected = Some(candidate);
+            }
+        }
         for first in 0..eligible.len() {
             for second in first + 1..eligible.len() {
                 let Some(total) = eligible[first].1.checked_add(eligible[second].1) else {
@@ -1298,20 +1329,21 @@ impl MemWallet {
                 }
                 let candidate = (
                     total - amount,
-                    eligible[first].0.clone(),
-                    eligible[second].0.clone(),
+                    2usize,
+                    vec![eligible[first].0.clone(), eligible[second].0.clone()],
+                    total,
                 );
-                if selected.as_ref().is_none_or(|current| &candidate < current) {
+                if selected.as_ref().is_none_or(|current| {
+                    (candidate.0, candidate.1, &candidate.2) < (current.0, current.1, &current.2)
+                }) {
                     selected = Some(candidate);
                 }
             }
         }
-        let (change, first, second) = selected.ok_or_else(|| {
-            format!(
-                "no unreserved pair of spendable coins for asset {asset_id_hex} covers {amount}"
-            )
+        let (_, _, selected_ids, total) = selected.ok_or_else(|| {
+            format!("no unreserved one- or two-coin spend for asset {asset_id_hex} covers {amount}")
         })?;
-        Ok((vec![first, second], amount + change))
+        Ok((selected_ids, total))
     }
 }
 
@@ -1417,6 +1449,11 @@ mod tests {
         store_coin(&mut wallet, Digest::from_bytes([8u8; 32]), 100, 4);
 
         let asset_hex = to_hex(asset_id.as_bytes());
+        let (single, total) = wallet.select_transfer_inputs(&asset_hex, 7).unwrap();
+        assert_eq!(single.len(), 1);
+        assert_eq!(total, 7);
+        assert_eq!(wallet.find_coin(&single[0]).unwrap().coin.value, 7);
+
         let (selected, total) = wallet.select_transfer_inputs(&asset_hex, 9).unwrap();
         assert_eq!(total, 9);
         let selected_values: Vec<u64> = selected

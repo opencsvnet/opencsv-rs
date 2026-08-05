@@ -62,6 +62,10 @@ call-site discipline.
   predecessor proofs** (one per consumed coin), built per proof from the
   predecessors' proof metadata (the upstream `prove_next_layer` pattern). A
   predecessor may be a mint proof or another node proof.
+- **One-input transfer circuit (v4)**: verifies one authenticated predecessor
+  and creates two outputs (recipient plus optional change). It retains the
+  53-element statement width with `nf_1` real and `nf_2 = 0`; no fake padding
+  coin is introduced and value conservation remains exact.
 - **Statement table** (`src/statement.rs`): a custom non-primitive table
   that exposes the circuit's full public statement as **STARK instance
   public values** — the binding channel the pinned upstream stack lacks for
@@ -91,7 +95,7 @@ call-site discipline.
   implements `opencsv-core`'s `ProofVerifier` trait — **no trait change and
   no `opencsv-core` dependency cycle** (the integration lives in this
   crate). The trait's `proof: &[u8]` blob carries a magic-prefixed,
-  version-3 postcard envelope of `(mode, full statement, batch-STARK proof)`
+  versioned postcard envelope of `(mode, full statement, batch-STARK proof)`
   (`encode_coin_proof`); the
   adapter decodes it, checks the statement *projects* onto the driver's
   reconstructed public input
@@ -102,8 +106,11 @@ call-site discipline.
   native batch-STARK verification). The full statement must ride in the
   proof bytes because anchors carry only truncated digests and openings do
   not carry nullifiers — this is sound because the statement-table values
-  are transcript-bound. `vk` must equal the frozen v3 profile tag
-  `opencsv-pcd-coin-v3-fri94`; legacy or foreign tags fail before decoding.
+  are transcript-bound. `vk` must equal the v4 verifier-set tag
+  `opencsv-pcd-coin-v4-with-v3-fri94`; foreign tags fail before decoding.
+  Version 4 is emitted for every new proof. Authenticated version-3 proofs are
+  accepted only for migration/root verification and as recursive
+  predecessors; versions 1/2 are inspectable but cannot verify.
   Recursive predecessor keys are pinned inside every transfer/redeem
   circuit. Registering the exact self-described *root-circuit commitments*
   remains a separate trust-distribution boundary (below). The proof lineage
@@ -114,7 +121,8 @@ call-site discipline.
   double-spend rejected by nullifier first-occurrence → redeem → anchor →
   `audit::supply` = mint − redeem at every height.
 - **Benchmarks**: `tests/bench.rs` (`#[ignore]`d) measures prove/verify/
-  proof-size for mint, transfer, 2-hop transfer, redeem — see
+  proof-size for mint, transfer, 2-hop transfer, redeem; `tests/node.rs`
+  carries the v4 one-input release receipt — see
   `BENCHMARKS.md`.
 
 ## Stage-3 architecture notes
@@ -143,16 +151,19 @@ point after a few recursion depths).
  nf_2(8) | out_1(8) | out_2(8)]
 ```
 
-All current proofs have transcript-bound `version = 3`. Mints: `mode = 1`,
-nullifiers zero. Transfers: `mode = 0`, `V` and
-`mint_commit` zero. Redeems (stage 4): `mode = 2`, `V` = burned value,
+New proofs have transcript-bound `version = 4`; authenticated version-3
+proofs retain their original bound version and are never relabeled. Mints:
+`mode = 1`, nullifiers zero. Transfers: `mode = 0`, `V` and
+`mint_commit` zero. Two-input transfers use both nullifier slots; one-input
+v4 transfers constrain `nf_2 = 0`. Redeems (stage 4): `mode = 2`, `V` = burned value,
 `nf_1` the coin's nullifier, `mint_commit` / `nf_2` / outputs zero. The
 statement elements are *computed* in-circuit (hash
 outputs / selected values), so they are pinned to the witness by the
 circuit's own constraints; the statement table then binds them into the
 proof (see below).
 
-**STARK config.** Proof lineage v3 freezes `CoinFriParams::production()`:
+**STARK config.** Authenticated proof lineages v3 and v4 use the frozen
+`CoinFriParams::production()` profile:
 `log_blowup = 3` (8× LDE), maximum folding arity 4,
 `log_final_poly_len = 2`, 64 queries, 16 commit-grinding bits per FRI round,
 and 16 query-grinding bits. The lookup-expanded batch shapes contain at most

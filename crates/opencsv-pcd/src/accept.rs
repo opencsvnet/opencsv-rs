@@ -60,10 +60,10 @@ const OPENING_BYTES: usize = 104;
 /// Unambiguous prefix for versioned coin-proof envelopes.
 const PROOF_ENVELOPE_MAGIC: &[u8; 7] = b"OCSVPCD";
 
-/// Version-3 serialized form of a [`CoinProof`] after the magic/version
+/// Versioned serialized form of a [`CoinProof`] after the magic/version
 /// prefix: the mode and full statement, plus the postcard-serialized proof.
 #[derive(Serialize, Deserialize)]
-struct ProofEnvelopeV3 {
+struct ProofEnvelope {
     mode: NodeMode,
     statement: NodeStatement,
     proof: Vec<u8>,
@@ -86,7 +86,7 @@ pub fn encode_coin_proof(proof: &CoinProof) -> Vec<u8> {
         "only the current authenticated proof lineage may be encoded"
     );
     let inner = postcard::to_allocvec(&proof.proof).expect("batch-STARK proof serializes");
-    let payload = postcard::to_allocvec(&ProofEnvelopeV3 {
+    let payload = postcard::to_allocvec(&ProofEnvelope {
         mode: proof.mode,
         statement: proof.statement.clone(),
         proof: inner,
@@ -108,7 +108,7 @@ pub fn encode_coin_proof(proof: &CoinProof) -> Vec<u8> {
 pub fn decode_coin_proof(bytes: &[u8]) -> Option<CoinProof> {
     if let Some(payload) = bytes.strip_prefix(PROOF_ENVELOPE_MAGIC) {
         let (&version, payload) = payload.split_first()?;
-        let envelope: ProofEnvelopeV3 = postcard::from_bytes(payload).ok()?;
+        let envelope: ProofEnvelope = postcard::from_bytes(payload).ok()?;
         let proof = postcard::from_bytes(&envelope.proof).ok()?;
         return Some(CoinProof {
             version,

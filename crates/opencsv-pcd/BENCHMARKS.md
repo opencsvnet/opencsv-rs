@@ -4,6 +4,15 @@ This is the D2 receipt for proof lineage v3. It freezes the FRI profile,
 states the security-accounting assumptions, and records cold/warm release
 measurements without relabeling the older test-grade results.
 
+Proof lineage v4 keeps these FRI parameters and adds the one-input recursive
+shape. Its first cold debug correctness receipt was 508.26 s for mint →
+one-input transfer → root verification; that number is intentionally not
+mixed into the release table below. The cold/warm release receipt is recorded
+in its own v4 table; a physical-device run is still required before the v4
+shape is described as production-performant.
+The separate migration receipt—v3 mint root verification → v4 one-input
+recursive transfer → v4 root verification—completed in 507.92 s cold debug.
+
 Reproduce the desktop table with:
 
 ```sh
@@ -34,10 +43,11 @@ Profile ID:
 | table packing | 1 public lane, 3 ALU lanes, 4-step Horner packing |
 
 `CoinFriParams::testing()` remains available only to the isolated recursion
-feasibility spike. Public proving, recursive verification, statement version,
-envelope version, and the accept-driver profile tag all use v3. A v1/v2
-envelope remains parseable for migration inspection but cannot verify or act
-as a recursive predecessor.
+feasibility spike. Public proving now emits v4 statements and envelopes under
+the explicit `opencsv-pcd-coin-v4-with-v3-fri94` verifier-set tag.
+Authenticated v3 proofs remain valid roots and recursive predecessors without
+relabeling. A v1/v2 envelope remains parseable for migration inspection but
+cannot verify or act as a recursive predecessor.
 
 ## Security accounting
 
@@ -54,9 +64,9 @@ OpenCSV uses conservative inputs:
 
 - 123 challenge-field bits rather than rounding the quartic field up to 124;
 - 128-bit Poseidon2 commitment collision target;
-- 1,024 total constraints and maximum degree 3, while the lookup-expanded
-  current circuits measure 699 constraints for mint and 707 for
-  transfer/redeem, all at maximum degree 3;
+- 1,024 total constraints and maximum degree 3; the v3 lookup-expanded
+  circuits measured 699 constraints for mint and 707 for transfer/redeem,
+  while v4 setup applies the same fail-closed cap;
 - `max_combo = 2` for local/next openings;
 - the minimum proven result across every actual batch-instance trace;
 - a 2-bit union margin for the calculator's four components (ALI, DEEP, FRI
@@ -76,8 +86,9 @@ Both setup and verification fail closed:
   degree 3;
 - verification recomputes the receipt from proof-carried trace degrees and
   rejects below 94 adjusted bits;
-- the v3 envelope and statement element prevent a v2 proof from being silently
-  interpreted under the new parameters.
+- the v4 envelope/statement boundary prevents a v3 proof from being
+  relabeled, while authenticated v3 is accepted explicitly and v1/v2 remain
+  non-verifying.
 
 This is concrete parameter accounting, not a substitute for an independent
 cryptographic review of Plonky3, Poseidon2, or the batch-composition model.
@@ -104,6 +115,23 @@ The D1 setup cache saves 15–22% on the warm rows in this run. Proof size and
 native verification remain history-independent, but predecessor shape changes
 the root circuit enough that the two transfer rows have different sizes and
 costs.
+
+## V4 one-input desktop receipt — 2026-08-05
+
+Same Apple M4 host and release profile. This is one cold process run of the
+exact `one_input_transfer_spending_mint_output_verifies` test; it includes a
+real predecessor mint, in-circuit predecessor verification, root verification,
+and the runtime security check.
+
+| circuit | prove | verify | proof size | proven | adjusted | degree bits |
+|---|---:|---:|---:|---:|---:|---|
+| predecessor mint | 184.10 ms | — | — | — | — | — |
+| v4 one-input / mint predecessor (cold) | 5.809 s | 19.41 ms | 788,068 B | 101 | 96 | `[8,9,16,15,15,6,6]` |
+| v4 one-input / mint predecessor (warm) | 4.803 s | 20.38 ms | 788,068 B | 101 | 96 | `[8,9,16,15,15,6,6]` |
+
+The separate cold-debug v3→v4 migration test verifies a bound v3 mint root,
+consumes it inside the v4 one-input circuit, and verifies the v4 root. An
+outer-byte v3→v4 relabel is rejected with `StatementMismatch`.
 
 ## D2 on-device impact
 

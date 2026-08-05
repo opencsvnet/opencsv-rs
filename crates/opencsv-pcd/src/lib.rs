@@ -38,9 +38,9 @@
 //!
 //! ## Stage 3: PCD recursion (paper §4.5 item 4)
 //!
-//! Real proof-carrying data: the **node (transfer) circuit** verifies two
-//! predecessor proofs *in-circuit* (genuine batch-STARK verification via
-//! `p3-recursion`), and a dedicated **statement table** exposes every
+//! Real proof-carrying data: transfer circuits verify either one (v4
+//! forwarding) or two predecessor proofs *in-circuit* (genuine batch-STARK
+//! verification via `p3-recursion`), and a dedicated **statement table** exposes every
 //! circuit's public statement as STARK instance public values, which the
 //! successor `connect`s to its own recomputed input commitments — this is
 //! what chains the PCD and binds predecessor public data. See the `node`
@@ -48,7 +48,8 @@
 //! transfer node), and the `statement` module docs for the binding channel.
 //!
 //! - Genesis: [`prove_genesis_mint`].
-//! - Recursive transfer: [`prove_coin_transfer`].
+//! - Two-input recursive transfer: [`prove_coin_transfer`].
+//! - One-input recursive transfer: [`prove_one_input_transfer`].
 //! - Root verification: [`verify_coin_proof`] (checks the bound statement
 //!   values, then natively verifies the proof).
 //!
@@ -108,9 +109,10 @@ pub use mint::{
 };
 pub use node::prove_transfer as prove_coin_transfer;
 pub use node::{
-    coin_fri_params, prove_genesis_mint, prove_genesis_mint_raw, prove_redeem, verify_coin_proof,
-    verify_redeem, CoinProof, NodeError, NodeMode, NodeStatement, RedeemProof, COIN_PROOF_VERSION,
-    NODE_INPUTS, NODE_OUTPUTS, NODE_PRIVATE_ELEMS, REDEEM_PRIVATE_ELEMS, STATEMENT_ELEMS,
+    coin_fri_params, prove_genesis_mint, prove_genesis_mint_raw, prove_one_input_transfer,
+    prove_redeem, verify_coin_proof, verify_redeem, CoinProof, NodeError, NodeMode, NodeStatement,
+    RedeemProof, COIN_PROOF_VERSION, LEGACY_COIN_PROOF_VERSION, NODE_INPUTS, NODE_OUTPUTS,
+    NODE_PRIVATE_ELEMS, ONE_INPUT_PRIVATE_ELEMS, REDEEM_PRIVATE_ELEMS, STATEMENT_ELEMS,
 };
 pub use opening::{
     prove_opening, prove_opening_raw, verify_opening, CoinWitness, OpeningError, OpeningProof,
@@ -118,7 +120,7 @@ pub use opening::{
 };
 pub use security::{
     proof_security_report, ProofSecurityReport, COIN_PROOF_PROFILE_ID, COIN_VK_TAG,
-    PRODUCTION_SECURITY_TARGET_BITS,
+    LEGACY_COIN_PROOF_PROFILE_ID, PRODUCTION_SECURITY_TARGET_BITS,
 };
 pub use transfer::{
     prove_transfer, verify_transfer, TransferError, TransferProof, TransferStatement,
