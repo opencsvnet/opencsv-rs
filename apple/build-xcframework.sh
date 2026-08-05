@@ -44,9 +44,16 @@ for target in aarch64-apple-ios aarch64-apple-ios-sim x86_64-apple-ios; do
     # Adding an already-installed target is a no-op, so this is safe to
     # run unconditionally (a fresh `pod install` machine will need it).
     rustup target add "$target" >/dev/null 2>&1 || true
-    echo ">> cargo build --release --target $target -p opencsv-ffi"
-    cargo build --release --target "$target" -p opencsv-ffi \
-        --manifest-path "$repo_root/Cargo.toml"
+    if [ "${OPENCSV_TEST_WALLET_RECOVERY:-0}" = "1" ]; then
+        echo ">> cargo build --release --target $target -p opencsv-ffi --features test-wallet-recovery"
+        cargo build --release --target "$target" -p opencsv-ffi \
+            --features test-wallet-recovery \
+            --manifest-path "$repo_root/Cargo.toml"
+    else
+        echo ">> cargo build --release --target $target -p opencsv-ffi"
+        cargo build --release --target "$target" -p opencsv-ffi \
+            --manifest-path "$repo_root/Cargo.toml"
+    fi
 done
 
 # Universal simulator slice (arm64 + x86_64), as Xcode's generic simulator
@@ -63,5 +70,13 @@ xcodebuild -create-xcframework \
     -library "$repo_root/target/aarch64-apple-ios/release/$lib" -headers "$headers" \
     -library "$sim_universal/$lib" -headers "$headers" \
     -output "$out_dir/OpenCsv.xcframework"
+
+if [ -n "${OPENCSV_BUILD_SOURCE_ID:-}" ]; then
+    printf '%s\n' "$OPENCSV_BUILD_SOURCE_ID" > "$out_dir/OpenCsv.xcframework.build-mode"
+elif [ "${OPENCSV_TEST_WALLET_RECOVERY:-0}" = "1" ]; then
+    printf '%s\n' test-wallet-recovery > "$out_dir/OpenCsv.xcframework.build-mode"
+else
+    printf '%s\n' default > "$out_dir/OpenCsv.xcframework.build-mode"
+fi
 
 echo ">> $out_dir/OpenCsv.xcframework"

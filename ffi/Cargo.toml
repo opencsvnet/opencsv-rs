@@ -10,6 +10,9 @@ crate-type = ["staticlib", "rlib"]
 
 [features]
 default = []
+# DEBUG-only simulator/device recovery facility. Production Signal builds do
+# not enable this feature, so the rebind C symbol is absent from their binary.
+test-wallet-recovery = []
 # Privileged issuer/reference tooling. Signal's CocoaPods build does not enable
 # this feature, and the C ABI intentionally exposes no corresponding symbols.
 issuer-tools = ["dep:clap"]

@@ -40,14 +40,22 @@ Pod::Spec.new do |s|
 
   s.prepare_command = <<~CMD
     set -euo pipefail
-    if [ -d OpenCsv.xcframework ]; then
-      echo "OpenCsv.xcframework already present; skipping build"
+    requested_mode=default
+    if [ "${OPENCSV_TEST_WALLET_RECOVERY:-0}" = "1" ]; then
+      requested_mode=test-wallet-recovery
+    fi
+    source_revision=$(git rev-parse HEAD 2>/dev/null || printf unknown)
+    source_diff=$(git diff --no-ext-diff --binary 2>/dev/null | shasum -a 256 | awk '{print $1}')
+    requested_build="$requested_mode:$source_revision:$source_diff"
+    if [ -d OpenCsv.xcframework ] && [ -f OpenCsv.xcframework.build-mode ] && \
+       [ "$(cat OpenCsv.xcframework.build-mode)" = "$requested_build" ]; then
+      echo "OpenCsv.xcframework already present for this $requested_mode source; skipping build"
       exit 0
     fi
     command -v cargo >/dev/null 2>&1 || {
       echo "error: OpenCsv builds from source and needs a Rust toolchain (https://rustup.rs)" >&2
       exit 1
     }
-    sh apple/build-xcframework.sh .
+    OPENCSV_BUILD_SOURCE_ID="$requested_build" sh apple/build-xcframework.sh .
   CMD
 end

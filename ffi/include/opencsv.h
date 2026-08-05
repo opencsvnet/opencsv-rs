@@ -47,15 +47,41 @@ char *opencsv_account_set_backup_state(uint64_t handle, bool verified,
 char *opencsv_account_checkpoint(uint64_t handle);
 char *opencsv_account_restore_checkpoint(uint64_t handle,
                                          const char *checkpoint_json);
+#if defined(OPENCSV_TEST_WALLET_RECOVERY)
+/* Present only in DEBUG signet/regtest builds compiled with the Rust
+ * test-wallet-recovery feature. The caller supplies a fresh 32-byte
+ * ThisDeviceOnly binding; no account root crosses this boundary. */
+char *opencsv_account_rebind_test_device(
+    uint64_t handle,
+    const uint8_t *device_binding_key,
+    size_t device_binding_key_len);
+#endif
 char *opencsv_account_verify_consignment(uint64_t handle,
                                          const uint8_t *blob,
                                          size_t blob_len,
                                          const char *snapshot_json);
+char *opencsv_account_inspect_consignment(uint64_t handle,
+                                          const uint8_t *blob,
+                                          size_t blob_len);
 char *opencsv_account_verify_consignment_unconfirmed(
     uint64_t handle,
     const uint8_t *blob,
     size_t blob_len,
     const char *snapshot_json);
+char *opencsv_account_verify_consignment_unconfirmed_observed(
+    uint64_t handle,
+    const uint8_t *blob,
+    size_t blob_len,
+    const char *snapshot_json,
+    const uint8_t *raw_transaction,
+    size_t raw_transaction_len,
+    const char *observations_json);
+char *opencsv_operation_observe_unconfirmed(
+    uint64_t handle,
+    const char *operation_id,
+    const uint8_t *raw_transaction,
+    size_t raw_transaction_len,
+    const char *observations_json);
 char *opencsv_account_scan_verify(uint64_t handle,
                                   const char *consignment_hex);
 char *opencsv_account_cross_check(uint64_t handle,
@@ -77,6 +103,8 @@ char *opencsv_operation_sign_and_broadcast(uint64_t handle,
                                            const char *operation_id,
                                            const char *fee_policy_json);
 char *opencsv_operation_status(uint64_t handle, const char *operation_id);
+char *opencsv_operation_refresh_spv(uint64_t handle,
+                                    const char *operation_id);
 char *opencsv_operation_resume(uint64_t handle, const char *operation_id);
 char *opencsv_operation_cancel(uint64_t handle, const char *operation_id);
 char *opencsv_fee_bump(uint64_t handle, const char *operation_id,

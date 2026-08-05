@@ -1,5 +1,8 @@
 /target
 /formal/.lake
 /apple/OpenCsv.xcframework
+/apple/OpenCsv.xcframework.build-mode
+/OpenCsv.xcframework
+/OpenCsv.xcframework.build-mode
 /apple/OpenCsvBench.xcodeproj
 /dist

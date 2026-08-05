@@ -366,4 +366,3 @@ pub fn verify_json<V: ProofVerifier>(
         })),
     }
 }
-

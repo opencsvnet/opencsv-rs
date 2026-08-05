@@ -131,6 +131,99 @@ fn default_max_verification_blocks() -> u64 {
     DEFAULT_MAX_VERIFICATION_BLOCKS
 }
 
+/// Enforcement mode for one independently identified network check.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ObservationMode {
+    /// Do not perform or require this check.
+    Off,
+    /// Record evidence and failures without gating spendability.
+    Observe,
+    /// Fail closed unless valid, exact evidence is supplied.
+    Require,
+}
+
+/// Stable kind of network observation. Cryptographic and transaction-layout
+/// checks are intentionally not represented here because they are mandatory
+/// protocol invariants and can never be disabled by configuration.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ObservationKind {
+    /// Esplora-compatible raw transaction lookup.
+    RawTransactionApi,
+    /// Complete write of the persisted transaction to a Bitcoin peer.
+    DirectP2pRelay,
+    /// Experimental mempool-possession probe; disabled by default.
+    ExperimentalP2pPossession,
+    /// Multi-peer headers, PoW, BIP158, block, and Merkle verification.
+    ConfirmedSpv,
+}
+
+/// One configurable observation policy row.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ObservationCheck {
+    /// Stable receipt identifier.
+    pub id: String,
+    /// Network mechanism used by this check.
+    pub kind: ObservationKind,
+    /// Immutable built-in API endpoint, or a custom endpoint.
+    #[serde(default)]
+    pub endpoint: Option<String>,
+    /// Off, Observe, or Require.
+    pub mode: ObservationMode,
+    /// Built-in or user-defined certificate-chain pin profile.
+    #[serde(default)]
+    pub pin_profile: Option<String>,
+    /// User-supplied SHA-256 DER certificate fingerprints for custom required
+    /// observers. Built-in profiles are compiled into Signal instead.
+    #[serde(default)]
+    pub chain_fingerprints_sha256: Vec<String>,
+    /// Maximum age of cached evidence when this check gates acceptance.
+    #[serde(default = "default_observation_max_age_seconds")]
+    pub max_age_seconds: u64,
+}
+
+fn default_observation_max_age_seconds() -> u64 {
+    120
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum ObservationResult {
+    Observed,
+    Submitted,
+    Unavailable,
+    Error,
+    NotChecked,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ObservationEvidence {
+    check_id: String,
+    #[serde(default)]
+    endpoint: Option<String>,
+    result: ObservationResult,
+    started_at_ms: i64,
+    completed_at_ms: i64,
+    cached_at_ms: i64,
+    #[serde(default)]
+    certificate_profile: Option<String>,
+    #[serde(default)]
+    certificate_chain_fingerprints_sha256: Vec<String>,
+    #[serde(default)]
+    raw_transaction_hex: Option<String>,
+    #[serde(default)]
+    detail: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ObservationEvidenceEnvelope {
+    observations: Vec<ObservationEvidence>,
+}
+
 /// One exact issuer-specific USD instrument trusted by the Signal product.
 /// Trust comes from the reviewed app configuration, never from the `USD`
 /// display code alone.
@@ -187,6 +280,10 @@ pub struct AccountConfig {
     /// Maximum parallel Esplora requests.
     #[serde(default = "default_parallel_requests")]
     pub parallel_requests: usize,
+    /// Independently configurable network observations. An omitted list gets
+    /// fail-closed signet defaults for the two built-in API observers.
+    #[serde(default)]
+    pub observation_checks: Vec<ObservationCheck>,
     /// Required for linked devices; public external descriptor.
     #[serde(default)]
     pub watch_external_descriptor: Option<String>,
@@ -451,7 +548,7 @@ struct InstrumentCreateRequest {
     terms: InstrumentTermsV1,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct TransferRequest {
     asset_id: String,
@@ -593,6 +690,13 @@ impl SqlitePersister {
                  created_at INTEGER NOT NULL,
                  PRIMARY KEY(txid, vout),
                  FOREIGN KEY(operation_id) REFERENCES opencsv_operations(operation_id)
+             ) STRICT;
+             CREATE TABLE IF NOT EXISTS opencsv_observation_receipts (
+                 subject_txid TEXT NOT NULL,
+                 check_id TEXT NOT NULL,
+                 receipt_json TEXT NOT NULL,
+                 observed_at INTEGER NOT NULL,
+                 PRIMARY KEY(subject_txid, check_id)
              ) STRICT;",
         )?;
         Ok(())
@@ -615,6 +719,12 @@ impl SqlitePersister {
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
             params![key, value],
         )?;
+        Ok(())
+    }
+
+    fn delete_meta(&self, key: &str) -> Result<(), AccountError> {
+        self.conn
+            .execute("DELETE FROM opencsv_account_meta WHERE key = ?1", [key])?;
         Ok(())
     }
 }
@@ -661,9 +771,106 @@ pub struct AccountWallet {
     #[cfg(any(test, feature = "issuer-tools"))]
     issuer_root: Option<Zeroizing<[u8; 32]>>,
     root_fingerprint: String,
+    #[cfg(feature = "test-wallet-recovery")]
+    account_root_for_test_rebind: Option<Zeroizing<[u8; 32]>>,
     device_binding_commitment: Option<String>,
     device_binding_valid: bool,
     pending_by_operation: HashMap<String, u64>,
+}
+
+/// Result of the short, locked phase that snapshots a durable proof job.
+pub(crate) enum ProofJobStart {
+    /// The operation was already proof-ready.
+    Ready(Value),
+    /// Expensive verification/proving must run outside the account lock.
+    Run(Box<AccountProofJob>),
+}
+
+/// Immutable inputs for one proof job. It owns a cloned protocol snapshot so
+/// recursive proving never holds the account registry or live-wallet lock.
+pub(crate) struct AccountProofJob {
+    operation_id: String,
+    request: TransferRequest,
+    funding: ReservedFunding,
+    verifier: Arc<dyn FundingVerifier>,
+    protocol_snapshot: MemWallet,
+    esplora_url: String,
+}
+
+pub(crate) struct CompletedProofJob {
+    operation_id: String,
+    request: TransferRequest,
+    funding: ReservedFunding,
+    verification: FundingVerificationReceipt,
+    pending_json: String,
+    record: [u8; 64],
+    unconfirmed_dependencies: Vec<String>,
+}
+
+impl AccountProofJob {
+    pub(crate) fn operation_id(&self) -> &str {
+        &self.operation_id
+    }
+
+    pub(crate) fn run(mut self) -> Result<CompletedProofJob, AccountError> {
+        let verification = self.verifier.verify(&FundingVerificationRequest {
+            outpoint: self.funding.outpoint,
+            txout: self.funding.txout.clone(),
+            birth_height: self.funding.birth_height,
+        })?;
+        let ctx = funding_context(self.funding.outpoint);
+        let proved = self
+            .protocol_snapshot
+            .prove_transfer_amount(
+                &self.request.asset_id,
+                &self.request.to_owner,
+                self.request.amount,
+            )
+            .map_err(|error| AccountError::new("unavailable_assets", error))?;
+
+        if !proved.unconfirmed_dependencies.is_empty() {
+            let client = esplora_client::Builder::new(&self.esplora_url).build_blocking();
+            for dependency in &proved.unconfirmed_dependencies {
+                let txid = dependency.parse::<Txid>().map_err(|error| {
+                    AccountError::new(
+                        "database_corrupt",
+                        format!("invalid unconfirmed dependency {dependency}: {error}"),
+                    )
+                })?;
+                match client.get_tx(&txid).map_err(|error| {
+                    AccountError::new(
+                        "unconfirmed_dependency_unavailable",
+                        format!("could not re-observe parent {dependency}: {error}"),
+                    )
+                })? {
+                    Some(transaction) if transaction.compute_txid() == txid => {}
+                    _ => {
+                        return Err(AccountError::new(
+                            "unconfirmed_dependency_changed",
+                            format!("zero-confirmation parent {dependency} disappeared or changed"),
+                        ));
+                    }
+                }
+            }
+        }
+        let record = self
+            .protocol_snapshot
+            .rebind_pending(proved.pending_id, ctx)
+            .map_err(|error| AccountError::new("protocol_layout_violation", error))?;
+        let pending_json = self
+            .protocol_snapshot
+            .export_pending(proved.pending_id)
+            .map_err(|error| AccountError::new("database_error", error))?;
+        Ok(CompletedProofJob {
+            operation_id: self.operation_id,
+            request: self.request,
+            funding: self.funding,
+            verification,
+            pending_json,
+            record,
+            unconfirmed_dependencies: proved.unconfirmed_dependencies,
+        })
+    }
 }
 
 impl AccountWallet {
@@ -674,7 +881,7 @@ impl AccountWallet {
         device_binding_key: &[u8],
         database_path: &str,
     ) -> Result<Self, AccountError> {
-        let config: AccountConfig = serde_json::from_str(config_json).map_err(|error| {
+        let mut config: AccountConfig = serde_json::from_str(config_json).map_err(|error| {
             AccountError::new("invalid_config", format!("config JSON: {error}"))
         })?;
         if config.version != SCHEMA_VERSION {
@@ -685,7 +892,22 @@ impl AccountWallet {
         }
         let network = parse_network(&config.network)?;
         validate_esplora_url(&config.esplora_url)?;
+        if config.observation_checks.is_empty() {
+            config.observation_checks = default_observation_checks(&config.network);
+        }
+        validate_observation_checks(&config)?;
         validate_usd_issuer_policy(&config)?;
+
+        #[cfg(feature = "test-wallet-recovery")]
+        let account_root_for_test_rebind = match config.role {
+            AccountRole::Primary => Some(Zeroizing::new(account_key.try_into().map_err(|_| {
+                AccountError::new(
+                    "invalid_account_key",
+                    "account key must be exactly 32 bytes",
+                )
+            })?)),
+            AccountRole::Linked => None,
+        };
 
         let (
             external,
@@ -891,6 +1113,8 @@ impl AccountWallet {
             #[cfg(any(test, feature = "issuer-tools"))]
             issuer_root,
             root_fingerprint,
+            #[cfg(feature = "test-wallet-recovery")]
+            account_root_for_test_rebind,
             device_binding_commitment,
             device_binding_valid,
             pending_by_operation: HashMap::new(),
@@ -904,6 +1128,162 @@ impl AccountWallet {
         account.restore_fee_reservations()?;
         account.restore_pending_operations()?;
         Ok(account)
+    }
+
+    /// Commit a DEBUG-only signet/regtest device rebind after an exact Secure
+    /// Backup checkpoint has been restored into a clean database.
+    ///
+    /// The database update is one SQLite transaction. Repeating the same
+    /// request after a crash returns the same new checkpoint; presenting a
+    /// different replacement binding is a hard conflict. The rebind itself
+    /// clears `backup_verified`, so Bitcoin-writing operations stay frozen
+    /// until Signal stores the newly returned checkpoint in a fresh backup.
+    #[cfg(feature = "test-wallet-recovery")]
+    pub fn rebind_test_device(&mut self, device_binding_key: &[u8]) -> Result<Value, AccountError> {
+        if self.config.role != AccountRole::Primary {
+            return Err(AccountError::new(
+                "primary_required",
+                "linked devices cannot be rebound",
+            ));
+        }
+        if !matches!(self.config.network.as_str(), "signet" | "regtest") {
+            return Err(AccountError::new(
+                "test_rebind_network_forbidden",
+                "test-device rebind is restricted to signet and regtest",
+            ));
+        }
+        let binding: Zeroizing<[u8; 32]> =
+            Zeroizing::new(device_binding_key.try_into().map_err(|_| {
+                AccountError::new(
+                    "invalid_device_binding",
+                    "test device binding must be exactly 32 bytes",
+                )
+            })?);
+        let root = self.account_root_for_test_rebind.as_ref().ok_or_else(|| {
+            AccountError::new(
+                "primary_required",
+                "test rebind has no primary account root",
+            )
+        })?;
+        let new_commitment = sha256::Hash::hash(
+            &[
+                b"OpenCSV device binding v1".as_slice(),
+                root.as_ref(),
+                binding.as_ref(),
+            ]
+            .concat(),
+        )
+        .to_string();
+
+        if let Some(existing) = self.db.meta("test_rebind_new_commitment")? {
+            if existing != new_commitment {
+                return Err(AccountError::new(
+                    "conflicting_test_rebind",
+                    "this restored wallet was already rebound to another test device",
+                ));
+            }
+            if self.write_enabled()? {
+                return Err(AccountError::new(
+                    "test_rebind_already_write_enabled",
+                    "an existing write-enabled wallet cannot be rebound",
+                ));
+            }
+            self.device_binding_commitment = Some(existing);
+            self.device_binding_valid = true;
+            let checkpoint = self.checkpoint()?;
+            return Ok(json!({
+                "status": "checkpoint_ready",
+                "idempotent": true,
+                "backup_required": !self.backup_verified()?,
+                "write_enabled": self.write_enabled()?,
+                "device_binding_commitment": self.device_binding_commitment,
+                "checkpoint": checkpoint,
+            }));
+        }
+
+        if self.write_enabled()? {
+            return Err(AccountError::new(
+                "test_rebind_already_write_enabled",
+                "an existing write-enabled wallet cannot be rebound",
+            ));
+        }
+        let restored_hash = self.db.meta("restored_checkpoint_hash")?.ok_or_else(|| {
+            AccountError::new(
+                "test_rebind_restore_required",
+                "restore and validate a Secure Backup checkpoint before rebinding",
+            )
+        })?;
+        let current_checkpoint = self.checkpoint()?;
+        let current_hash = current_checkpoint["checkpoint_hash"]
+            .as_str()
+            .ok_or_else(|| AccountError::new("checkpoint_failed", "checkpoint has no hash"))?;
+        if current_hash != restored_hash {
+            return Err(AccountError::new(
+                "test_rebind_checkpoint_modified",
+                "wallet state changed after the restored checkpoint was validated",
+            ));
+        }
+        let old_commitment = self.device_binding_commitment.clone().ok_or_else(|| {
+            AccountError::new(
+                "test_rebind_checkpoint_invalid",
+                "restored checkpoint has no prior device-binding commitment",
+            )
+        })?;
+        if self.device_binding_valid {
+            return Err(AccountError::new(
+                "test_rebind_existing_binding",
+                "wallet is already bound to the current test device",
+            ));
+        }
+
+        let transaction = self
+            .db
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute(
+            "INSERT INTO opencsv_account_meta(key, value) VALUES('test_rebind_old_commitment', ?1)",
+            [&old_commitment],
+        )?;
+        transaction.execute(
+            "INSERT INTO opencsv_account_meta(key, value) VALUES('test_rebind_source_checkpoint_hash', ?1)",
+            [&restored_hash],
+        )?;
+        transaction.execute(
+            "INSERT INTO opencsv_account_meta(key, value) VALUES('test_rebind_new_commitment', ?1)",
+            [&new_commitment],
+        )?;
+        transaction.execute(
+            "INSERT INTO opencsv_account_meta(key, value) VALUES('device_binding_commitment', ?1)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            [&new_commitment],
+        )?;
+        transaction.execute(
+            "INSERT INTO opencsv_account_meta(key, value) VALUES('device_binding_missing_seen', '0')
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            [],
+        )?;
+        transaction.execute(
+            "INSERT INTO opencsv_account_meta(key, value) VALUES('backup_verified', '0')
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            [],
+        )?;
+        transaction.execute(
+            "INSERT INTO opencsv_account_meta(key, value) VALUES('test_rebind_state', 'checkpoint_ready')",
+            [],
+        )?;
+        transaction.commit()?;
+
+        self.device_binding_commitment = Some(new_commitment.clone());
+        self.device_binding_valid = true;
+        let checkpoint = self.checkpoint()?;
+        Ok(json!({
+            "status": "checkpoint_ready",
+            "idempotent": false,
+            "backup_required": true,
+            "write_enabled": false,
+            "device_binding_commitment": new_commitment,
+            "checkpoint": checkpoint,
+        }))
     }
 
     #[cfg(test)]
@@ -997,6 +1377,12 @@ impl AccountWallet {
                 "last_sync_at": self.db.meta("last_sync_at")?,
                 "last_sync_tip": self.db.meta("last_sync_tip")?,
             },
+            "observation_policy": self.config.observation_checks,
+            "observation_receipts": query_json_rows(
+                &self.db.conn,
+                "SELECT receipt_json FROM opencsv_observation_receipts
+                 ORDER BY observed_at DESC, check_id LIMIT 20",
+            )?,
             "root_fingerprint": self.root_fingerprint,
         }))
     }
@@ -1097,6 +1483,20 @@ impl AccountWallet {
         }
     }
 
+    /// Inspect only the canonical public identity and anchor reference of a
+    /// consignment. No crediting, networking, or wallet mutation occurs.
+    pub fn inspect_consignment(&self, blob: &[u8]) -> Result<Value, AccountError> {
+        let (canonical, consignment_id) = canonical_consignment_identity(blob)?;
+        let consignment = Consignment::from_bytes(&canonical)
+            .map_err(|error| AccountError::new("invalid_consignment", error.to_string()))?;
+        Ok(json!({
+            "consignment_id": consignment_id,
+            "anchor_txid": Txid::from_byte_array(consignment.anchor_ref.txid).to_string(),
+            "anchor_height": consignment.anchor_ref.location.height,
+            "anchor_position": consignment.anchor_ref.location.position,
+        }))
+    }
+
     /// Credit a fully proof-verified consignment whose exact anchor
     /// transaction is independently observable through the configured
     /// generic Esplora accelerator but has not met settlement depth yet.
@@ -1107,6 +1507,17 @@ impl AccountWallet {
         blob: &[u8],
         confirmed_snapshot_json: &str,
     ) -> Result<Value, AccountError> {
+        if self
+            .config
+            .observation_checks
+            .iter()
+            .any(|check| check.mode == ObservationMode::Require)
+        {
+            return Err(AccountError::new(
+                "observation_evidence_required",
+                "required observer policy needs pinned host evidence and exact raw transaction bytes",
+            ));
+        }
         let (canonical_blob, consignment_id) = canonical_consignment_identity(blob)?;
         let consignment = Consignment::from_bytes(&canonical_blob)
             .map_err(|error| AccountError::new("invalid_consignment", error.to_string()))?;
@@ -1201,6 +1612,360 @@ impl AccountWallet {
                 "reason": reason,
             })),
         }
+    }
+
+    /// Credit an unconfirmed consignment using exact raw transaction bytes and
+    /// per-check evidence fetched by Signal's pinned `OWSURLSession` client.
+    /// Rust treats every host field as untrusted: it recomputes the txid,
+    /// validates the complete transaction layout/context, compares each
+    /// provider's raw bytes, enforces the stored Off/Observe/Require policy,
+    /// and durably stores normalized receipts.
+    pub fn verify_consignment_unconfirmed_observed(
+        &mut self,
+        blob: &[u8],
+        confirmed_snapshot_json: &str,
+        raw_transaction: &[u8],
+        observations_json: &str,
+    ) -> Result<Value, AccountError> {
+        let (canonical_blob, consignment_id) = canonical_consignment_identity(blob)?;
+        let consignment = Consignment::from_bytes(&canonical_blob)
+            .map_err(|error| AccountError::new("invalid_consignment", error.to_string()))?;
+        let anchor_txid = Txid::from_byte_array(consignment.anchor_ref.txid);
+        let transaction: Transaction = deserialize(raw_transaction).map_err(|error| {
+            AccountError::new(
+                "invalid_observation_transaction",
+                format!("raw transaction: {error}"),
+            )
+        })?;
+        if transaction.compute_txid() != anchor_txid {
+            return Err(AccountError::new(
+                "unconfirmed_anchor_mismatch",
+                format!(
+                    "raw transaction computes to {}, expected {anchor_txid}",
+                    transaction.compute_txid()
+                ),
+            ));
+        }
+        let (receipts, policy_failure) = evaluate_observation_evidence(
+            &self.config.observation_checks,
+            raw_transaction,
+            observations_json,
+        )?;
+        self.persist_observation_receipts(&anchor_txid.to_string(), &receipts)?;
+        if let Some(error) = policy_failure {
+            self.freeze_unconfirmed_dependency(&anchor_txid.to_string(), &error.message)?;
+            return Err(error);
+        }
+        self.enforce_unconfirmed_non_host_policy(&anchor_txid.to_string(), false)?;
+
+        let provisional_snapshot =
+            snapshot_with_unconfirmed_anchor(confirmed_snapshot_json, &consignment, &transaction)?;
+        let provisional_snapshot_json = serde_json::to_string(&provisional_snapshot)
+            .map_err(|error| AccountError::new("invalid_chain_view", error.to_string()))?;
+        let chain = SnapshotChain::from_snapshot(&provisional_snapshot)
+            .map_err(|error| AccountError::new("invalid_chain_view", error))?;
+        let verdict = self
+            .primary_protocol_mut()?
+            .verify_unconfirmed(&canonical_blob, &chain, &anchor_txid.to_string())
+            .map_err(|error| AccountError::new("invalid_consignment", error))?;
+        match verdict {
+            Ok(verified) => {
+                let now = unix_time()?;
+                let db_tx = self
+                    .db
+                    .conn
+                    .transaction_with_behavior(TransactionBehavior::Immediate)?;
+                db_tx.execute(
+                    "INSERT INTO opencsv_consignments(
+                         consignment_id, consignment_base64, spent_state_json, created_at
+                     ) VALUES(?1, ?2, '{}', ?3)
+                     ON CONFLICT(consignment_id) DO UPDATE SET
+                         consignment_base64 = excluded.consignment_base64",
+                    params![
+                        consignment_id,
+                        base64::engine::general_purpose::STANDARD.encode(&canonical_blob),
+                        now,
+                    ],
+                )?;
+                db_tx.execute(
+                    "INSERT INTO opencsv_consignment_snapshots(consignment_id, snapshot_json)
+                     VALUES(?1, ?2)
+                     ON CONFLICT(consignment_id) DO UPDATE SET
+                         snapshot_json = excluded.snapshot_json",
+                    params![consignment_id, provisional_snapshot_json],
+                )?;
+                db_tx.execute(
+                    "INSERT INTO opencsv_consignment_finality(
+                         consignment_id, anchor_txid, finality, observed_at,
+                         last_checked_at, last_error
+                     ) VALUES(?1, ?2, 'unconfirmed', ?3, ?3, NULL)
+                     ON CONFLICT(consignment_id) DO UPDATE SET
+                         anchor_txid = excluded.anchor_txid,
+                         finality = CASE
+                             WHEN opencsv_consignment_finality.finality = 'settled' THEN 'settled'
+                             ELSE 'unconfirmed'
+                         END,
+                         last_checked_at = excluded.last_checked_at,
+                         last_error = NULL",
+                    params![consignment_id, anchor_txid.to_string(), now],
+                )?;
+                db_tx.commit()?;
+                Ok(json!({
+                    "status": "verified",
+                    "finality": "unconfirmed",
+                    "spendable": true,
+                    "risk": "zero_confirmation_replacement_or_conflict",
+                    "consignment_id": consignment_id,
+                    "credits": verified.credits,
+                    "coins": verified.coins,
+                    "anchor": {
+                        "height": verified.height,
+                        "position": verified.position,
+                    },
+                    "anchor_txid": anchor_txid.to_string(),
+                    "observations": receipts,
+                }))
+            }
+            Err(reason) => Ok(json!({
+                "status": "rejected",
+                "finality": "unconfirmed",
+                "spendable": false,
+                "consignment_id": consignment_id,
+                "reason": reason,
+                "observations": receipts,
+            })),
+        }
+    }
+
+    /// Record independent pinned visibility for this wallet's exact signed
+    /// transaction. Direct peer writes remain submission receipts only; this
+    /// is the transition that may make a transaction mempool-observed and
+    /// release its consignment for Signal delivery.
+    pub fn observe_operation_unconfirmed(
+        &mut self,
+        operation_id: &str,
+        raw_transaction: &[u8],
+        observations_json: &str,
+    ) -> Result<Value, AccountError> {
+        let operation = self.operation(operation_id)?;
+        if !matches!(
+            operation.state.as_str(),
+            "signed_persisted" | "broadcast_unobserved" | "mempool"
+        ) {
+            return Err(AccountError::new(
+                "invalid_operation_state",
+                format!("operation is {}", operation.state),
+            ));
+        }
+        let signed_hex = operation.signed_tx_hex.as_deref().ok_or_else(|| {
+            AccountError::new(
+                "database_corrupt",
+                "signed operation has no transaction bytes",
+            )
+        })?;
+        let signed_bytes = hex_decode(signed_hex, "signed transaction")?;
+        if signed_bytes != raw_transaction {
+            return Err(AccountError::new(
+                "raw_transaction_mismatch",
+                "observer bytes do not equal the exact persisted signed transaction",
+            ));
+        }
+        let transaction: Transaction = deserialize(raw_transaction).map_err(|error| {
+            AccountError::new(
+                "invalid_observation_transaction",
+                format!("raw transaction: {error}"),
+            )
+        })?;
+        let txid = transaction.compute_txid();
+        let txid_string = txid.to_string();
+        if operation.txid.as_deref() != Some(txid_string.as_str()) {
+            return Err(AccountError::new(
+                "raw_transaction_mismatch",
+                "observer transaction id differs from the signed operation",
+            ));
+        }
+        let (receipts, policy_failure) = evaluate_observation_evidence(
+            &self.config.observation_checks,
+            raw_transaction,
+            observations_json,
+        )?;
+        self.persist_observation_receipts(&txid_string, &receipts)?;
+        if let Some(error) = policy_failure {
+            return Err(error);
+        }
+        self.enforce_unconfirmed_non_host_policy(&txid_string, true)?;
+        let independently_visible = receipts.iter().any(|receipt| {
+            receipt["kind"] == json!(ObservationKind::RawTransactionApi)
+                && receipt["result"] == json!(ObservationResult::Observed)
+                && receipt["raw_byte_match"] == true
+        });
+        if !independently_visible {
+            return Err(AccountError::new(
+                "mempool_observation_failed",
+                "no enabled independent observer returned the exact signed transaction",
+            ));
+        }
+        if operation.state != OperationState::Mempool.as_str() {
+            self.finalize_observed_operation(operation_id, txid)?;
+        }
+        let mut value = operation_json(&self.operation(operation_id)?)?;
+        if let Some(object) = value.as_object_mut() {
+            object.insert("observations".into(), json!(receipts));
+            object.insert("confirmed".into(), json!(false));
+            object.insert("observed_via".into(), json!("pinned_raw_transaction_apis"));
+        }
+        Ok(value)
+    }
+
+    fn enforce_unconfirmed_non_host_policy(
+        &self,
+        subject_txid: &str,
+        locally_relayed: bool,
+    ) -> Result<(), AccountError> {
+        for check in self
+            .config
+            .observation_checks
+            .iter()
+            .filter(|check| check.mode == ObservationMode::Require)
+        {
+            match check.kind {
+                ObservationKind::RawTransactionApi => {}
+                ObservationKind::DirectP2pRelay if !locally_relayed => {
+                    // A receiver cannot prove how the sender submitted the
+                    // transaction. The receiver's independent raw-byte checks
+                    // remain the acceptance gate.
+                }
+                ObservationKind::DirectP2pRelay => {
+                    let receipt: Option<String> = self
+                        .db
+                        .conn
+                        .query_row(
+                            "SELECT receipt_json FROM opencsv_observation_receipts
+                             WHERE subject_txid = ?1 AND check_id = ?2",
+                            params![subject_txid, check.id],
+                            |row| row.get(0),
+                        )
+                        .optional()?;
+                    let passed = receipt
+                        .as_deref()
+                        .and_then(|encoded| serde_json::from_str::<Value>(encoded).ok())
+                        .is_some_and(|receipt| {
+                            receipt["result"] == json!(ObservationResult::Submitted)
+                                && receipt["failures"].as_array().is_some_and(Vec::is_empty)
+                        });
+                    if !passed {
+                        return Err(AccountError::new(
+                            "required_observation_failed",
+                            format!("required direct relay check {} did not pass", check.id),
+                        ));
+                    }
+                }
+                ObservationKind::ExperimentalP2pPossession => {
+                    return Err(AccountError::new(
+                        "required_observation_failed",
+                        format!(
+                            "required experimental check {} has no valid receipt",
+                            check.id
+                        ),
+                    ));
+                }
+                ObservationKind::ConfirmedSpv => {
+                    return Err(AccountError::new(
+                        "confirmation_required",
+                        format!("{} requires SPV confirmation before acceptance", check.id),
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn persist_observation_receipts(
+        &self,
+        subject_txid: &str,
+        receipts: &[Value],
+    ) -> Result<(), AccountError> {
+        let observed_at = unix_time()?;
+        for receipt in receipts {
+            let check_id = receipt["check_id"].as_str().ok_or_else(|| {
+                AccountError::new("invalid_observation_evidence", "receipt has no check id")
+            })?;
+            self.db.conn.execute(
+                "INSERT INTO opencsv_observation_receipts(
+                     subject_txid, check_id, receipt_json, observed_at
+                 ) VALUES(?1, ?2, ?3, ?4)
+                 ON CONFLICT(subject_txid, check_id) DO UPDATE SET
+                     receipt_json = excluded.receipt_json,
+                     observed_at = excluded.observed_at",
+                params![subject_txid, check_id, receipt.to_string(), observed_at],
+            )?;
+        }
+        Ok(())
+    }
+
+    fn submit_direct_p2p(
+        &self,
+        transaction: &Transaction,
+    ) -> Result<(usize, Vec<Value>), AccountError> {
+        let check = self
+            .config
+            .observation_checks
+            .iter()
+            .find(|check| check.kind == ObservationKind::DirectP2pRelay);
+        if check.is_some_and(|check| check.mode == ObservationMode::Off) {
+            return Ok((0, Vec::new()));
+        }
+        let relay = relay_transaction(
+            self.bitcoin.network(),
+            &self.config.peers,
+            transaction,
+            Duration::from_secs(8),
+        );
+        let submitted = relay.submitted_count();
+        let peers: Vec<Value> = relay
+            .peers
+            .iter()
+            .map(|peer| {
+                json!({
+                    "peer": peer.peer,
+                    "submitted": peer.submitted,
+                    "error": peer.error,
+                })
+            })
+            .collect();
+        if let Some(check) = check.filter(|check| check.mode != ObservationMode::Off) {
+            let now_ms = unix_time_millis()?;
+            let failures = if submitted == 0 {
+                vec!["no peer completed a transaction write"]
+            } else {
+                Vec::new()
+            };
+            self.persist_observation_receipts(
+                &transaction.compute_txid().to_string(),
+                &[json!({
+                    "check_id": check.id,
+                    "kind": check.kind,
+                    "mode": check.mode,
+                    "endpoint": Value::Null,
+                    "result": if submitted > 0 {
+                        ObservationResult::Submitted
+                    } else {
+                        ObservationResult::Unavailable
+                    },
+                    "started_at_ms": now_ms,
+                    "completed_at_ms": now_ms,
+                    "latency_ms": 0,
+                    "cached_at_ms": now_ms,
+                    "cache_age_ms": 0,
+                    "certificate_profile": Value::Null,
+                    "certificate_chain_fingerprints_sha256": [],
+                    "raw_byte_match": false,
+                    "detail": format!("{} of {} peers accepted a complete socket write", submitted, peers.len()),
+                    "failures": failures,
+                })],
+            )?;
+        }
+        Ok((submitted, peers))
     }
 
     /// Read-only self-scan verdict using this account's owner and asset set.
@@ -1410,6 +2175,21 @@ impl AccountWallet {
     /// transition is crash-resumable from both `planned` and `fee_reserved`;
     /// a repeated call after `proof_ready` returns the exact stored receipt.
     pub fn prove_operation(&mut self, operation_id: &str) -> Result<Value, AccountError> {
+        match self.begin_proof_job(operation_id)? {
+            ProofJobStart::Ready(receipt) => Ok(receipt),
+            ProofJobStart::Run(job) => match job.run() {
+                Ok(completed) => self.finish_proof_job(completed),
+                Err(error) => self.fail_proof_job(operation_id, error),
+            },
+        }
+    }
+
+    /// Snapshot and durably reserve one proof job while holding the live
+    /// wallet lock for only the short state-transition phase.
+    pub(crate) fn begin_proof_job(
+        &mut self,
+        operation_id: &str,
+    ) -> Result<ProofJobStart, AccountError> {
         self.require_write_enabled()?;
         let operation = self.operation(operation_id)?;
         if operation.kind != "transfer" {
@@ -1419,7 +2199,17 @@ impl AccountWallet {
             ));
         }
         if operation.state == OperationState::ProofReady.as_str() {
-            return self.prepared_operation_receipt(&operation);
+            return Ok(ProofJobStart::Ready(
+                self.prepared_operation_receipt(&operation)?,
+            ));
+        }
+        if let Some(active) = self.db.meta("active_proof_operation")? {
+            if active != operation_id {
+                return Err(AccountError::new(
+                    "proof_job_busy",
+                    format!("another proof job is active for operation {active}"),
+                ));
+            }
         }
         let funding = match operation.state.as_str() {
             "planned" => match self.reserve_fee_utxo(operation_id) {
@@ -1440,13 +2230,6 @@ impl AccountWallet {
                 ));
             }
         };
-        let verification = match self.verify_funding(&funding) {
-            Ok(receipt) => receipt,
-            Err(error) => {
-                self.reject_prebroadcast_operation(operation_id, error.code)?;
-                return Err(error);
-            }
-        };
         let request: TransferRequest = match serde_json::from_str(&operation.request_json) {
             Ok(request) => request,
             Err(error) => {
@@ -1456,68 +2239,159 @@ impl AccountWallet {
                 );
             }
         };
-        let ctx = funding_context(funding.outpoint);
-        let proved = {
-            let protocol = match self.primary_protocol_mut() {
-                Ok(protocol) => protocol,
-                Err(error) => return self.fail_prebroadcast(operation_id, error),
-            };
-            match protocol.prove_transfer_amount(
-                &request.asset_id,
-                &request.to_owner,
-                request.amount,
-            ) {
-                Ok(proved) => proved,
-                Err(error) => {
-                    return self.fail_prebroadcast(
-                        operation_id,
-                        AccountError::new("unavailable_assets", error),
-                    );
-                }
-            }
-        };
-        if let Err(error) =
-            self.reobserve_unconfirmed_dependencies(&proved.unconfirmed_dependencies)
+        let protocol_snapshot = self.protocol.as_ref().cloned().ok_or_else(|| {
+            AccountError::new("primary_required", "linked devices cannot prove transfers")
+        })?;
+        self.db.set_meta("active_proof_operation", operation_id)?;
+        Ok(ProofJobStart::Run(Box::new(AccountProofJob {
+            operation_id: operation_id.to_owned(),
+            request,
+            funding,
+            verifier: self.funding_verifier.clone(),
+            protocol_snapshot,
+            esplora_url: self.config.esplora_url.clone(),
+        })))
+    }
+
+    /// Atomically install the proved snapshot only if the proposal, fee
+    /// reservation, and live OpenCSV inputs remain current.
+    pub(crate) fn finish_proof_job(
+        &mut self,
+        completed: CompletedProofJob,
+    ) -> Result<Value, AccountError> {
+        let operation = self.operation(&completed.operation_id)?;
+        if operation.state == OperationState::ProofReady.as_str() {
+            self.db.delete_meta("active_proof_operation")?;
+            return self.prepared_operation_receipt(&operation);
+        }
+        if self.db.meta("active_proof_operation")?.as_deref()
+            != Some(completed.operation_id.as_str())
         {
-            if let Ok(protocol) = self.primary_protocol_mut() {
-                protocol.cancel_pending(proved.pending_id);
+            return Err(AccountError::new(
+                "stale_proof_job",
+                "proof job no longer owns the active reservation",
+            ));
+        }
+        if operation.state != OperationState::FeeReserved.as_str()
+            || operation_outpoint(&operation)? != completed.funding.outpoint
+        {
+            return self.fail_proof_job(
+                &completed.operation_id,
+                AccountError::new(
+                    "stale_proof_job",
+                    "operation or fee reservation changed while proving",
+                ),
+            );
+        }
+        let current_request: TransferRequest = serde_json::from_str(&operation.request_json)
+            .map_err(|error| {
+                AccountError::new("database_corrupt", format!("transfer request: {error}"))
+            })?;
+        if current_request.asset_id != completed.request.asset_id
+            || current_request.to_owner != completed.request.to_owner
+            || current_request.amount != completed.request.amount
+        {
+            return self.fail_proof_job(
+                &completed.operation_id,
+                AccountError::new("stale_proof_job", "transfer proposal changed while proving"),
+            );
+        }
+
+        let pending_id = self
+            .primary_protocol_mut()?
+            .import_pending(&completed.pending_json)
+            .map_err(|error| AccountError::new("database_error", error))?;
+        let validation = self.primary_protocol_mut().and_then(|protocol| {
+            if protocol
+                .pending_spend_conflicts(pending_id)
+                .map_err(|error| AccountError::new("database_error", error))?
+                || !protocol
+                    .pending_spends_available(pending_id)
+                    .map_err(|error| AccountError::new("database_error", error))?
+            {
+                return Err(AccountError::new(
+                    "conflicting_operation",
+                    "selected OpenCSV inputs changed or were reserved while proving",
+                ));
             }
-            return self.fail_prebroadcast(operation_id, error);
+            let dependencies = protocol
+                .pending_unconfirmed_dependencies(pending_id)
+                .map_err(|error| AccountError::new("database_error", error))?;
+            if dependencies != completed.unconfirmed_dependencies {
+                return Err(AccountError::new(
+                    "stale_proof_job",
+                    "unconfirmed dependency set changed while proving",
+                ));
+            }
+            let record = protocol
+                .rebind_pending(pending_id, funding_context(completed.funding.outpoint))
+                .map_err(|error| AccountError::new("protocol_layout_violation", error))?;
+            if record != completed.record {
+                return Err(AccountError::new(
+                    "stale_proof_job",
+                    "proposal-bound record changed while proving",
+                ));
+            }
+            Ok(())
+        });
+        if let Err(error) = validation {
+            if let Some(protocol) = self.protocol.as_mut() {
+                protocol.cancel_pending(pending_id);
+            }
+            return self.fail_proof_job(&completed.operation_id, error);
         }
         self.pending_by_operation
-            .insert(operation_id.to_owned(), proved.pending_id);
-        let record = match self.primary_protocol_mut().and_then(|protocol| {
-            protocol
-                .rebind_pending(proved.pending_id, ctx)
-                .map_err(|error| AccountError::new("protocol_layout_violation", error))
-        }) {
-            Ok(record) => record,
-            Err(error) => return self.fail_prebroadcast(operation_id, error),
-        };
-        let pending_json = match self.primary_protocol_mut().and_then(|protocol| {
-            protocol
-                .export_pending(proved.pending_id)
-                .map_err(|error| AccountError::new("database_error", error))
-        }) {
-            Ok(pending_json) => pending_json,
-            Err(error) => return self.fail_prebroadcast(operation_id, error),
-        };
+            .insert(completed.operation_id.clone(), pending_id);
+        for dependency in &completed.unconfirmed_dependencies {
+            self.db.conn.execute(
+                "UPDATE opencsv_consignment_finality
+                 SET last_checked_at = ?2, last_error = NULL
+                 WHERE anchor_txid = ?1 AND finality = 'unconfirmed'",
+                params![dependency, unix_time()?],
+            )?;
+        }
         if let Err(error) = self.mark_proof_ready(
-            operation_id,
+            &completed.operation_id,
             &json!({
-                "asset_id": request.asset_id,
-                "to_owner": request.to_owner,
-                "amount": request.amount,
+                "asset_id": completed.request.asset_id,
+                "to_owner": completed.request.to_owner,
+                "amount": completed.request.amount,
             }),
-            &pending_json,
-            &hex_encode(&record),
+            &completed.pending_json,
+            &hex_encode(&completed.record),
         ) {
-            return self.fail_prebroadcast(operation_id, error);
+            return self.fail_proof_job(&completed.operation_id, error);
         }
-        match self.prepared_receipt(operation_id, funding, &verification, &record) {
+        self.db.delete_meta("active_proof_operation")?;
+        match self.prepared_receipt(
+            &completed.operation_id,
+            completed.funding,
+            &completed.verification,
+            &completed.record,
+        ) {
             Ok(receipt) => Ok(receipt),
-            Err(error) => self.fail_prebroadcast(operation_id, error),
+            Err(error) => self.fail_prebroadcast(&completed.operation_id, error),
         }
+    }
+
+    pub(crate) fn fail_proof_job<T>(
+        &mut self,
+        operation_id: &str,
+        error: AccountError,
+    ) -> Result<T, AccountError> {
+        self.db.delete_meta("active_proof_operation")?;
+        if error.code == "unconfirmed_dependency_changed" {
+            if let Some(dependency) = error
+                .message
+                .split_whitespace()
+                .nth(2)
+                .map(|value| value.trim_matches(|character: char| !character.is_ascii_hexdigit()))
+                .filter(|value| value.len() == 64)
+            {
+                self.freeze_unconfirmed_dependency(dependency, &error.message)?;
+            }
+        }
+        self.fail_prebroadcast(operation_id, error)
     }
 
     /// Compatibility one-shot used by existing callers. New interactive
@@ -1735,24 +2609,7 @@ impl AccountWallet {
             .apply_unconfirmed_txs([(Arc::new(tx.clone()), seen_at)]);
         self.bitcoin.persist(&mut self.db)?;
 
-        let relay = relay_transaction(
-            self.bitcoin.network(),
-            &self.config.peers,
-            &tx,
-            Duration::from_secs(8),
-        );
-        let p2p_submissions = relay.submitted_count();
-        let relay_peers: Vec<Value> = relay
-            .peers
-            .iter()
-            .map(|peer| {
-                json!({
-                    "peer": peer.peer,
-                    "submitted": peer.submitted,
-                    "error": peer.error,
-                })
-            })
-            .collect();
+        let (p2p_submissions, relay_peers) = self.submit_direct_p2p(&tx)?;
         let client = esplora_client::Builder::new(&self.config.esplora_url).build_blocking();
         // A completed P2P socket write proves submission only. Core can
         // close before processing the unsolicited transaction, so never let
@@ -1765,28 +2622,13 @@ impl AccountWallet {
                 "generic_relay_fallback".into(),
                 json!(matches!(&fallback, Ok(true))),
             );
-        }
-        if let Err(error) = fallback {
-            self.db.conn.execute(
-                "UPDATE opencsv_operations SET state = ?2,
-                 rejection_reason = 'broadcast_unobserved', receipt_json = ?3,
-                 updated_at = ?4
-                 WHERE operation_id = ?1",
-                params![
-                    operation_id,
-                    OperationState::BroadcastUnobserved.as_str(),
-                    receipt.to_string(),
-                    unix_time()?
-                ],
-            )?;
-            return Err(AccountError::new(
-                "broadcast_unobserved",
-                format!("signed transaction preserved for resume: {error}"),
-            ));
+            if let Err(error) = &fallback {
+                object.insert("generic_relay_error".into(), json!(error.to_string()));
+            }
         }
         self.db.conn.execute(
             "UPDATE opencsv_operations SET state = ?2,
-             rejection_reason = NULL, receipt_json = ?3, updated_at = ?4
+             rejection_reason = 'broadcast_unobserved', receipt_json = ?3, updated_at = ?4
              WHERE operation_id = ?1",
             params![
                 operation_id,
@@ -1795,7 +2637,10 @@ impl AccountWallet {
                 unix_time()?
             ],
         )?;
-        self.refresh_operation(operation_id)
+        // Neither a socket write nor an unpinned relay response establishes
+        // mempool acceptance. Signal must return exact bytes plus pinned host
+        // evidence through `observe_operation_unconfirmed` before delivery.
+        operation_json(&self.operation(operation_id)?)
     }
 
     /// Return one durable operation, refreshing mempool/confirmation state
@@ -1810,6 +2655,124 @@ impl AccountWallet {
             return self.refresh_operation(operation_id);
         }
         operation_json(&operation)
+    }
+
+    /// Refresh settlement only through the registered multi-peer CBF scan.
+    /// The scan owns peer agreement, header PoW, BIP158 discovery, full block
+    /// retrieval and merkle/record verification; no host-provided Boolean can
+    /// move an operation to `confirmed`.
+    pub fn refresh_operation_spv(&mut self, operation_id: &str) -> Result<Value, AccountError> {
+        let operation = self.operation(operation_id)?;
+        let check = self
+            .config
+            .observation_checks
+            .iter()
+            .find(|check| check.kind == ObservationKind::ConfirmedSpv)
+            .cloned();
+        if check
+            .as_ref()
+            .is_none_or(|check| check.mode == ObservationMode::Off)
+        {
+            return operation_json(&operation);
+        }
+        let mut receipt: Value = operation
+            .receipt_json
+            .as_deref()
+            .and_then(|encoded| serde_json::from_str(encoded).ok())
+            .unwrap_or_else(|| json!({}));
+        let consignment_base64 = receipt["consignment_base64"].as_str().ok_or_else(|| {
+            AccountError::new(
+                "operation_not_observed",
+                "SPV settlement requires an independently observed consignment",
+            )
+        })?;
+        let consignment = base64::engine::general_purpose::STANDARD
+            .decode(consignment_base64)
+            .map_err(|error| AccountError::new("database_corrupt", error.to_string()))?;
+        let verdict = self.scan_verify(&hex_encode(&consignment))?;
+        let now_ms = unix_time_millis()?;
+        let txid = operation.txid.as_deref().ok_or_else(|| {
+            AccountError::new(
+                "invalid_operation_state",
+                "SPV operation has no transaction id",
+            )
+        })?;
+        let verified = verdict["status"] == "verified";
+        let failures = if verified {
+            Vec::new()
+        } else {
+            vec![verdict["reason"]
+                .as_str()
+                .unwrap_or("multi-peer scan has not settled the transaction")]
+        };
+        self.persist_observation_receipts(
+            txid,
+            &[json!({
+                "check_id": check.as_ref().map(|check| check.id.as_str()).unwrap_or("multi_peer_spv_confirmation"),
+                "kind": ObservationKind::ConfirmedSpv,
+                "mode": check.as_ref().map(|check| check.mode).unwrap_or(ObservationMode::Observe),
+                "endpoint": Value::Null,
+                "result": if verified { ObservationResult::Observed } else { ObservationResult::Unavailable },
+                "started_at_ms": now_ms,
+                "completed_at_ms": now_ms,
+                "latency_ms": 0,
+                "cached_at_ms": now_ms,
+                "cache_age_ms": 0,
+                "certificate_profile": Value::Null,
+                "certificate_chain_fingerprints_sha256": [],
+                "raw_byte_match": false,
+                "detail": verdict,
+                "failures": failures,
+            })],
+        )?;
+
+        if verified {
+            let delivered = receipt["consignment_delivered"] == true;
+            let next = if delivered {
+                OperationState::ConsignmentDelivered.as_str()
+            } else {
+                OperationState::Confirmed.as_str()
+            };
+            self.db.conn.execute(
+                "UPDATE opencsv_operations SET state = ?2, rejection_reason = NULL,
+                 updated_at = ?3 WHERE operation_id = ?1",
+                params![operation_id, next, unix_time()?],
+            )?;
+        } else if matches!(
+            operation.state.as_str(),
+            "confirmed" | "consignment_delivered"
+        ) {
+            // Reorgs do not erase history. They demote settlement, freeze
+            // descendants through the exact parent dependency, and require a
+            // refreshed backup before any new write.
+            self.freeze_unconfirmed_dependency(
+                txid,
+                "previously settled transaction is no longer in the verified scan",
+            )?;
+            let delivered = receipt["consignment_delivered"] == true;
+            receipt["spv_reorg_detected"] = json!(true);
+            self.db.conn.execute(
+                "UPDATE opencsv_operations SET state = ?2, receipt_json = ?3,
+                 rejection_reason = 'spv_reorg_unsettled', updated_at = ?4
+                 WHERE operation_id = ?1",
+                params![
+                    operation_id,
+                    if delivered {
+                        "mempool"
+                    } else {
+                        "broadcast_unobserved"
+                    },
+                    receipt.to_string(),
+                    unix_time()?,
+                ],
+            )?;
+            self.db.set_meta("backup_verified", "0")?;
+        }
+        let mut value = operation_json(&self.operation(operation_id)?)?;
+        if let Some(object) = value.as_object_mut() {
+            object.insert("spv".into(), verdict);
+        }
+        Ok(value)
     }
 
     /// Resume a crash-interrupted operation. Signed transactions are
@@ -1838,43 +2801,29 @@ impl AccountWallet {
                 )? {
                     return Ok(value);
                 }
-                let relay = relay_transaction(
-                    self.bitcoin.network(),
-                    &self.config.peers,
-                    &tx,
-                    Duration::from_secs(8),
-                );
+                let (p2p_submissions, _) = self.submit_direct_p2p(&tx)?;
                 let client =
                     esplora_client::Builder::new(&self.config.esplora_url).build_blocking();
-                let fallback_used = match relay_via_esplora_if_unobserved(&client, &tx) {
-                    Ok(used) => used,
-                    Err(error) => {
-                        if let Some(value) = self.reconcile_confirmed_replacement(
-                            operation_id,
-                            tx.compute_txid(),
-                            &mut receipt,
-                        )? {
-                            return Ok(value);
-                        }
-                        return Err(AccountError::new(
-                            "broadcast_unobserved",
-                            format!("signed transaction preserved for resume: {error}"),
-                        ));
-                    }
-                };
+                let fallback = relay_via_esplora_if_unobserved(&client, &tx);
                 if let Some(object) = receipt.as_object_mut() {
+                    object.insert("resume_p2p_submissions".into(), json!(p2p_submissions));
                     object.insert(
-                        "resume_p2p_submissions".into(),
-                        json!(relay.submitted_count()),
+                        "resume_generic_relay_fallback".into(),
+                        json!(matches!(&fallback, Ok(true))),
                     );
-                    object.insert("resume_generic_relay_fallback".into(), json!(fallback_used));
+                    if let Err(error) = &fallback {
+                        object.insert(
+                            "resume_generic_relay_error".into(),
+                            json!(error.to_string()),
+                        );
+                    }
                 }
                 self.db.conn.execute(
                     "UPDATE opencsv_operations SET receipt_json = ?2,
                      updated_at = ?3 WHERE operation_id = ?1",
                     params![operation_id, receipt.to_string(), unix_time()?],
                 )?;
-                self.refresh_operation(operation_id)
+                operation_json(&self.operation(operation_id)?)
             }
             _ => self.operation_status(operation_id),
         }
@@ -2143,39 +3092,19 @@ impl AccountWallet {
         self.bitcoin
             .apply_unconfirmed_txs([(Arc::new(replacement.clone()), seen_at)]);
         self.bitcoin.persist(&mut self.db)?;
-        let relay = relay_transaction(
-            self.bitcoin.network(),
-            &self.config.peers,
-            &replacement,
-            Duration::from_secs(8),
-        );
-        let p2p_submissions = relay.submitted_count();
-        let relay_peers: Vec<Value> = relay
-            .peers
-            .iter()
-            .map(|peer| {
-                json!({
-                    "peer": peer.peer,
-                    "submitted": peer.submitted,
-                    "error": peer.error,
-                })
-            })
-            .collect();
+        let (p2p_submissions, relay_peers) = self.submit_direct_p2p(&replacement)?;
         let client = esplora_client::Builder::new(&self.config.esplora_url).build_blocking();
-        let generic_relay_fallback = relay_via_esplora_if_unobserved(&client, &replacement)
-            .map_err(|error| {
-                AccountError::new(
-                    "broadcast_unobserved",
-                    format!("replacement persisted for resume: {error}"),
-                )
-            })?;
+        let generic_relay_fallback = relay_via_esplora_if_unobserved(&client, &replacement);
         if let Some(object) = receipt.as_object_mut() {
             object.insert("p2p_submissions".into(), json!(p2p_submissions));
             object.insert("p2p_peers".into(), json!(relay_peers));
             object.insert(
                 "generic_relay_fallback".into(),
-                json!(generic_relay_fallback),
+                json!(matches!(&generic_relay_fallback, Ok(true))),
             );
+            if let Err(error) = &generic_relay_fallback {
+                object.insert("generic_relay_error".into(), json!(error.to_string()));
+            }
         }
         self.db.conn.execute(
             "UPDATE opencsv_operations SET state = ?2, receipt_json = ?3,
@@ -2188,7 +3117,7 @@ impl AccountWallet {
                 unix_time()?,
             ],
         )?;
-        self.refresh_operation(operation_id)
+        operation_json(&self.operation(operation_id)?)
     }
 
     /// Mark the Signal attachment for a mempool-observed operation delivered.
@@ -3257,6 +4186,17 @@ impl AccountWallet {
 
     fn refresh_operation(&mut self, operation_id: &str) -> Result<Value, AccountError> {
         let operation = self.operation(operation_id)?;
+        if self.config.observation_checks.iter().any(|check| {
+            check.kind == ObservationKind::RawTransactionApi
+                && check.mode == ObservationMode::Require
+        }) && !matches!(
+            operation.state.as_str(),
+            "confirmed" | "consignment_delivered"
+        ) {
+            // The generic accelerator remains useful for fee-wallet sync but
+            // cannot silently replace required pinned raw-byte evidence.
+            return operation_json(&operation);
+        }
         let txid = operation
             .txid
             .as_deref()
@@ -3307,7 +4247,13 @@ impl AccountWallet {
                 self.finalize_observed_operation(operation_id, txid)?;
             }
         }
-        if status.confirmed && operation.state != OperationState::ConsignmentDelivered.as_str() {
+        let spv_settlement_enabled = self.config.observation_checks.iter().any(|check| {
+            check.kind == ObservationKind::ConfirmedSpv && check.mode != ObservationMode::Off
+        });
+        if status.confirmed
+            && !spv_settlement_enabled
+            && operation.state != OperationState::ConsignmentDelivered.as_str()
+        {
             let delivered = operation
                 .receipt_json
                 .as_deref()
@@ -4215,6 +5161,192 @@ fn snapshot_with_unconfirmed_anchor(
     Ok(snapshot)
 }
 
+fn evaluate_observation_evidence(
+    policy: &[ObservationCheck],
+    exact_raw_transaction: &[u8],
+    observations_json: &str,
+) -> Result<(Vec<Value>, Option<AccountError>), AccountError> {
+    let envelope: ObservationEvidenceEnvelope =
+        serde_json::from_str(observations_json).map_err(|error| {
+            AccountError::new(
+                "invalid_observation_evidence",
+                format!("observation evidence JSON: {error}"),
+            )
+        })?;
+    let mut evidence_by_id = HashMap::new();
+    for evidence in envelope.observations {
+        if evidence_by_id
+            .insert(evidence.check_id.clone(), evidence)
+            .is_some()
+        {
+            return Err(AccountError::new(
+                "invalid_observation_evidence",
+                "duplicate observation evidence identifier",
+            ));
+        }
+    }
+
+    let now_ms = unix_time_millis()?;
+    let mut receipts = Vec::new();
+    let mut first_required_failure = None;
+    for check in policy {
+        // Raw host evidence is supplied by Signal. Direct relay submission
+        // and multi-peer confirmation have separate Rust-owned receipts and
+        // must not be synthesized as "missing" host checks here.
+        if check.kind != ObservationKind::RawTransactionApi {
+            continue;
+        }
+        if check.mode == ObservationMode::Off {
+            continue;
+        }
+        let evidence = evidence_by_id.remove(&check.id);
+        let mut failures = Vec::new();
+        let (
+            result,
+            endpoint,
+            started_at_ms,
+            completed_at_ms,
+            cached_at_ms,
+            profile,
+            fingerprints,
+            raw_match,
+            detail,
+        ) = if let Some(evidence) = evidence {
+            if evidence.endpoint != check.endpoint {
+                failures.push("endpoint mismatch".to_owned());
+            }
+            if evidence.completed_at_ms < evidence.started_at_ms {
+                failures.push("negative request duration".to_owned());
+            }
+            if evidence.cached_at_ms > now_ms + 30_000 {
+                failures.push("cache timestamp is in the future".to_owned());
+            }
+            let cache_age_ms = now_ms.saturating_sub(evidence.cached_at_ms);
+            if u64::try_from(cache_age_ms).unwrap_or(u64::MAX)
+                > check.max_age_seconds.saturating_mul(1_000)
+            {
+                failures.push("observation cache is stale".to_owned());
+            }
+            if evidence.certificate_profile != check.pin_profile {
+                failures.push("certificate profile mismatch".to_owned());
+            }
+            for fingerprint in &evidence.certificate_chain_fingerprints_sha256 {
+                if validate_hex_32_config(fingerprint, "observed certificate fingerprint").is_err()
+                {
+                    failures.push("invalid certificate fingerprint".to_owned());
+                }
+            }
+            if check.pin_profile.is_some()
+                && evidence.certificate_chain_fingerprints_sha256.is_empty()
+            {
+                failures.push("pinned certificate chain is missing".to_owned());
+            }
+            if !check.chain_fingerprints_sha256.is_empty()
+                && !evidence
+                    .certificate_chain_fingerprints_sha256
+                    .iter()
+                    .any(|fingerprint| check.chain_fingerprints_sha256.contains(fingerprint))
+            {
+                failures.push("certificate chain does not match configured pins".to_owned());
+            }
+            let raw_match = if check.kind == ObservationKind::RawTransactionApi {
+                evidence
+                    .raw_transaction_hex
+                    .as_deref()
+                    .and_then(|encoded| hex_decode(encoded, "observed raw transaction").ok())
+                    .is_some_and(|raw| raw == exact_raw_transaction)
+            } else {
+                false
+            };
+            if check.kind == ObservationKind::RawTransactionApi && !raw_match {
+                failures.push("raw transaction bytes do not match".to_owned());
+            }
+            if check.kind == ObservationKind::RawTransactionApi
+                && evidence.result != ObservationResult::Observed
+            {
+                failures.push("transaction was not observed".to_owned());
+            }
+            (
+                evidence.result,
+                evidence.endpoint,
+                evidence.started_at_ms,
+                evidence.completed_at_ms,
+                evidence.cached_at_ms,
+                evidence.certificate_profile,
+                evidence.certificate_chain_fingerprints_sha256,
+                raw_match,
+                evidence.detail,
+            )
+        } else {
+            failures.push("evidence is missing".to_owned());
+            (
+                ObservationResult::NotChecked,
+                check.endpoint.clone(),
+                now_ms,
+                now_ms,
+                now_ms,
+                check.pin_profile.clone(),
+                Vec::new(),
+                false,
+                None,
+            )
+        };
+        let receipt = json!({
+            "check_id": check.id,
+            "kind": check.kind,
+            "mode": check.mode,
+            "endpoint": endpoint,
+            "result": result,
+            "started_at_ms": started_at_ms,
+            "completed_at_ms": completed_at_ms,
+            "latency_ms": completed_at_ms.saturating_sub(started_at_ms),
+            "cached_at_ms": cached_at_ms,
+            "cache_age_ms": now_ms.saturating_sub(cached_at_ms),
+            "certificate_profile": profile,
+            "certificate_chain_fingerprints_sha256": fingerprints,
+            "raw_byte_match": raw_match,
+            "detail": detail,
+            "failures": failures,
+        });
+        if check.mode == ObservationMode::Require
+            && !receipt["failures"]
+                .as_array()
+                .is_some_and(|failures| failures.is_empty())
+            && first_required_failure.is_none()
+        {
+            first_required_failure = Some(AccountError::new(
+                "required_observation_failed",
+                format!(
+                    "required observer {} failed: {}",
+                    check.id,
+                    receipt["failures"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+            ));
+        }
+        receipts.push(receipt);
+    }
+    if !evidence_by_id.is_empty() {
+        return Err(AccountError::new(
+            "invalid_observation_evidence",
+            format!(
+                "evidence contains unconfigured checks: {}",
+                evidence_by_id
+                    .keys()
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        ));
+    }
+    Ok((receipts, first_required_failure))
+}
+
 fn derive<const N: usize>(
     root: &[u8],
     label: &[u8],
@@ -4268,6 +5400,148 @@ fn validate_esplora_url(url: &str) -> Result<(), AccountError> {
     }
 }
 
+fn default_observation_checks(network: &str) -> Vec<ObservationCheck> {
+    let mut checks = Vec::new();
+    if network == "signet" {
+        checks.push(ObservationCheck {
+            id: "mempool_space_signet".into(),
+            kind: ObservationKind::RawTransactionApi,
+            endpoint: Some("https://mempool.space/signet/api".into()),
+            mode: ObservationMode::Require,
+            pin_profile: Some("sectigo_r46".into()),
+            chain_fingerprints_sha256: Vec::new(),
+            max_age_seconds: default_observation_max_age_seconds(),
+        });
+        checks.push(ObservationCheck {
+            id: "blockstream_signet".into(),
+            kind: ObservationKind::RawTransactionApi,
+            endpoint: Some("https://blockstream.info/signet/api".into()),
+            mode: ObservationMode::Require,
+            pin_profile: Some("lets_encrypt_yr".into()),
+            chain_fingerprints_sha256: Vec::new(),
+            max_age_seconds: default_observation_max_age_seconds(),
+        });
+    }
+    checks.extend([
+        ObservationCheck {
+            id: "direct_p2p_relay".into(),
+            kind: ObservationKind::DirectP2pRelay,
+            endpoint: None,
+            mode: ObservationMode::Observe,
+            pin_profile: None,
+            chain_fingerprints_sha256: Vec::new(),
+            max_age_seconds: default_observation_max_age_seconds(),
+        },
+        ObservationCheck {
+            id: "experimental_p2p_mempool_possession".into(),
+            kind: ObservationKind::ExperimentalP2pPossession,
+            endpoint: None,
+            mode: ObservationMode::Off,
+            pin_profile: None,
+            chain_fingerprints_sha256: Vec::new(),
+            max_age_seconds: default_observation_max_age_seconds(),
+        },
+        ObservationCheck {
+            id: "multi_peer_spv_confirmation".into(),
+            kind: ObservationKind::ConfirmedSpv,
+            endpoint: None,
+            mode: ObservationMode::Observe,
+            pin_profile: None,
+            chain_fingerprints_sha256: Vec::new(),
+            max_age_seconds: default_observation_max_age_seconds(),
+        },
+    ]);
+    checks
+}
+
+fn validate_observation_checks(config: &AccountConfig) -> Result<(), AccountError> {
+    let mut ids = HashSet::new();
+    for check in &config.observation_checks {
+        if check.id.trim().is_empty() || !ids.insert(check.id.as_str()) {
+            return Err(AccountError::new(
+                "invalid_config",
+                "observation check identifiers must be non-empty and unique",
+            ));
+        }
+        if check.kind == ObservationKind::RawTransactionApi {
+            let endpoint = check.endpoint.as_deref().ok_or_else(|| {
+                AccountError::new(
+                    "invalid_config",
+                    "raw-transaction observer needs an endpoint",
+                )
+            })?;
+            validate_esplora_url(endpoint)?;
+        } else if check.endpoint.is_some() {
+            return Err(AccountError::new(
+                "invalid_config",
+                format!(
+                    "non-API observation {} cannot configure an endpoint",
+                    check.id
+                ),
+            ));
+        }
+        if check.mode == ObservationMode::Require && check.max_age_seconds == 0 {
+            return Err(AccountError::new(
+                "invalid_config",
+                format!(
+                    "required observer {} must have a positive max age",
+                    check.id
+                ),
+            ));
+        }
+        match check.id.as_str() {
+            "mempool_space_signet" => {
+                if config.network != "signet"
+                    || check.kind != ObservationKind::RawTransactionApi
+                    || check.endpoint.as_deref() != Some("https://mempool.space/signet/api")
+                    || check.pin_profile.as_deref() != Some("sectigo_r46")
+                    || !check.chain_fingerprints_sha256.is_empty()
+                {
+                    return Err(AccountError::new(
+                        "invalid_config",
+                        "the built-in mempool.space signet endpoint and pin profile are immutable",
+                    ));
+                }
+            }
+            "blockstream_signet" => {
+                if config.network != "signet"
+                    || check.kind != ObservationKind::RawTransactionApi
+                    || check.endpoint.as_deref() != Some("https://blockstream.info/signet/api")
+                    || check.pin_profile.as_deref() != Some("lets_encrypt_yr")
+                    || !check.chain_fingerprints_sha256.is_empty()
+                {
+                    return Err(AccountError::new(
+                        "invalid_config",
+                        "the built-in Blockstream signet endpoint and pin profile are immutable",
+                    ));
+                }
+            }
+            _ if check.mode == ObservationMode::Require
+                && check.kind == ObservationKind::RawTransactionApi =>
+            {
+                if check.chain_fingerprints_sha256.is_empty() {
+                    return Err(AccountError::new(
+                        "invalid_config",
+                        format!(
+                            "custom required observer {} needs a certificate-chain fingerprint",
+                            check.id
+                        ),
+                    ));
+                }
+                for fingerprint in &check.chain_fingerprints_sha256 {
+                    validate_hex_32_config(fingerprint, "certificate-chain fingerprint")?;
+                }
+            }
+            _ => {
+                for fingerprint in &check.chain_fingerprints_sha256 {
+                    validate_hex_32_config(fingerprint, "certificate-chain fingerprint")?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 fn validate_usd_issuer_policy(config: &AccountConfig) -> Result<(), AccountError> {
     let mut asset_ids = HashSet::new();
     for issuer in &config.usd_issuers {
@@ -4303,6 +5577,16 @@ fn unix_time() -> Result<i64, AccountError> {
         .map_err(|error| AccountError::new("clock_error", error.to_string()))
         .and_then(|duration| {
             i64::try_from(duration.as_secs())
+                .map_err(|_| AccountError::new("clock_error", "timestamp exceeds SQLite range"))
+        })
+}
+
+fn unix_time_millis() -> Result<i64, AccountError> {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| AccountError::new("clock_error", error.to_string()))
+        .and_then(|duration| {
+            i64::try_from(duration.as_millis())
                 .map_err(|_| AccountError::new("clock_error", "timestamp exceeds SQLite range"))
         })
 }
@@ -4465,6 +5749,12 @@ mod tests {
             "esplora_url": esplora_url,
             "role": role,
             "backup_verified": backup_verified,
+            "observation_checks": [{
+                "id": "test_accelerator",
+                "kind": "raw_transaction_api",
+                "endpoint": esplora_url,
+                "mode": "observe",
+            }],
         }))
         .unwrap()
     }
@@ -4904,6 +6194,115 @@ mod tests {
     }
 
     #[test]
+    fn fresh_signet_defaults_require_both_pinned_api_observers() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = json!({
+            "version": 1,
+            "network": "signet",
+            "esplora_url": "https://mempool.space/signet/api",
+            "role": "primary",
+            "backup_verified": false,
+        });
+        let mut wallet = AccountWallet::open_device_bound(
+            &cfg.to_string(),
+            &[71u8; 32],
+            &[72u8; 32],
+            dir.path().join("wallet.sqlite").to_str().unwrap(),
+        )
+        .unwrap();
+        let status = wallet.status().unwrap();
+        let policy = status["observation_policy"].as_array().unwrap();
+        assert_eq!(policy.len(), 5);
+        assert_eq!(policy[0]["id"], "mempool_space_signet");
+        assert_eq!(policy[0]["mode"], "require");
+        assert_eq!(policy[0]["pin_profile"], "sectigo_r46");
+        assert_eq!(policy[1]["id"], "blockstream_signet");
+        assert_eq!(policy[1]["mode"], "require");
+        assert_eq!(policy[1]["pin_profile"], "lets_encrypt_yr");
+        assert_eq!(policy[2]["mode"], "observe");
+        assert_eq!(policy[3]["mode"], "off");
+        assert_eq!(policy[4]["mode"], "observe");
+        assert_eq!(
+            wallet
+                .verify_consignment_unconfirmed(&[1], r#"{"tip_height":0,"entries":[]}"#)
+                .unwrap_err()
+                .code,
+            "observation_evidence_required"
+        );
+    }
+
+    #[test]
+    fn observation_policy_enforces_required_raw_bytes_and_records_observe_failures() {
+        let policy = default_observation_checks("signet");
+        let now = unix_time_millis().unwrap();
+        let evidence = json!({
+            "observations": [
+                {
+                    "check_id": "mempool_space_signet",
+                    "endpoint": "https://mempool.space/signet/api",
+                    "result": "observed",
+                    "started_at_ms": now - 15,
+                    "completed_at_ms": now - 5,
+                    "cached_at_ms": now - 5,
+                    "certificate_profile": "sectigo_r46",
+                    "certificate_chain_fingerprints_sha256": ["11".repeat(32)],
+                    "raw_transaction_hex": "0102"
+                },
+                {
+                    "check_id": "blockstream_signet",
+                    "endpoint": "https://blockstream.info/signet/api",
+                    "result": "observed",
+                    "started_at_ms": now - 20,
+                    "completed_at_ms": now - 4,
+                    "cached_at_ms": now - 4,
+                    "certificate_profile": "lets_encrypt_yr",
+                    "certificate_chain_fingerprints_sha256": ["22".repeat(32)],
+                    "raw_transaction_hex": "0102"
+                }
+            ]
+        });
+        let (receipts, failure) =
+            evaluate_observation_evidence(&policy, &[1, 2], &evidence.to_string()).unwrap();
+        assert!(failure.is_none());
+        assert_eq!(receipts.len(), 2);
+        assert_eq!(receipts[0]["raw_byte_match"], true);
+        assert_eq!(receipts[1]["raw_byte_match"], true);
+
+        let mut wrong = evidence;
+        wrong["observations"][1]["raw_transaction_hex"] = json!("0103");
+        let (_, failure) =
+            evaluate_observation_evidence(&policy, &[1, 2], &wrong.to_string()).unwrap();
+        assert_eq!(failure.unwrap().code, "required_observation_failed");
+    }
+
+    #[test]
+    fn custom_required_observer_needs_a_chain_pin() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = json!({
+            "version": 1,
+            "network": "signet",
+            "esplora_url": "https://mempool.space/signet/api",
+            "role": "primary",
+            "backup_verified": false,
+            "observation_checks": [{
+                "id": "custom",
+                "kind": "raw_transaction_api",
+                "endpoint": "https://observer.example/api",
+                "mode": "require"
+            }]
+        });
+        let error = AccountWallet::open_device_bound(
+            &cfg.to_string(),
+            &[81u8; 32],
+            &[82u8; 32],
+            dir.path().join("wallet.sqlite").to_str().unwrap(),
+        )
+        .err()
+        .unwrap();
+        assert_eq!(error.code, "invalid_config");
+    }
+
+    #[test]
     fn restored_primary_with_different_device_binding_is_read_only() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("wallet.sqlite");
@@ -5061,6 +6460,108 @@ mod tests {
                 .unwrap_err()
                 .code,
             "backup_checkpoint_hash_mismatch"
+        );
+    }
+
+    #[cfg(feature = "test-wallet-recovery")]
+    #[test]
+    fn test_rebind_is_signet_only_idempotent_and_backup_gated() {
+        let dir = tempfile::tempdir().unwrap();
+        let original_path = dir.path().join("original.sqlite");
+        let restored_path = dir.path().join("restored.sqlite");
+        let key = [41u8; 32];
+        let original_binding = [42u8; 32];
+        let replacement_binding = [43u8; 32];
+        let cfg = config(AccountRole::Primary, true);
+        let mut original = AccountWallet::open_device_bound(
+            &cfg,
+            &key,
+            &original_binding,
+            original_path.to_str().unwrap(),
+        )
+        .unwrap();
+        create_test_instrument(&mut original, "TST");
+        let checkpoint = original.checkpoint().unwrap();
+        let old_commitment = checkpoint["checkpoint"]["device_binding_commitment"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        drop(original);
+
+        let mut restored_config: Value = serde_json::from_str(&cfg).unwrap();
+        restored_config["backup_verified"] = json!(false);
+        restored_config["expected_device_binding_commitment"] = json!(old_commitment);
+        let mut restored = AccountWallet::open_device_bound(
+            &restored_config.to_string(),
+            &key,
+            &[],
+            restored_path.to_str().unwrap(),
+        )
+        .unwrap();
+        restored
+            .restore_checkpoint(&checkpoint.to_string())
+            .unwrap();
+
+        let first = restored.rebind_test_device(&replacement_binding).unwrap();
+        assert_eq!(first["status"], "checkpoint_ready");
+        assert_eq!(first["idempotent"], false);
+        assert_eq!(first["backup_required"], true);
+        assert_eq!(first["write_enabled"], false);
+        let new_commitment = first["device_binding_commitment"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert_ne!(new_commitment, old_commitment);
+        assert_eq!(
+            first["checkpoint"]["checkpoint"]["device_binding_commitment"],
+            new_commitment
+        );
+
+        let replay = restored.rebind_test_device(&replacement_binding).unwrap();
+        assert_eq!(replay["idempotent"], true);
+        assert_eq!(
+            restored.rebind_test_device(&[44u8; 32]).unwrap_err().code,
+            "conflicting_test_rebind"
+        );
+        restored.set_backup_state(true, CHECKPOINT_VERSION).unwrap();
+        assert_eq!(restored.status().unwrap()["write_enabled"], true);
+        assert_eq!(
+            restored
+                .rebind_test_device(&replacement_binding)
+                .unwrap_err()
+                .code,
+            "test_rebind_already_write_enabled"
+        );
+        drop(restored);
+
+        restored_config["expected_device_binding_commitment"] = json!(new_commitment);
+        let mut reopened = AccountWallet::open_device_bound(
+            &restored_config.to_string(),
+            &key,
+            &replacement_binding,
+            restored_path.to_str().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(reopened.status().unwrap()["write_enabled"], true);
+    }
+
+    #[cfg(feature = "test-wallet-recovery")]
+    #[test]
+    fn test_rebind_runtime_rejects_mainnet() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut mainnet: Value =
+            serde_json::from_str(&config(AccountRole::Primary, false)).unwrap();
+        mainnet["network"] = json!("mainnet");
+        let mut wallet = AccountWallet::open_device_bound(
+            &mainnet.to_string(),
+            &[51u8; 32],
+            &[],
+            dir.path().join("mainnet.sqlite").to_str().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            wallet.rebind_test_device(&[52u8; 32]).unwrap_err().code,
+            "test_rebind_network_forbidden"
         );
     }
 
@@ -5568,13 +7069,17 @@ mod tests {
                 prepared["checkpoint_hash"].as_str().unwrap(),
             )
             .unwrap();
-        let error = wallet
+        let pending = wallet
             .sign_and_broadcast(
                 operation_id,
                 &json!({ "target_sat_per_vb": 1, "max_fee_sats": 5_000 }).to_string(),
             )
-            .unwrap_err();
-        assert_eq!(error.code, "broadcast_unobserved");
+            .unwrap();
+        assert_eq!(
+            pending["state"],
+            OperationState::BroadcastUnobserved.as_str()
+        );
+        assert_eq!(pending["receipt"]["generic_relay_fallback"], false);
         let operation = wallet.operation(operation_id).unwrap();
         assert_eq!(
             operation.state,
@@ -5585,6 +7090,37 @@ mod tests {
             deserialize(&hex_decode(&signed, "signed tx").unwrap()).unwrap();
         assert_eq!(transaction.input[0].previous_output, funding);
         assert_eq!(transaction.output.len(), 3);
+        let mut wrong_bytes = serialize(&transaction);
+        *wrong_bytes.last_mut().unwrap() ^= 1;
+        assert_eq!(
+            wallet
+                .observe_operation_unconfirmed(operation_id, &wrong_bytes, r#"{"observations":[]}"#)
+                .unwrap_err()
+                .code,
+            "raw_transaction_mismatch"
+        );
+        assert_eq!(
+            wallet.operation(operation_id).unwrap().state,
+            OperationState::BroadcastUnobserved.as_str()
+        );
+        let raw = serialize(&transaction);
+        let now = unix_time_millis().unwrap();
+        let evidence = json!({
+            "observations": [{
+                "check_id": "test_accelerator",
+                "endpoint": "http://127.0.0.1:1",
+                "result": "observed",
+                "started_at_ms": now - 2,
+                "completed_at_ms": now - 1,
+                "cached_at_ms": now - 1,
+                "certificate_chain_fingerprints_sha256": [],
+                "raw_transaction_hex": hex_encode(&raw),
+            }]
+        });
+        let observed = wallet
+            .observe_operation_unconfirmed(operation_id, &raw, &evidence.to_string())
+            .unwrap();
+        assert_eq!(observed["state"], OperationState::Mempool.as_str());
         assert!(transaction.output[0].script_pubkey.is_op_return());
         assert_eq!(transaction.output[1].script_pubkey.as_bytes(), MARKER_SPK);
         assert!(!transaction.output[2].script_pubkey.is_op_return());
@@ -6214,27 +7750,28 @@ mod tests {
                 prepared["checkpoint_hash"].as_str().unwrap(),
             )
             .unwrap();
+        let pending = wallet
+            .sign_and_broadcast(
+                &operation_id,
+                &json!({ "target_sat_per_vb": 1, "max_fee_sats": 5_000 }).to_string(),
+            )
+            .unwrap();
         assert_eq!(
-            wallet
-                .sign_and_broadcast(
-                    &operation_id,
-                    &json!({ "target_sat_per_vb": 1, "max_fee_sats": 5_000 }).to_string(),
-                )
-                .unwrap_err()
-                .code,
-            "broadcast_unobserved"
+            pending["state"],
+            OperationState::BroadcastUnobserved.as_str()
         );
         let original_hex = wallet
             .operation(&operation_id)
             .unwrap()
             .signed_tx_hex
             .unwrap();
+        let bump_pending = wallet.fee_bump(&operation_id, 5).unwrap();
         assert_eq!(
-            wallet.fee_bump(&operation_id, 5).unwrap_err().code,
-            "broadcast_unobserved"
+            bump_pending["state"],
+            OperationState::BroadcastUnobserved.as_str()
         );
         let bumped = wallet.operation(&operation_id).unwrap();
-        assert_eq!(bumped.state, OperationState::SignedPersisted.as_str());
+        assert_eq!(bumped.state, OperationState::BroadcastUnobserved.as_str());
         let replacement_hex = bumped.signed_tx_hex.unwrap();
         assert_ne!(replacement_hex, original_hex);
         let original: Transaction =
@@ -6252,7 +7789,7 @@ mod tests {
         )
         .unwrap();
         let restored = reopened.operation(&operation_id).unwrap();
-        assert_eq!(restored.state, OperationState::SignedPersisted.as_str());
+        assert_eq!(restored.state, OperationState::BroadcastUnobserved.as_str());
         assert_eq!(
             restored.signed_tx_hex.as_deref(),
             Some(replacement_hex.as_str())
@@ -6418,15 +7955,15 @@ mod tests {
                 prepared["checkpoint_hash"].as_str().unwrap(),
             )
             .unwrap();
+        let pending = wallet
+            .sign_and_broadcast(
+                &operation_id,
+                &json!({ "target_sat_per_vb": 1, "max_fee_sats": 5_000 }).to_string(),
+            )
+            .unwrap();
         assert_eq!(
-            wallet
-                .sign_and_broadcast(
-                    &operation_id,
-                    &json!({ "target_sat_per_vb": 1, "max_fee_sats": 5_000 }).to_string(),
-                )
-                .unwrap_err()
-                .code,
-            "broadcast_unobserved"
+            pending["state"],
+            OperationState::BroadcastUnobserved.as_str()
         );
         let before = wallet.operation(&operation_id).unwrap();
         let error = wallet.fee_bump(&operation_id, 5).unwrap_err();

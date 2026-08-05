@@ -129,6 +129,7 @@ impl StoredCoin {
 /// but proving is expensive and `ctx` does not enter the proof. Keeping the
 /// record's *shape* lets the host rebind cheaply (see
 /// [`MemWallet::rebind_pending`]).
+#[derive(Clone)]
 enum RecordShape {
     /// MINT publishes no bound payload, so its record is ctx-independent.
     Fixed(AnchorRecord),
@@ -158,6 +159,7 @@ impl RecordShape {
 }
 
 /// A proved-but-not-yet-anchored transaction awaiting [`MemWallet::finalize`].
+#[derive(Clone)]
 struct Pending {
     /// How to (re)build the anchor record for a given `ctx`.
     shape: RecordShape,
@@ -378,6 +380,7 @@ fn genesis_from_json(g: &GenesisJson) -> Result<AssetGenesis, OpError> {
 // ---------------------------------------------------------------------------
 
 /// An in-memory OpenCSV wallet (see module docs for the persistence model).
+#[derive(Clone)]
 pub struct MemWallet {
     keys: Vec<OwnerSecret>,
     issuers: Vec<IssuerRecord>,
@@ -1175,6 +1178,41 @@ impl MemWallet {
             .get(&pending_id)
             .map(|pending| pending.spent_ids.clone())
             .ok_or_else(|| format!("no pending transaction {pending_id}"))
+    }
+
+    /// Whether one pending operation consumes any coin already reserved by a
+    /// different pending operation. Used by the account layer when a proof
+    /// generated from a snapshot is atomically committed back into the live
+    /// wallet.
+    pub fn pending_spend_conflicts(&self, pending_id: u64) -> Result<bool, OpError> {
+        let pending = self
+            .pending
+            .get(&pending_id)
+            .ok_or_else(|| format!("no pending transaction {pending_id}"))?;
+        let spends: std::collections::HashSet<&str> =
+            pending.spent_ids.iter().map(String::as_str).collect();
+        Ok(self.pending.iter().any(|(other_id, other)| {
+            *other_id != pending_id
+                && other
+                    .spent_ids
+                    .iter()
+                    .any(|coin_id| spends.contains(coin_id.as_str()))
+        }))
+    }
+
+    /// Whether every coin consumed by one pending operation still exists and
+    /// is unspent in the live wallet snapshot.
+    pub fn pending_spends_available(&self, pending_id: u64) -> Result<bool, OpError> {
+        let pending = self
+            .pending
+            .get(&pending_id)
+            .ok_or_else(|| format!("no pending transaction {pending_id}"))?;
+        Ok(pending.spent_ids.iter().all(|coin_id| {
+            self.coins
+                .iter()
+                .find(|coin| coin.id() == *coin_id)
+                .is_some_and(|coin| coin.status == CoinStatus::Unspent)
+        }))
     }
 
     /// Remove every coin created by `anchor_txid` from balance and selection
