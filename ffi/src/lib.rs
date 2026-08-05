@@ -820,6 +820,25 @@ pub unsafe extern "C" fn opencsv_send_batch_status(
     })
 }
 
+/// Cancel the complete ordered batch before any signature is released.
+/// Partial member cancellation is intentionally not exposed.
+///
+/// # Safety
+/// `batch_local_id` must be valid NUL-terminated UTF-8.
+#[no_mangle]
+pub unsafe extern "C" fn opencsv_send_batch_cancel(
+    handle: u64,
+    batch_local_id: *const c_char,
+) -> *mut c_char {
+    guarded(|| {
+        let batch_local_id = match unsafe { in_str(batch_local_id, "batch_local_id") } {
+            Ok(value) => value,
+            Err(error) => return err(error),
+        };
+        with_account(handle, |account| account.cancel_send_batch(batch_local_id))
+    })
+}
+
 /// Reserve the frozen stock/fee cells, verify them, and produce every
 /// proposal-bound proof plus the deterministic C1 manifest. Recursive proof
 /// work runs outside the global account registry and live-wallet lock.

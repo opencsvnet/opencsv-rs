@@ -118,6 +118,8 @@ char *opencsv_send_batch_freeze(uint64_t handle,
                                 const char *batch_local_id);
 char *opencsv_send_batch_status(uint64_t handle,
                                 const char *batch_local_id);
+char *opencsv_send_batch_cancel(uint64_t handle,
+                                const char *batch_local_id);
 char *opencsv_send_batch_prove(uint64_t handle,
                                const char *batch_local_id);
 char *opencsv_send_batch_ack_backup(uint64_t handle,

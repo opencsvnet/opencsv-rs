@@ -3250,6 +3250,57 @@ impl AccountWallet {
         self.send_batch_json(batch_local_id)
     }
 
+    /// Cancel every member of a batch before any signature is released.
+    ///
+    /// This is the rollback boundary used by Signal when an explicitly
+    /// assembled Add Recipient set cannot be completed. It is deliberately
+    /// batch-scoped: cancelling only one member would mutate the ordered C1
+    /// membership while leaving the remaining intents looking sendable.
+    pub fn cancel_send_batch(&mut self, batch_local_id: &str) -> Result<Value, AccountError> {
+        let batch = self.send_batch(batch_local_id)?;
+        if batch.state == "cancelled" {
+            return self.send_batch_json(batch_local_id);
+        }
+        if matches!(
+            batch.state.as_str(),
+            "signed_persisted" | "broadcast_unobserved" | "mempool" | "confirmed"
+        ) {
+            return Err(AccountError::new(
+                "cancellation_forbidden",
+                "a send batch cannot be cancelled after a signature was released",
+            ));
+        }
+
+        // A proof job executes outside the wallet lock. Clearing this lease
+        // makes its eventual commit fail as stale; the immutable job may
+        // finish computation but can no longer install or sign anything.
+        if self.db.meta("active_batch_proof")?.as_deref() == Some(batch_local_id) {
+            self.db.delete_meta("active_batch_proof")?;
+        }
+        let members = self.send_batch_members(batch_local_id)?;
+        for member in members {
+            self.cancel_operation(&member.operation_id)?;
+        }
+        self.db.conn.execute(
+            "UPDATE opencsv_batch_stocks
+             SET state = 'available', reserved_by_batch = NULL
+             WHERE reserved_by_batch = ?1 AND state = 'reserved'",
+            [batch_local_id],
+        )?;
+        self.db.conn.execute(
+            "DELETE FROM opencsv_account_meta
+             WHERE key = 'active_send_batch' AND value = ?1",
+            [batch_local_id],
+        )?;
+        self.db.conn.execute(
+            "UPDATE opencsv_send_batches
+             SET state = 'cancelled', updated_at = ?2
+             WHERE batch_local_id = ?1",
+            params![batch_local_id, unix_time()?],
+        )?;
+        self.send_batch_json(batch_local_id)
+    }
+
     /// Snapshot a frozen C1 batch under the wallet lock. All authoritative
     /// chain checks and recursive proofs run from the returned immutable job,
     /// outside the global account registry and live-wallet mutex.
@@ -10322,6 +10373,53 @@ mod tests {
 
         let next = wallet.transfer_batch_plan(&request).unwrap();
         assert_ne!(next["batch"]["batch_local_id"], batch_id);
+    }
+
+    #[test]
+    fn cancelling_collecting_batch_cancels_every_member_and_is_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut wallet = AccountWallet::open(
+            &config(AccountRole::Primary, true),
+            &[78u8; 32],
+            dir.path().join("wallet.sqlite").to_str().unwrap(),
+        )
+        .unwrap();
+        let request = |recipient: u8| {
+            json!({
+                "asset_id": hex_encode(&[79u8; 32]),
+                "to_owner": hex_encode(&[recipient; 32]),
+                "amount": u64::from(recipient),
+            })
+            .to_string()
+        };
+        let first = wallet.transfer_batch_plan(&request(1)).unwrap();
+        let batch_id = first["batch"]["batch_local_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let second = wallet
+            .transfer_batch_add_recipient(&batch_id, &request(2))
+            .unwrap();
+
+        let cancelled = wallet.cancel_send_batch(&batch_id).unwrap();
+        assert_eq!(cancelled["state"], "cancelled");
+        assert!(cancelled["operations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|operation| operation["state"] == OperationState::Cancelled.as_str()));
+        assert_eq!(wallet.cancel_send_batch(&batch_id).unwrap(), cancelled);
+        assert_eq!(
+            wallet
+                .transfer_batch_add_recipient(&batch_id, &request(3))
+                .unwrap_err()
+                .code,
+            "batch_window_closed",
+        );
+        let next = wallet.transfer_batch_plan(&request(4)).unwrap();
+        assert_ne!(next["batch"]["batch_local_id"], batch_id);
+        assert_ne!(next["operation_id"], first["operation_id"]);
+        assert_ne!(next["operation_id"], second["operation_id"]);
     }
 
     #[test]
