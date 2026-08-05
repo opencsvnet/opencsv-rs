@@ -23,6 +23,10 @@ required-features = ["issuer-tools"]
 name = "signet_account_acceptance"
 required-features = ["issuer-tools"]
 
+[[example]]
+name = "zero_conf_simulator_fixture"
+required-features = ["issuer-tools"]
+
 [dependencies]
 opencsv-core = { path = "../crates/opencsv-core" }
 opencsv-pcd = { path = "../crates/opencsv-pcd" }
