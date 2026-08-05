@@ -7,9 +7,8 @@ measurements without relabeling the older test-grade results.
 Proof lineage v4 keeps these FRI parameters and adds the one-input recursive
 shape. Its first cold debug correctness receipt was 508.26 s for mint →
 one-input transfer → root verification; that number is intentionally not
-mixed into the release table below. The cold/warm release receipt is recorded
-in its own v4 table; a physical-device run is still required before the v4
-shape is described as production-performant.
+mixed into the release table below. The cold/warm release receipt and the
+physical iPhone 16e receipt are recorded in their own v4 tables.
 The separate migration receipt—v3 mint root verification → v4 one-input
 recursive transfer → v4 root verification—completed in 507.92 s cold debug.
 
@@ -132,6 +131,31 @@ and the runtime security check.
 The separate cold-debug v3→v4 migration test verifies a bound v3 mint root,
 consumes it inside the v4 one-input circuit, and verifies the v4 root. An
 outer-byte v3→v4 relabel is rejected with `StatementMismatch`.
+
+## V4 one-input physical-device receipt — 2026-08-05
+
+Physical iPhone 16e (A18, iOS 26.2.1), release build from source tip
+`b0bc324432c515ec3e66c0bddc04c240a2db512b`, one cold sequential run through
+the separately signed `net.opencsv.bench` harness. The app was signed by team
+`2858MX5336`; its installed build had CDHash
+`ff3ddcc4d10793cf37c87b0775aa48812c7e8d27`.
+
+| circuit | prove | verify | proof size | proven | adjusted | degree bits |
+|---|---:|---:|---:|---:|---:|---|
+| genesis mint | 162.0 ms | 14.08 ms | 536,420 B | 105 | 100 | `[6,6,10,6,6,6]` |
+| v4 one-input / mint predecessor | 6.4353 s | 19.75 ms | 788,047 B | 101 | 96 | `[8,9,16,15,15,6,6]` |
+| transfer / two mint predecessors | 11.2755 s | 22.51 ms | 854,307 B | 100 | 95 | `[8,10,17,15,16,6,6]` |
+| transfer / two node predecessors | 15.8715 s | 25.83 ms | 842,103 B | 100 | 95 | `[9,10,17,16,16,6,6]` |
+| redeem / one node predecessor | 8.6888 s | 23.96 ms | 778,406 B | 101 | 96 | `[9,9,16,15,15,6,6]` |
+
+The one-input path completed proof generation and root verification on the
+physical phone. In this sequential run it proved 42.9% faster than the
+two-mint-predecessor transfer; the comparison is a single-device measurement,
+not a population estimate. The final `OPENCSV_BENCH_RESULT` included all five
+rows, so the receipt also confirms that the v4 addition did not prevent the
+existing two-input and redeem shapes from completing under the iOS process
+memory limit. The harness is a separate bundle and did not read or modify
+Signal.
 
 ## D2 on-device impact
 
