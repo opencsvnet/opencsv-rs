@@ -37,10 +37,22 @@ fn str_of(v: &serde_json::Value, key: &str) -> String {
 
 /// The test's stand-in for the anchor server: an append-only log with
 /// FileAnchorChain's txid derivation.
-#[derive(Default)]
 struct TestChain {
     tip_height: u64,
     entries: Vec<SnapshotEntry>,
+}
+
+impl Default for TestChain {
+    fn default() -> Self {
+        // Height 0 / position 0 is reserved by the public snapshot format
+        // for a transaction seen in the mempool. Confirmed fixtures begin
+        // at height 1 because Bitcoin's genesis coinbase cannot contain an
+        // OpenCSV anchor record.
+        Self {
+            tip_height: 1,
+            entries: Vec::new(),
+        }
+    }
 }
 
 impl TestChain {

@@ -50,10 +50,21 @@ fn digest(byte: u8) -> Digest {
 }
 
 /// The test's stand-in anchor log (append-only, mock txids).
-#[derive(Default)]
 struct TestChain {
     tip_height: u64,
     entries: Vec<opencsv_ffi::snapshot::SnapshotEntry>,
+}
+
+impl Default for TestChain {
+    fn default() -> Self {
+        // Height 0 / position 0 is the public mempool sentinel. Bitcoin's
+        // only real height-0 transaction is the genesis coinbase, which
+        // cannot carry an OpenCSV record, so confirmed fixtures start at 1.
+        Self {
+            tip_height: 1,
+            entries: Vec::new(),
+        }
+    }
 }
 
 impl TestChain {
@@ -207,7 +218,7 @@ fn ds_scenario() -> DsScenario {
         anchor_ref: opencsv_core::chain::AnchorRef {
             txid: [0xb0; 32],
             location: AnchorLocation {
-                height: 1,
+                height: 2,
                 position: 0,
             },
         },
@@ -218,7 +229,7 @@ fn ds_scenario() -> DsScenario {
     };
     let e1 = entry_json(
         AnchorLocation {
-            height: 0,
+            height: 1,
             position: 0,
         },
         &[0xa0; 32],
@@ -227,7 +238,7 @@ fn ds_scenario() -> DsScenario {
     );
     let e2 = entry_json(
         AnchorLocation {
-            height: 1,
+            height: 2,
             position: 0,
         },
         &[0xb0; 32],
