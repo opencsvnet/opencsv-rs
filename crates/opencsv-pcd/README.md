@@ -108,9 +108,11 @@ call-site discipline.
   not carry nullifiers — this is sound because the statement-table values
   are transcript-bound. `vk` must equal the v4 verifier-set tag
   `opencsv-pcd-coin-v4-with-v3-fri94`; foreign tags fail before decoding.
-  Version 4 is emitted for every new proof. Authenticated version-3 proofs are
-  accepted only for migration/root verification and as recursive
-  predecessors; versions 1/2 are inspectable but cannot verify.
+  Version 4 is emitted for every new proof and required at the production
+  receiver boundary. Version-3 proofs remain low-level-verifiable for explicit
+  migration inspection, but only ancestor-free v3 mints may seed a v4
+  recursive proof. V3 transfer/redeem roots are not accepted and cannot act as
+  recursive predecessors; versions 1/2 are inspectable but cannot verify.
   Recursive predecessor keys are pinned inside every transfer/redeem
   circuit. Registering the exact self-described *root-circuit commitments*
   remains a separate trust-distribution boundary (below). The proof lineage
@@ -214,6 +216,15 @@ gone for coin proofs (the stage-1/2 standalone circuits keep it).
   zero or injecting non-zero extension coefficients fails witness
   generation. Circuits without this table (genesis) retain their original
   table manifest, while transfer/redeem proofs advertise it explicitly.
+- *Duplicate two-input ancestry is constrained in the AIR.* Three private
+  boolean selector bits point to one unequal input-commitment limb and the
+  selected difference must be invertible. Equal inputs make every selector
+  unsatisfiable. The Rust wrapper and receiver retain their independent
+  duplicate checks as defense in depth.
+- *Legacy recursion is narrowed.* V3 transfer circuits predate the preceding
+  AIR constraint, so v3 transfers and redeems are inspection-only. Only v3
+  mints, which have no ancestors, may be recursive migration roots. Production
+  acceptance requires a v4 root.
 - *Root key authorization remains external.* `verify_coin_proof` verifies
   the proof-carried root common data. A production verifier must map the
   accepted proof-format/circuit version to an allowlisted root identity; D4
@@ -520,7 +531,7 @@ spike.)
 ## What's next
 
 1. **Root-circuit commitment registry:** the accept adapter already pins the
-   v3 lineage/profile tag and recursive predecessor keys are hard-bound, but
+   v4 lineage/profile tag and recursive predecessor keys are hard-bound, but
    deployments must distribute the accepted self-described root circuit
    commitments as shapes converge.
 2. **Paper gap carried from stage 2:** single-asset transfers (§4.5).

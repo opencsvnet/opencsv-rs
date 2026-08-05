@@ -44,9 +44,12 @@ Profile ID:
 `CoinFriParams::testing()` remains available only to the isolated recursion
 feasibility spike. Public proving now emits v4 statements and envelopes under
 the explicit `opencsv-pcd-coin-v4-with-v3-fri94` verifier-set tag.
-Authenticated v3 proofs remain valid roots and recursive predecessors without
-relabeling. A v1/v2 envelope remains parseable for migration inspection but
-cannot verify or act as a recursive predecessor.
+Authenticated v3 proofs remain low-level-verifiable for migration inspection,
+but production acceptance requires a v4 root and only ancestor-free v3 mints
+may seed v4 recursion. V3 transfers predate the in-circuit distinct-input
+constraint and are therefore inspection-only. A v1/v2 envelope remains
+parseable for migration inspection but cannot verify or act as a recursive
+predecessor.
 
 ## Security accounting
 

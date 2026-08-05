@@ -62,6 +62,12 @@
 //! predecessor's statement is transcript-bound (statement table), tied to its
 //! computation (AIR + witness bus), and connected to the successor's
 //! recomputed commitments.
+//! The two-input circuit additionally proves that the consumed commitments
+//! differ: three private boolean bits select one of eight unequal digest
+//! limbs, whose difference must be invertible. Duplicate-input rejection is
+//! therefore an AIR constraint, not merely a check in [`prove_transfer`].
+//! Because v3 transfer circuits predate that constraint, only ancestor-free
+//! v3 mints may act as migration predecessors for v4.
 //!
 //! # Verification-key binding (honest)
 //!
@@ -135,11 +141,15 @@ pub const STATEMENT_PUBLIC_VALUES: usize = 4 * STATEMENT_ELEMS; // 212
 
 /// Private witness elements of the node (transfer) circuit: asset_id (8) +
 /// per input (v 3 + owner 8 + r 8 + osk 11) + per output (v 3 + owner 8 +
-/// r 8) + per-input predecessor output selector `k_i` (1).
+/// r 8) + per-input predecessor output selector `k_i` (1) + three boolean
+/// bits selecting one unequal input-commitment limb. The selected difference
+/// is inverted in-circuit, so equality of the two consumed coins is
+/// unsatisfiable rather than merely rejected by the Rust proving wrapper.
 pub const NODE_PRIVATE_ELEMS: usize = DIGEST_ELEMS
     + NODE_INPUTS * (VALUE_LIMBS + 2 * DIGEST_ELEMS + crate::hash::OSK_ELEMS)
     + NODE_OUTPUTS * (VALUE_LIMBS + 2 * DIGEST_ELEMS)
-    + NODE_INPUTS; // 108
+    + NODE_INPUTS
+    + 3; // 111
 
 /// Private witness elements of a one-input transfer: asset id (8), one input
 /// (30), two outputs (38), and one predecessor selector.
@@ -224,6 +234,11 @@ impl NodeStatement {
 
 fn proof_version_is_supported(version: u8) -> bool {
     matches!(version, LEGACY_COIN_PROOF_VERSION | COIN_PROOF_VERSION)
+}
+
+fn predecessor_lineage_is_safe(version: u8, mode: NodeMode) -> bool {
+    version == COIN_PROOF_VERSION
+        || (version == LEGACY_COIN_PROOF_VERSION && mode == NodeMode::Mint)
 }
 
 /// A proof-carrying-data coin proof: a batch-STARK proof of the mint circuit
@@ -333,6 +348,9 @@ pub enum NodeError {
         /// Version carried by the proof.
         actual: u8,
     },
+    /// A legacy recursive transfer may contain a duplicate-input ancestor.
+    /// Only ancestor-free legacy mints are safe migration predecessors.
+    UnsafeLegacyPredecessor,
     /// The concrete proof's trace degrees fall below the frozen production
     /// security floor after conservative union-bound margins.
     InsufficientProofSecurity {
@@ -401,6 +419,10 @@ impl std::fmt::Display for NodeError {
             Self::UnsupportedProofVersion { actual } => write!(
                 f,
                 "unsupported coin-proof version {actual}; supported versions are {LEGACY_COIN_PROOF_VERSION} and {COIN_PROOF_VERSION}"
+            ),
+            Self::UnsafeLegacyPredecessor => write!(
+                f,
+                "legacy transfer/redeem proofs are inspection-only; only legacy mints may be recursive predecessors"
             ),
             Self::InsufficientProofSecurity { actual, required } => write!(
                 f,
@@ -619,6 +641,8 @@ struct NodeWitness<'a> {
     outputs: [(&'a [ExprId], &'a [ExprId], &'a [ExprId]); NODE_OUTPUTS],
     /// Per input: predecessor output selector `k_i ∈ {0, 1}`.
     selectors: &'a [ExprId],
+    /// Little-endian index of a limb where the two input commitments differ.
+    distinct_limb_bits: &'a [ExprId],
 }
 
 fn node_witness_layout(private: &[ExprId]) -> NodeWitness<'_> {
@@ -644,13 +668,64 @@ fn node_witness_layout(private: &[ExprId]) -> NodeWitness<'_> {
             &private[s + VALUE_LIMBS + DIGEST_ELEMS..s + OUT_ELEMS],
         )
     });
-    let selectors = &private[out_base + NODE_OUTPUTS * OUT_ELEMS..];
+    let selector_base = out_base + NODE_OUTPUTS * OUT_ELEMS;
+    let selectors = &private[selector_base..selector_base + NODE_INPUTS];
+    let distinct_limb_bits = &private[selector_base + NODE_INPUTS..];
+    debug_assert_eq!(distinct_limb_bits.len(), 3);
     NodeWitness {
         asset_id,
         inputs,
         outputs,
         selectors,
+        distinct_limb_bits,
     }
+}
+
+/// Enforce that two digest witnesses differ in at least one field element.
+///
+/// Three private boolean bits select one of the eight digest limbs. The
+/// selected difference must be invertible (`1 / difference`), which is
+/// impossible when every limb is equal. The selector is witness data only;
+/// it reveals nothing in the public statement.
+fn enforce_distinct_digest(
+    builder: &mut CircuitBuilder<EF>,
+    left: &[ExprId; DIGEST_ELEMS],
+    right: &[ExprId; DIGEST_ELEMS],
+    selector_bits: &[ExprId],
+) {
+    assert_eq!(
+        DIGEST_ELEMS, 8,
+        "three selector bits address eight digest limbs"
+    );
+    assert_eq!(selector_bits.len(), 3);
+    for &bit in selector_bits {
+        builder.assert_bool(bit);
+    }
+
+    let differences: [ExprId; DIGEST_ELEMS] =
+        std::array::from_fn(|index| builder.sub(left[index], right[index]));
+    let pair: [ExprId; 4] = std::array::from_fn(|index| {
+        builder.select(
+            selector_bits[0],
+            differences[2 * index + 1],
+            differences[2 * index],
+        )
+    });
+    let quartet: [ExprId; 2] = std::array::from_fn(|index| {
+        builder.select(selector_bits[1], pair[2 * index + 1], pair[2 * index])
+    });
+    let selected = builder.select(selector_bits[2], quartet[1], quartet[0]);
+    let one = const_expr(builder, BabyBear::ONE);
+    let inverse = builder.div(one, selected);
+    let check = builder.mul(selected, inverse);
+    builder.connect(check, one);
+}
+
+fn first_differing_digest_limb(left: &Digest, right: &Digest) -> Option<usize> {
+    left.to_elems()
+        .into_iter()
+        .zip(right.to_elems())
+        .position(|(left, right)| left != right)
 }
 
 /// In-circuit verifier state for one predecessor proof.
@@ -699,6 +774,16 @@ fn build_node_circuit(
         // Nullifier: nf_i = H("null" ∥ osk_i ∥ C_i).
         nullifiers[i] = hash_felts_base(&mut builder, "null", &[osk, &in_commitments[i]])?;
     }
+
+    // Host preflight also rejects duplicate inputs, but proof soundness must
+    // not depend on callers using that wrapper. This constraint closes the
+    // duplicate-input path inside the recursive AIR itself.
+    enforce_distinct_digest(
+        &mut builder,
+        &in_commitments[0],
+        &in_commitments[1],
+        witness.distinct_limb_bits,
+    );
 
     let mut out_values = [[ExprId::ZERO; VALUE_LIMBS]; NODE_OUTPUTS];
     let mut out_commitments = [[ExprId::ZERO; DIGEST_ELEMS]; NODE_OUTPUTS];
@@ -937,6 +1022,14 @@ fn chain_predecessor(
         return Err(NodeError::UnsupportedProofVersion {
             actual: pred.version,
         });
+    }
+    // V3 two-input transfer circuits predate the in-circuit distinct-input
+    // constraint. Their public wrappers rejected duplicates, but a hostile
+    // prover must not be able to hide an unsafe v3 transfer deeper in a v4
+    // recursive lineage. Only ancestor-free v3 mints remain valid migration
+    // roots; historical v3 transfers are inspection-only.
+    if !predecessor_lineage_is_safe(pred.version, pred.mode) {
+        return Err(NodeError::UnsafeLegacyPredecessor);
     }
     let carried_statement = pred
         .statement_public_values()
@@ -1239,6 +1332,9 @@ pub fn prove_transfer(
     if inputs[0].0.commitment() == inputs[1].0.commitment() {
         return Err(NodeError::DuplicateInput);
     }
+    let input_commitments = [inputs[0].0.commitment(), inputs[1].0.commitment()];
+    let distinct_limb = first_differing_digest_limb(&input_commitments[0], &input_commitments[1])
+        .ok_or(NodeError::DuplicateInput)?;
     for (i, pred) in predecessors.iter().enumerate() {
         if pred.statement.asset_id != *asset_id {
             return Err(NodeError::PredecessorAssetMismatch);
@@ -1281,6 +1377,9 @@ pub fn prove_transfer(
     }
     for &k in &selectors {
         private_values.push(EF::from(BabyBear::new(k as u32)));
+    }
+    for bit in 0..3 {
+        private_values.push(EF::from(BabyBear::new(((distinct_limb >> bit) & 1) as u32)));
     }
 
     // Public inputs: per-predecessor verifier publics (statement instance
@@ -1598,6 +1697,39 @@ mod verification_key_binding_tests {
         Ok(())
     }
 
+    fn run_distinct_digest_constraint(
+        left: [BabyBear; DIGEST_ELEMS],
+        right: [BabyBear; DIGEST_ELEMS],
+        selector_bits: [BabyBear; 3],
+    ) -> Result<(), NodeError> {
+        let mut builder = CircuitBuilder::<EF>::new();
+        let private = builder.alloc_private_inputs(2 * DIGEST_ELEMS + 3, "distinct_digest_test");
+        let left_targets: [ExprId; DIGEST_ELEMS] = private[..DIGEST_ELEMS]
+            .try_into()
+            .expect("eight left digest elements");
+        let right_targets: [ExprId; DIGEST_ELEMS] = private[DIGEST_ELEMS..2 * DIGEST_ELEMS]
+            .try_into()
+            .expect("eight right digest elements");
+        enforce_distinct_digest(
+            &mut builder,
+            &left_targets,
+            &right_targets,
+            &private[2 * DIGEST_ELEMS..],
+        );
+
+        let circuit = builder.build()?;
+        let mut runner = circuit.runner();
+        let values = left
+            .into_iter()
+            .chain(right)
+            .chain(selector_bits)
+            .map(EF::from)
+            .collect::<Vec<_>>();
+        runner.set_private_inputs(&values)?;
+        runner.run()?;
+        Ok(())
+    }
+
     fn authenticated_v3_mint() -> (AssetId, OwnerSecret, [Coin; 2], CoinProof) {
         let issuer_secret = [0x42; 32];
         let genesis = AssetGenesis {
@@ -1658,6 +1790,51 @@ mod verification_key_binding_tests {
         let error = run_key_binding(non_base, EF::ONE)
             .expect_err("predecessor key elements must be base-field embedded");
         assert!(matches!(error, NodeError::Circuit(_)));
+    }
+
+    #[test]
+    fn digest_distinctness_is_an_in_circuit_constraint() {
+        let left = [BabyBear::ZERO; DIGEST_ELEMS];
+        let mut right = left;
+        right[7] = BabyBear::ONE;
+        run_distinct_digest_constraint(left, right, [BabyBear::ONE, BabyBear::ONE, BabyBear::ONE])
+            .expect("selector 111 points at the unequal seventh limb");
+
+        let duplicate = run_distinct_digest_constraint(
+            left,
+            left,
+            [BabyBear::ZERO, BabyBear::ZERO, BabyBear::ZERO],
+        )
+        .expect_err("equal digests make every selected difference non-invertible");
+        assert!(matches!(duplicate, NodeError::Circuit(_)));
+
+        let wrong_limb = run_distinct_digest_constraint(
+            left,
+            right,
+            [BabyBear::ZERO, BabyBear::ZERO, BabyBear::ZERO],
+        )
+        .expect_err("a witness cannot point at an equal limb");
+        assert!(matches!(wrong_limb, NodeError::Circuit(_)));
+    }
+
+    #[test]
+    fn legacy_recursive_policy_allows_only_ancestor_free_mints() {
+        assert!(predecessor_lineage_is_safe(
+            LEGACY_COIN_PROOF_VERSION,
+            NodeMode::Mint
+        ));
+        assert!(!predecessor_lineage_is_safe(
+            LEGACY_COIN_PROOF_VERSION,
+            NodeMode::Transfer
+        ));
+        assert!(!predecessor_lineage_is_safe(
+            LEGACY_COIN_PROOF_VERSION,
+            NodeMode::Redeem
+        ));
+        assert!(predecessor_lineage_is_safe(
+            COIN_PROOF_VERSION,
+            NodeMode::Transfer
+        ));
     }
 
     #[test]

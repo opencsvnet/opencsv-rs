@@ -43,8 +43,10 @@ Known gaps are documented in `crates/opencsv-pcd/README.md` (single-asset
 transfers and explicit root-circuit commitment registration).
 Issuer authorization and recursive predecessor keys are bound in-circuit;
 proof envelopes, FRI parameters, and accept tags are fail-closed at version 4.
-Authenticated v3 proofs remain accepted only as an explicit compatibility
-lineage and recursive predecessor; v1/v2 and foreign versions remain rejected.
+Authenticated v3 proofs remain available for explicit read-only inspection;
+only ancestor-free v3 mints may seed a v4 recursive migration. V3 transfer and
+redeem roots cannot cross the production accept boundary or become recursive
+predecessors. V1/v2 and foreign versions remain rejected.
 
 The frozen co-funded batching protocol and threat model is
 [`BATCHING_V2.md`](BATCHING_V2.md). C1 is implemented in

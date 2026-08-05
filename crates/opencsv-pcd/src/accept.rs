@@ -247,6 +247,10 @@ fn statement_matches_public_input(mode: NodeMode, st: &NodeStatement, x: &[u8]) 
 /// verification).
 pub struct CoinProofVerifier;
 
+fn root_lineage_is_current(version: u8) -> bool {
+    version == COIN_PROOF_VERSION
+}
+
 impl ProofVerifier for CoinProofVerifier {
     fn verify(&self, vk: &[u8], public_input: &[u8], proof: &[u8]) -> bool {
         if vk != COIN_VK_TAG {
@@ -255,6 +259,12 @@ impl ProofVerifier for CoinProofVerifier {
         let Some(coin) = decode_coin_proof(proof) else {
             return false;
         };
+        // V3 stays decodable/verifiable for explicit migration inspection,
+        // but it predates the in-circuit duplicate-input constraint. It must
+        // never cross the production receiver boundary as a root proof.
+        if !root_lineage_is_current(coin.version) {
+            return false;
+        }
         if !statement_matches_public_input(coin.mode, &coin.statement, public_input) {
             return false;
         }
@@ -266,6 +276,13 @@ impl ProofVerifier for CoinProofVerifier {
 mod tests {
     use super::*;
     use opencsv_core::{AssetGenesis, PoseidonIssuerAuthorization};
+
+    #[test]
+    fn production_accepts_only_the_current_root_lineage() {
+        assert!(root_lineage_is_current(COIN_PROOF_VERSION));
+        assert!(!root_lineage_is_current(crate::LEGACY_COIN_PROOF_VERSION));
+        assert!(!root_lineage_is_current(2));
+    }
 
     /// The envelope round-trips (guards the postcard encoding the
     /// consignment relies on).
@@ -301,6 +318,26 @@ mod tests {
         assert_eq!(decoded.mode, proof.mode);
         assert_eq!(decoded.statement, proof.statement);
         crate::verify_coin_proof(&proof.statement, &decoded).expect("decoded proof verifies");
+
+        let openings = coins.map(|coin| CoinOpening {
+            asset_id: coin.asset_id,
+            value: coin.value,
+            owner: coin.owner,
+            randomness: coin.randomness,
+        });
+        let ctx = [0x91; 32];
+        let record = AnchorRecord::Mint {
+            asset_id: asset_id.to_anchor(),
+            value: proof.statement.value,
+            mint_commit: proof.statement.mint_commit.to_anchor(),
+        };
+        let public_input = opencsv_core::accept::public_input(&record, &ctx, &openings);
+        assert!(CoinProofVerifier.verify(COIN_VK_TAG, &public_input, &bytes));
+
+        let mut legacy_root = bytes.clone();
+        legacy_root[PROOF_ENVELOPE_MAGIC.len()] = crate::LEGACY_COIN_PROOF_VERSION;
+        assert!(decode_coin_proof(&legacy_root).is_some());
+        assert!(!CoinProofVerifier.verify(COIN_VK_TAG, &public_input, &legacy_root));
 
         // The v2 wire shape remains parseable for migration tooling, but its
         // explicit lineage byte cannot be relabeled as production v3.
