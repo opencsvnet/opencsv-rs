@@ -11,8 +11,8 @@ use std::time::Instant;
 
 use opencsv_core::{AssetGenesis, Coin, Digest, OwnerSecret, PoseidonIssuerAuthorization};
 use opencsv_pcd::{
-    proof_security_report, prove_coin_transfer, prove_genesis_mint, prove_redeem,
-    verify_coin_proof, verify_redeem, CoinProof, COIN_PROOF_PROFILE_ID,
+    proof_security_report, prove_coin_transfer, prove_genesis_mint, prove_one_input_transfer,
+    prove_redeem, verify_coin_proof, verify_redeem, CoinProof, COIN_PROOF_PROFILE_ID,
 };
 
 const ISSUER_SECRET: [u8; 32] = [0x42; 32];
@@ -95,6 +95,38 @@ fn run() -> Result<String, String> {
         mint_security.degree_bits,
     ));
     emit_partial("genesis mint", mint_prove, mint_verify, &mint);
+
+    // Version-4 one-input forwarding (one mint predecessor, recipient + change).
+    let one_input_outputs = [coin(45, 0x66, 0x71), coin(15, 0x22, 0x72)];
+    let t = Instant::now();
+    let one_input = prove_one_input_transfer(
+        &asset_id(),
+        &(coins[0], osk(0x22)),
+        &one_input_outputs,
+        &mint,
+        0,
+    )
+    .map_err(|e| e.to_string())?;
+    let one_input_prove = t.elapsed();
+    let t = Instant::now();
+    verify_coin_proof(&one_input.statement, &one_input).map_err(|e| e.to_string())?;
+    let one_input_verify = t.elapsed();
+    let one_input_security = proof_security_report(&one_input);
+    rows.push_str(&format!(
+        "{{\"circuit\":\"v4 one-input transfer (mint predecessor)\",\"prove_ms\":{:.1},\"verify_ms\":{:.2},\"proof_bytes\":{},\"proven_bits\":{},\"adjusted_bits\":{},\"degree_bits\":{:?}}},",
+        fmt_ms(one_input_prove),
+        fmt_ms(one_input_verify),
+        proof_size(&one_input),
+        one_input_security.proven_bits,
+        one_input_security.union_adjusted_bits,
+        one_input_security.degree_bits,
+    ));
+    emit_partial(
+        "v4 one-input transfer (mint predecessor)",
+        one_input_prove,
+        one_input_verify,
+        &one_input,
+    );
 
     // Transfer, hop 1 (2 in-circuit verifications of mint proofs).
     let inputs1 = [(coins[0], osk(0x22)), (coins[1], osk(0x44))];

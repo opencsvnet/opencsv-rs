@@ -1,8 +1,9 @@
 # OpenCSV iOS benchmark
 
 Measures the OpenCSV recursive prover's speed on an actual iPhone/iPad:
-prove time, verify time, and proof size for genesis mint, two transfer hops
-(each verifying two predecessor proofs in-circuit), and redeem — the same
+prove time, verify time, and proof size for genesis mint, v4 one-input
+forwarding, two transfer hops (each verifying two predecessor proofs
+in-circuit), and redeem — the same
 measurements as `crates/opencsv-pcd/tests/bench.rs`, through a C ABI shim
 (`bench-ffi/`) and a minimal SwiftUI app (`OpenCsvBench/`).
 
