@@ -15,10 +15,12 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use base64::Engine as _;
 use bdk_esplora::{esplora_client, EsploraExt};
-use bdk_wallet::bitcoin::bip32::Xpriv;
+use bdk_wallet::bitcoin::bip32::{ChildNumber, DerivationPath, Xpriv};
 use bdk_wallet::bitcoin::consensus::encode::{deserialize, serialize};
+use bdk_wallet::bitcoin::constants::genesis_block;
 use bdk_wallet::bitcoin::hashes::{sha256, Hash as _};
 use bdk_wallet::bitcoin::script::PushBytesBuf;
+use bdk_wallet::bitcoin::secp256k1::{PublicKey, Secp256k1, SecretKey};
 use bdk_wallet::bitcoin::{
     Amount, FeeRate, Network, OutPoint, ScriptBuf, Sequence, Transaction, Txid,
 };
@@ -29,6 +31,10 @@ use bdk_wallet::{
 };
 use hkdf::Hkdf;
 use opencsv_bitcoin::{
+    batch_v2::{
+        stock_witness_script, Manifest as BatchManifest, ParticipantCommitment,
+        Proposal as BatchProposal,
+    },
     funding_ctx, relay_transaction, validate_solo_anchor_replacement, Network as OpenCsvNetwork,
     MARKER_DUST_SATS, MARKER_SPK, MEMPOOL_LOCATION,
 };
@@ -38,7 +44,7 @@ use opencsv_core::chain::AnchorRef;
 use opencsv_core::consignment::Consignment;
 #[cfg(any(test, feature = "issuer-tools"))]
 use opencsv_core::{AssetGenesis, InstrumentTermsV1, PoseidonIssuerAuthorization};
-use opencsv_core::{AssetId, InstrumentManifestV1, OwnerSecret};
+use opencsv_core::{AssetId, InstrumentManifestV1, OwnerSecret, TruncatedDigest};
 use rand::RngExt as _;
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde::{Deserialize, Serialize};
@@ -53,12 +59,16 @@ use crate::{
 };
 
 const SCHEMA_VERSION: u32 = 1;
-const CHECKPOINT_VERSION: u32 = 1;
+const LEGACY_CHECKPOINT_VERSION: u32 = 1;
+const BATCH_CHECKPOINT_VERSION: u32 = 2;
+const CHECKPOINT_VERSION: u32 = 3;
 const DEFAULT_STOP_GAP: usize = 20;
 const DEFAULT_PARALLEL_REQUESTS: usize = 4;
 const DEFAULT_VERIFICATION_TIMEOUT_SECS: u64 = 8;
 const DEFAULT_MAX_VERIFICATION_BLOCKS: u64 = 10_000;
 const MIN_FEE_RESERVE_SATS: u64 = 2_500;
+const SEND_BATCH_WINDOW_MILLIS: i64 = 2_000;
+const MAX_LOCAL_BATCH_RECIPIENTS: usize = opencsv_core::MAX_BATCH_V2_PARTICIPANTS;
 
 /// Stable account-wallet failure crossing the JSON/FFI boundary.
 #[derive(Debug)]
@@ -319,6 +329,14 @@ struct BackupCheckpointPayload {
     instrument_manifests: Vec<InstrumentManifestV1>,
     operations: Vec<BackupOperation>,
     consignments: Vec<BackupConsignment>,
+    #[serde(default)]
+    send_batches: Vec<BackupSendBatch>,
+    #[serde(default)]
+    send_batch_members: Vec<BackupSendBatchMember>,
+    #[serde(default)]
+    batch_stocks: Vec<BackupBatchStock>,
+    #[serde(default)]
+    batch_reserve_operations: Vec<BackupBatchReserveOperation>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -339,6 +357,14 @@ struct BackupOperation {
     state: String,
     request: Value,
     pending_json: Option<String>,
+    #[serde(default)]
+    funding_txid: Option<String>,
+    #[serde(default)]
+    funding_vout: Option<u32>,
+    #[serde(default)]
+    funding_value_sats: Option<u64>,
+    #[serde(default)]
+    signed_tx_hex: Option<String>,
     delivery_nonce: String,
     txid: Option<String>,
     #[serde(default)]
@@ -362,6 +388,59 @@ struct BackupConsignment {
     finality: Option<String>,
     #[serde(default)]
     anchor_txid: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct BackupSendBatch {
+    batch_local_id: String,
+    state: String,
+    deadline_ms: i64,
+    participant_count: Option<u8>,
+    proposal_wire_base64: Option<String>,
+    manifest_wire_base64: Option<String>,
+    signed_tx_hex: Option<String>,
+    txid: Option<String>,
+    receipt_json: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct BackupSendBatchMember {
+    batch_local_id: String,
+    operation_id: String,
+    ordinal: u8,
+    added_at_ms: i64,
+    change_spk_hex: Option<String>,
+    commit_nonce_hex: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct BackupBatchStock {
+    participant_count: u8,
+    txid: String,
+    vout: u32,
+    value_sats: u64,
+    birth_height: u64,
+    state: String,
+    reserved_by_batch: Option<String>,
+    created_at: i64,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct BackupBatchReserveOperation {
+    maintenance_id: String,
+    state: String,
+    participant_count: u8,
+    stock_count: u8,
+    fee_cell_count: u16,
+    signed_tx_hex: String,
+    txid: String,
+    receipt_json: String,
+    created_at: i64,
+    updated_at: i64,
 }
 
 #[derive(Clone, Debug)]
@@ -581,6 +660,38 @@ struct OperationRow {
     backup_acked: bool,
 }
 
+#[derive(Clone, Debug)]
+struct SendBatchRow {
+    batch_local_id: String,
+    state: String,
+    deadline_ms: i64,
+    participant_count: Option<u8>,
+    proposal_wire: Option<Vec<u8>>,
+    manifest_wire: Option<Vec<u8>>,
+    signed_tx_hex: Option<String>,
+    txid: Option<String>,
+    receipt_json: Option<String>,
+    checkpoint_hash: Option<String>,
+    backup_acked: bool,
+}
+
+#[derive(Clone, Debug)]
+struct SendBatchMember {
+    operation_id: String,
+    ordinal: u8,
+    added_at_ms: i64,
+    change_spk_hex: Option<String>,
+    commit_nonce_hex: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+struct BatchStock {
+    participant_count: u8,
+    outpoint: OutPoint,
+    value_sats: u64,
+    birth_height: u64,
+}
+
 const fn schema_version() -> u32 {
     SCHEMA_VERSION
 }
@@ -697,6 +808,66 @@ impl SqlitePersister {
                  receipt_json TEXT NOT NULL,
                  observed_at INTEGER NOT NULL,
                  PRIMARY KEY(subject_txid, check_id)
+             ) STRICT;
+             CREATE TABLE IF NOT EXISTS opencsv_send_batches (
+                 batch_local_id TEXT PRIMARY KEY,
+                 state TEXT NOT NULL CHECK(state IN (
+                     'collecting', 'solo', 'frozen', 'proof_ready',
+                     'signed_persisted', 'broadcast_unobserved', 'mempool',
+                     'confirmed', 'cancelled'
+                 )),
+                 deadline_ms INTEGER NOT NULL,
+                 participant_count INTEGER,
+                 proposal_wire BLOB,
+                 manifest_wire BLOB,
+                 signed_tx_hex TEXT,
+                 txid TEXT,
+                 receipt_json TEXT,
+                 checkpoint_hash TEXT,
+                 backup_acked INTEGER NOT NULL DEFAULT 0,
+                 created_at INTEGER NOT NULL,
+                 updated_at INTEGER NOT NULL
+             ) STRICT;
+             CREATE TABLE IF NOT EXISTS opencsv_send_batch_members (
+                 batch_local_id TEXT NOT NULL,
+                 operation_id TEXT NOT NULL UNIQUE,
+                 ordinal INTEGER NOT NULL,
+                 added_at_ms INTEGER NOT NULL,
+                 change_spk_hex TEXT,
+                 commit_nonce_hex TEXT,
+                 PRIMARY KEY(batch_local_id, ordinal),
+                 FOREIGN KEY(batch_local_id) REFERENCES opencsv_send_batches(batch_local_id),
+                 FOREIGN KEY(operation_id) REFERENCES opencsv_operations(operation_id)
+             ) STRICT;
+             CREATE TABLE IF NOT EXISTS opencsv_batch_stocks (
+                 participant_count INTEGER NOT NULL,
+                 txid TEXT NOT NULL,
+                 vout INTEGER NOT NULL,
+                 value_sats INTEGER NOT NULL,
+                 birth_height INTEGER NOT NULL,
+                 state TEXT NOT NULL CHECK(state IN (
+                     'pending', 'available', 'reserved', 'signature_released',
+                     'confirmed', 'invalidated'
+                 )),
+                 reserved_by_batch TEXT UNIQUE,
+                 created_at INTEGER NOT NULL,
+                 PRIMARY KEY(txid, vout),
+                 FOREIGN KEY(reserved_by_batch) REFERENCES opencsv_send_batches(batch_local_id)
+             ) STRICT;
+             CREATE TABLE IF NOT EXISTS opencsv_batch_reserve_operations (
+                 maintenance_id TEXT PRIMARY KEY,
+                 state TEXT NOT NULL CHECK(state IN (
+                     'signed_persisted', 'broadcast_unobserved', 'mempool',
+                     'confirmed', 'failed'
+                 )),
+                 participant_count INTEGER NOT NULL,
+                 stock_count INTEGER NOT NULL,
+                 fee_cell_count INTEGER NOT NULL,
+                 signed_tx_hex TEXT NOT NULL,
+                 txid TEXT NOT NULL UNIQUE,
+                 receipt_json TEXT NOT NULL,
+                 created_at INTEGER NOT NULL,
+                 updated_at INTEGER NOT NULL
              ) STRICT;",
         )?;
         Ok(())
@@ -768,6 +939,8 @@ pub struct AccountWallet {
     bitcoin: PersistedWallet<SqlitePersister>,
     db: SqlitePersister,
     protocol: Option<MemWallet>,
+    bitcoin_fee_seed: Option<Zeroizing<[u8; 64]>>,
+    batch_stock_secret: Option<Zeroizing<[u8; 32]>>,
     #[cfg(any(test, feature = "issuer-tools"))]
     issuer_root: Option<Zeroizing<[u8; 32]>>,
     root_fingerprint: String,
@@ -805,6 +978,56 @@ pub(crate) struct CompletedProofJob {
     pending_json: String,
     record: [u8; 64],
     unconfirmed_dependencies: Vec<String>,
+}
+
+/// Result of the short locked phase for a frozen multi-recipient batch.
+pub(crate) enum BatchProofJobStart {
+    /// One-member timeout: continue through the existing solo operation path.
+    Solo(String),
+    /// The exact batch proof/manifest is already durable.
+    Ready(Value),
+    /// Verify and prove outside the live account lock.
+    Run(Box<AccountBatchProofJob>),
+}
+
+struct BatchProofMemberJob {
+    operation_id: String,
+    request: TransferRequest,
+    funding: ReservedFunding,
+    fee_secret: SecretKey,
+    change_spk: ScriptBuf,
+    commit_nonce: [u8; 32],
+}
+
+pub(crate) struct AccountBatchProofJob {
+    batch_local_id: String,
+    stock: BatchStock,
+    stock_secret: SecretKey,
+    proposal_nonce: [u8; 32],
+    chain_id: [u8; 32],
+    members: Vec<BatchProofMemberJob>,
+    verifier: Arc<dyn FundingVerifier>,
+    protocol_snapshot: MemWallet,
+    esplora_url: String,
+}
+
+struct CompletedBatchProofMember {
+    operation_id: String,
+    request: TransferRequest,
+    funding: ReservedFunding,
+    funding_verification: FundingVerificationReceipt,
+    pending_json: String,
+    payload: TruncatedDigest,
+    unconfirmed_dependencies: Vec<String>,
+}
+
+pub(crate) struct CompletedBatchProofJob {
+    batch_local_id: String,
+    stock: BatchStock,
+    stock_verification: FundingVerificationReceipt,
+    proposal: BatchProposal,
+    manifest: BatchManifest,
+    members: Vec<CompletedBatchProofMember>,
 }
 
 impl AccountProofJob {
@@ -873,6 +1096,155 @@ impl AccountProofJob {
     }
 }
 
+impl AccountBatchProofJob {
+    pub(crate) fn batch_local_id(&self) -> &str {
+        &self.batch_local_id
+    }
+
+    pub(crate) fn run(mut self) -> Result<CompletedBatchProofJob, AccountError> {
+        let secp = Secp256k1::new();
+        let stock_pubkey = PublicKey::from_secret_key(&secp, &self.stock_secret);
+        let stock_script = stock_witness_script(stock_pubkey, self.members.len()).to_p2wsh();
+        let stock_verification = self.verifier.verify(&FundingVerificationRequest {
+            outpoint: self.stock.outpoint,
+            txout: bdk_wallet::bitcoin::TxOut {
+                value: Amount::from_sat(self.stock.value_sats),
+                script_pubkey: stock_script,
+            },
+            birth_height: self.stock.birth_height,
+        })?;
+        let mut funding_verifications = Vec::with_capacity(self.members.len());
+        let mut checked_through = stock_verification.checked_through;
+        for member in &self.members {
+            let verification = self.verifier.verify(&FundingVerificationRequest {
+                outpoint: member.funding.outpoint,
+                txout: member.funding.txout.clone(),
+                birth_height: member.funding.birth_height,
+            })?;
+            checked_through = checked_through.max(verification.checked_through);
+            funding_verifications.push(verification);
+        }
+        let observed_tip_height = u32::try_from(checked_through).map_err(|_| {
+            AccountError::new("stale_chain_state", "verified tip height exceeds u32")
+        })?;
+        let expiry_height = observed_tip_height.checked_add(12).ok_or_else(|| {
+            AccountError::new("stale_chain_state", "batch expiry height overflow")
+        })?;
+        let participant_count = u8::try_from(self.members.len())
+            .map_err(|_| AccountError::new("batch_full", "batch participant count exceeds u8"))?;
+        let proposal = BatchProposal::new(
+            self.chain_id,
+            self.stock.outpoint,
+            self.stock.value_sats,
+            stock_pubkey,
+            participant_count,
+            self.proposal_nonce,
+            observed_tip_height,
+            expiry_height,
+            2,
+            100,
+        )
+        .map_err(batch_protocol_error)?;
+
+        let client = esplora_client::Builder::new(&self.esplora_url).build_blocking();
+        let mut completed_members = Vec::with_capacity(self.members.len());
+        let mut commitments = Vec::with_capacity(self.members.len());
+        for (member, funding_verification) in self.members.into_iter().zip(funding_verifications) {
+            let proved = self
+                .protocol_snapshot
+                .prove_transfer_amount(
+                    &member.request.asset_id,
+                    &member.request.to_owner,
+                    member.request.amount,
+                )
+                .map_err(|error| AccountError::new("unavailable_assets", error))?;
+            for dependency in &proved.unconfirmed_dependencies {
+                let txid = dependency.parse::<Txid>().map_err(|error| {
+                    AccountError::new(
+                        "database_corrupt",
+                        format!("invalid unconfirmed dependency {dependency}: {error}"),
+                    )
+                })?;
+                match client.get_tx(&txid).map_err(|error| {
+                    AccountError::new(
+                        "unconfirmed_dependency_unavailable",
+                        format!("could not re-observe parent {dependency}: {error}"),
+                    )
+                })? {
+                    Some(transaction) if transaction.compute_txid() == txid => {}
+                    _ => {
+                        return Err(AccountError::new(
+                            "unconfirmed_dependency_changed",
+                            format!("zero-confirmation parent {dependency} disappeared or changed"),
+                        ));
+                    }
+                }
+            }
+            let payload = self
+                .protocol_snapshot
+                .rebind_pending_batch_payload(proved.pending_id, proposal.context())
+                .map_err(|error| AccountError::new("batch_payload_incompatible", error))?;
+            let pending_json = self
+                .protocol_snapshot
+                .export_pending(proved.pending_id)
+                .map_err(|error| AccountError::new("database_error", error))?;
+            let operation_id = sha256::Hash::hash(
+                [
+                    b"OpenCSV batch operation v1".as_slice(),
+                    member.operation_id.as_bytes(),
+                ]
+                .concat()
+                .as_slice(),
+            )
+            .to_byte_array();
+            let fee_pubkey = PublicKey::from_secret_key(&secp, &member.fee_secret);
+            let max_charge = member
+                .funding
+                .value_sats()
+                .checked_sub(opencsv_bitcoin::batch_v2::MIN_OUTPUT_SATS)
+                .ok_or_else(|| {
+                    AccountError::new(
+                        "insufficient_fees",
+                        "batch fee cell cannot preserve minimum change",
+                    )
+                })?;
+            commitments.push(
+                ParticipantCommitment::new(
+                    &proposal,
+                    operation_id,
+                    member.commit_nonce,
+                    payload,
+                    member.funding.outpoint,
+                    member.funding.txout.clone(),
+                    fee_pubkey,
+                    member.change_spk,
+                    max_charge,
+                )
+                .map_err(batch_protocol_error)?,
+            );
+            completed_members.push(CompletedBatchProofMember {
+                operation_id: member.operation_id,
+                request: member.request,
+                funding: member.funding,
+                funding_verification,
+                pending_json,
+                payload,
+                unconfirmed_dependencies: proved.unconfirmed_dependencies,
+            });
+        }
+        let manifest =
+            BatchManifest::build(&proposal, commitments).map_err(batch_protocol_error)?;
+        Ok(CompletedBatchProofJob {
+            batch_local_id: self.batch_local_id,
+            stock: self.stock,
+            stock_verification,
+            proposal,
+            manifest,
+            members: completed_members,
+        })
+    }
+}
+
 impl AccountWallet {
     /// Open or initialize an account database.
     pub fn open_device_bound(
@@ -913,6 +1285,8 @@ impl AccountWallet {
             external,
             internal,
             protocol,
+            bitcoin_fee_seed,
+            batch_stock_secret,
             issuer_root,
             root_fingerprint,
             current_device_binding_commitment,
@@ -931,6 +1305,14 @@ impl AccountWallet {
                     Zeroizing::new(derive::<32>(root.as_ref(), b"opencsv-owner-v1", &[])?);
                 let issuer_root =
                     Zeroizing::new(derive::<32>(root.as_ref(), b"opencsv-issuer-root-v1", &[])?);
+                let batch_stock_secret =
+                    Zeroizing::new(derive::<32>(root.as_ref(), b"opencsv-batch-stock-v1", &[])?);
+                SecretKey::from_slice(batch_stock_secret.as_ref()).map_err(|_| {
+                    AccountError::new(
+                        "key_derivation_failed",
+                        "derived batch stock key is not a valid secp256k1 scalar",
+                    )
+                })?;
                 let xpriv = Xpriv::new_master(network, bitcoin_seed.as_ref()).map_err(|error| {
                     AccountError::new("key_derivation_failed", error.to_string())
                 })?;
@@ -967,6 +1349,8 @@ impl AccountWallet {
                     external,
                     internal,
                     Some(MemWallet::from_owner_seed(*owner_seed)),
+                    Some(bitcoin_seed),
+                    Some(batch_stock_secret),
                     Some(issuer_root),
                     fingerprint,
                     binding_commitment,
@@ -1000,7 +1384,16 @@ impl AccountWallet {
                 let fingerprint =
                     sha256::Hash::hash(&[external.as_bytes(), b"\0", internal.as_bytes()].concat())
                         .to_string();
-                (external, internal, None, None, fingerprint, None)
+                (
+                    external,
+                    internal,
+                    None,
+                    None,
+                    None,
+                    None,
+                    fingerprint,
+                    None,
+                )
             }
         };
 
@@ -1110,6 +1503,8 @@ impl AccountWallet {
             bitcoin,
             db,
             protocol,
+            bitcoin_fee_seed,
+            batch_stock_secret,
             #[cfg(any(test, feature = "issuer-tools"))]
             issuer_root,
             root_fingerprint,
@@ -1335,6 +1730,30 @@ impl AccountWallet {
             .map(MemWallet::owners)
             .or_else(|| self.config.watch_owner.clone().map(|owner| vec![owner]))
             .unwrap_or_default();
+        let batch_stock_inventory = query_json_rows(
+            &self.db.conn,
+            "SELECT json_object(
+                 'participant_count', participant_count,
+                 'state', state,
+                 'count', COUNT(*),
+                 'total_sats', SUM(value_sats)
+             ) FROM opencsv_batch_stocks
+             GROUP BY participant_count, state
+             ORDER BY participant_count, state",
+        )?;
+        let batch_reserve_operations = query_json_rows(
+            &self.db.conn,
+            "SELECT json_object(
+                 'maintenance_id', maintenance_id,
+                 'state', state,
+                 'participant_count', participant_count,
+                 'stock_count', stock_count,
+                 'fee_cell_count', fee_cell_count,
+                 'txid', txid,
+                 'updated_at', updated_at
+             ) FROM opencsv_batch_reserve_operations
+             ORDER BY updated_at DESC LIMIT 10",
+        )?;
         Ok(json!({
             "version": SCHEMA_VERSION,
             "role": self.config.role,
@@ -1383,6 +1802,10 @@ impl AccountWallet {
                 "SELECT receipt_json FROM opencsv_observation_receipts
                  ORDER BY observed_at DESC, check_id LIMIT 20",
             )?,
+            "batch_reserves": {
+                "inventory": batch_stock_inventory,
+                "maintenance_operations": batch_reserve_operations,
+            },
             "root_fingerprint": self.root_fingerprint,
         }))
     }
@@ -1968,6 +2391,479 @@ impl AccountWallet {
         Ok((submitted, peers))
     }
 
+    /// Create a wallet-internal reserve split for one batching-v2 participant
+    /// count. The transaction has only count-specific signed stock outputs,
+    /// derived P2WPKH fee cells, and wallet change; there is no arbitrary BTC
+    /// recipient surface. Exact signed bytes are durable before relay.
+    pub fn prepare_batch_reserves(
+        &mut self,
+        participant_count: u8,
+        fee_policy_json: &str,
+    ) -> Result<Value, AccountError> {
+        self.require_write_enabled()?;
+        if !(2..=u8::try_from(MAX_LOCAL_BATCH_RECIPIENTS).unwrap_or(u8::MAX))
+            .contains(&participant_count)
+        {
+            return Err(AccountError::new(
+                "invalid_batch_count",
+                "reserve maintenance supports 2..=64 participants",
+            ));
+        }
+        if let Some(maintenance_id) = self
+            .db
+            .conn
+            .query_row(
+                "SELECT maintenance_id FROM opencsv_batch_reserve_operations
+                 WHERE participant_count = ?1
+                   AND state IN ('signed_persisted', 'broadcast_unobserved', 'mempool')
+                 ORDER BY created_at DESC LIMIT 1",
+                [participant_count],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+        {
+            return self.batch_reserve_operation_json(&maintenance_id);
+        }
+        let policy: FeePolicy = serde_json::from_str(fee_policy_json)
+            .map_err(|error| AccountError::new("invalid_fee_policy", error.to_string()))?;
+        if policy.target_sat_per_vb == 0 {
+            return Err(AccountError::new(
+                "invalid_fee_policy",
+                "target_sat_per_vb must be positive",
+            ));
+        }
+        let stock_count = 3usize;
+        let fee_cell_count = usize::from(participant_count)
+            .checked_mul(3)
+            .ok_or_else(|| AccountError::new("arithmetic_overflow", "fee cell count overflow"))?;
+        let stock_secret = self.batch_stock_secret()?;
+        let stock_pubkey = PublicKey::from_secret_key(&Secp256k1::new(), &stock_secret);
+        let stock_script =
+            stock_witness_script(stock_pubkey, usize::from(participant_count)).to_p2wsh();
+        let mut fee_cell_scripts = Vec::with_capacity(fee_cell_count);
+        for _ in 0..fee_cell_count {
+            fee_cell_scripts.push(
+                self.bitcoin
+                    .reveal_next_address(KeychainKind::Internal)
+                    .address
+                    .script_pubkey(),
+            );
+        }
+        let change_script = self
+            .bitcoin
+            .reveal_next_address(KeychainKind::Internal)
+            .address
+            .script_pubkey();
+        self.bitcoin.persist(&mut self.db)?;
+        let unspendable = self
+            .bitcoin
+            .list_unspent()
+            .filter(|output| {
+                self.bitcoin.is_outpoint_locked(output.outpoint)
+                    || ReservedFunding::from_local(output.clone()).is_err()
+            })
+            .map(|output| output.outpoint)
+            .collect::<Vec<_>>();
+        let fee_rate = FeeRate::from_sat_per_vb(policy.target_sat_per_vb).ok_or_else(|| {
+            AccountError::new("invalid_fee_policy", "fee rate exceeds Bitcoin limits")
+        })?;
+        let mut builder = self.bitcoin.build_tx();
+        builder.ordering(TxOrdering::Untouched);
+        builder.set_exact_sequence(Sequence::ENABLE_RBF_NO_LOCKTIME);
+        builder.unspendable(unspendable);
+        for _ in 0..stock_count {
+            builder.add_recipient(
+                stock_script.clone(),
+                Amount::from_sat(opencsv_bitcoin::batch_v2::MIN_OUTPUT_SATS),
+            );
+        }
+        for script in &fee_cell_scripts {
+            builder.add_recipient(script.clone(), Amount::from_sat(MIN_FEE_RESERVE_SATS));
+        }
+        builder.drain_to(change_script);
+        builder.fee_rate(fee_rate);
+        let mut psbt = builder
+            .finish()
+            .map_err(|error| AccountError::new("insufficient_fees", error.to_string()))?;
+        let finalized = self
+            .bitcoin
+            .sign(&mut psbt, SignOptions::default())
+            .map_err(|error| AccountError::new("signing_failed", error.to_string()))?;
+        if !finalized {
+            return Err(AccountError::new(
+                "signing_failed",
+                "BDK did not finalize the reserve-maintenance transaction",
+            ));
+        }
+        let fee = psbt.fee_amount().ok_or_else(|| {
+            AccountError::new("signing_failed", "could not calculate maintenance fee")
+        })?;
+        if policy
+            .max_fee_sats
+            .is_some_and(|maximum| fee.to_sat() > maximum)
+        {
+            return Err(AccountError::new(
+                "fee_limit_exceeded",
+                format!("{} sats exceeds configured maximum", fee.to_sat()),
+            ));
+        }
+        let transaction = psbt
+            .extract_tx()
+            .map_err(|error| AccountError::new("signing_failed", error.to_string()))?;
+        if transaction.output.len() < stock_count + fee_cell_count
+            || transaction.output[..stock_count].iter().any(|output| {
+                output.value.to_sat() != opencsv_bitcoin::batch_v2::MIN_OUTPUT_SATS
+                    || output.script_pubkey != stock_script
+            })
+            || transaction.output[stock_count..stock_count + fee_cell_count]
+                .iter()
+                .zip(&fee_cell_scripts)
+                .any(|(output, expected_script)| {
+                    output.value.to_sat() != MIN_FEE_RESERVE_SATS
+                        || &output.script_pubkey != expected_script
+                })
+        {
+            return Err(AccountError::new(
+                "protocol_layout_violation",
+                "reserve-maintenance outputs changed before signing",
+            ));
+        }
+        let maintenance_id = random_id(16);
+        let txid = transaction.compute_txid();
+        let signed_tx_hex = hex_encode(&serialize(&transaction));
+        let stock_vouts: Vec<u32> = (0..stock_count)
+            .map(|index| u32::try_from(index).expect("three stock outputs"))
+            .collect();
+        let mut receipt = json!({
+            "maintenance_id": maintenance_id,
+            "txid": txid.to_string(),
+            "participant_count": participant_count,
+            "stock_vouts": stock_vouts,
+            "stock_value_sats": opencsv_bitcoin::batch_v2::MIN_OUTPUT_SATS,
+            "fee_cell_vouts": (stock_count..stock_count + fee_cell_count).collect::<Vec<_>>(),
+            "fee_cell_value_sats": MIN_FEE_RESERVE_SATS,
+            "fee_sats": fee.to_sat(),
+            "fee_rate_sat_per_vb": policy.target_sat_per_vb,
+        });
+        let now = unix_time()?;
+        self.db.conn.execute_batch("BEGIN IMMEDIATE")?;
+        let persisted = (|| -> Result<(), AccountError> {
+            self.db.conn.execute(
+                "INSERT INTO opencsv_batch_reserve_operations(
+                     maintenance_id, state, participant_count, stock_count,
+                     fee_cell_count, signed_tx_hex, txid, receipt_json,
+                     created_at, updated_at
+                 ) VALUES(?1, 'signed_persisted', ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8)",
+                params![
+                    maintenance_id,
+                    participant_count,
+                    i64::try_from(stock_count).unwrap_or(i64::MAX),
+                    i64::try_from(fee_cell_count).unwrap_or(i64::MAX),
+                    signed_tx_hex,
+                    txid.to_string(),
+                    receipt.to_string(),
+                    now,
+                ],
+            )?;
+            for vout in &stock_vouts {
+                self.db.conn.execute(
+                    "INSERT INTO opencsv_batch_stocks(
+                         participant_count, txid, vout, value_sats,
+                         birth_height, state, reserved_by_batch, created_at
+                     ) VALUES(?1, ?2, ?3, ?4, 0, 'pending', NULL, ?5)",
+                    params![
+                        participant_count,
+                        txid.to_string(),
+                        vout,
+                        i64::try_from(opencsv_bitcoin::batch_v2::MIN_OUTPUT_SATS)
+                            .expect("batch stock floor fits SQLite"),
+                        now,
+                    ],
+                )?;
+            }
+            Ok(())
+        })();
+        match persisted {
+            Ok(()) => self.db.conn.execute_batch("COMMIT")?,
+            Err(error) => {
+                let _ = self.db.conn.execute_batch("ROLLBACK");
+                return Err(error);
+            }
+        }
+        let seen_at = u64::try_from(now)
+            .map_err(|_| AccountError::new("clock_error", "negative timestamp"))?;
+        self.bitcoin
+            .apply_unconfirmed_txs([(Arc::new(transaction.clone()), seen_at)]);
+        self.bitcoin.persist(&mut self.db)?;
+        let (p2p_submissions, relay_peers) = self.submit_direct_p2p(&transaction)?;
+        let client = esplora_client::Builder::new(&self.config.esplora_url).build_blocking();
+        let fallback = relay_via_esplora_if_unobserved(&client, &transaction);
+        receipt["p2p_submissions"] = json!(p2p_submissions);
+        receipt["p2p_peers"] = json!(relay_peers);
+        receipt["generic_relay_fallback"] = json!(matches!(&fallback, Ok(true)));
+        if let Err(error) = &fallback {
+            receipt["generic_relay_error"] = json!(error.to_string());
+        }
+        self.db.conn.execute(
+            "UPDATE opencsv_batch_reserve_operations
+             SET state = 'broadcast_unobserved', receipt_json = ?2, updated_at = ?3
+             WHERE maintenance_id = ?1",
+            params![maintenance_id, receipt.to_string(), unix_time()?],
+        )?;
+        self.batch_reserve_operation_json(&maintenance_id)
+    }
+
+    /// Apply pinned raw-byte observation to an exact reserve-maintenance
+    /// transaction. A socket submission alone never reaches `mempool`.
+    pub fn observe_batch_reserve_unconfirmed(
+        &mut self,
+        maintenance_id: &str,
+        raw_transaction: &[u8],
+        observations_json: &str,
+    ) -> Result<Value, AccountError> {
+        let (state, signed_tx_hex, expected_txid): (String, String, String) = self
+            .db
+            .conn
+            .query_row(
+                "SELECT state, signed_tx_hex, txid
+                 FROM opencsv_batch_reserve_operations WHERE maintenance_id = ?1",
+                [maintenance_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?
+            .ok_or_else(|| {
+                AccountError::new(
+                    "unknown_reserve_maintenance",
+                    format!("unknown maintenance operation {maintenance_id}"),
+                )
+            })?;
+        if !matches!(
+            state.as_str(),
+            "signed_persisted" | "broadcast_unobserved" | "mempool"
+        ) {
+            return Err(AccountError::new(
+                "invalid_operation_state",
+                format!("reserve maintenance is {state}"),
+            ));
+        }
+        if hex_decode(&signed_tx_hex, "reserve maintenance transaction")? != raw_transaction {
+            return Err(AccountError::new(
+                "raw_transaction_mismatch",
+                "observer bytes differ from the persisted reserve transaction",
+            ));
+        }
+        let transaction: Transaction = deserialize(raw_transaction).map_err(|error| {
+            AccountError::new("invalid_observation_transaction", error.to_string())
+        })?;
+        if transaction.compute_txid().to_string() != expected_txid {
+            return Err(AccountError::new(
+                "raw_transaction_mismatch",
+                "reserve transaction id differs from persisted bytes",
+            ));
+        }
+        let (receipts, policy_failure) = evaluate_observation_evidence(
+            &self.config.observation_checks,
+            raw_transaction,
+            observations_json,
+        )?;
+        self.persist_observation_receipts(&expected_txid, &receipts)?;
+        if let Some(error) = policy_failure {
+            return Err(error);
+        }
+        self.enforce_unconfirmed_non_host_policy(&expected_txid, true)?;
+        if !receipts.iter().any(|receipt| {
+            receipt["kind"] == json!(ObservationKind::RawTransactionApi)
+                && receipt["result"] == json!(ObservationResult::Observed)
+                && receipt["raw_byte_match"] == true
+        }) {
+            return Err(AccountError::new(
+                "mempool_observation_failed",
+                "no pinned observer returned the exact reserve transaction",
+            ));
+        }
+        self.db.conn.execute(
+            "UPDATE opencsv_batch_reserve_operations
+             SET state = 'mempool', updated_at = ?2 WHERE maintenance_id = ?1",
+            params![maintenance_id, unix_time()?],
+        )?;
+        let mut value = self.batch_reserve_operation_json(maintenance_id)?;
+        value["observations"] = json!(receipts);
+        Ok(value)
+    }
+
+    /// Reapply and rebroadcast an exact persisted reserve-maintenance
+    /// transaction after a crash. No new outputs or coin selection occur.
+    pub fn resume_batch_reserves(&mut self, maintenance_id: &str) -> Result<Value, AccountError> {
+        let current = self.batch_reserve_operation_json(maintenance_id)?;
+        if !matches!(
+            current["state"].as_str(),
+            Some("signed_persisted" | "broadcast_unobserved")
+        ) {
+            return Ok(current);
+        }
+        let raw = hex_decode(
+            current["signed_tx_hex"].as_str().ok_or_else(|| {
+                AccountError::new("database_corrupt", "maintenance has no transaction")
+            })?,
+            "reserve maintenance transaction",
+        )?;
+        let transaction: Transaction = deserialize(&raw)
+            .map_err(|error| AccountError::new("database_corrupt", error.to_string()))?;
+        let txid = transaction.compute_txid().to_string();
+        if current["txid"].as_str() != Some(txid.as_str()) {
+            return Err(AccountError::new(
+                "database_corrupt",
+                "maintenance txid differs from its persisted bytes",
+            ));
+        }
+        let seen_at = u64::try_from(unix_time()?)
+            .map_err(|_| AccountError::new("clock_error", "negative timestamp"))?;
+        self.bitcoin
+            .apply_unconfirmed_txs([(Arc::new(transaction.clone()), seen_at)]);
+        self.bitcoin.persist(&mut self.db)?;
+        let (p2p_submissions, relay_peers) = self.submit_direct_p2p(&transaction)?;
+        let client = esplora_client::Builder::new(&self.config.esplora_url).build_blocking();
+        let fallback = relay_via_esplora_if_unobserved(&client, &transaction);
+        let mut receipt = current["receipt"].clone();
+        receipt["resume_p2p_submissions"] = json!(p2p_submissions);
+        receipt["resume_p2p_peers"] = json!(relay_peers);
+        receipt["resume_generic_relay_fallback"] = json!(matches!(&fallback, Ok(true)));
+        if let Err(error) = fallback {
+            receipt["resume_generic_relay_error"] = json!(error.to_string());
+        }
+        self.db.conn.execute(
+            "UPDATE opencsv_batch_reserve_operations
+             SET state = 'broadcast_unobserved', receipt_json = ?2, updated_at = ?3
+             WHERE maintenance_id = ?1",
+            params![maintenance_id, receipt.to_string(), unix_time()?],
+        )?;
+        self.batch_reserve_operation_json(maintenance_id)
+    }
+
+    /// Promote pending stock only after the accelerator discovers a block and
+    /// the CBF verifier independently proves each exact outpoint unspent.
+    pub fn refresh_batch_reserves(&mut self, maintenance_id: &str) -> Result<Value, AccountError> {
+        let value = self.batch_reserve_operation_json(maintenance_id)?;
+        if value["state"] == "confirmed" {
+            return Ok(value);
+        }
+        let txid = value["txid"]
+            .as_str()
+            .ok_or_else(|| AccountError::new("database_corrupt", "maintenance has no txid"))?
+            .parse::<Txid>()
+            .map_err(|error| AccountError::new("database_corrupt", error.to_string()))?;
+        let client = esplora_client::Builder::new(&self.config.esplora_url).build_blocking();
+        let status = client
+            .get_tx_status(&txid)
+            .map_err(|error| AccountError::new("sync_failed", error.to_string()))?;
+        let Some(block_height) = status.block_height else {
+            return Ok(value);
+        };
+        let participant_count =
+            u8::try_from(value["participant_count"].as_u64().ok_or_else(|| {
+                AccountError::new("database_corrupt", "maintenance has no participant count")
+            })?)
+            .map_err(|_| AccountError::new("database_corrupt", "participant count exceeds u8"))?;
+        let stock_pubkey =
+            PublicKey::from_secret_key(&Secp256k1::new(), &self.batch_stock_secret()?);
+        let stock_script =
+            stock_witness_script(stock_pubkey, usize::from(participant_count)).to_p2wsh();
+        let stocks = {
+            let mut statement = self.db.conn.prepare(
+                "SELECT vout, value_sats FROM opencsv_batch_stocks
+                 WHERE txid = ?1 AND state = 'pending' ORDER BY vout",
+            )?;
+            let rows = statement.query_map([txid.to_string()], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+            })?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        if stocks.is_empty() {
+            return Err(AccountError::new(
+                "database_corrupt",
+                "maintenance transaction has no pending stocks",
+            ));
+        }
+        for (vout, value_sats) in &stocks {
+            self.funding_verifier.verify(&FundingVerificationRequest {
+                outpoint: OutPoint::new(
+                    txid,
+                    u32::try_from(*vout).map_err(|_| {
+                        AccountError::new("database_corrupt", "stock vout exceeds u32")
+                    })?,
+                ),
+                txout: bdk_wallet::bitcoin::TxOut {
+                    value: Amount::from_sat(u64::try_from(*value_sats).map_err(|_| {
+                        AccountError::new("database_corrupt", "stock value is negative")
+                    })?),
+                    script_pubkey: stock_script.clone(),
+                },
+                birth_height: u64::from(block_height),
+            })?;
+        }
+        self.sync()?;
+        let now = unix_time()?;
+        let transaction = self
+            .db
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute(
+            "UPDATE opencsv_batch_stocks
+             SET state = 'available', birth_height = ?2
+             WHERE txid = ?1 AND state = 'pending'",
+            params![txid.to_string(), block_height],
+        )?;
+        transaction.execute(
+            "UPDATE opencsv_batch_reserve_operations
+             SET state = 'confirmed', updated_at = ?2 WHERE maintenance_id = ?1",
+            params![maintenance_id, now],
+        )?;
+        transaction.commit()?;
+        self.batch_reserve_operation_json(maintenance_id)
+    }
+
+    fn batch_reserve_operation_json(&self, maintenance_id: &str) -> Result<Value, AccountError> {
+        let row: (String, i64, i64, i64, String, String, String) = self
+            .db
+            .conn
+            .query_row(
+                "SELECT state, participant_count, stock_count, fee_cell_count,
+                        signed_tx_hex, txid, receipt_json
+                 FROM opencsv_batch_reserve_operations WHERE maintenance_id = ?1",
+                [maintenance_id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                    ))
+                },
+            )
+            .optional()?
+            .ok_or_else(|| {
+                AccountError::new(
+                    "unknown_reserve_maintenance",
+                    format!("unknown maintenance operation {maintenance_id}"),
+                )
+            })?;
+        let receipt: Value = serde_json::from_str(&row.6)
+            .map_err(|error| AccountError::new("database_corrupt", error.to_string()))?;
+        Ok(json!({
+            "maintenance_id": maintenance_id,
+            "state": row.0,
+            "participant_count": row.1,
+            "stock_count": row.2,
+            "fee_cell_count": row.3,
+            "signed_tx_hex": row.4,
+            "txid": row.5,
+            "receipt": receipt,
+        }))
+    }
+
     /// Read-only self-scan verdict using this account's owner and asset set.
     pub fn scan_verify(&self, consignment_hex: &str) -> Result<Value, AccountError> {
         scan::verify_json(
@@ -2147,19 +3043,7 @@ impl AccountWallet {
     /// arbitrary-send field at this boundary.
     pub fn transfer_plan(&mut self, request_json: &str) -> Result<Value, AccountError> {
         self.require_write_enabled()?;
-        let request: TransferRequest = serde_json::from_str(request_json).map_err(|error| {
-            AccountError::new("invalid_request", format!("transfer request: {error}"))
-        })?;
-        decode_hex_32(&request.asset_id, "asset id")?;
-        decode_hex_32(&request.to_owner, "recipient owner")?;
-        if request.amount == 0 {
-            return Err(AccountError::new(
-                "invalid_request",
-                "transfer amount must be positive",
-            ));
-        }
-        let normalized_request = serde_json::to_string(&request)
-            .map_err(|error| AccountError::new("database_error", error.to_string()))?;
+        let (_, normalized_request) = normalize_transfer_request(request_json)?;
         let operation_id = random_id(16);
         let delivery_nonce = random_id(16);
         self.insert_planned_operation(
@@ -2169,6 +3053,1513 @@ impl AccountWallet {
             &delivery_nonce,
         )?;
         operation_json(&self.operation(&operation_id)?)
+    }
+
+    /// Durably plan the first transfer in a two-second collection window, or
+    /// coalesce it into the currently open local window. No proof or Bitcoin
+    /// reservation begins until the window is frozen, so a recipient added
+    /// before the deadline is guaranteed membership rather than being a UI
+    /// hint racing a background prover.
+    pub fn transfer_batch_plan(&mut self, request_json: &str) -> Result<Value, AccountError> {
+        self.plan_batched_transfer(request_json, None)
+    }
+
+    /// Add one exact recipient intent to a named, still-open collection
+    /// window. This is the explicit Add Recipient boundary: the call either
+    /// commits membership durably or fails without creating an operation.
+    pub fn transfer_batch_add_recipient(
+        &mut self,
+        batch_local_id: &str,
+        request_json: &str,
+    ) -> Result<Value, AccountError> {
+        self.plan_batched_transfer(request_json, Some(batch_local_id))
+    }
+
+    fn plan_batched_transfer(
+        &mut self,
+        request_json: &str,
+        requested_batch: Option<&str>,
+    ) -> Result<Value, AccountError> {
+        self.require_write_enabled()?;
+        let (_, normalized_request) = normalize_transfer_request(request_json)?;
+        let now_ms = unix_time_millis()?;
+        let operation_created_at = unix_time()?;
+        let existing = match requested_batch {
+            Some(batch_local_id) => Some(self.send_batch(batch_local_id)?),
+            None => self
+                .db
+                .meta("active_send_batch")?
+                .and_then(|batch_local_id| self.send_batch(&batch_local_id).ok())
+                .filter(|batch| {
+                    batch.state == "collecting"
+                        && batch.deadline_ms >= now_ms
+                        && self
+                            .send_batch_members(&batch.batch_local_id)
+                            .is_ok_and(|members| members.len() < MAX_LOCAL_BATCH_RECIPIENTS)
+                }),
+        };
+
+        if let Some(batch) = existing {
+            if batch.state != "collecting" {
+                return Err(AccountError::new(
+                    "batch_window_closed",
+                    format!("batch is {}", batch.state),
+                ));
+            }
+            if now_ms > batch.deadline_ms {
+                return Err(AccountError::new(
+                    "batch_window_closed",
+                    "the two-second Add Recipient guarantee has expired",
+                ));
+            }
+            let members = self.send_batch_members(&batch.batch_local_id)?;
+            if members.len() >= MAX_LOCAL_BATCH_RECIPIENTS {
+                return Err(AccountError::new(
+                    "batch_full",
+                    "the local batch reached the reviewed C1 participant limit",
+                ));
+            }
+            let operation_id = random_id(16);
+            let delivery_nonce = random_id(16);
+            let ordinal = u8::try_from(members.len()).map_err(|_| {
+                AccountError::new("batch_full", "batch participant ordinal exceeds u8")
+            })?;
+            let transaction = self
+                .db
+                .conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)?;
+            insert_planned_operation_in_transaction(
+                &transaction,
+                &operation_id,
+                &normalized_request,
+                &delivery_nonce,
+                operation_created_at,
+            )?;
+            transaction.execute(
+                "INSERT INTO opencsv_send_batch_members(
+                     batch_local_id, operation_id, ordinal, added_at_ms
+                 ) VALUES(?1, ?2, ?3, ?4)",
+                params![batch.batch_local_id, operation_id, ordinal, now_ms],
+            )?;
+            transaction.commit()?;
+            return self.send_batch_member_json(&batch.batch_local_id, &operation_id);
+        }
+
+        if requested_batch.is_some() {
+            return Err(AccountError::new(
+                "unknown_batch",
+                "the requested Add Recipient batch does not exist",
+            ));
+        }
+        let batch_local_id = random_id(16);
+        let operation_id = random_id(16);
+        let delivery_nonce = random_id(16);
+        let deadline_ms = now_ms
+            .checked_add(SEND_BATCH_WINDOW_MILLIS)
+            .ok_or_else(|| {
+                AccountError::new("clock_error", "batch collection deadline overflow")
+            })?;
+        let transaction = self
+            .db
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute(
+            "INSERT INTO opencsv_send_batches(
+                 batch_local_id, state, deadline_ms, created_at, updated_at
+             ) VALUES(?1, 'collecting', ?2, ?3, ?3)",
+            params![batch_local_id, deadline_ms, now_ms],
+        )?;
+        insert_planned_operation_in_transaction(
+            &transaction,
+            &operation_id,
+            &normalized_request,
+            &delivery_nonce,
+            operation_created_at,
+        )?;
+        transaction.execute(
+            "INSERT INTO opencsv_send_batch_members(
+                 batch_local_id, operation_id, ordinal, added_at_ms
+             ) VALUES(?1, ?2, 0, ?3)",
+            params![batch_local_id, operation_id, now_ms],
+        )?;
+        transaction.execute(
+            "INSERT INTO opencsv_account_meta(key, value)
+             VALUES('active_send_batch', ?1)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            [&batch_local_id],
+        )?;
+        transaction.commit()?;
+        self.send_batch_member_json(&batch_local_id, &operation_id)
+    }
+
+    /// Freeze membership. A one-member timeout deliberately returns to the
+    /// established solo path; two or more members become an immutable C1
+    /// proposal candidate. Re-entry returns the same frozen membership.
+    pub fn freeze_send_batch(&mut self, batch_local_id: &str) -> Result<Value, AccountError> {
+        self.require_write_enabled()?;
+        let batch = self.send_batch(batch_local_id)?;
+        let members = self.send_batch_members(batch_local_id)?;
+        if members.is_empty() {
+            return Err(AccountError::new(
+                "database_corrupt",
+                "send batch contains no operations",
+            ));
+        }
+        if batch.state == "collecting" {
+            let next_state = if members.len() == 1 { "solo" } else { "frozen" };
+            let count = u8::try_from(members.len()).map_err(|_| {
+                AccountError::new("batch_full", "batch participant count exceeds u8")
+            })?;
+            let now_ms = unix_time_millis()?;
+            let transaction = self
+                .db
+                .conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)?;
+            transaction.execute(
+                "UPDATE opencsv_send_batches
+                 SET state = ?2, participant_count = ?3, updated_at = ?4
+                 WHERE batch_local_id = ?1 AND state = 'collecting'",
+                params![batch_local_id, next_state, count, now_ms],
+            )?;
+            transaction.execute(
+                "DELETE FROM opencsv_account_meta
+                 WHERE key = 'active_send_batch' AND value = ?1",
+                [batch_local_id],
+            )?;
+            transaction.commit()?;
+        } else if !matches!(
+            batch.state.as_str(),
+            "solo"
+                | "frozen"
+                | "proof_ready"
+                | "signed_persisted"
+                | "broadcast_unobserved"
+                | "mempool"
+                | "confirmed"
+        ) {
+            return Err(AccountError::new(
+                "invalid_batch_state",
+                format!("batch is {}", batch.state),
+            ));
+        }
+        self.send_batch_json(batch_local_id)
+    }
+
+    /// Read one collection/frozen batch and its durably ordered members.
+    pub fn send_batch_status(&self, batch_local_id: &str) -> Result<Value, AccountError> {
+        self.send_batch_json(batch_local_id)
+    }
+
+    /// Snapshot a frozen C1 batch under the wallet lock. All authoritative
+    /// chain checks and recursive proofs run from the returned immutable job,
+    /// outside the global account registry and live-wallet mutex.
+    pub(crate) fn begin_send_batch_proof(
+        &mut self,
+        batch_local_id: &str,
+    ) -> Result<BatchProofJobStart, AccountError> {
+        self.require_write_enabled()?;
+        let batch = self.send_batch(batch_local_id)?;
+        let members = self.send_batch_members(batch_local_id)?;
+        if batch.state == "solo" {
+            let operation_id = members
+                .first()
+                .ok_or_else(|| AccountError::new("database_corrupt", "solo batch is empty"))?
+                .operation_id
+                .clone();
+            return Ok(BatchProofJobStart::Solo(operation_id));
+        }
+        if batch.state == "proof_ready" {
+            return Ok(BatchProofJobStart::Ready(
+                self.send_batch_json(batch_local_id)?,
+            ));
+        }
+        if batch.state != "frozen" {
+            return Err(AccountError::new(
+                "invalid_batch_state",
+                format!("batch is {}", batch.state),
+            ));
+        }
+        let participant_count = u8::try_from(members.len())
+            .map_err(|_| AccountError::new("batch_full", "batch participant count exceeds u8"))?;
+        if participant_count < 2 {
+            return Err(AccountError::new(
+                "database_corrupt",
+                "frozen batching-v2 path has fewer than two participants",
+            ));
+        }
+        if batch.participant_count != Some(participant_count) {
+            return Err(AccountError::new(
+                "database_corrupt",
+                "frozen batch participant count changed",
+            ));
+        }
+        if let Some(active) = self.db.meta("active_batch_proof")? {
+            if active != batch_local_id {
+                return Err(AccountError::new(
+                    "proof_job_busy",
+                    format!("another batch proof job is active for {active}"),
+                ));
+            }
+        }
+
+        let stock = self.reserve_batch_stock(batch_local_id, participant_count)?;
+        let mut jobs = Vec::with_capacity(members.len());
+        for member in members {
+            let operation = self.operation(&member.operation_id)?;
+            let funding = match operation.state.as_str() {
+                "planned" => self.reserve_fee_utxo(&member.operation_id)?,
+                "fee_reserved" => self.reserved_funding_for_operation(&operation)?,
+                state => {
+                    return Err(AccountError::new(
+                        "invalid_operation_state",
+                        format!("batch member {} is {state}", member.operation_id),
+                    ));
+                }
+            };
+            let request: TransferRequest =
+                serde_json::from_str(&operation.request_json).map_err(|error| {
+                    AccountError::new("database_corrupt", format!("transfer request: {error}"))
+                })?;
+            let (change_spk, change_spk_hex) = match member.change_spk_hex {
+                Some(encoded) => {
+                    let script =
+                        ScriptBuf::from_bytes(hex_decode(&encoded, "batch change script")?);
+                    (script, encoded)
+                }
+                None => {
+                    let address = self
+                        .bitcoin
+                        .reveal_next_address(KeychainKind::Internal)
+                        .address;
+                    let script = address.script_pubkey();
+                    let encoded = hex_encode(script.as_bytes());
+                    self.bitcoin.persist(&mut self.db)?;
+                    (script, encoded)
+                }
+            };
+            let (commit_nonce, commit_nonce_hex) = match member.commit_nonce_hex {
+                Some(encoded) => (decode_hex_32(&encoded, "batch commit nonce")?, encoded),
+                None => {
+                    let encoded = random_id(32);
+                    (decode_hex_32(&encoded, "batch commit nonce")?, encoded)
+                }
+            };
+            self.db.conn.execute(
+                "UPDATE opencsv_send_batch_members
+                 SET change_spk_hex = ?3, commit_nonce_hex = ?4
+                 WHERE batch_local_id = ?1 AND operation_id = ?2",
+                params![
+                    batch_local_id,
+                    member.operation_id,
+                    change_spk_hex,
+                    commit_nonce_hex,
+                ],
+            )?;
+            let fee_secret = self.batch_fee_secret(&funding)?;
+            let fee_pubkey = PublicKey::from_secret_key(&Secp256k1::new(), &fee_secret);
+            if opencsv_bitcoin::batch_v2::p2wpkh_script(fee_pubkey) != funding.txout.script_pubkey {
+                return Err(AccountError::new(
+                    "database_corrupt",
+                    "derived batch fee key does not control its reserved output",
+                ));
+            }
+            jobs.push(BatchProofMemberJob {
+                operation_id: member.operation_id,
+                request,
+                funding,
+                fee_secret,
+                change_spk,
+                commit_nonce,
+            });
+        }
+        let network = parse_network(&self.config.network)?;
+        let proposal_nonce = sha256::Hash::hash(
+            [
+                b"OpenCSV local batch proposal v1".as_slice(),
+                batch_local_id.as_bytes(),
+            ]
+            .concat()
+            .as_slice(),
+        )
+        .to_byte_array();
+        self.db.set_meta("active_batch_proof", batch_local_id)?;
+        Ok(BatchProofJobStart::Run(Box::new(AccountBatchProofJob {
+            batch_local_id: batch_local_id.to_owned(),
+            stock,
+            stock_secret: self.batch_stock_secret()?,
+            proposal_nonce,
+            chain_id: genesis_block(network).block_hash().to_byte_array(),
+            members: jobs,
+            verifier: self.funding_verifier.clone(),
+            protocol_snapshot: self.protocol.as_ref().cloned().ok_or_else(|| {
+                AccountError::new("primary_required", "linked devices cannot prove batches")
+            })?,
+            esplora_url: self.config.esplora_url.clone(),
+        })))
+    }
+
+    /// Atomically install every proved member only if the frozen membership,
+    /// stock, fee reservations, proposal, and OpenCSV coin inputs remain
+    /// current. Every member receives the same backup checkpoint hash.
+    pub(crate) fn finish_send_batch_proof(
+        &mut self,
+        completed: CompletedBatchProofJob,
+    ) -> Result<Value, AccountError> {
+        let batch = self.send_batch(&completed.batch_local_id)?;
+        if batch.state == "proof_ready" {
+            self.db.delete_meta("active_batch_proof")?;
+            return self.send_batch_json(&completed.batch_local_id);
+        }
+        if batch.state != "frozen"
+            || self.db.meta("active_batch_proof")?.as_deref()
+                != Some(completed.batch_local_id.as_str())
+        {
+            return Err(AccountError::new(
+                "stale_proof_job",
+                "batch no longer owns the frozen proof reservation",
+            ));
+        }
+        let current_stock = self
+            .batch_stock_reserved_by(&completed.batch_local_id)?
+            .ok_or_else(|| {
+                AccountError::new("stale_proof_job", "batch stock reservation disappeared")
+            })?;
+        if current_stock.outpoint != completed.stock.outpoint
+            || current_stock.participant_count != completed.stock.participant_count
+        {
+            return Err(AccountError::new(
+                "stale_proof_job",
+                "batch stock reservation changed while proving",
+            ));
+        }
+        let members = self.send_batch_members(&completed.batch_local_id)?;
+        if members.len() != completed.members.len()
+            || members
+                .iter()
+                .map(|member| member.operation_id.as_str())
+                .ne(completed
+                    .members
+                    .iter()
+                    .map(|member| member.operation_id.as_str()))
+        {
+            return Err(AccountError::new(
+                "stale_proof_job",
+                "batch membership changed while proving",
+            ));
+        }
+
+        let mut protocol_candidate = self.protocol.as_ref().cloned().ok_or_else(|| {
+            AccountError::new("primary_required", "linked devices cannot prove batches")
+        })?;
+        let mut pending_ids = Vec::with_capacity(completed.members.len());
+        for member in &completed.members {
+            let operation = self.operation(&member.operation_id)?;
+            if operation.state != "fee_reserved"
+                || operation_outpoint(&operation)? != member.funding.outpoint
+            {
+                return Err(AccountError::new(
+                    "stale_proof_job",
+                    format!("fee reservation changed for {}", member.operation_id),
+                ));
+            }
+            let pending_id = protocol_candidate
+                .import_pending(&member.pending_json)
+                .map_err(|error| AccountError::new("database_error", error))?;
+            if protocol_candidate
+                .pending_spend_conflicts(pending_id)
+                .map_err(|error| AccountError::new("database_error", error))?
+                || !protocol_candidate
+                    .pending_spends_available(pending_id)
+                    .map_err(|error| AccountError::new("database_error", error))?
+            {
+                return Err(AccountError::new(
+                    "conflicting_operation",
+                    "a batch member's OpenCSV inputs changed while proving",
+                ));
+            }
+            if protocol_candidate
+                .rebind_pending_batch_payload(pending_id, completed.proposal.context())
+                .map_err(|error| AccountError::new("batch_payload_incompatible", error))?
+                != member.payload
+            {
+                return Err(AccountError::new(
+                    "stale_proof_job",
+                    "proposal-bound batch payload changed while proving",
+                ));
+            }
+            if protocol_candidate
+                .pending_unconfirmed_dependencies(pending_id)
+                .map_err(|error| AccountError::new("database_error", error))?
+                != member.unconfirmed_dependencies
+            {
+                return Err(AccountError::new(
+                    "stale_proof_job",
+                    "a batch member's zero-confirmation dependency set changed",
+                ));
+            }
+            pending_ids.push((member.operation_id.clone(), pending_id));
+        }
+
+        self.db.conn.execute_batch("BEGIN IMMEDIATE")?;
+        let installed = (|| -> Result<Value, AccountError> {
+            let now = unix_time()?;
+            for member in &completed.members {
+                for dependency in &member.unconfirmed_dependencies {
+                    self.db.conn.execute(
+                        "UPDATE opencsv_consignment_finality
+                         SET last_checked_at = ?2, last_error = NULL
+                         WHERE anchor_txid = ?1 AND finality = 'unconfirmed'",
+                        params![dependency, now],
+                    )?;
+                }
+                let envelope_position = completed
+                    .manifest
+                    .commitments()
+                    .iter()
+                    .position(|commitment| commitment.fee_outpoint() == member.funding.outpoint)
+                    .ok_or_else(|| {
+                        AccountError::new(
+                            "database_corrupt",
+                            "manifest omitted a proved batch member",
+                        )
+                    })?;
+                let receipt = json!({
+                    "batch_local_id": completed.batch_local_id,
+                    "batch_id": hex_encode(&completed.proposal.batch_id()),
+                    "manifest_id": hex_encode(&completed.manifest.manifest_id()),
+                    "envelope_position": envelope_position,
+                    "payload_hex": hex_encode(member.payload.as_bytes()),
+                    "funding_outpoint": member.funding.outpoint.to_string(),
+                    "funding_value_sats": member.funding.value_sats(),
+                    "funding_verification": member.funding_verification,
+                    "backup_ack_required": true,
+                });
+                self.db.conn.execute(
+                    "UPDATE opencsv_operations
+                     SET state = 'proof_ready', request_json = ?2,
+                         pending_json = ?3, receipt_json = ?4,
+                         checkpoint_hash = NULL, backup_acked = 0,
+                         updated_at = ?5 WHERE operation_id = ?1",
+                    params![
+                        member.operation_id,
+                        serde_json::to_string(&member.request).map_err(|error| {
+                            AccountError::new("database_error", error.to_string())
+                        })?,
+                        member.pending_json,
+                        receipt.to_string(),
+                        now,
+                    ],
+                )?;
+            }
+            let batch_receipt = json!({
+                "batch_id": hex_encode(&completed.proposal.batch_id()),
+                "manifest_id": hex_encode(&completed.manifest.manifest_id()),
+                "stock_outpoint": completed.stock.outpoint.to_string(),
+                "stock_value_sats": completed.stock.value_sats,
+                "stock_verification": completed.stock_verification,
+                "participant_count": completed.members.len(),
+                "miner_fee_sats": completed.manifest.miner_fee(),
+                "charges_sats": completed.manifest.charges(),
+                "backup_ack_required": true,
+            });
+            self.db.conn.execute(
+                "UPDATE opencsv_send_batches
+                 SET state = 'proof_ready', proposal_wire = ?2,
+                     manifest_wire = ?3, receipt_json = ?4,
+                     checkpoint_hash = NULL, backup_acked = 0,
+                     updated_at = ?5 WHERE batch_local_id = ?1",
+                params![
+                    completed.batch_local_id,
+                    completed.proposal.wire_bytes(),
+                    completed.manifest.wire_bytes(),
+                    batch_receipt.to_string(),
+                    now,
+                ],
+            )?;
+            self.db.delete_meta("active_batch_proof")?;
+            let checkpoint = self.checkpoint()?;
+            let checkpoint_hash = checkpoint["checkpoint_hash"].as_str().ok_or_else(|| {
+                AccountError::new("checkpoint_failed", "batch checkpoint has no hash")
+            })?;
+            self.db.conn.execute(
+                "UPDATE opencsv_send_batches
+                 SET checkpoint_hash = ?2 WHERE batch_local_id = ?1",
+                params![completed.batch_local_id, checkpoint_hash],
+            )?;
+            for member in &completed.members {
+                self.db.conn.execute(
+                    "UPDATE opencsv_operations
+                     SET checkpoint_hash = ?2 WHERE operation_id = ?1",
+                    params![member.operation_id, checkpoint_hash],
+                )?;
+            }
+            let mut response = self.send_batch_json(&completed.batch_local_id)?;
+            response["checkpoint_hash"] = json!(checkpoint_hash);
+            Ok(response)
+        })();
+        match installed {
+            Ok(response) => {
+                self.db.conn.execute_batch("COMMIT")?;
+                self.protocol = Some(protocol_candidate);
+                for (operation_id, pending_id) in pending_ids {
+                    self.pending_by_operation.insert(operation_id, pending_id);
+                }
+                Ok(response)
+            }
+            Err(error) => {
+                let _ = self.db.conn.execute_batch("ROLLBACK");
+                Err(error)
+            }
+        }
+    }
+
+    pub(crate) fn fail_send_batch_proof<T>(
+        &mut self,
+        batch_local_id: &str,
+        error: AccountError,
+    ) -> Result<T, AccountError> {
+        self.db.delete_meta("active_batch_proof")?;
+        self.db.conn.execute(
+            "UPDATE opencsv_send_batches SET receipt_json = ?2, updated_at = ?3
+             WHERE batch_local_id = ?1",
+            params![
+                batch_local_id,
+                json!({"proof_error": error.json()}).to_string(),
+                unix_time()?,
+            ],
+        )?;
+        Err(error)
+    }
+
+    /// Acknowledge one checkpoint for the complete frozen batch. Every member
+    /// must name the same hash; partial acknowledgement cannot release any
+    /// signature.
+    pub fn acknowledge_send_batch_backup(
+        &mut self,
+        batch_local_id: &str,
+        checkpoint_hash: &str,
+    ) -> Result<Value, AccountError> {
+        let batch = self.send_batch(batch_local_id)?;
+        if batch.state != "proof_ready" {
+            return Err(AccountError::new(
+                "invalid_batch_state",
+                format!("batch is {}", batch.state),
+            ));
+        }
+        if batch.checkpoint_hash.as_deref() != Some(checkpoint_hash) {
+            return Err(AccountError::new(
+                "backup_checkpoint_mismatch",
+                "Secure Backup acknowledged a different batch checkpoint",
+            ));
+        }
+        let current = self.checkpoint()?;
+        if current["checkpoint_hash"].as_str() != Some(checkpoint_hash) {
+            return Err(AccountError::new(
+                "backup_checkpoint_mismatch",
+                "wallet state changed after the batch checkpoint was emitted",
+            ));
+        }
+        let transaction = self
+            .db
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute(
+            "UPDATE opencsv_send_batches SET backup_acked = 1, updated_at = ?2
+             WHERE batch_local_id = ?1",
+            params![batch_local_id, unix_time()?],
+        )?;
+        transaction.execute(
+            "UPDATE opencsv_operations SET backup_acked = 1
+             WHERE operation_id IN (
+                 SELECT operation_id FROM opencsv_send_batch_members
+                 WHERE batch_local_id = ?1
+             )",
+            [batch_local_id],
+        )?;
+        transaction.commit()?;
+        self.send_batch_json(batch_local_id)
+    }
+
+    /// Reconstruct, reverify, sign, persist, and relay one local multi-
+    /// recipient C1 batch. The stock owner and every participant key remain
+    /// Rust-owned; all signatures are `SIGHASH_ALL` over the exact manifest.
+    pub fn sign_and_broadcast_send_batch(
+        &mut self,
+        batch_local_id: &str,
+    ) -> Result<Value, AccountError> {
+        self.require_write_enabled()?;
+        let batch = self.send_batch(batch_local_id)?;
+        if batch.state != "proof_ready" {
+            return Err(AccountError::new(
+                "invalid_batch_state",
+                format!("batch is {}", batch.state),
+            ));
+        }
+        if !batch.backup_acked {
+            return Err(AccountError::new(
+                "backup_required",
+                "the complete prepared batch checkpoint is not acknowledged",
+            ));
+        }
+        let proposal_wire = batch.proposal_wire.as_deref().ok_or_else(|| {
+            AccountError::new("database_corrupt", "proof-ready batch has no proposal")
+        })?;
+        let manifest_wire = batch.manifest_wire.as_deref().ok_or_else(|| {
+            AccountError::new("database_corrupt", "proof-ready batch has no manifest")
+        })?;
+        let proposal = BatchProposal::from_wire(proposal_wire).map_err(batch_protocol_error)?;
+        let members = self.send_batch_members(batch_local_id)?;
+        let stock = self
+            .batch_stock_reserved_by(batch_local_id)?
+            .ok_or_else(|| AccountError::new("conflicting_operation", "batch stock is unlocked"))?;
+        if stock.outpoint != proposal.stock_outpoint()
+            || stock.participant_count != u8::try_from(members.len()).unwrap_or(u8::MAX)
+        {
+            return Err(AccountError::new(
+                "conflicting_operation",
+                "proposal and reserved stock differ",
+            ));
+        }
+        let stock_script = proposal.stock_script_pubkey();
+        let stock_verification = self.funding_verifier.verify(&FundingVerificationRequest {
+            outpoint: stock.outpoint,
+            txout: bdk_wallet::bitcoin::TxOut {
+                value: Amount::from_sat(stock.value_sats),
+                script_pubkey: stock_script,
+            },
+            birth_height: stock.birth_height,
+        })?;
+        let mut commitments = Vec::with_capacity(members.len());
+        let mut signing_keys = HashMap::new();
+        let mut member_verifications = HashMap::new();
+        for member in &members {
+            let operation = self.operation(&member.operation_id)?;
+            if operation.state != "proof_ready" || !operation.backup_acked {
+                return Err(AccountError::new(
+                    "backup_required",
+                    format!(
+                        "batch member {} is not backup-acknowledged",
+                        member.operation_id
+                    ),
+                ));
+            }
+            let funding = self.reserved_funding_for_operation(&operation)?;
+            let verification = self.verify_funding(&funding)?;
+            let pending_id = *self
+                .pending_by_operation
+                .get(&member.operation_id)
+                .ok_or_else(|| {
+                    AccountError::new(
+                        "operation_not_resumable",
+                        format!("batch member {} has no pending proof", member.operation_id),
+                    )
+                })?;
+            let dependencies = self
+                .primary_protocol_mut()?
+                .pending_unconfirmed_dependencies(pending_id)
+                .map_err(|error| AccountError::new("operation_not_resumable", error))?;
+            self.reobserve_unconfirmed_dependencies(&dependencies)?;
+            let payload = self
+                .primary_protocol_mut()?
+                .rebind_pending_batch_payload(pending_id, proposal.context())
+                .map_err(|error| AccountError::new("batch_payload_incompatible", error))?;
+            let change_spk = ScriptBuf::from_bytes(hex_decode(
+                member.change_spk_hex.as_deref().ok_or_else(|| {
+                    AccountError::new("database_corrupt", "batch member has no change script")
+                })?,
+                "batch change script",
+            )?);
+            let commit_nonce = decode_hex_32(
+                member.commit_nonce_hex.as_deref().ok_or_else(|| {
+                    AccountError::new("database_corrupt", "batch member has no commit nonce")
+                })?,
+                "batch commit nonce",
+            )?;
+            let fee_secret = self.batch_fee_secret(&funding)?;
+            let fee_pubkey = PublicKey::from_secret_key(&Secp256k1::new(), &fee_secret);
+            let max_charge = funding
+                .value_sats()
+                .checked_sub(opencsv_bitcoin::batch_v2::MIN_OUTPUT_SATS)
+                .ok_or_else(|| {
+                    AccountError::new(
+                        "insufficient_fees",
+                        "batch fee cell cannot preserve minimum change",
+                    )
+                })?;
+            commitments.push(
+                ParticipantCommitment::new(
+                    &proposal,
+                    batch_operation_id(&member.operation_id),
+                    commit_nonce,
+                    payload,
+                    funding.outpoint,
+                    funding.txout.clone(),
+                    fee_pubkey,
+                    change_spk,
+                    max_charge,
+                )
+                .map_err(batch_protocol_error)?,
+            );
+            signing_keys.insert(funding.outpoint, fee_secret);
+            member_verifications.insert(member.operation_id.clone(), verification);
+        }
+        let current_height = member_verifications
+            .values()
+            .map(|receipt| receipt.checked_through)
+            .chain(std::iter::once(stock_verification.checked_through))
+            .max()
+            .unwrap_or(stock_verification.checked_through);
+        proposal
+            .validate_at(
+                genesis_block(parse_network(&self.config.network)?)
+                    .block_hash()
+                    .to_byte_array(),
+                u32::try_from(current_height).map_err(|_| {
+                    AccountError::new("stale_chain_state", "verified tip exceeds u32")
+                })?,
+            )
+            .map_err(batch_protocol_error)?;
+        let manifest = BatchManifest::from_wire(&proposal, commitments, manifest_wire)
+            .map_err(batch_protocol_error)?;
+        let stock_signature = manifest
+            .sign_stock(&proposal, &self.batch_stock_secret()?)
+            .map_err(batch_protocol_error)?;
+        let participant_signatures = manifest
+            .commitments()
+            .iter()
+            .enumerate()
+            .map(|(index, commitment)| {
+                let key = signing_keys
+                    .get(&commitment.fee_outpoint())
+                    .ok_or_else(|| {
+                        AccountError::new(
+                            "database_corrupt",
+                            "canonical manifest contains an unknown fee input",
+                        )
+                    })?;
+                manifest
+                    .sign_participant(&proposal, index, key)
+                    .map_err(batch_protocol_error)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let transaction = manifest
+            .finalize(&proposal, &stock_signature, &participant_signatures)
+            .map_err(batch_protocol_error)?;
+        let txid = transaction.compute_txid();
+        let signed_tx_hex = hex_encode(&serialize(&transaction));
+        let now = unix_time()?;
+        self.db.conn.execute_batch("BEGIN IMMEDIATE")?;
+        let persisted = (|| -> Result<(), AccountError> {
+            let mut batch_receipt: Value = batch
+                .receipt_json
+                .as_deref()
+                .and_then(|encoded| serde_json::from_str(encoded).ok())
+                .unwrap_or_else(|| json!({}));
+            batch_receipt["txid"] = json!(txid.to_string());
+            batch_receipt["signed_at"] = json!(now);
+            batch_receipt["stock_verification"] = json!(stock_verification);
+            self.db.conn.execute(
+                "UPDATE opencsv_send_batches
+                 SET state = 'signed_persisted', signed_tx_hex = ?2,
+                     txid = ?3, receipt_json = ?4, updated_at = ?5
+                 WHERE batch_local_id = ?1",
+                params![
+                    batch_local_id,
+                    signed_tx_hex,
+                    txid.to_string(),
+                    batch_receipt.to_string(),
+                    now,
+                ],
+            )?;
+            self.db.conn.execute(
+                "UPDATE opencsv_batch_stocks
+                 SET state = 'signature_released'
+                 WHERE reserved_by_batch = ?1",
+                [batch_local_id],
+            )?;
+            for member in &members {
+                let operation = self.operation(&member.operation_id)?;
+                let mut receipt: Value = operation
+                    .receipt_json
+                    .as_deref()
+                    .and_then(|encoded| serde_json::from_str(encoded).ok())
+                    .unwrap_or_else(|| json!({}));
+                receipt["txid"] = json!(txid.to_string());
+                receipt["funding_verification"] = json!(member_verifications
+                    .get(&member.operation_id)
+                    .ok_or_else(|| AccountError::new(
+                        "database_corrupt",
+                        "missing member verification"
+                    ))?);
+                self.db.conn.execute(
+                    "UPDATE opencsv_operations
+                     SET state = 'signed_persisted', signed_tx_hex = ?2,
+                         txid = ?3, receipt_json = ?4, updated_at = ?5
+                     WHERE operation_id = ?1",
+                    params![
+                        member.operation_id,
+                        signed_tx_hex,
+                        txid.to_string(),
+                        receipt.to_string(),
+                        now,
+                    ],
+                )?;
+                self.db.conn.execute(
+                    "UPDATE opencsv_utxo_reservations
+                     SET state = 'signature_released' WHERE operation_id = ?1",
+                    [&member.operation_id],
+                )?;
+            }
+            self.db.conn.execute(
+                "INSERT OR IGNORE INTO opencsv_batch_stocks(
+                     participant_count, txid, vout, value_sats, birth_height,
+                     state, reserved_by_batch, created_at
+                 ) VALUES(?1, ?2, 2, ?3, 0, 'pending', NULL, ?4)",
+                params![
+                    u8::try_from(members.len()).unwrap_or(u8::MAX),
+                    txid.to_string(),
+                    i64::try_from(stock.value_sats).map_err(|_| {
+                        AccountError::new("database_error", "stock value exceeds SQLite i64")
+                    })?,
+                    now,
+                ],
+            )?;
+            Ok(())
+        })();
+        match persisted {
+            Ok(()) => self.db.conn.execute_batch("COMMIT")?,
+            Err(error) => {
+                let _ = self.db.conn.execute_batch("ROLLBACK");
+                return Err(error);
+            }
+        }
+        let seen_at = u64::try_from(now)
+            .map_err(|_| AccountError::new("clock_error", "negative timestamp"))?;
+        self.bitcoin
+            .apply_unconfirmed_txs([(Arc::new(transaction.clone()), seen_at)]);
+        self.bitcoin.persist(&mut self.db)?;
+        let (p2p_submissions, relay_peers) = self.submit_direct_p2p(&transaction)?;
+        let client = esplora_client::Builder::new(&self.config.esplora_url).build_blocking();
+        let fallback = relay_via_esplora_if_unobserved(&client, &transaction);
+        let mut receipt: Value = self
+            .send_batch(batch_local_id)?
+            .receipt_json
+            .as_deref()
+            .and_then(|encoded| serde_json::from_str(encoded).ok())
+            .unwrap_or_else(|| json!({}));
+        receipt["p2p_submissions"] = json!(p2p_submissions);
+        receipt["p2p_peers"] = json!(relay_peers);
+        receipt["generic_relay_fallback"] = json!(matches!(&fallback, Ok(true)));
+        if let Err(error) = &fallback {
+            receipt["generic_relay_error"] = json!(error.to_string());
+        }
+        let updated = unix_time()?;
+        let transaction = self
+            .db
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute(
+            "UPDATE opencsv_send_batches
+             SET state = 'broadcast_unobserved', receipt_json = ?2, updated_at = ?3
+             WHERE batch_local_id = ?1",
+            params![batch_local_id, receipt.to_string(), updated],
+        )?;
+        transaction.execute(
+            "UPDATE opencsv_operations SET state = 'broadcast_unobserved', updated_at = ?2
+             WHERE operation_id IN (
+                 SELECT operation_id FROM opencsv_send_batch_members
+                 WHERE batch_local_id = ?1
+             )",
+            params![batch_local_id, updated],
+        )?;
+        transaction.commit()?;
+        self.send_batch_json(batch_local_id)
+    }
+
+    /// Require pinned exact-byte visibility for the shared transaction, then
+    /// finalize one independently deliverable consignment per member.
+    pub fn observe_send_batch_unconfirmed(
+        &mut self,
+        batch_local_id: &str,
+        raw_transaction: &[u8],
+        observations_json: &str,
+    ) -> Result<Value, AccountError> {
+        let batch = self.send_batch(batch_local_id)?;
+        if !matches!(
+            batch.state.as_str(),
+            "signed_persisted" | "broadcast_unobserved" | "mempool"
+        ) {
+            return Err(AccountError::new(
+                "invalid_batch_state",
+                format!("batch is {}", batch.state),
+            ));
+        }
+        if hex_decode(
+            batch.signed_tx_hex.as_deref().ok_or_else(|| {
+                AccountError::new("database_corrupt", "signed batch has no transaction")
+            })?,
+            "signed batch transaction",
+        )? != raw_transaction
+        {
+            return Err(AccountError::new(
+                "raw_transaction_mismatch",
+                "observer bytes differ from the exact persisted batch",
+            ));
+        }
+        let transaction: Transaction = deserialize(raw_transaction).map_err(|error| {
+            AccountError::new("invalid_observation_transaction", error.to_string())
+        })?;
+        let txid = transaction.compute_txid();
+        let txid_string = txid.to_string();
+        if batch.txid.as_deref() != Some(txid_string.as_str()) {
+            return Err(AccountError::new(
+                "raw_transaction_mismatch",
+                "observer txid differs from the persisted batch",
+            ));
+        }
+        let (receipts, policy_failure) = evaluate_observation_evidence(
+            &self.config.observation_checks,
+            raw_transaction,
+            observations_json,
+        )?;
+        self.persist_observation_receipts(&txid_string, &receipts)?;
+        if let Some(error) = policy_failure {
+            return Err(error);
+        }
+        self.enforce_unconfirmed_non_host_policy(&txid_string, true)?;
+        if !receipts.iter().any(|receipt| {
+            receipt["kind"] == json!(ObservationKind::RawTransactionApi)
+                && receipt["result"] == json!(ObservationResult::Observed)
+                && receipt["raw_byte_match"] == true
+        }) {
+            return Err(AccountError::new(
+                "mempool_observation_failed",
+                "no pinned observer returned the exact shared transaction",
+            ));
+        }
+        if batch.state != "mempool" {
+            for member in self.send_batch_members(batch_local_id)? {
+                self.finalize_observed_operation(&member.operation_id, txid)?;
+            }
+            self.db.conn.execute(
+                "UPDATE opencsv_send_batches SET state = 'mempool', updated_at = ?2
+                 WHERE batch_local_id = ?1",
+                params![batch_local_id, unix_time()?],
+            )?;
+        }
+        let mut value = self.send_batch_json(batch_local_id)?;
+        value["observations"] = json!(receipts);
+        Ok(value)
+    }
+
+    /// Resume one crash-interrupted shared transaction without changing its
+    /// proposal, manifest, signatures, member ordering, or delivery IDs.
+    pub fn resume_send_batch(&mut self, batch_local_id: &str) -> Result<Value, AccountError> {
+        let batch = self.send_batch(batch_local_id)?;
+        if !matches!(
+            batch.state.as_str(),
+            "signed_persisted" | "broadcast_unobserved"
+        ) {
+            return self.send_batch_json(batch_local_id);
+        }
+        let signed = batch.signed_tx_hex.as_deref().ok_or_else(|| {
+            AccountError::new("database_corrupt", "signed batch has no transaction")
+        })?;
+        let transaction: Transaction = deserialize(&hex_decode(signed, "signed batch")?)
+            .map_err(|error| AccountError::new("database_corrupt", error.to_string()))?;
+        let txid = transaction.compute_txid();
+        let txid_string = txid.to_string();
+        if batch.txid.as_deref() != Some(txid_string.as_str()) {
+            return Err(AccountError::new(
+                "database_corrupt",
+                "signed batch txid differs from its persisted bytes",
+            ));
+        }
+        let seen_at = u64::try_from(unix_time()?)
+            .map_err(|_| AccountError::new("clock_error", "negative timestamp"))?;
+        self.bitcoin
+            .apply_unconfirmed_txs([(Arc::new(transaction.clone()), seen_at)]);
+        self.bitcoin.persist(&mut self.db)?;
+        let (p2p_submissions, relay_peers) = self.submit_direct_p2p(&transaction)?;
+        let client = esplora_client::Builder::new(&self.config.esplora_url).build_blocking();
+        let fallback = relay_via_esplora_if_unobserved(&client, &transaction);
+        let mut receipt: Value = batch
+            .receipt_json
+            .as_deref()
+            .and_then(|encoded| serde_json::from_str(encoded).ok())
+            .unwrap_or_else(|| json!({}));
+        receipt["resume_p2p_submissions"] = json!(p2p_submissions);
+        receipt["resume_p2p_peers"] = json!(relay_peers);
+        receipt["resume_generic_relay_fallback"] = json!(matches!(&fallback, Ok(true)));
+        if let Err(error) = fallback {
+            receipt["resume_generic_relay_error"] = json!(error.to_string());
+        }
+        let now = unix_time()?;
+        let transaction = self
+            .db
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute(
+            "UPDATE opencsv_send_batches
+             SET state = 'broadcast_unobserved', receipt_json = ?2, updated_at = ?3
+             WHERE batch_local_id = ?1",
+            params![batch_local_id, receipt.to_string(), now],
+        )?;
+        transaction.execute(
+            "UPDATE opencsv_operations
+             SET state = 'broadcast_unobserved', updated_at = ?2
+             WHERE operation_id IN (
+                 SELECT operation_id FROM opencsv_send_batch_members
+                 WHERE batch_local_id = ?1
+             )",
+            params![batch_local_id, now],
+        )?;
+        transaction.commit()?;
+        self.send_batch_json(batch_local_id)
+    }
+
+    /// Build the next unanimous C1 replacement epoch. All inputs, payloads,
+    /// protected outputs, member identities, and output positions are fixed;
+    /// only participant change values may decrease to pay the higher fee.
+    pub fn fee_bump_send_batch(
+        &mut self,
+        batch_local_id: &str,
+        target_sat_per_vb: u64,
+    ) -> Result<Value, AccountError> {
+        self.require_write_enabled()?;
+        let target_sat_per_vb = u32::try_from(target_sat_per_vb)
+            .map_err(|_| AccountError::new("invalid_fee_policy", "target feerate exceeds u32"))?;
+        if target_sat_per_vb == 0 {
+            return Err(AccountError::new(
+                "invalid_fee_policy",
+                "target_sat_per_vb must be positive",
+            ));
+        }
+        let batch = self.send_batch(batch_local_id)?;
+        if !matches!(batch.state.as_str(), "broadcast_unobserved" | "mempool") {
+            return Err(AccountError::new(
+                "invalid_batch_state",
+                format!("cannot fee-bump batch in {}", batch.state),
+            ));
+        }
+        let proposal =
+            BatchProposal::from_wire(batch.proposal_wire.as_deref().ok_or_else(|| {
+                AccountError::new("database_corrupt", "signed batch has no proposal")
+            })?)
+            .map_err(batch_protocol_error)?;
+        let manifest_wire = batch
+            .manifest_wire
+            .as_deref()
+            .ok_or_else(|| AccountError::new("database_corrupt", "signed batch has no manifest"))?;
+        let original_bytes = hex_decode(
+            batch.signed_tx_hex.as_deref().ok_or_else(|| {
+                AccountError::new("database_corrupt", "signed batch has no transaction")
+            })?,
+            "signed batch transaction",
+        )?;
+        let original: Transaction = deserialize(&original_bytes)
+            .map_err(|error| AccountError::new("database_corrupt", error.to_string()))?;
+        let original_txid = original.compute_txid();
+        let original_txid_string = original_txid.to_string();
+        if batch.txid.as_deref() != Some(original_txid_string.as_str()) {
+            return Err(AccountError::new(
+                "database_corrupt",
+                "signed batch txid differs from its exact bytes",
+            ));
+        }
+        let members = self.send_batch_members(batch_local_id)?;
+        let stock = self
+            .batch_stock_reserved_by(batch_local_id)?
+            .ok_or_else(|| AccountError::new("conflicting_operation", "batch stock is unlocked"))?;
+        if stock.outpoint != proposal.stock_outpoint()
+            || stock.participant_count != u8::try_from(members.len()).unwrap_or(u8::MAX)
+        {
+            return Err(AccountError::new(
+                "conflicting_operation",
+                "replacement proposal and durable stock differ",
+            ));
+        }
+        let stock_verification = self.funding_verifier.verify(&FundingVerificationRequest {
+            outpoint: stock.outpoint,
+            txout: bdk_wallet::bitcoin::TxOut {
+                value: Amount::from_sat(stock.value_sats),
+                script_pubkey: proposal.stock_script_pubkey(),
+            },
+            birth_height: stock.birth_height,
+        })?;
+        let mut protocol_candidate = self.protocol.as_ref().cloned().ok_or_else(|| {
+            AccountError::new("primary_required", "linked devices cannot bump batches")
+        })?;
+        let mut pending_candidate = self.pending_by_operation.clone();
+        let mut commitments = Vec::with_capacity(members.len());
+        let mut signing_keys = HashMap::new();
+        let mut member_verifications = HashMap::new();
+        let mut operations = Vec::with_capacity(members.len());
+        for member in &members {
+            let operation = self.operation(&member.operation_id)?;
+            if !matches!(operation.state.as_str(), "broadcast_unobserved" | "mempool") {
+                return Err(AccountError::new(
+                    "invalid_operation_state",
+                    format!(
+                        "batch member {} is {}",
+                        member.operation_id, operation.state
+                    ),
+                ));
+            }
+            let funding = self.historical_funding_for_operation(&operation)?;
+            if !original
+                .input
+                .iter()
+                .skip(1)
+                .any(|input| input.previous_output == funding.outpoint)
+            {
+                return Err(AccountError::new(
+                    "protocol_layout_violation",
+                    "persisted batch omits a member fee input",
+                ));
+            }
+            let verification = self.verify_funding(&funding)?;
+            let pending_id = match pending_candidate.get(&member.operation_id).copied() {
+                Some(pending_id) => pending_id,
+                None => {
+                    let pending_json = self
+                        .db
+                        .conn
+                        .query_row(
+                            "SELECT pending_json FROM opencsv_operations
+                             WHERE operation_id = ?1",
+                            [&member.operation_id],
+                            |row| row.get::<_, Option<String>>(0),
+                        )?
+                        .ok_or_else(|| {
+                            AccountError::new(
+                                "operation_not_resumable",
+                                "batch replacement has no durable pending proof",
+                            )
+                        })?;
+                    let pending_id = protocol_candidate
+                        .import_pending(&pending_json)
+                        .map_err(|error| AccountError::new("operation_not_resumable", error))?;
+                    pending_candidate.insert(member.operation_id.clone(), pending_id);
+                    pending_id
+                }
+            };
+            let dependencies = protocol_candidate
+                .pending_unconfirmed_dependencies(pending_id)
+                .map_err(|error| AccountError::new("operation_not_resumable", error))?;
+            self.reobserve_unconfirmed_dependencies(&dependencies)?;
+            let payload = protocol_candidate
+                .rebind_pending_batch_payload(pending_id, proposal.context())
+                .map_err(|error| AccountError::new("batch_payload_incompatible", error))?;
+            let change_spk = ScriptBuf::from_bytes(hex_decode(
+                member.change_spk_hex.as_deref().ok_or_else(|| {
+                    AccountError::new("database_corrupt", "batch member has no change script")
+                })?,
+                "batch change script",
+            )?);
+            let commit_nonce = decode_hex_32(
+                member.commit_nonce_hex.as_deref().ok_or_else(|| {
+                    AccountError::new("database_corrupt", "batch member has no commit nonce")
+                })?,
+                "batch commit nonce",
+            )?;
+            let fee_secret = self.batch_fee_secret(&funding)?;
+            let fee_pubkey = PublicKey::from_secret_key(&Secp256k1::new(), &fee_secret);
+            let max_charge = funding
+                .value_sats()
+                .checked_sub(opencsv_bitcoin::batch_v2::MIN_OUTPUT_SATS)
+                .ok_or_else(|| {
+                    AccountError::new(
+                        "insufficient_fees",
+                        "batch fee cell cannot preserve minimum change",
+                    )
+                })?;
+            commitments.push(
+                ParticipantCommitment::new(
+                    &proposal,
+                    batch_operation_id(&member.operation_id),
+                    commit_nonce,
+                    payload,
+                    funding.outpoint,
+                    funding.txout.clone(),
+                    fee_pubkey,
+                    change_spk,
+                    max_charge,
+                )
+                .map_err(batch_protocol_error)?,
+            );
+            signing_keys.insert(funding.outpoint, fee_secret);
+            member_verifications.insert(member.operation_id.clone(), verification);
+            operations.push(operation);
+        }
+        let current_height = member_verifications
+            .values()
+            .map(|receipt| receipt.checked_through)
+            .chain(std::iter::once(stock_verification.checked_through))
+            .max()
+            .unwrap_or(stock_verification.checked_through);
+        proposal
+            .validate_at(
+                genesis_block(parse_network(&self.config.network)?)
+                    .block_hash()
+                    .to_byte_array(),
+                u32::try_from(current_height).map_err(|_| {
+                    AccountError::new("stale_chain_state", "verified tip exceeds u32")
+                })?,
+            )
+            .map_err(batch_protocol_error)?;
+        let manifest = BatchManifest::from_wire(&proposal, commitments, manifest_wire)
+            .map_err(batch_protocol_error)?;
+        let stock_secret = self.batch_stock_secret()?;
+        let sign_manifest = |manifest: &BatchManifest| -> Result<Transaction, AccountError> {
+            let stock_signature = manifest
+                .sign_stock(&proposal, &stock_secret)
+                .map_err(batch_protocol_error)?;
+            let participant_signatures = manifest
+                .commitments()
+                .iter()
+                .enumerate()
+                .map(|(index, commitment)| {
+                    let key = signing_keys
+                        .get(&commitment.fee_outpoint())
+                        .ok_or_else(|| {
+                            AccountError::new(
+                                "database_corrupt",
+                                "manifest contains an unknown fee input",
+                            )
+                        })?;
+                    manifest
+                        .sign_participant(&proposal, index, key)
+                        .map_err(batch_protocol_error)
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            manifest
+                .finalize(&proposal, &stock_signature, &participant_signatures)
+                .map_err(batch_protocol_error)
+        };
+        if serialize(&sign_manifest(&manifest)?) != original_bytes {
+            return Err(AccountError::new(
+                "database_corrupt",
+                "persisted batch signatures do not match the frozen manifest",
+            ));
+        }
+        let replacement = manifest
+            .replacement(&proposal, target_sat_per_vb)
+            .map_err(batch_protocol_error)?;
+        let replacement_transaction = sign_manifest(&replacement)?;
+        let replacement_txid = replacement_transaction.compute_txid();
+        let replacement_hex = hex_encode(&serialize(&replacement_transaction));
+        let mut operation_updates = Vec::with_capacity(operations.len());
+        for operation in &operations {
+            let mut receipt: Value = operation
+                .receipt_json
+                .as_deref()
+                .and_then(|encoded| serde_json::from_str(encoded).ok())
+                .unwrap_or_else(|| json!({}));
+            let receipt_object = receipt.as_object_mut().ok_or_else(|| {
+                AccountError::new("database_corrupt", "operation receipt is not an object")
+            })?;
+            let stale_consignment_id = receipt_object
+                .remove("consignment_id")
+                .and_then(|value| value.as_str().map(str::to_owned));
+            receipt_object.remove("consignment_base64");
+            receipt_object.remove("delivery_ready");
+            receipt_object.remove("consignment_delivered");
+            receipt_object.remove("consignment_delivered_at");
+            receipt_object.insert("replacement_delivery_required".into(), json!(true));
+            receipt_object.insert("replaces".into(), json!(original_txid.to_string()));
+            receipt_object.insert("txid".into(), json!(replacement_txid.to_string()));
+            receipt_object.insert(
+                "replacement_epoch".into(),
+                json!(replacement.replacement_epoch()),
+            );
+            receipt_object.insert("target_sat_per_vb".into(), json!(target_sat_per_vb));
+            receipt_object.insert(
+                "funding_verification".into(),
+                json!(member_verifications.get(&operation.operation_id)),
+            );
+            if let Some(stale_id) = stale_consignment_id.as_deref() {
+                let superseded = receipt_object
+                    .entry("superseded_consignment_ids")
+                    .or_insert_with(|| json!([]))
+                    .as_array_mut()
+                    .ok_or_else(|| {
+                        AccountError::new(
+                            "database_corrupt",
+                            "superseded consignment list is not an array",
+                        )
+                    })?;
+                if !superseded
+                    .iter()
+                    .any(|value| value.as_str() == Some(stale_id))
+                {
+                    superseded.push(json!(stale_id));
+                }
+            }
+            operation_updates.push((
+                operation.operation_id.clone(),
+                receipt.to_string(),
+                stale_consignment_id,
+            ));
+        }
+        let now = unix_time()?;
+        let mut batch_receipt: Value = batch
+            .receipt_json
+            .as_deref()
+            .and_then(|encoded| serde_json::from_str(encoded).ok())
+            .unwrap_or_else(|| json!({}));
+        batch_receipt["replaces"] = json!(original_txid.to_string());
+        batch_receipt["txid"] = json!(replacement_txid.to_string());
+        batch_receipt["replacement_epoch"] = json!(replacement.replacement_epoch());
+        batch_receipt["target_sat_per_vb"] = json!(target_sat_per_vb);
+        batch_receipt["miner_fee_sats"] = json!(replacement.miner_fee());
+        self.db.conn.execute_batch("BEGIN IMMEDIATE")?;
+        let persisted = (|| -> Result<(), AccountError> {
+            for (operation_id, receipt, stale_consignment_id) in &operation_updates {
+                if let Some(stale_id) = stale_consignment_id {
+                    self.db.conn.execute(
+                        "DELETE FROM opencsv_consignment_snapshots WHERE consignment_id = ?1",
+                        [stale_id],
+                    )?;
+                    self.db.conn.execute(
+                        "DELETE FROM opencsv_consignments WHERE consignment_id = ?1",
+                        [stale_id],
+                    )?;
+                }
+                self.db.conn.execute(
+                    "UPDATE opencsv_operations
+                     SET state = 'signed_persisted', signed_tx_hex = ?2,
+                         txid = ?3, receipt_json = ?4, updated_at = ?5
+                     WHERE operation_id = ?1",
+                    params![
+                        operation_id,
+                        replacement_hex,
+                        replacement_txid.to_string(),
+                        receipt,
+                        now,
+                    ],
+                )?;
+            }
+            self.db.conn.execute(
+                "UPDATE opencsv_send_batches
+                 SET state = 'signed_persisted', manifest_wire = ?2,
+                     signed_tx_hex = ?3, txid = ?4, receipt_json = ?5,
+                     updated_at = ?6 WHERE batch_local_id = ?1",
+                params![
+                    batch_local_id,
+                    replacement.wire_bytes(),
+                    replacement_hex,
+                    replacement_txid.to_string(),
+                    batch_receipt.to_string(),
+                    now,
+                ],
+            )?;
+            self.db.conn.execute(
+                "UPDATE opencsv_batch_stocks SET state = 'invalidated'
+                 WHERE txid = ?1 AND vout = 2 AND state = 'pending'",
+                [original_txid.to_string()],
+            )?;
+            self.db.conn.execute(
+                "INSERT OR IGNORE INTO opencsv_batch_stocks(
+                     participant_count, txid, vout, value_sats, birth_height,
+                     state, reserved_by_batch, created_at
+                 ) VALUES(?1, ?2, 2, ?3, 0, 'pending', NULL, ?4)",
+                params![
+                    u8::try_from(members.len()).unwrap_or(u8::MAX),
+                    replacement_txid.to_string(),
+                    i64::try_from(stock.value_sats).map_err(|_| {
+                        AccountError::new("database_error", "stock value exceeds SQLite i64")
+                    })?,
+                    now,
+                ],
+            )?;
+            Ok(())
+        })();
+        match persisted {
+            Ok(()) => self.db.conn.execute_batch("COMMIT")?,
+            Err(error) => {
+                let _ = self.db.conn.execute_batch("ROLLBACK");
+                return Err(error);
+            }
+        }
+        self.protocol = Some(protocol_candidate);
+        self.pending_by_operation = pending_candidate;
+        let seen_at = u64::try_from(now)
+            .map_err(|_| AccountError::new("clock_error", "negative timestamp"))?;
+        self.bitcoin
+            .apply_unconfirmed_txs([(Arc::new(replacement_transaction.clone()), seen_at)]);
+        self.bitcoin.persist(&mut self.db)?;
+        let (p2p_submissions, relay_peers) = self.submit_direct_p2p(&replacement_transaction)?;
+        let client = esplora_client::Builder::new(&self.config.esplora_url).build_blocking();
+        let fallback = relay_via_esplora_if_unobserved(&client, &replacement_transaction);
+        batch_receipt["p2p_submissions"] = json!(p2p_submissions);
+        batch_receipt["p2p_peers"] = json!(relay_peers);
+        batch_receipt["generic_relay_fallback"] = json!(matches!(&fallback, Ok(true)));
+        if let Err(error) = fallback {
+            batch_receipt["generic_relay_error"] = json!(error.to_string());
+        }
+        let updated = unix_time()?;
+        let transaction = self
+            .db
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute(
+            "UPDATE opencsv_send_batches
+             SET state = 'broadcast_unobserved', receipt_json = ?2, updated_at = ?3
+             WHERE batch_local_id = ?1",
+            params![batch_local_id, batch_receipt.to_string(), updated],
+        )?;
+        transaction.execute(
+            "UPDATE opencsv_operations SET state = 'broadcast_unobserved', updated_at = ?2
+             WHERE operation_id IN (
+                 SELECT operation_id FROM opencsv_send_batch_members
+                 WHERE batch_local_id = ?1
+             )",
+            params![batch_local_id, updated],
+        )?;
+        transaction.commit()?;
+        self.send_batch_json(batch_local_id)
+    }
+
+    /// Refresh every member against the authoritative CBF path and mark the
+    /// shared transaction confirmed only when every member reaches settlement.
+    pub fn refresh_send_batch_spv(&mut self, batch_local_id: &str) -> Result<Value, AccountError> {
+        let batch = self.send_batch(batch_local_id)?;
+        if !matches!(batch.state.as_str(), "mempool" | "confirmed") {
+            return Err(AccountError::new(
+                "invalid_batch_state",
+                format!("batch is {}", batch.state),
+            ));
+        }
+        let members = self.send_batch_members(batch_local_id)?;
+        let mut receipts = Vec::with_capacity(members.len());
+        let mut all_confirmed = true;
+        for member in members {
+            let receipt = self.refresh_operation_spv(&member.operation_id)?;
+            all_confirmed &= matches!(
+                receipt["state"].as_str(),
+                Some("confirmed" | "consignment_delivered")
+            );
+            receipts.push(receipt);
+        }
+        if all_confirmed {
+            self.db.conn.execute(
+                "UPDATE opencsv_send_batches SET state = 'confirmed', updated_at = ?2
+                 WHERE batch_local_id = ?1",
+                params![batch_local_id, unix_time()?],
+            )?;
+            self.db.conn.execute(
+                "UPDATE opencsv_batch_stocks
+                 SET state = 'confirmed'
+                 WHERE txid = (SELECT txid FROM opencsv_send_batches
+                               WHERE batch_local_id = ?1)
+                   AND vout = 2 AND state = 'pending'",
+                [batch_local_id],
+            )?;
+        }
+        let mut result = self.send_batch_json(batch_local_id)?;
+        result["member_spv"] = json!(receipts);
+        Ok(result)
     }
 
     /// Reserve, verify, and prove one previously planned transfer. The
@@ -2906,7 +5297,8 @@ impl AccountWallet {
         let operation = self.operation(operation_id)?;
         if matches!(
             operation.state.as_str(),
-            "broadcast_unobserved"
+            "signed_persisted"
+                | "broadcast_unobserved"
                 | "broadcast"
                 | "mempool"
                 | "confirmed"
@@ -3012,6 +5404,8 @@ impl AccountWallet {
             outpoint: funding_outpoint,
             txout: funding_txout,
             birth_height: funding_birth_height,
+            keychain: None,
+            derivation_index: None,
         };
         let verification = match self.verify_funding(&funding) {
             Ok(receipt) => receipt,
@@ -3216,6 +5610,10 @@ impl AccountWallet {
             "SELECT json_object('operation_id', operation_id, 'kind', kind,
                                 'state', state, 'request', json(request_json),
                                 'pending_json', pending_json,
+                                'funding_txid', funding_txid,
+                                'funding_vout', funding_vout,
+                                'funding_value_sats', funding_value_sats,
+                                'signed_tx_hex', signed_tx_hex,
                                 'delivery_nonce', delivery_nonce,
                                 'txid', txid, 'receipt_json', receipt_json,
                                 'rejection_reason', rejection_reason,
@@ -3258,6 +5656,195 @@ impl AccountWallet {
              LEFT JOIN opencsv_consignment_finality USING(consignment_id)
              ORDER BY created_at",
         )?;
+        let send_batches = {
+            let mut statement = self.db.conn.prepare(
+                "SELECT batch_local_id, state, deadline_ms, participant_count,
+                        proposal_wire, manifest_wire, signed_tx_hex, txid,
+                        receipt_json
+                 FROM opencsv_send_batches
+                 WHERE state != 'cancelled' ORDER BY created_at, rowid",
+            )?;
+            let rows = statement.query_map([], |row| {
+                let participant_count = row
+                    .get::<_, Option<i64>>(3)?
+                    .and_then(|value| u8::try_from(value).ok());
+                let proposal_wire = row.get::<_, Option<Vec<u8>>>(4)?;
+                let manifest_wire = row.get::<_, Option<Vec<u8>>>(5)?;
+                Ok(BackupSendBatch {
+                    batch_local_id: row.get(0)?,
+                    state: row.get(1)?,
+                    deadline_ms: row.get(2)?,
+                    participant_count,
+                    proposal_wire_base64: proposal_wire
+                        .map(|wire| base64::engine::general_purpose::STANDARD.encode(wire)),
+                    manifest_wire_base64: manifest_wire
+                        .map(|wire| base64::engine::general_purpose::STANDARD.encode(wire)),
+                    signed_tx_hex: row.get(6)?,
+                    txid: row.get(7)?,
+                    receipt_json: row.get(8)?,
+                })
+            })?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        let send_batch_members = {
+            let mut statement = self.db.conn.prepare(
+                "SELECT m.batch_local_id, m.operation_id, m.ordinal, m.added_at_ms,
+                        m.change_spk_hex, m.commit_nonce_hex
+                 FROM opencsv_send_batch_members m
+                 JOIN opencsv_send_batches b USING(batch_local_id)
+                 WHERE b.state != 'cancelled'
+                 ORDER BY b.created_at, m.ordinal",
+            )?;
+            let rows = statement.query_map([], |row| {
+                let ordinal = row.get::<_, i64>(2)?;
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    ordinal,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                ))
+            })?;
+            rows.map(|row| {
+                let (
+                    batch_local_id,
+                    operation_id,
+                    ordinal,
+                    added_at_ms,
+                    change_spk_hex,
+                    commit_nonce_hex,
+                ) = row?;
+                Ok(BackupSendBatchMember {
+                    batch_local_id,
+                    operation_id,
+                    ordinal: u8::try_from(ordinal).map_err(|_| {
+                        AccountError::new("database_corrupt", "backup batch ordinal is outside u8")
+                    })?,
+                    added_at_ms,
+                    change_spk_hex,
+                    commit_nonce_hex,
+                })
+            })
+            .collect::<Result<Vec<_>, AccountError>>()?
+        };
+        let batch_stocks = {
+            let mut statement = self.db.conn.prepare(
+                "SELECT participant_count, txid, vout, value_sats, birth_height,
+                        state, reserved_by_batch, created_at
+                 FROM opencsv_batch_stocks ORDER BY created_at, txid, vout",
+            )?;
+            let rows = statement.query_map([], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                    row.get::<_, i64>(7)?,
+                ))
+            })?;
+            rows.map(|row| {
+                let (
+                    participant_count,
+                    txid,
+                    vout,
+                    value_sats,
+                    birth_height,
+                    state,
+                    reserved_by_batch,
+                    created_at,
+                ) = row?;
+                Ok(BackupBatchStock {
+                    participant_count: u8::try_from(participant_count).map_err(|_| {
+                        AccountError::new(
+                            "database_corrupt",
+                            "batch stock participant count is outside u8",
+                        )
+                    })?,
+                    txid,
+                    vout: u32::try_from(vout).map_err(|_| {
+                        AccountError::new("database_corrupt", "batch stock vout is outside u32")
+                    })?,
+                    value_sats: u64::try_from(value_sats).map_err(|_| {
+                        AccountError::new("database_corrupt", "batch stock value is negative")
+                    })?,
+                    birth_height: u64::try_from(birth_height).map_err(|_| {
+                        AccountError::new(
+                            "database_corrupt",
+                            "batch stock birth height is negative",
+                        )
+                    })?,
+                    state,
+                    reserved_by_batch,
+                    created_at,
+                })
+            })
+            .collect::<Result<Vec<_>, AccountError>>()?
+        };
+        let batch_reserve_operations = {
+            let mut statement = self.db.conn.prepare(
+                "SELECT maintenance_id, state, participant_count, stock_count,
+                        fee_cell_count, signed_tx_hex, txid, receipt_json,
+                        created_at, updated_at
+                 FROM opencsv_batch_reserve_operations ORDER BY created_at, rowid",
+            )?;
+            let rows = statement.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, String>(7)?,
+                    row.get::<_, i64>(8)?,
+                    row.get::<_, i64>(9)?,
+                ))
+            })?;
+            rows.map(|row| {
+                let (
+                    maintenance_id,
+                    state,
+                    participant_count,
+                    stock_count,
+                    fee_cell_count,
+                    signed_tx_hex,
+                    txid,
+                    receipt_json,
+                    created_at,
+                    updated_at,
+                ) = row?;
+                Ok(BackupBatchReserveOperation {
+                    maintenance_id,
+                    state,
+                    participant_count: u8::try_from(participant_count).map_err(|_| {
+                        AccountError::new(
+                            "database_corrupt",
+                            "reserve participant count is outside u8",
+                        )
+                    })?,
+                    stock_count: u8::try_from(stock_count).map_err(|_| {
+                        AccountError::new("database_corrupt", "reserve stock count is outside u8")
+                    })?,
+                    fee_cell_count: u16::try_from(fee_cell_count).map_err(|_| {
+                        AccountError::new(
+                            "database_corrupt",
+                            "reserve fee-cell count is outside u16",
+                        )
+                    })?,
+                    signed_tx_hex,
+                    txid,
+                    receipt_json,
+                    created_at,
+                    updated_at,
+                })
+            })
+            .collect::<Result<Vec<_>, AccountError>>()?
+        };
         let owners = self
             .protocol
             .as_ref()
@@ -3274,6 +5861,10 @@ impl AccountWallet {
             "instrument_manifests": instrument_manifests,
             "operations": operations,
             "consignments": consignments,
+            "send_batches": send_batches,
+            "send_batch_members": send_batch_members,
+            "batch_stocks": batch_stocks,
+            "batch_reserve_operations": batch_reserve_operations,
         });
         let canonical = serde_json::to_vec(&payload)
             .map_err(|error| AccountError::new("checkpoint_failed", error.to_string()))?;
@@ -3337,10 +5928,15 @@ impl AccountWallet {
                 "Secure Backup checkpoint hash does not match its payload",
             ));
         }
-        if envelope.checkpoint.version != CHECKPOINT_VERSION {
+        if !matches!(
+            envelope.checkpoint.version,
+            LEGACY_CHECKPOINT_VERSION | BATCH_CHECKPOINT_VERSION | CHECKPOINT_VERSION
+        ) {
             return Err(AccountError::new(
                 "backup_version_mismatch",
-                format!("expected checkpoint version {CHECKPOINT_VERSION}"),
+                format!(
+                    "expected checkpoint version {LEGACY_CHECKPOINT_VERSION}, {BATCH_CHECKPOINT_VERSION}, or {CHECKPOINT_VERSION}"
+                ),
             ));
         }
         if envelope.checkpoint.network != self.config.network {
@@ -3372,7 +5968,7 @@ impl AccountWallet {
                 "Secure Backup owner identity does not derive from this account root",
             ));
         }
-        if let Some(existing) = self.db.meta("restored_checkpoint_hash")? {
+        if let Some(existing) = self.db.meta("restored_checkpoint_source_hash")? {
             if existing == actual_hash {
                 return self.status();
             }
@@ -3385,7 +5981,11 @@ impl AccountWallet {
             "SELECT (SELECT COUNT(*) FROM opencsv_assets)
                   + (SELECT COUNT(*) FROM opencsv_instrument_manifests)
                   + (SELECT COUNT(*) FROM opencsv_operations)
-                  + (SELECT COUNT(*) FROM opencsv_consignments)",
+                  + (SELECT COUNT(*) FROM opencsv_consignments)
+                  + (SELECT COUNT(*) FROM opencsv_send_batches)
+                  + (SELECT COUNT(*) FROM opencsv_send_batch_members)
+                  + (SELECT COUNT(*) FROM opencsv_batch_stocks)
+                  + (SELECT COUNT(*) FROM opencsv_batch_reserve_operations)",
             [],
             |row| row.get(0),
         )?;
@@ -3462,6 +6062,260 @@ impl AccountWallet {
                     format!("unknown operation state {}", operation.state),
                 ));
             }
+            let funding_fields = [
+                operation.funding_txid.is_some(),
+                operation.funding_vout.is_some(),
+                operation.funding_value_sats.is_some(),
+            ];
+            if funding_fields.iter().any(|present| *present)
+                && !funding_fields.iter().all(|present| *present)
+            {
+                return Err(AccountError::new(
+                    "invalid_backup_checkpoint",
+                    format!(
+                        "operation {} has an incomplete fee reservation",
+                        operation.operation_id
+                    ),
+                ));
+            }
+            if let Some(txid) = operation.funding_txid.as_deref() {
+                Txid::from_str(txid).map_err(|error| {
+                    AccountError::new(
+                        "invalid_backup_checkpoint",
+                        format!("operation funding txid: {error}"),
+                    )
+                })?;
+            }
+            if let Some(encoded) = operation.signed_tx_hex.as_deref() {
+                let transaction: Transaction =
+                    deserialize(&hex_decode(encoded, "backup operation signed transaction")?)
+                        .map_err(|error| {
+                            AccountError::new(
+                                "invalid_backup_checkpoint",
+                                format!("operation signed transaction: {error}"),
+                            )
+                        })?;
+                let computed_txid = transaction.compute_txid().to_string();
+                if operation.txid.as_deref() != Some(computed_txid.as_str()) {
+                    return Err(AccountError::new(
+                        "invalid_backup_checkpoint",
+                        format!(
+                            "operation {} txid does not match its signed bytes",
+                            operation.operation_id
+                        ),
+                    ));
+                }
+            }
+        }
+        let operation_ids: HashSet<&str> = envelope
+            .checkpoint
+            .operations
+            .iter()
+            .map(|operation| operation.operation_id.as_str())
+            .collect();
+        let batch_ids: HashSet<&str> = envelope
+            .checkpoint
+            .send_batches
+            .iter()
+            .map(|batch| batch.batch_local_id.as_str())
+            .collect();
+        if batch_ids.len() != envelope.checkpoint.send_batches.len() {
+            return Err(AccountError::new(
+                "invalid_backup_checkpoint",
+                "send batch ids are not unique",
+            ));
+        }
+        if envelope
+            .checkpoint
+            .send_batches
+            .iter()
+            .filter(|batch| batch.state == "collecting")
+            .count()
+            > 1
+        {
+            return Err(AccountError::new(
+                "invalid_backup_checkpoint",
+                "more than one send batch is collecting",
+            ));
+        }
+        for batch in &envelope.checkpoint.send_batches {
+            if !matches!(
+                batch.state.as_str(),
+                "collecting"
+                    | "solo"
+                    | "frozen"
+                    | "proof_ready"
+                    | "signed_persisted"
+                    | "broadcast_unobserved"
+                    | "mempool"
+                    | "confirmed"
+            ) {
+                return Err(AccountError::new(
+                    "invalid_backup_checkpoint",
+                    format!("unknown send batch state {}", batch.state),
+                ));
+            }
+            for encoded in [
+                batch.proposal_wire_base64.as_deref(),
+                batch.manifest_wire_base64.as_deref(),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                base64::engine::general_purpose::STANDARD
+                    .decode(encoded)
+                    .map_err(|error| {
+                        AccountError::new(
+                            "invalid_backup_checkpoint",
+                            format!("send batch wire bytes: {error}"),
+                        )
+                    })?;
+            }
+            if let Some(signed_tx_hex) = batch.signed_tx_hex.as_deref() {
+                let transaction: Transaction = deserialize(&hex_decode(
+                    signed_tx_hex,
+                    "backup batch signed transaction",
+                )?)
+                .map_err(|error| {
+                    AccountError::new(
+                        "invalid_backup_checkpoint",
+                        format!("batch signed transaction: {error}"),
+                    )
+                })?;
+                let computed_txid = transaction.compute_txid().to_string();
+                if batch.txid.as_deref() != Some(computed_txid.as_str()) {
+                    return Err(AccountError::new(
+                        "invalid_backup_checkpoint",
+                        "batch txid does not match its signed bytes",
+                    ));
+                }
+            }
+        }
+        let mut stock_outpoints = HashSet::new();
+        let mut reserved_batches = HashSet::new();
+        for stock in &envelope.checkpoint.batch_stocks {
+            Txid::from_str(&stock.txid).map_err(|error| {
+                AccountError::new(
+                    "invalid_backup_checkpoint",
+                    format!("batch stock txid: {error}"),
+                )
+            })?;
+            if stock.participant_count == 0
+                || usize::from(stock.participant_count) > MAX_LOCAL_BATCH_RECIPIENTS
+                || !matches!(
+                    stock.state.as_str(),
+                    "pending"
+                        | "available"
+                        | "reserved"
+                        | "signature_released"
+                        | "confirmed"
+                        | "invalidated"
+                )
+                || !stock_outpoints.insert((stock.txid.as_str(), stock.vout))
+            {
+                return Err(AccountError::new(
+                    "invalid_backup_checkpoint",
+                    "invalid or duplicate batch stock",
+                ));
+            }
+            if let Some(batch_id) = stock.reserved_by_batch.as_deref() {
+                if !batch_ids.contains(batch_id) || !reserved_batches.insert(batch_id) {
+                    return Err(AccountError::new(
+                        "invalid_backup_checkpoint",
+                        "batch stock names an unavailable or duplicate reservation",
+                    ));
+                }
+                if !matches!(stock.state.as_str(), "reserved" | "signature_released") {
+                    return Err(AccountError::new(
+                        "invalid_backup_checkpoint",
+                        "reserved batch stock has an incompatible state",
+                    ));
+                }
+            }
+        }
+        let mut maintenance_ids = HashSet::new();
+        let mut maintenance_txids = HashSet::new();
+        for reserve in &envelope.checkpoint.batch_reserve_operations {
+            if reserve.participant_count == 0
+                || usize::from(reserve.participant_count) > MAX_LOCAL_BATCH_RECIPIENTS
+                || reserve.stock_count == 0
+                || reserve.fee_cell_count == 0
+                || !matches!(
+                    reserve.state.as_str(),
+                    "signed_persisted"
+                        | "broadcast_unobserved"
+                        | "mempool"
+                        | "confirmed"
+                        | "failed"
+                )
+                || !maintenance_ids.insert(reserve.maintenance_id.as_str())
+                || !maintenance_txids.insert(reserve.txid.as_str())
+            {
+                return Err(AccountError::new(
+                    "invalid_backup_checkpoint",
+                    "invalid or duplicate batch reserve maintenance operation",
+                ));
+            }
+            let transaction: Transaction = deserialize(&hex_decode(
+                &reserve.signed_tx_hex,
+                "backup reserve transaction",
+            )?)
+            .map_err(|error| {
+                AccountError::new(
+                    "invalid_backup_checkpoint",
+                    format!("batch reserve transaction: {error}"),
+                )
+            })?;
+            if transaction.compute_txid().to_string() != reserve.txid {
+                return Err(AccountError::new(
+                    "invalid_backup_checkpoint",
+                    "batch reserve txid does not match its signed bytes",
+                ));
+            }
+            serde_json::from_str::<Value>(&reserve.receipt_json).map_err(|error| {
+                AccountError::new(
+                    "invalid_backup_checkpoint",
+                    format!("batch reserve receipt: {error}"),
+                )
+            })?;
+        }
+        let mut member_keys = HashSet::new();
+        let mut member_operations = HashSet::new();
+        for member in &envelope.checkpoint.send_batch_members {
+            if !batch_ids.contains(member.batch_local_id.as_str())
+                || !operation_ids.contains(member.operation_id.as_str())
+            {
+                return Err(AccountError::new(
+                    "invalid_backup_checkpoint",
+                    "send batch member names an unavailable batch or operation",
+                ));
+            }
+            if !member_keys.insert((member.batch_local_id.as_str(), member.ordinal))
+                || !member_operations.insert(member.operation_id.as_str())
+            {
+                return Err(AccountError::new(
+                    "invalid_backup_checkpoint",
+                    "send batch membership is duplicated",
+                ));
+            }
+        }
+        for batch in &envelope.checkpoint.send_batches {
+            let count = envelope
+                .checkpoint
+                .send_batch_members
+                .iter()
+                .filter(|member| member.batch_local_id == batch.batch_local_id)
+                .count();
+            if count == 0
+                || batch
+                    .participant_count
+                    .is_some_and(|expected| usize::from(expected) != count)
+            {
+                return Err(AccountError::new(
+                    "invalid_backup_checkpoint",
+                    "send batch participant count does not match its members",
+                ));
+            }
         }
         for consignment in &envelope.checkpoint.consignments {
             let blob = base64::engine::general_purpose::STANDARD
@@ -3529,20 +6383,37 @@ impl AccountWallet {
                 )?;
             }
             for operation in &envelope.checkpoint.operations {
+                let funding_value_sats = operation
+                    .funding_value_sats
+                    .map(i64::try_from)
+                    .transpose()
+                    .map_err(|_| {
+                        AccountError::new(
+                            "invalid_backup_checkpoint",
+                            "operation fee value exceeds SQLite i64",
+                        )
+                    })?;
                 self.db.conn.execute(
                     "INSERT INTO opencsv_operations(
-                         operation_id, kind, state, request_json, pending_json,
-                         txid, receipt_json, rejection_reason, delivery_nonce,
-                         checkpoint_hash, backup_acked, created_at, updated_at
+                         operation_id, kind, state, request_json,
+                         funding_txid, funding_vout, funding_value_sats,
+                         pending_json, signed_tx_hex, txid, receipt_json,
+                         rejection_reason, delivery_nonce, checkpoint_hash,
+                         backup_acked, created_at, updated_at
                      ) VALUES(
-                         ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?12
+                         ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11,
+                         ?12, ?13, ?14, ?15, ?16, ?16
                      )",
                     params![
                         operation.operation_id,
                         operation.kind,
                         operation.state,
                         operation.request.to_string(),
+                        operation.funding_txid,
+                        operation.funding_vout,
+                        funding_value_sats,
                         operation.pending_json,
+                        operation.signed_tx_hex,
                         operation.txid,
                         operation.receipt_json,
                         operation.rejection_reason,
@@ -3551,6 +6422,161 @@ impl AccountWallet {
                         operation.backup_acked,
                         now,
                     ],
+                )?;
+                if let (Some(txid), Some(vout)) = (&operation.funding_txid, operation.funding_vout)
+                {
+                    let reservation_state = if matches!(
+                        operation.state.as_str(),
+                        "signed_persisted"
+                            | "broadcast_unobserved"
+                            | "broadcast"
+                            | "mempool"
+                            | "confirmed"
+                            | "consignment_delivered"
+                    ) {
+                        "signature_released"
+                    } else {
+                        "reserved"
+                    };
+                    self.db.conn.execute(
+                        "INSERT INTO opencsv_utxo_reservations(
+                             txid, vout, operation_id, state, created_at
+                         ) VALUES(?1, ?2, ?3, ?4, ?5)",
+                        params![txid, vout, operation.operation_id, reservation_state, now,],
+                    )?;
+                }
+            }
+            for batch in &envelope.checkpoint.send_batches {
+                let proposal_wire = batch
+                    .proposal_wire_base64
+                    .as_deref()
+                    .map(|encoded| {
+                        base64::engine::general_purpose::STANDARD
+                            .decode(encoded)
+                            .map_err(|error| {
+                                AccountError::new(
+                                    "invalid_backup_checkpoint",
+                                    format!("batch proposal bytes: {error}"),
+                                )
+                            })
+                    })
+                    .transpose()?;
+                let manifest_wire = batch
+                    .manifest_wire_base64
+                    .as_deref()
+                    .map(|encoded| {
+                        base64::engine::general_purpose::STANDARD
+                            .decode(encoded)
+                            .map_err(|error| {
+                                AccountError::new(
+                                    "invalid_backup_checkpoint",
+                                    format!("batch manifest bytes: {error}"),
+                                )
+                            })
+                    })
+                    .transpose()?;
+                self.db.conn.execute(
+                    "INSERT INTO opencsv_send_batches(
+                         batch_local_id, state, deadline_ms, participant_count,
+                         proposal_wire, manifest_wire, signed_tx_hex, txid,
+                         receipt_json, checkpoint_hash, backup_acked,
+                         created_at, updated_at
+                     ) VALUES(
+                         ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9,
+                         NULL, 0, ?10, ?10
+                     )",
+                    params![
+                        batch.batch_local_id,
+                        batch.state,
+                        batch.deadline_ms,
+                        batch.participant_count,
+                        proposal_wire,
+                        manifest_wire,
+                        batch.signed_tx_hex,
+                        batch.txid,
+                        batch.receipt_json,
+                        now,
+                    ],
+                )?;
+            }
+            for member in &envelope.checkpoint.send_batch_members {
+                self.db.conn.execute(
+                    "INSERT INTO opencsv_send_batch_members(
+                         batch_local_id, operation_id, ordinal, added_at_ms,
+                         change_spk_hex, commit_nonce_hex
+                     ) VALUES(?1, ?2, ?3, ?4, ?5, ?6)",
+                    params![
+                        member.batch_local_id,
+                        member.operation_id,
+                        member.ordinal,
+                        member.added_at_ms,
+                        member.change_spk_hex,
+                        member.commit_nonce_hex,
+                    ],
+                )?;
+            }
+            for stock in &envelope.checkpoint.batch_stocks {
+                let value_sats = i64::try_from(stock.value_sats).map_err(|_| {
+                    AccountError::new(
+                        "invalid_backup_checkpoint",
+                        "batch stock value exceeds SQLite i64",
+                    )
+                })?;
+                let birth_height = i64::try_from(stock.birth_height).map_err(|_| {
+                    AccountError::new(
+                        "invalid_backup_checkpoint",
+                        "batch stock height exceeds SQLite i64",
+                    )
+                })?;
+                self.db.conn.execute(
+                    "INSERT INTO opencsv_batch_stocks(
+                         participant_count, txid, vout, value_sats,
+                         birth_height, state, reserved_by_batch, created_at
+                     ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                    params![
+                        stock.participant_count,
+                        stock.txid,
+                        stock.vout,
+                        value_sats,
+                        birth_height,
+                        stock.state,
+                        stock.reserved_by_batch,
+                        stock.created_at,
+                    ],
+                )?;
+            }
+            for reserve in &envelope.checkpoint.batch_reserve_operations {
+                self.db.conn.execute(
+                    "INSERT INTO opencsv_batch_reserve_operations(
+                         maintenance_id, state, participant_count, stock_count,
+                         fee_cell_count, signed_tx_hex, txid, receipt_json,
+                         created_at, updated_at
+                     ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                    params![
+                        reserve.maintenance_id,
+                        reserve.state,
+                        reserve.participant_count,
+                        reserve.stock_count,
+                        reserve.fee_cell_count,
+                        reserve.signed_tx_hex,
+                        reserve.txid,
+                        reserve.receipt_json,
+                        reserve.created_at,
+                        reserve.updated_at,
+                    ],
+                )?;
+            }
+            if let Some(collecting) = envelope
+                .checkpoint
+                .send_batches
+                .iter()
+                .find(|batch| batch.state == "collecting")
+            {
+                self.db.conn.execute(
+                    "INSERT INTO opencsv_account_meta(key, value)
+                     VALUES('active_send_batch', ?1)
+                     ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                    [&collecting.batch_local_id],
                 )?;
             }
             for consignment in &envelope.checkpoint.consignments {
@@ -3588,7 +6614,8 @@ impl AccountWallet {
             self.db.set_meta("backup_verified", "1")?;
             self.db
                 .set_meta("backup_checkpoint_version", &CHECKPOINT_VERSION.to_string())?;
-            self.db.set_meta("restored_checkpoint_hash", &actual_hash)?;
+            self.db
+                .set_meta("restored_checkpoint_source_hash", &actual_hash)?;
             #[cfg(any(test, feature = "issuer-tools"))]
             self.restore_issuers()?;
             self.restore_consignment_state()?;
@@ -3601,6 +6628,21 @@ impl AccountWallet {
                 return Err(error);
             }
         }
+        // The compact checkpoint intentionally omits rebuildable BDK chain
+        // history, but its durable protocol proofs and fee reservations are
+        // live state. Reinstall them immediately so the first post-restore
+        // process is as safe as every later reopen.
+        self.restore_fee_reservations()?;
+        self.restore_pending_operations()?;
+        // Version-1 backups predate durable send batches. Normalize every
+        // accepted source checkpoint into the current version before the
+        // DEBUG rebind compares hashes or a new Secure Backup is required.
+        let normalized = self.checkpoint()?;
+        let normalized_hash = normalized["checkpoint_hash"].as_str().ok_or_else(|| {
+            AccountError::new("checkpoint_failed", "normalized checkpoint has no hash")
+        })?;
+        self.db
+            .set_meta("restored_checkpoint_hash", normalized_hash)?;
         self.status()
     }
 
@@ -3641,6 +6683,58 @@ impl AccountWallet {
             txout: funding.txout.clone(),
             birth_height: funding.birth_height,
         })
+    }
+
+    fn batch_stock_secret(&self) -> Result<SecretKey, AccountError> {
+        let bytes = self.batch_stock_secret.as_ref().ok_or_else(|| {
+            AccountError::new("primary_required", "linked devices have no batch stock key")
+        })?;
+        SecretKey::from_slice(bytes.as_ref()).map_err(|_| {
+            AccountError::new("key_derivation_failed", "invalid derived batch stock key")
+        })
+    }
+
+    fn batch_fee_secret(&self, funding: &ReservedFunding) -> Result<SecretKey, AccountError> {
+        let seed = self.bitcoin_fee_seed.as_ref().ok_or_else(|| {
+            AccountError::new(
+                "primary_required",
+                "linked devices have no Bitcoin fee keys",
+            )
+        })?;
+        let keychain = funding.keychain.ok_or_else(|| {
+            AccountError::new(
+                "database_corrupt",
+                "reserved batch fee input has no descriptor keychain",
+            )
+        })?;
+        let index = funding.derivation_index.ok_or_else(|| {
+            AccountError::new(
+                "database_corrupt",
+                "reserved batch fee input has no derivation index",
+            )
+        })?;
+        let network = parse_network(&self.config.network)?;
+        let coin_type = if network == Network::Bitcoin { 0 } else { 1 };
+        let branch = match keychain {
+            KeychainKind::External => 0,
+            KeychainKind::Internal => 1,
+        };
+        let path = DerivationPath::from(vec![
+            ChildNumber::from_hardened_idx(84)
+                .map_err(|error| AccountError::new("key_derivation_failed", error.to_string()))?,
+            ChildNumber::from_hardened_idx(coin_type)
+                .map_err(|error| AccountError::new("key_derivation_failed", error.to_string()))?,
+            ChildNumber::from_hardened_idx(0)
+                .map_err(|error| AccountError::new("key_derivation_failed", error.to_string()))?,
+            ChildNumber::from_normal_idx(branch)
+                .map_err(|error| AccountError::new("key_derivation_failed", error.to_string()))?,
+            ChildNumber::from_normal_idx(index)
+                .map_err(|error| AccountError::new("key_derivation_failed", error.to_string()))?,
+        ]);
+        Xpriv::new_master(network, seed.as_ref())
+            .and_then(|master| master.derive_priv(&Secp256k1::new(), &path))
+            .map(|derived| derived.private_key)
+            .map_err(|error| AccountError::new("key_derivation_failed", error.to_string()))
     }
 
     fn insert_planned_operation(
@@ -3746,6 +6840,98 @@ impl AccountWallet {
         ))
     }
 
+    fn reserve_batch_stock(
+        &mut self,
+        batch_local_id: &str,
+        participant_count: u8,
+    ) -> Result<BatchStock, AccountError> {
+        if let Some(stock) = self.batch_stock_reserved_by(batch_local_id)? {
+            if stock.participant_count != participant_count {
+                return Err(AccountError::new(
+                    "conflicting_operation",
+                    "batch already reserves stock for another participant count",
+                ));
+            }
+            return Ok(stock);
+        }
+        let transaction = self
+            .db
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let candidate = transaction
+            .query_row(
+                "SELECT txid, vout, value_sats, birth_height
+                 FROM opencsv_batch_stocks
+                 WHERE participant_count = ?1 AND state = 'available'
+                 ORDER BY birth_height, created_at, txid, vout LIMIT 1",
+                [participant_count],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, i64>(3)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((txid, vout, value_sats, birth_height)) = candidate else {
+            return Err(AccountError::new(
+                "batch_reserve_required",
+                format!(
+                    "no confirmed count-{participant_count} batching stock is available; wallet reserve maintenance must prepare one"
+                ),
+            ));
+        };
+        let updated = transaction.execute(
+            "UPDATE opencsv_batch_stocks
+             SET state = 'reserved', reserved_by_batch = ?3
+             WHERE txid = ?1 AND vout = ?2 AND state = 'available'",
+            params![txid, vout, batch_local_id],
+        )?;
+        if updated != 1 {
+            return Err(AccountError::new(
+                "conflicting_operation",
+                "batch stock was concurrently reserved",
+            ));
+        }
+        transaction.commit()?;
+        decode_batch_stock(participant_count, &txid, vout, value_sats, birth_height)
+    }
+
+    fn batch_stock_reserved_by(
+        &self,
+        batch_local_id: &str,
+    ) -> Result<Option<BatchStock>, AccountError> {
+        let row = self
+            .db
+            .conn
+            .query_row(
+                "SELECT participant_count, txid, vout, value_sats, birth_height
+                 FROM opencsv_batch_stocks WHERE reserved_by_batch = ?1",
+                [batch_local_id],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, i64>(4)?,
+                    ))
+                },
+            )
+            .optional()?;
+        row.map(
+            |(participant_count, txid, vout, value_sats, birth_height)| {
+                let participant_count = u8::try_from(participant_count).map_err(|_| {
+                    AccountError::new("database_corrupt", "batch stock count is outside u8")
+                })?;
+                decode_batch_stock(participant_count, &txid, vout, value_sats, birth_height)
+            },
+        )
+        .transpose()
+    }
+
     fn reserved_funding_for_operation(
         &self,
         operation: &OperationRow,
@@ -3770,7 +6956,95 @@ impl AccountWallet {
         ReservedFunding::from_local(output)
     }
 
+    fn historical_funding_for_operation(
+        &self,
+        operation: &OperationRow,
+    ) -> Result<ReservedFunding, AccountError> {
+        let outpoint = operation_outpoint(operation)?;
+        let reservation_state = self
+            .db
+            .conn
+            .query_row(
+                "SELECT state FROM opencsv_utxo_reservations
+                 WHERE operation_id = ?1 AND txid = ?2 AND vout = ?3",
+                params![
+                    operation.operation_id,
+                    outpoint.txid.to_string(),
+                    outpoint.vout,
+                ],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        if reservation_state.as_deref() != Some("signature_released") {
+            return Err(AccountError::new(
+                "conflicting_operation",
+                "signed batch fee input lost its durable released-signature lock",
+            ));
+        }
+        let parent = self.bitcoin.get_tx(outpoint.txid).ok_or_else(|| {
+            AccountError::new(
+                "stale_chain_state",
+                "batch fee-input parent is absent from the wallet graph",
+            )
+        })?;
+        let txout = parent
+            .tx_node
+            .tx
+            .output
+            .get(outpoint.vout as usize)
+            .cloned()
+            .ok_or_else(|| {
+                AccountError::new(
+                    "database_corrupt",
+                    "batch fee-input vout is outside its parent transaction",
+                )
+            })?;
+        let birth_height = match parent.chain_position {
+            ChainPosition::Confirmed {
+                anchor,
+                transitively: None,
+            } => u64::from(anchor.block_id.height),
+            _ => {
+                return Err(AccountError::new(
+                    "stale_chain_state",
+                    "batch fee input lacks an exact confirmed birth height",
+                ));
+            }
+        };
+        let (keychain, derivation_index) = self
+            .bitcoin
+            .derivation_of_spk(txout.script_pubkey.clone())
+            .ok_or_else(|| {
+                AccountError::new(
+                    "database_corrupt",
+                    "batch fee input is not controlled by a wallet descriptor",
+                )
+            })?;
+        Ok(ReservedFunding {
+            outpoint,
+            txout,
+            birth_height,
+            keychain: Some(keychain),
+            derivation_index: Some(derivation_index),
+        })
+    }
+
     fn release_fee_reservation(&mut self, operation_id: &str) -> Result<(), AccountError> {
+        let reservation_state = self
+            .db
+            .conn
+            .query_row(
+                "SELECT state FROM opencsv_utxo_reservations WHERE operation_id = ?1",
+                [operation_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        if reservation_state.as_deref() == Some("signature_released") {
+            return Err(AccountError::new(
+                "cancellation_forbidden",
+                "a fee input cannot be unlocked after its signature was released",
+            ));
+        }
         let operation = self.operation(operation_id)?;
         if let (Some(txid), Some(vout)) = (operation.funding_txid, operation.funding_vout) {
             let txid = Txid::from_str(&txid).map_err(|error| {
@@ -4144,6 +7418,138 @@ impl AccountWallet {
                 )
             })?;
         Err(error)
+    }
+
+    fn send_batch(&self, batch_local_id: &str) -> Result<SendBatchRow, AccountError> {
+        self.db
+            .conn
+            .query_row(
+                "SELECT batch_local_id, state, deadline_ms, participant_count,
+                        proposal_wire, manifest_wire, signed_tx_hex, txid,
+                        receipt_json, checkpoint_hash, backup_acked
+                 FROM opencsv_send_batches WHERE batch_local_id = ?1",
+                [batch_local_id],
+                |row| {
+                    let participant_count = row
+                        .get::<_, Option<i64>>(3)?
+                        .and_then(|value| u8::try_from(value).ok());
+                    Ok(SendBatchRow {
+                        batch_local_id: row.get(0)?,
+                        state: row.get(1)?,
+                        deadline_ms: row.get(2)?,
+                        participant_count,
+                        proposal_wire: row.get(4)?,
+                        manifest_wire: row.get(5)?,
+                        signed_tx_hex: row.get(6)?,
+                        txid: row.get(7)?,
+                        receipt_json: row.get(8)?,
+                        checkpoint_hash: row.get(9)?,
+                        backup_acked: row.get::<_, i64>(10)? != 0,
+                    })
+                },
+            )
+            .optional()?
+            .ok_or_else(|| {
+                AccountError::new("unknown_batch", format!("unknown batch {batch_local_id}"))
+            })
+    }
+
+    fn send_batch_members(
+        &self,
+        batch_local_id: &str,
+    ) -> Result<Vec<SendBatchMember>, AccountError> {
+        let mut statement = self.db.conn.prepare(
+            "SELECT operation_id, ordinal, added_at_ms,
+                    change_spk_hex, commit_nonce_hex
+             FROM opencsv_send_batch_members
+             WHERE batch_local_id = ?1 ORDER BY ordinal",
+        )?;
+        let rows = statement.query_map([batch_local_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, Option<String>>(3)?,
+                row.get::<_, Option<String>>(4)?,
+            ))
+        })?;
+        rows.map(|row| {
+            let (operation_id, ordinal, added_at_ms, change_spk_hex, commit_nonce_hex) = row?;
+            Ok(SendBatchMember {
+                operation_id,
+                ordinal: u8::try_from(ordinal).map_err(|_| {
+                    AccountError::new("database_corrupt", "batch ordinal is outside u8")
+                })?,
+                added_at_ms,
+                change_spk_hex,
+                commit_nonce_hex,
+            })
+        })
+        .collect()
+    }
+
+    fn send_batch_member_json(
+        &self,
+        batch_local_id: &str,
+        operation_id: &str,
+    ) -> Result<Value, AccountError> {
+        let mut operation = operation_json(&self.operation(operation_id)?)?;
+        let batch = self.send_batch(batch_local_id)?;
+        let members = self.send_batch_members(batch_local_id)?;
+        let member = members
+            .iter()
+            .find(|member| member.operation_id == operation_id)
+            .ok_or_else(|| {
+                AccountError::new(
+                    "database_corrupt",
+                    "planned operation lost batch membership",
+                )
+            })?;
+        operation["batch"] = json!({
+            "batch_local_id": batch_local_id,
+            "state": batch.state,
+            "deadline_ms": batch.deadline_ms,
+            "ordinal": member.ordinal,
+            "added_at_ms": member.added_at_ms,
+            "member_count": members.len(),
+            "add_recipient_guaranteed": batch.state == "collecting"
+                && unix_time_millis()? <= batch.deadline_ms,
+        });
+        Ok(operation)
+    }
+
+    fn send_batch_json(&self, batch_local_id: &str) -> Result<Value, AccountError> {
+        let batch = self.send_batch(batch_local_id)?;
+        let members = self.send_batch_members(batch_local_id)?;
+        let operations = members
+            .iter()
+            .map(|member| operation_json(&self.operation(&member.operation_id)?))
+            .collect::<Result<Vec<_>, _>>()?;
+        let receipt: Option<Value> = batch
+            .receipt_json
+            .as_deref()
+            .map(serde_json::from_str)
+            .transpose()
+            .map_err(|error| AccountError::new("database_corrupt", error.to_string()))?;
+        Ok(json!({
+            "batch_local_id": batch.batch_local_id,
+            "state": batch.state,
+            "deadline_ms": batch.deadline_ms,
+            "participant_count": batch.participant_count,
+            "member_count": members.len(),
+            "operations": operations,
+            "proposal_wire_base64": batch.proposal_wire.map(|wire| {
+                base64::engine::general_purpose::STANDARD.encode(wire)
+            }),
+            "manifest_wire_base64": batch.manifest_wire.map(|wire| {
+                base64::engine::general_purpose::STANDARD.encode(wire)
+            }),
+            "signed_tx_hex": batch.signed_tx_hex,
+            "txid": batch.txid,
+            "receipt": receipt,
+            "checkpoint_hash": batch.checkpoint_hash,
+            "backup_acked": batch.backup_acked,
+        }))
     }
 
     fn operation(&self, operation_id: &str) -> Result<OperationRow, AccountError> {
@@ -4865,7 +8271,7 @@ impl AccountWallet {
         let outpoints = {
             let mut statement = self.db.conn.prepare(
                 "SELECT txid, vout FROM opencsv_utxo_reservations
-                 WHERE state = 'reserved' ORDER BY created_at",
+                 WHERE state IN ('reserved', 'signature_released') ORDER BY created_at",
             )?;
             let rows = statement.query_map([], |row| {
                 Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
@@ -4922,6 +8328,8 @@ struct ReservedFunding {
     outpoint: OutPoint,
     txout: bdk_wallet::bitcoin::TxOut,
     birth_height: u64,
+    keychain: Option<KeychainKind>,
+    derivation_index: Option<u32>,
 }
 
 impl ReservedFunding {
@@ -4951,12 +8359,39 @@ impl ReservedFunding {
             outpoint: output.outpoint,
             txout: output.txout,
             birth_height,
+            keychain: Some(output.keychain),
+            derivation_index: Some(output.derivation_index),
         })
     }
 
     fn value_sats(&self) -> u64 {
         self.txout.value.to_sat()
     }
+}
+
+fn decode_batch_stock(
+    participant_count: u8,
+    txid: &str,
+    vout: i64,
+    value_sats: i64,
+    birth_height: i64,
+) -> Result<BatchStock, AccountError> {
+    Ok(BatchStock {
+        participant_count,
+        outpoint: OutPoint::new(
+            Txid::from_str(txid).map_err(|error| {
+                AccountError::new("database_corrupt", format!("batch stock txid: {error}"))
+            })?,
+            u32::try_from(vout).map_err(|_| {
+                AccountError::new("database_corrupt", "batch stock vout is outside u32")
+            })?,
+        ),
+        value_sats: u64::try_from(value_sats)
+            .map_err(|_| AccountError::new("database_corrupt", "batch stock value is negative"))?,
+        birth_height: u64::try_from(birth_height).map_err(|_| {
+            AccountError::new("database_corrupt", "batch stock birth height is negative")
+        })?,
+    })
 }
 
 fn operation_outpoint(operation: &OperationRow) -> Result<OutPoint, AccountError> {
@@ -4997,6 +8432,64 @@ fn operation_json(operation: &OperationRow) -> Result<Value, AccountError> {
         "checkpoint_hash": operation.checkpoint_hash,
         "backup_acked": operation.backup_acked,
     }))
+}
+
+fn normalize_transfer_request(
+    request_json: &str,
+) -> Result<(TransferRequest, String), AccountError> {
+    let request: TransferRequest = serde_json::from_str(request_json).map_err(|error| {
+        AccountError::new("invalid_request", format!("transfer request: {error}"))
+    })?;
+    decode_hex_32(&request.asset_id, "asset id")?;
+    decode_hex_32(&request.to_owner, "recipient owner")?;
+    if request.amount == 0 {
+        return Err(AccountError::new(
+            "invalid_request",
+            "transfer amount must be positive",
+        ));
+    }
+    let normalized = serde_json::to_string(&request)
+        .map_err(|error| AccountError::new("database_error", error.to_string()))?;
+    Ok((request, normalized))
+}
+
+fn batch_protocol_error(error: opencsv_bitcoin::batch_v2::ProtocolError) -> AccountError {
+    AccountError::new("batch_protocol_rejected", error.to_string())
+}
+
+fn batch_operation_id(operation_id: &str) -> [u8; 32] {
+    sha256::Hash::hash(
+        [
+            b"OpenCSV batch operation v1".as_slice(),
+            operation_id.as_bytes(),
+        ]
+        .concat()
+        .as_slice(),
+    )
+    .to_byte_array()
+}
+
+fn insert_planned_operation_in_transaction(
+    transaction: &rusqlite::Transaction<'_>,
+    operation_id: &str,
+    normalized_request: &str,
+    delivery_nonce: &str,
+    created_at: i64,
+) -> Result<(), AccountError> {
+    transaction.execute(
+        "INSERT INTO opencsv_operations(
+             operation_id, kind, state, request_json, delivery_nonce,
+             created_at, updated_at
+         ) VALUES(?1, 'transfer', ?2, ?3, ?4, ?5, ?5)",
+        params![
+            operation_id,
+            OperationState::Planned.as_str(),
+            normalized_request,
+            delivery_nonce,
+            created_at,
+        ],
+    )?;
+    Ok(())
 }
 
 fn funding_context(outpoint: OutPoint) -> [u8; 32] {
@@ -6712,6 +10205,195 @@ mod tests {
     }
 
     #[test]
+    fn two_second_batch_membership_is_durable_and_freezes_exactly() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wallet.sqlite");
+        let key = [73u8; 32];
+        let cfg = config(AccountRole::Primary, true);
+        let request = |recipient: u8| {
+            json!({
+                "asset_id": hex_encode(&[74u8; 32]),
+                "to_owner": hex_encode(&[recipient; 32]),
+                "amount": u64::from(recipient),
+            })
+            .to_string()
+        };
+        let mut wallet = AccountWallet::open(&cfg, &key, path.to_str().unwrap()).unwrap();
+        let first = wallet.transfer_batch_plan(&request(1)).unwrap();
+        let batch_id = first["batch"]["batch_local_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert_eq!(first["batch"]["ordinal"], 0);
+        assert_eq!(first["batch"]["member_count"], 1);
+        assert_eq!(first["batch"]["add_recipient_guaranteed"], true);
+
+        let second = wallet
+            .transfer_batch_add_recipient(&batch_id, &request(2))
+            .unwrap();
+        assert_eq!(second["batch"]["batch_local_id"], batch_id);
+        assert_eq!(second["batch"]["ordinal"], 1);
+        assert_eq!(second["batch"]["member_count"], 2);
+        let operation_ids = [
+            first["operation_id"].as_str().unwrap().to_owned(),
+            second["operation_id"].as_str().unwrap().to_owned(),
+        ];
+        drop(wallet);
+
+        let mut reopened = AccountWallet::open(&cfg, &key, path.to_str().unwrap()).unwrap();
+        let frozen = reopened.freeze_send_batch(&batch_id).unwrap();
+        assert_eq!(frozen["state"], "frozen");
+        assert_eq!(frozen["participant_count"], 2);
+        assert_eq!(frozen["member_count"], 2);
+        assert_eq!(
+            frozen["operations"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|operation| operation["operation_id"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            operation_ids.iter().map(String::as_str).collect::<Vec<_>>(),
+        );
+        let error = reopened
+            .transfer_batch_add_recipient(&batch_id, &request(3))
+            .unwrap_err();
+        assert_eq!(error.code, "batch_window_closed");
+
+        let next = reopened.transfer_batch_plan(&request(4)).unwrap();
+        assert_ne!(next["batch"]["batch_local_id"], batch_id);
+        let next_batch_id = next["batch"]["batch_local_id"].as_str().unwrap();
+        assert_eq!(
+            reopened.freeze_send_batch(next_batch_id).unwrap()["state"],
+            "solo"
+        );
+    }
+
+    #[test]
+    fn expired_add_recipient_creates_nothing_and_automatic_send_starts_next_batch() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut wallet = AccountWallet::open(
+            &config(AccountRole::Primary, true),
+            &[75u8; 32],
+            dir.path().join("wallet.sqlite").to_str().unwrap(),
+        )
+        .unwrap();
+        let request = json!({
+            "asset_id": hex_encode(&[76u8; 32]),
+            "to_owner": hex_encode(&[77u8; 32]),
+            "amount": 1,
+        })
+        .to_string();
+        let first = wallet.transfer_batch_plan(&request).unwrap();
+        let batch_id = first["batch"]["batch_local_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        wallet
+            .db
+            .conn
+            .execute(
+                "UPDATE opencsv_send_batches SET deadline_ms = ?2
+                 WHERE batch_local_id = ?1",
+                params![batch_id, unix_time_millis().unwrap() - 1],
+            )
+            .unwrap();
+        let operation_count_before: i64 = wallet
+            .db
+            .conn
+            .query_row("SELECT COUNT(*) FROM opencsv_operations", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            wallet
+                .transfer_batch_add_recipient(&batch_id, &request)
+                .unwrap_err()
+                .code,
+            "batch_window_closed",
+        );
+        let operation_count_after: i64 = wallet
+            .db
+            .conn
+            .query_row("SELECT COUNT(*) FROM opencsv_operations", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(operation_count_after, operation_count_before);
+
+        let next = wallet.transfer_batch_plan(&request).unwrap();
+        assert_ne!(next["batch"]["batch_local_id"], batch_id);
+    }
+
+    #[test]
+    fn reserve_maintenance_creates_only_stock_fee_cells_and_wallet_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut wallet = AccountWallet::open(
+            &config_with_url(AccountRole::Primary, true, "http://127.0.0.1:1"),
+            &[69u8; 32],
+            dir.path().join("wallet.sqlite").to_str().unwrap(),
+        )
+        .unwrap();
+        fund(&mut wallet, 100_000);
+        let prepared = wallet
+            .prepare_batch_reserves(
+                2,
+                &json!({ "target_sat_per_vb": 1, "max_fee_sats": 5_000 }).to_string(),
+            )
+            .unwrap();
+        assert_eq!(prepared["state"], "broadcast_unobserved");
+        let raw = hex_decode(
+            prepared["signed_tx_hex"].as_str().unwrap(),
+            "reserve maintenance transaction",
+        )
+        .unwrap();
+        let transaction: Transaction = deserialize(&raw).unwrap();
+        assert_eq!(transaction.output.len(), 10);
+        let stock_secret = wallet.batch_stock_secret().unwrap();
+        let stock_pubkey = PublicKey::from_secret_key(&Secp256k1::new(), &stock_secret);
+        let stock_script = stock_witness_script(stock_pubkey, 2).to_p2wsh();
+        assert!(transaction.output[..3].iter().all(|output| {
+            output.value.to_sat() == opencsv_bitcoin::batch_v2::MIN_OUTPUT_SATS
+                && output.script_pubkey == stock_script
+        }));
+        assert!(transaction.output[3..9].iter().all(|output| {
+            output.value.to_sat() == MIN_FEE_RESERVE_SATS
+                && wallet
+                    .bitcoin
+                    .derivation_of_spk(output.script_pubkey.clone())
+                    .is_some()
+        }));
+        assert!(wallet
+            .bitcoin
+            .derivation_of_spk(transaction.output[9].script_pubkey.clone())
+            .is_some());
+        let now = unix_time_millis().unwrap();
+        let evidence = json!({
+            "observations": [{
+                "check_id": "test_accelerator",
+                "endpoint": "http://127.0.0.1:1",
+                "result": "observed",
+                "started_at_ms": now - 2,
+                "completed_at_ms": now - 1,
+                "cached_at_ms": now - 1,
+                "certificate_chain_fingerprints_sha256": [],
+                "raw_transaction_hex": hex_encode(&raw),
+            }]
+        });
+        let observed = wallet
+            .observe_batch_reserve_unconfirmed(
+                prepared["maintenance_id"].as_str().unwrap(),
+                &raw,
+                &evidence.to_string(),
+            )
+            .unwrap();
+        assert_eq!(observed["state"], "mempool");
+        assert_eq!(
+            wallet.status().unwrap()["batch_reserves"]["inventory"][0]["count"],
+            3
+        );
+    }
+
+    #[test]
     #[ignore = "slow recursive receipt; run explicitly with --release --ignored"]
     fn planned_transfer_resumes_proving_after_reopen() {
         let dir = tempfile::tempdir().unwrap();
@@ -6777,6 +10459,192 @@ mod tests {
         assert!(reopened.pending_by_operation.contains_key(&operation_id));
         assert_eq!(reopened.prove_operation(&operation_id).unwrap(), prepared);
         server.join().unwrap();
+    }
+
+    #[test]
+    #[ignore = "slow recursive receipts; run explicitly with --release --ignored"]
+    fn two_recipient_batch_proves_signs_and_observes_one_transaction() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut wallet = AccountWallet::open(
+            &config_with_url(AccountRole::Primary, true, "http://127.0.0.1:1"),
+            &[91u8; 32],
+            dir.path().join("wallet.sqlite").to_str().unwrap(),
+        )
+        .unwrap();
+        allow_funding_verification(&mut wallet);
+        fund(&mut wallet, 60_000);
+        let minted = prepare_test_issuance(&mut wallet, "BTT", &[60, 40]).unwrap();
+        let asset_id = minted["asset_id"].as_str().unwrap().to_owned();
+        let mint_operation = minted["operation_id"].as_str().unwrap().to_owned();
+        let mint_pending = wallet.pending_by_operation.remove(&mint_operation).unwrap();
+        wallet
+            .primary_protocol_mut()
+            .unwrap()
+            .finalize(
+                mint_pending,
+                AnchorRef {
+                    txid: [92u8; 32],
+                    location: opencsv_core::chain::AnchorLocation {
+                        height: 1,
+                        position: 0,
+                    },
+                },
+            )
+            .unwrap();
+        wallet.release_fee_reservation(&mint_operation).unwrap();
+        wallet
+            .db
+            .conn
+            .execute(
+                "UPDATE opencsv_operations SET state = 'cancelled'
+                 WHERE operation_id = ?1",
+                [&mint_operation],
+            )
+            .unwrap();
+        fund(&mut wallet, 20_000);
+        fund(&mut wallet, 19_000);
+        let stock_outpoint = OutPoint::new(Txid::from_byte_array([93u8; 32]), 0);
+        wallet
+            .db
+            .conn
+            .execute(
+                "INSERT INTO opencsv_batch_stocks(
+                     participant_count, txid, vout, value_sats, birth_height,
+                     state, reserved_by_batch, created_at
+                 ) VALUES(2, ?1, 0, ?2, 1, 'available', NULL, 1)",
+                params![
+                    stock_outpoint.txid.to_string(),
+                    i64::try_from(opencsv_bitcoin::batch_v2::MIN_OUTPUT_SATS).unwrap(),
+                ],
+            )
+            .unwrap();
+        let request = |owner: u8, amount: u64| {
+            json!({
+                "asset_id": asset_id,
+                "to_owner": hex_encode(&[owner; 32]),
+                "amount": amount,
+            })
+            .to_string()
+        };
+        let first = wallet.transfer_batch_plan(&request(94, 60)).unwrap();
+        let batch_id = first["batch"]["batch_local_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        wallet
+            .transfer_batch_add_recipient(&batch_id, &request(95, 40))
+            .unwrap();
+        wallet.freeze_send_batch(&batch_id).unwrap();
+        let job = match wallet.begin_send_batch_proof(&batch_id).unwrap() {
+            BatchProofJobStart::Run(job) => job,
+            _ => panic!("frozen two-member batch did not produce a proof job"),
+        };
+        let completed = job.run().unwrap();
+        let proved = wallet.finish_send_batch_proof(completed).unwrap();
+        assert_eq!(proved["state"], "proof_ready");
+        wallet
+            .acknowledge_send_batch_backup(&batch_id, proved["checkpoint_hash"].as_str().unwrap())
+            .unwrap();
+        let broadcast = wallet.sign_and_broadcast_send_batch(&batch_id).unwrap();
+        assert_eq!(broadcast["state"], "broadcast_unobserved");
+        let resumed = wallet.resume_send_batch(&batch_id).unwrap();
+        assert_eq!(resumed["signed_tx_hex"], broadcast["signed_tx_hex"]);
+        assert_eq!(resumed["txid"], broadcast["txid"]);
+        let raw = hex_decode(
+            broadcast["signed_tx_hex"].as_str().unwrap(),
+            "test batch transaction",
+        )
+        .unwrap();
+        let transaction: Transaction = deserialize(&raw).unwrap();
+        assert_eq!(transaction.input.len(), 3);
+        assert_eq!(transaction.input[0].previous_output, stock_outpoint);
+        assert_eq!(transaction.output.len(), 5);
+        assert!(transaction.output[0].script_pubkey.is_op_return());
+        assert_eq!(transaction.output[1].script_pubkey.as_bytes(), MARKER_SPK);
+        assert!(transaction.input[1..]
+            .iter()
+            .all(|input| input.previous_output != stock_outpoint));
+        assert_ne!(
+            transaction.input[1].previous_output,
+            transaction.input[2].previous_output
+        );
+        let now = unix_time_millis().unwrap();
+        let evidence = json!({
+            "observations": [{
+                "check_id": "test_accelerator",
+                "endpoint": "http://127.0.0.1:1",
+                "result": "observed",
+                "started_at_ms": now - 2,
+                "completed_at_ms": now - 1,
+                "cached_at_ms": now - 1,
+                "certificate_chain_fingerprints_sha256": [],
+                "raw_transaction_hex": hex_encode(&raw),
+            }]
+        });
+        let observed = wallet
+            .observe_send_batch_unconfirmed(&batch_id, &raw, &evidence.to_string())
+            .unwrap();
+        assert_eq!(observed["state"], "mempool");
+        let bumped = wallet.fee_bump_send_batch(&batch_id, 3).unwrap();
+        assert_eq!(bumped["state"], "broadcast_unobserved");
+        let replacement_raw = hex_decode(
+            bumped["signed_tx_hex"].as_str().unwrap(),
+            "test batch replacement",
+        )
+        .unwrap();
+        let replacement: Transaction = deserialize(&replacement_raw).unwrap();
+        assert!(replacement
+            .input
+            .iter()
+            .zip(&transaction.input)
+            .all(|(new, old)| {
+                new.previous_output == old.previous_output
+                    && new.sequence == old.sequence
+                    && new.script_sig == old.script_sig
+            }));
+        assert_eq!(replacement.output[..3], transaction.output[..3]);
+        assert!(replacement.output[3..]
+            .iter()
+            .zip(&transaction.output[3..])
+            .all(|(new, old)| {
+                new.script_pubkey == old.script_pubkey && new.value <= old.value
+            }));
+        assert!(replacement.output[3..]
+            .iter()
+            .zip(&transaction.output[3..])
+            .any(|(new, old)| new.value < old.value));
+        let replacement_now = unix_time_millis().unwrap();
+        let replacement_evidence = json!({
+            "observations": [{
+                "check_id": "test_accelerator",
+                "endpoint": "http://127.0.0.1:1",
+                "result": "observed",
+                "started_at_ms": replacement_now - 2,
+                "completed_at_ms": replacement_now - 1,
+                "cached_at_ms": replacement_now - 1,
+                "certificate_chain_fingerprints_sha256": [],
+                "raw_transaction_hex": hex_encode(&replacement_raw),
+            }]
+        });
+        let replacement_observed = wallet
+            .observe_send_batch_unconfirmed(
+                &batch_id,
+                &replacement_raw,
+                &replacement_evidence.to_string(),
+            )
+            .unwrap();
+        assert_eq!(replacement_observed["state"], "mempool");
+        let members = wallet.send_batch_members(&batch_id).unwrap();
+        assert_eq!(members.len(), 2);
+        let expected_txid = replacement.compute_txid().to_string();
+        for member in members {
+            let operation = wallet.operation(&member.operation_id).unwrap();
+            assert_eq!(operation.state, OperationState::Mempool.as_str());
+            assert_eq!(operation.txid.as_deref(), Some(expected_txid.as_str()));
+            let receipt: Value =
+                serde_json::from_str(operation.receipt_json.as_deref().unwrap()).unwrap();
+            assert_eq!(receipt["delivery_ready"], true);
+        }
     }
 
     #[test]
@@ -6944,6 +10812,258 @@ mod tests {
                 .unwrap_err()
                 .code,
             "device_binding_mismatch"
+        );
+    }
+
+    #[test]
+    fn checkpoint_restore_preserves_frozen_batch_membership() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = [81u8; 32];
+        let binding = [82u8; 32];
+        let cfg = config(AccountRole::Primary, true);
+        let mut original = AccountWallet::open_device_bound(
+            &cfg,
+            &key,
+            &binding,
+            dir.path().join("original.sqlite").to_str().unwrap(),
+        )
+        .unwrap();
+        let request = |recipient: u8| {
+            json!({
+                "asset_id": hex_encode(&[83u8; 32]),
+                "to_owner": hex_encode(&[recipient; 32]),
+                "amount": u64::from(recipient),
+            })
+            .to_string()
+        };
+        let first = original.transfer_batch_plan(&request(1)).unwrap();
+        let batch_id = first["batch"]["batch_local_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        original
+            .transfer_batch_add_recipient(&batch_id, &request(2))
+            .unwrap();
+        original.freeze_send_batch(&batch_id).unwrap();
+        let checkpoint = original.checkpoint().unwrap();
+        assert_eq!(checkpoint["checkpoint"]["version"], CHECKPOINT_VERSION);
+        assert_eq!(
+            checkpoint["checkpoint"]["send_batch_members"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2,
+        );
+        let commitment = original.status().unwrap()["device_binding"]["commitment"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        drop(original);
+
+        let mut recovery_config: Value = serde_json::from_str(&cfg).unwrap();
+        recovery_config["expected_device_binding_commitment"] = json!(commitment);
+        let mut restored = AccountWallet::open_device_bound(
+            &recovery_config.to_string(),
+            &key,
+            &[],
+            dir.path().join("restored.sqlite").to_str().unwrap(),
+        )
+        .unwrap();
+        restored
+            .restore_checkpoint(&checkpoint.to_string())
+            .unwrap();
+        let batch = restored.send_batch_status(&batch_id).unwrap();
+        assert_eq!(batch["state"], "frozen");
+        assert_eq!(batch["participant_count"], 2);
+        assert_eq!(batch["member_count"], 2);
+        assert_eq!(
+            restored.checkpoint().unwrap()["checkpoint_hash"],
+            restored
+                .db
+                .meta("restored_checkpoint_hash")
+                .unwrap()
+                .unwrap(),
+        );
+    }
+
+    #[test]
+    fn checkpoint_round_trips_signed_fee_locks_and_batch_reserves() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = [86u8; 32];
+        let binding = [87u8; 32];
+        let cfg = config(AccountRole::Primary, true);
+        let mut original = AccountWallet::open_device_bound(
+            &cfg,
+            &key,
+            &binding,
+            dir.path().join("original.sqlite").to_str().unwrap(),
+        )
+        .unwrap();
+        let funding = fund(&mut original, 60_000);
+        let funding_transaction = original.bitcoin.get_tx(funding.txid).unwrap();
+        let signed_hex = hex_encode(&serialize(funding_transaction.tx_node.tx.as_ref()));
+        original
+            .insert_planned_operation("signed-member", "transfer", "{}", "delivery")
+            .unwrap();
+        original
+            .db
+            .conn
+            .execute(
+                "UPDATE opencsv_operations
+                 SET state = 'signed_persisted', funding_txid = ?2,
+                     funding_vout = ?3, funding_value_sats = 60000,
+                     signed_tx_hex = ?4, txid = ?2
+                 WHERE operation_id = ?1",
+                params![
+                    "signed-member",
+                    funding.txid.to_string(),
+                    funding.vout,
+                    signed_hex,
+                ],
+            )
+            .unwrap();
+        original
+            .db
+            .conn
+            .execute(
+                "INSERT INTO opencsv_utxo_reservations(
+                     txid, vout, operation_id, state, created_at
+                 ) VALUES(?1, ?2, 'signed-member', 'signature_released', 1)",
+                params![funding.txid.to_string(), funding.vout],
+            )
+            .unwrap();
+        original.bitcoin.lock_outpoint(funding);
+        original.bitcoin.persist(&mut original.db).unwrap();
+        original
+            .db
+            .conn
+            .execute(
+                "INSERT INTO opencsv_batch_stocks(
+                     participant_count, txid, vout, value_sats, birth_height,
+                     state, reserved_by_batch, created_at
+                 ) VALUES(2, ?1, 7, 4000, 123, 'available', NULL, 1)",
+                [funding.txid.to_string()],
+            )
+            .unwrap();
+        original
+            .db
+            .conn
+            .execute(
+                "INSERT INTO opencsv_batch_reserve_operations(
+                     maintenance_id, state, participant_count, stock_count,
+                     fee_cell_count, signed_tx_hex, txid, receipt_json,
+                     created_at, updated_at
+                 ) VALUES(
+                     'maintenance-1', 'mempool', 2, 3, 6, ?1, ?2, '{}', 1, 2
+                 )",
+                params![signed_hex, funding.txid.to_string()],
+            )
+            .unwrap();
+        let checkpoint = original.checkpoint().unwrap();
+        let commitment = original.status().unwrap()["device_binding"]["commitment"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        drop(original);
+
+        let mut recovery_config: Value = serde_json::from_str(&cfg).unwrap();
+        recovery_config["expected_device_binding_commitment"] = json!(commitment);
+        let mut restored = AccountWallet::open_device_bound(
+            &recovery_config.to_string(),
+            &key,
+            &[],
+            dir.path().join("restored.sqlite").to_str().unwrap(),
+        )
+        .unwrap();
+        restored
+            .restore_checkpoint(&checkpoint.to_string())
+            .unwrap();
+        assert!(restored.bitcoin.is_outpoint_locked(funding));
+        assert_eq!(
+            restored.cancel_operation("signed-member").unwrap_err().code,
+            "cancellation_forbidden"
+        );
+        let restored_checkpoint = restored.checkpoint().unwrap();
+        assert_eq!(
+            restored_checkpoint["checkpoint"]["batch_stocks"],
+            checkpoint["checkpoint"]["batch_stocks"]
+        );
+        assert_eq!(
+            restored_checkpoint["checkpoint"]["batch_reserve_operations"],
+            checkpoint["checkpoint"]["batch_reserve_operations"]
+        );
+        assert_eq!(
+            restored_checkpoint["checkpoint_hash"],
+            checkpoint["checkpoint_hash"]
+        );
+    }
+
+    #[test]
+    fn version_one_checkpoint_restores_and_normalizes_to_current_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = [84u8; 32];
+        let binding = [85u8; 32];
+        let cfg = config(AccountRole::Primary, true);
+        let mut original = AccountWallet::open_device_bound(
+            &cfg,
+            &key,
+            &binding,
+            dir.path().join("original.sqlite").to_str().unwrap(),
+        )
+        .unwrap();
+        let commitment = original.status().unwrap()["device_binding"]["commitment"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let mut legacy = original.checkpoint().unwrap();
+        legacy["checkpoint"]["version"] = json!(LEGACY_CHECKPOINT_VERSION);
+        legacy["checkpoint"]
+            .as_object_mut()
+            .unwrap()
+            .remove("send_batches");
+        legacy["checkpoint"]
+            .as_object_mut()
+            .unwrap()
+            .remove("send_batch_members");
+        legacy["checkpoint"]
+            .as_object_mut()
+            .unwrap()
+            .remove("batch_stocks");
+        legacy["checkpoint"]
+            .as_object_mut()
+            .unwrap()
+            .remove("batch_reserve_operations");
+        let canonical = serde_json::to_vec(&legacy["checkpoint"]).unwrap();
+        legacy["checkpoint_hash"] = json!(sha256::Hash::hash(&canonical).to_string());
+        drop(original);
+
+        let mut recovery_config: Value = serde_json::from_str(&cfg).unwrap();
+        recovery_config["expected_device_binding_commitment"] = json!(commitment);
+        let mut restored = AccountWallet::open_device_bound(
+            &recovery_config.to_string(),
+            &key,
+            &[],
+            dir.path().join("restored.sqlite").to_str().unwrap(),
+        )
+        .unwrap();
+        restored.restore_checkpoint(&legacy.to_string()).unwrap();
+        let normalized = restored.checkpoint().unwrap();
+        assert_eq!(normalized["checkpoint"]["version"], CHECKPOINT_VERSION);
+        assert_eq!(
+            normalized["checkpoint_hash"],
+            restored
+                .db
+                .meta("restored_checkpoint_hash")
+                .unwrap()
+                .unwrap(),
+        );
+        assert_eq!(
+            restored
+                .db
+                .meta("restored_checkpoint_source_hash")
+                .unwrap()
+                .unwrap(),
+            legacy["checkpoint_hash"].as_str().unwrap(),
         );
     }
 

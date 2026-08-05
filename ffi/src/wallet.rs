@@ -846,6 +846,47 @@ impl MemWallet {
         Ok(record.to_bytes())
     }
 
+    /// Rebind a pending transfer for batching-v2 and return its single
+    /// witness-envelope payload.
+    ///
+    /// C1 has a deliberately frozen one-participant/one-payload shape. A
+    /// transfer consuming two OpenCSV coins therefore cannot be smuggled into
+    /// one participant slot: it must use the solo anchor path. Keeping this
+    /// check inside Rust lets an interactive client advertise Add Recipient
+    /// only after the exact proved operation is known to be batchable.
+    pub fn rebind_pending_batch_payload(
+        &self,
+        pending_id: u64,
+        ctx: [u8; 32],
+    ) -> Result<opencsv_core::TruncatedDigest, OpError> {
+        let pending = self
+            .pending
+            .get(&pending_id)
+            .ok_or_else(|| format!("unknown pending transaction {pending_id}"))?;
+        let RecordShape::Xfer { nullifiers } = &pending.shape else {
+            return Err("batching-v2 currently accepts transfer operations only".into());
+        };
+        if nullifiers.len() != 1 {
+            return Err(
+                "batching-v2 requires exactly one OpenCSV input payload per participant".into(),
+            );
+        }
+        let record = pending.shape.build(&ctx);
+        if !record_parses_cleanly(&record) {
+            return Err(
+                "this batch context would make the payload misparse; reserve another stock".into(),
+            );
+        }
+        match record {
+            AnchorRecord::Xfer { payloads }
+                if payloads[1] == opencsv_core::TruncatedDigest([0; 24]) =>
+            {
+                Ok(payloads[0])
+            }
+            _ => Err("batching-v2 transfer did not produce one canonical payload".into()),
+        }
+    }
+
     /// Build the consignment for a proved transaction once the host knows
     /// where its anchor record landed, and mark the consumed coins spent.
     /// Returns the serialized consignment blob.
@@ -1547,6 +1588,50 @@ mod tests {
                 .unwrap(),
             vec!["parent-txid"]
         );
+    }
+
+    #[test]
+    fn batch_payload_requires_exactly_one_transfer_nullifier() {
+        let mut wallet = MemWallet::from_owner_seed([7u8; 32]);
+        wallet.pending.insert(
+            1,
+            Pending {
+                shape: RecordShape::Xfer {
+                    nullifiers: vec![Digest::from_bytes([1u8; 32])],
+                },
+                openings: Vec::new(),
+                nullifiers: vec![Digest::from_bytes([1u8; 32])],
+                proof: Vec::new(),
+                aux: None,
+                spent_ids: vec!["coin-a".into()],
+                unconfirmed_dependencies: Vec::new(),
+            },
+        );
+        wallet.pending.insert(
+            2,
+            Pending {
+                shape: RecordShape::Xfer {
+                    nullifiers: vec![Digest::from_bytes([2u8; 32]), Digest::from_bytes([3u8; 32])],
+                },
+                openings: Vec::new(),
+                nullifiers: vec![Digest::from_bytes([2u8; 32]), Digest::from_bytes([3u8; 32])],
+                proof: Vec::new(),
+                aux: None,
+                spent_ids: vec!["coin-b".into(), "coin-c".into()],
+                unconfirmed_dependencies: Vec::new(),
+            },
+        );
+
+        let ctx = [9u8; 32];
+        let payload = wallet.rebind_pending_batch_payload(1, ctx).unwrap();
+        assert_eq!(
+            payload,
+            opencsv_core::anchor::binding(&Digest::from_bytes([1u8; 32]), &ctx).to_anchor(),
+        );
+        assert!(wallet
+            .rebind_pending_batch_payload(2, ctx)
+            .unwrap_err()
+            .contains("exactly one OpenCSV input payload"));
     }
 
     #[test]

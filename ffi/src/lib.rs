@@ -48,8 +48,7 @@ use opencsv_core::chain::{AnchorLocation, AnchorRef};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use crate::account::AccountWallet;
-use crate::account::ProofJobStart;
+use crate::account::{AccountWallet, BatchProofJobStart, ProofJobStart};
 use crate::hex::{from_hex_array, to_hex};
 use crate::snapshot::SnapshotChain;
 use crate::wallet::MemWallet;
@@ -323,6 +322,103 @@ pub extern "C" fn opencsv_account_status(handle: u64) -> *mut c_char {
 #[no_mangle]
 pub extern "C" fn opencsv_account_sync(handle: u64) -> *mut c_char {
     guarded(|| with_account(handle, AccountWallet::sync))
+}
+
+/// Build, sign, persist, and relay a wallet-internal stock/fee-cell split for
+/// one batching-v2 participant count. No Bitcoin recipient is accepted.
+///
+/// # Safety
+/// `fee_policy_json` must be valid NUL-terminated UTF-8.
+#[no_mangle]
+pub unsafe extern "C" fn opencsv_account_prepare_batch_reserves(
+    handle: u64,
+    participant_count: u8,
+    fee_policy_json: *const c_char,
+) -> *mut c_char {
+    guarded(|| {
+        let fee_policy = match unsafe { in_str(fee_policy_json, "fee_policy_json") } {
+            Ok(value) => value,
+            Err(error) => return err(error),
+        };
+        with_account(handle, |account| {
+            account.prepare_batch_reserves(participant_count, fee_policy)
+        })
+    })
+}
+
+/// Apply exact pinned raw-byte observations to reserve maintenance.
+///
+/// # Safety
+/// Pointers must be valid for their documented lengths and strings valid
+/// NUL-terminated UTF-8.
+#[no_mangle]
+pub unsafe extern "C" fn opencsv_account_observe_batch_reserves(
+    handle: u64,
+    maintenance_id: *const c_char,
+    raw_transaction: *const u8,
+    raw_transaction_len: usize,
+    observations_json: *const c_char,
+) -> *mut c_char {
+    guarded(|| {
+        let maintenance_id = match unsafe { in_str(maintenance_id, "maintenance_id") } {
+            Ok(value) => value,
+            Err(error) => return err(error),
+        };
+        let raw_transaction =
+            match unsafe { in_bytes(raw_transaction, raw_transaction_len, "raw_transaction") } {
+                Ok(value) if !value.is_empty() => value,
+                Ok(_) => return err("raw transaction is empty"),
+                Err(error) => return err(error),
+            };
+        let observations = match unsafe { in_str(observations_json, "observations_json") } {
+            Ok(value) => value,
+            Err(error) => return err(error),
+        };
+        with_account(handle, |account| {
+            account.observe_batch_reserve_unconfirmed(maintenance_id, raw_transaction, observations)
+        })
+    })
+}
+
+/// Reapply and rebroadcast one exact persisted reserve-maintenance
+/// transaction after a crash.
+///
+/// # Safety
+/// `maintenance_id` must be a valid NUL-terminated UTF-8 string.
+#[no_mangle]
+pub unsafe extern "C" fn opencsv_account_resume_batch_reserves(
+    handle: u64,
+    maintenance_id: *const c_char,
+) -> *mut c_char {
+    guarded(|| {
+        let maintenance_id = match unsafe { in_str(maintenance_id, "maintenance_id") } {
+            Ok(value) => value,
+            Err(error) => return err(error),
+        };
+        with_account(handle, |account| {
+            account.resume_batch_reserves(maintenance_id)
+        })
+    })
+}
+
+/// Promote reserve stock after CBF proves the exact confirmed outpoints.
+///
+/// # Safety
+/// `maintenance_id` must be valid NUL-terminated UTF-8.
+#[no_mangle]
+pub unsafe extern "C" fn opencsv_account_refresh_batch_reserves(
+    handle: u64,
+    maintenance_id: *const c_char,
+) -> *mut c_char {
+    guarded(|| {
+        let maintenance_id = match unsafe { in_str(maintenance_id, "maintenance_id") } {
+            Ok(value) => value,
+            Err(error) => return err(error),
+        };
+        with_account(handle, |account| {
+            account.refresh_batch_reserves(maintenance_id)
+        })
+    })
 }
 
 /// Update Secure Backup policy. Disabling it freezes new Bitcoin-writing
@@ -636,6 +732,292 @@ pub unsafe extern "C" fn opencsv_transfer_plan(
             Err(error) => return err(error),
         };
         with_account(handle, |account| account.transfer_plan(request))
+    })
+}
+
+/// Durably plan a transfer inside the wallet-owned two-second collection
+/// window. Concurrent calls coalesce while the window is open; a new window
+/// starts after freeze/expiry. The returned operation includes its local batch
+/// identity and exact deadline.
+///
+/// # Safety
+/// `request_json` must be a valid NUL-terminated UTF-8 string.
+#[no_mangle]
+pub unsafe extern "C" fn opencsv_transfer_batch_plan(
+    handle: u64,
+    request_json: *const c_char,
+) -> *mut c_char {
+    guarded(|| {
+        let request = match unsafe { in_str(request_json, "request_json") } {
+            Ok(value) => value,
+            Err(error) => return err(error),
+        };
+        with_account(handle, |account| account.transfer_batch_plan(request))
+    })
+}
+
+/// Commit an explicit Add Recipient intent to a named open batch. Success is
+/// the membership guarantee; a closed window fails without creating a second
+/// unbatched operation.
+///
+/// # Safety
+/// Both strings must be valid NUL-terminated UTF-8.
+#[no_mangle]
+pub unsafe extern "C" fn opencsv_transfer_batch_add_recipient(
+    handle: u64,
+    batch_local_id: *const c_char,
+    request_json: *const c_char,
+) -> *mut c_char {
+    guarded(|| {
+        let batch_local_id = match unsafe { in_str(batch_local_id, "batch_local_id") } {
+            Ok(value) => value,
+            Err(error) => return err(error),
+        };
+        let request = match unsafe { in_str(request_json, "request_json") } {
+            Ok(value) => value,
+            Err(error) => return err(error),
+        };
+        with_account(handle, |account| {
+            account.transfer_batch_add_recipient(batch_local_id, request)
+        })
+    })
+}
+
+/// Freeze the ordered membership. One member selects the established solo
+/// path; two or more select batching-v2.
+///
+/// # Safety
+/// `batch_local_id` must be valid NUL-terminated UTF-8.
+#[no_mangle]
+pub unsafe extern "C" fn opencsv_send_batch_freeze(
+    handle: u64,
+    batch_local_id: *const c_char,
+) -> *mut c_char {
+    guarded(|| {
+        let batch_local_id = match unsafe { in_str(batch_local_id, "batch_local_id") } {
+            Ok(value) => value,
+            Err(error) => return err(error),
+        };
+        with_account(handle, |account| account.freeze_send_batch(batch_local_id))
+    })
+}
+
+/// Return one durable send batch and its ordered operation intents.
+///
+/// # Safety
+/// `batch_local_id` must be valid NUL-terminated UTF-8.
+#[no_mangle]
+pub unsafe extern "C" fn opencsv_send_batch_status(
+    handle: u64,
+    batch_local_id: *const c_char,
+) -> *mut c_char {
+    guarded(|| {
+        let batch_local_id = match unsafe { in_str(batch_local_id, "batch_local_id") } {
+            Ok(value) => value,
+            Err(error) => return err(error),
+        };
+        with_account(handle, |account| account.send_batch_status(batch_local_id))
+    })
+}
+
+/// Reserve the frozen stock/fee cells, verify them, and produce every
+/// proposal-bound proof plus the deterministic C1 manifest. Recursive proof
+/// work runs outside the global account registry and live-wallet lock.
+/// A solo timeout returns `{"path":"solo","operation_id":...}`.
+///
+/// # Safety
+/// `batch_local_id` must be valid NUL-terminated UTF-8.
+#[no_mangle]
+pub unsafe extern "C" fn opencsv_send_batch_prove(
+    handle: u64,
+    batch_local_id: *const c_char,
+) -> *mut c_char {
+    guarded(|| {
+        let batch_local_id = match unsafe { in_str(batch_local_id, "batch_local_id") } {
+            Ok(value) => value,
+            Err(error) => return err(error),
+        };
+        let Some(account) = account_for_handle(handle) else {
+            return out(json!({
+                "error": format!("unknown account handle {handle}"),
+                "reason": "unknown_handle",
+            }));
+        };
+        let start = {
+            let mut account = match account.lock() {
+                Ok(account) => account,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            account.begin_send_batch_proof(batch_local_id)
+        };
+        let job = match start {
+            Ok(BatchProofJobStart::Solo(operation_id)) => {
+                return out(json!({"path": "solo", "operation_id": operation_id}));
+            }
+            Ok(BatchProofJobStart::Ready(receipt)) => return out(receipt),
+            Ok(BatchProofJobStart::Run(job)) => job,
+            Err(error) => return out(error.json()),
+        };
+        let job_batch_id = job.batch_local_id().to_owned();
+        let result = job.run();
+        let mut account = match account.lock() {
+            Ok(account) => account,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        match result {
+            Ok(completed) => match account.finish_send_batch_proof(completed) {
+                Ok(receipt) => out(receipt),
+                Err(error) => out(error.json()),
+            },
+            Err(error) => match account.fail_send_batch_proof::<Value>(&job_batch_id, error) {
+                Ok(receipt) => out(receipt),
+                Err(error) => out(error.json()),
+            },
+        }
+    })
+}
+
+/// Acknowledge that Signal Secure Backup durably accepted the exact complete
+/// batch checkpoint. One acknowledgement covers every frozen member.
+///
+/// # Safety
+/// Both arguments must be valid NUL-terminated UTF-8 strings.
+#[no_mangle]
+pub unsafe extern "C" fn opencsv_send_batch_ack_backup(
+    handle: u64,
+    batch_local_id: *const c_char,
+    checkpoint_hash: *const c_char,
+) -> *mut c_char {
+    guarded(|| {
+        let batch_local_id = match unsafe { in_str(batch_local_id, "batch_local_id") } {
+            Ok(value) => value,
+            Err(error) => return err(error),
+        };
+        let checkpoint_hash = match unsafe { in_str(checkpoint_hash, "checkpoint_hash") } {
+            Ok(value) => value,
+            Err(error) => return err(error),
+        };
+        with_account(handle, |account| {
+            account.acknowledge_send_batch_backup(batch_local_id, checkpoint_hash)
+        })
+    })
+}
+
+/// Reverify every reserved input, sign the frozen C1 manifest, persist the
+/// exact shared transaction, and then submit it to the configured relays.
+///
+/// # Safety
+/// `batch_local_id` must be a valid NUL-terminated UTF-8 string.
+#[no_mangle]
+pub unsafe extern "C" fn opencsv_send_batch_sign_and_broadcast(
+    handle: u64,
+    batch_local_id: *const c_char,
+) -> *mut c_char {
+    guarded(|| {
+        let batch_local_id = match unsafe { in_str(batch_local_id, "batch_local_id") } {
+            Ok(value) => value,
+            Err(error) => return err(error),
+        };
+        with_account(handle, |account| {
+            account.sign_and_broadcast_send_batch(batch_local_id)
+        })
+    })
+}
+
+/// Record pinned independent visibility for the exact shared transaction and
+/// finalize one independently deliverable consignment per batch member.
+///
+/// # Safety
+/// Byte pointers must be valid for their lengths. String pointers must be
+/// valid NUL-terminated UTF-8.
+#[no_mangle]
+pub unsafe extern "C" fn opencsv_send_batch_observe_unconfirmed(
+    handle: u64,
+    batch_local_id: *const c_char,
+    raw_transaction: *const u8,
+    raw_transaction_len: usize,
+    observations_json: *const c_char,
+) -> *mut c_char {
+    guarded(|| {
+        let batch_local_id = match unsafe { in_str(batch_local_id, "batch_local_id") } {
+            Ok(value) => value,
+            Err(error) => return err(error),
+        };
+        let raw_transaction =
+            match unsafe { in_bytes(raw_transaction, raw_transaction_len, "raw_transaction") } {
+                Ok(value) if !value.is_empty() => value,
+                Ok(_) => return err("raw transaction is empty"),
+                Err(error) => return err(error),
+            };
+        let observations = match unsafe { in_str(observations_json, "observations_json") } {
+            Ok(value) => value,
+            Err(error) => return err(error),
+        };
+        with_account(handle, |account| {
+            account.observe_send_batch_unconfirmed(batch_local_id, raw_transaction, observations)
+        })
+    })
+}
+
+/// Idempotently rebroadcast an exact persisted shared transaction after a
+/// crash without changing its frozen manifest.
+///
+/// # Safety
+/// `batch_local_id` must be a valid NUL-terminated UTF-8 string.
+#[no_mangle]
+pub unsafe extern "C" fn opencsv_send_batch_resume(
+    handle: u64,
+    batch_local_id: *const c_char,
+) -> *mut c_char {
+    guarded(|| {
+        let batch_local_id = match unsafe { in_str(batch_local_id, "batch_local_id") } {
+            Ok(value) => value,
+            Err(error) => return err(error),
+        };
+        with_account(handle, |account| account.resume_send_batch(batch_local_id))
+    })
+}
+
+/// Build, persist, and submit the next protocol-safe shared-transaction RBF
+/// epoch while preserving every member and protected output.
+///
+/// # Safety
+/// `batch_local_id` must be a valid NUL-terminated UTF-8 string.
+#[no_mangle]
+pub unsafe extern "C" fn opencsv_send_batch_fee_bump(
+    handle: u64,
+    batch_local_id: *const c_char,
+    target_sat_per_vb: u64,
+) -> *mut c_char {
+    guarded(|| {
+        let batch_local_id = match unsafe { in_str(batch_local_id, "batch_local_id") } {
+            Ok(value) => value,
+            Err(error) => return err(error),
+        };
+        with_account(handle, |account| {
+            account.fee_bump_send_batch(batch_local_id, target_sat_per_vb)
+        })
+    })
+}
+
+/// Refresh every member through authoritative compact-filter/full-block
+/// verification and settle the shared transaction only when all agree.
+///
+/// # Safety
+/// `batch_local_id` must be a valid NUL-terminated UTF-8 string.
+#[no_mangle]
+pub unsafe extern "C" fn opencsv_send_batch_refresh_spv(
+    handle: u64,
+    batch_local_id: *const c_char,
+) -> *mut c_char {
+    guarded(|| {
+        let batch_local_id = match unsafe { in_str(batch_local_id, "batch_local_id") } {
+            Ok(value) => value,
+            Err(error) => return err(error),
+        };
+        with_account(handle, |account| {
+            account.refresh_send_batch_spv(batch_local_id)
+        })
     })
 }
 

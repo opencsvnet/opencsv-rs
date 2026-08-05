@@ -42,6 +42,19 @@ char *opencsv_account_open(const char *config_json,
 char *opencsv_account_close(uint64_t handle);
 char *opencsv_account_status(uint64_t handle);
 char *opencsv_account_sync(uint64_t handle);
+char *opencsv_account_prepare_batch_reserves(uint64_t handle,
+                                             uint8_t participant_count,
+                                             const char *fee_policy_json);
+char *opencsv_account_observe_batch_reserves(
+    uint64_t handle,
+    const char *maintenance_id,
+    const uint8_t *raw_transaction,
+    size_t raw_transaction_len,
+    const char *observations_json);
+char *opencsv_account_resume_batch_reserves(uint64_t handle,
+                                            const char *maintenance_id);
+char *opencsv_account_refresh_batch_reserves(uint64_t handle,
+                                             const char *maintenance_id);
 char *opencsv_account_set_backup_state(uint64_t handle, bool verified,
                                        uint32_t checkpoint_version);
 char *opencsv_account_checkpoint(uint64_t handle);
@@ -93,6 +106,38 @@ char *opencsv_account_cross_check(uint64_t handle,
  * fast durable UI boundary; proof generation resumes the same operation in
  * background. Swift never supplies OpenCSV coins, Bitcoin inputs, or change. */
 char *opencsv_transfer_plan(uint64_t handle, const char *request_json);
+/* Wallet-owned two-second collection window. Add Recipient succeeds only
+ * while membership can still be durably guaranteed. Freeze routes a
+ * one-member timeout to the solo path and 2+ members to batching-v2. */
+char *opencsv_transfer_batch_plan(uint64_t handle,
+                                  const char *request_json);
+char *opencsv_transfer_batch_add_recipient(uint64_t handle,
+                                           const char *batch_local_id,
+                                           const char *request_json);
+char *opencsv_send_batch_freeze(uint64_t handle,
+                                const char *batch_local_id);
+char *opencsv_send_batch_status(uint64_t handle,
+                                const char *batch_local_id);
+char *opencsv_send_batch_prove(uint64_t handle,
+                               const char *batch_local_id);
+char *opencsv_send_batch_ack_backup(uint64_t handle,
+                                    const char *batch_local_id,
+                                    const char *checkpoint_hash);
+char *opencsv_send_batch_sign_and_broadcast(uint64_t handle,
+                                            const char *batch_local_id);
+char *opencsv_send_batch_observe_unconfirmed(
+    uint64_t handle,
+    const char *batch_local_id,
+    const uint8_t *raw_transaction,
+    size_t raw_transaction_len,
+    const char *observations_json);
+char *opencsv_send_batch_resume(uint64_t handle,
+                                const char *batch_local_id);
+char *opencsv_send_batch_fee_bump(uint64_t handle,
+                                  const char *batch_local_id,
+                                  uint64_t target_sat_per_vb);
+char *opencsv_send_batch_refresh_spv(uint64_t handle,
+                                     const char *batch_local_id);
 char *opencsv_operation_prove(uint64_t handle, const char *operation_id);
 /* Compatibility one-shot for non-interactive callers. */
 char *opencsv_transfer_prepare(uint64_t handle, const char *request_json);
