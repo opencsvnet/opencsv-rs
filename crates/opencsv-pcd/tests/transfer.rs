@@ -99,6 +99,20 @@ fn wrong_osk_fails() {
     assert!(matches!(err, TransferError::Circuit(_)));
 }
 
+/// A fixed-width circuit must never count one coin twice as two inputs.
+#[test]
+fn duplicate_input_fails_before_proving() {
+    let input = (coin(10, 0x22, 0x33), osk(0x22));
+    let inputs = [input, input];
+    let outputs = [coin(10, 0x66, 0x77), coin(10, 0x88, 0x99)];
+
+    let err = match prove_transfer(&asset_id(), &inputs, &outputs) {
+        Ok(_) => panic!("duplicating one input coin must fail"),
+        Err(error) => error,
+    };
+    assert!(matches!(err, TransferError::DuplicateInput));
+}
+
 /// Negative test: a valid proof must not verify against tampered public
 /// data.
 #[test]

@@ -479,6 +479,53 @@ fn accept_compressed_transfer_happy_path_and_double_spend() {
 }
 
 #[test]
+fn accept_rejects_duplicate_nullifier_in_direct_and_compressed_transfers() {
+    let g = genesis();
+    let asset_id = g.asset_id();
+    let duplicate = d(39);
+    let nfs = vec![duplicate, duplicate];
+    let openings = vec![opening_for(asset_id, 60, 3, 4)];
+
+    let mut direct_chain = MockAnchorChain::new();
+    let (record, ctx) = xfer_for(&direct_chain, &nfs);
+    let anchor_ref = direct_chain.append_with_ctx(record, ctx);
+    let consignment = consignment_for(
+        &direct_chain,
+        anchor_ref,
+        nfs.clone(),
+        openings.clone(),
+        None,
+    );
+    direct_chain.advance_blocks(5);
+    assert_eq!(
+        accept(
+            &consignment,
+            &direct_chain,
+            &MockVerifier,
+            &params(&[secret(3)], &[asset_id]),
+        ),
+        Err(RejectReason::DuplicateNullifier)
+    );
+
+    let mut compressed_chain = MockAnchorChain::new();
+    let ctx = compressed_chain.fresh_ctx();
+    let commit = nullifier_commit(&nfs);
+    let anchor_ref =
+        compressed_chain.append_with_ctx(AnchorRecord::xfer_compressed(&commit, &ctx), ctx);
+    let consignment = consignment_for(&compressed_chain, anchor_ref, nfs, openings, None);
+    compressed_chain.advance_blocks(5);
+    assert_eq!(
+        accept(
+            &consignment,
+            &compressed_chain,
+            &MockVerifier,
+            &params(&[secret(3)], &[asset_id]),
+        ),
+        Err(RejectReason::DuplicateNullifier)
+    );
+}
+
+#[test]
 fn accept_rejects_consignment_missing_a_nullifier() {
     let g = genesis();
     let asset_id = g.asset_id();

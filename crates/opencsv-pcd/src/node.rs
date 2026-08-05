@@ -302,6 +302,8 @@ pub enum NodeError {
     IssuerKeyMismatch,
     /// Not all coins are denominated in the stated asset.
     AssetMismatch,
+    /// The same coin or nullifier was supplied in more than one input slot.
+    DuplicateInput,
     /// The minted output values sum to more than `u64::MAX`.
     ValueOverflow,
     /// The proof belongs to an unsupported or unauthenticated lineage.
@@ -372,6 +374,7 @@ impl std::fmt::Display for NodeError {
                 write!(f, "issuer seed does not control the asset genesis key")
             }
             Self::AssetMismatch => write!(f, "coin asset does not match the stated asset"),
+            Self::DuplicateInput => write!(f, "transfer input coin is duplicated"),
             Self::ValueOverflow => write!(f, "mint output values overflow u64"),
             Self::UnsupportedProofVersion { actual } => write!(
                 f,
@@ -1095,6 +1098,9 @@ pub fn prove_transfer(
     {
         return Err(NodeError::AssetMismatch);
     }
+    if inputs[0].0.commitment() == inputs[1].0.commitment() {
+        return Err(NodeError::DuplicateInput);
+    }
     for (i, pred) in predecessors.iter().enumerate() {
         if pred.statement.asset_id != *asset_id {
             return Err(NodeError::PredecessorAssetMismatch);
@@ -1108,6 +1114,9 @@ pub fn prove_transfer(
         let (coin, osk) = &inputs[i];
         opencsv_core::coin::nullifier(osk, &coin.commitment())
     });
+    if nullifiers[0] == nullifiers[1] {
+        return Err(NodeError::DuplicateInput);
+    }
 
     let config = CoinRecursionConfig::new(&coin_fri_params());
     let (circuit, preds) = build_node_circuit(&config, predecessors)?;

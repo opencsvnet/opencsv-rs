@@ -97,6 +97,8 @@ pub enum RejectReason {
     UnknownAsset,
     /// No anchor record exists at the referenced location / txid (step 3a).
     AnchorNotFound,
+    /// The same raw nullifier appears more than once in one operation.
+    DuplicateNullifier,
     /// The anchor is not buried under `k` confirmations (step 3, rule 2).
     InsufficientConfirmations {
         /// Confirmations the anchor actually has.
@@ -135,6 +137,7 @@ impl RejectReason {
             Self::GenesisMismatch => "genesis_mismatch",
             Self::UnknownAsset => "unknown_asset",
             Self::AnchorNotFound => "anchor_not_found",
+            Self::DuplicateNullifier => "duplicate_nullifier",
             Self::InsufficientConfirmations { .. } => "insufficient_confirmations",
             Self::NullifierConflict { .. } => "nullifier_conflict",
             Self::IllFormedAnchor => "ill_formed_anchor",
@@ -151,6 +154,9 @@ impl std::fmt::Display for RejectReason {
             Self::GenesisMismatch => write!(f, "genesis aux does not match openings' asset ID"),
             Self::UnknownAsset => write!(f, "unknown asset and no genesis aux supplied"),
             Self::AnchorNotFound => write!(f, "anchor not found at the referenced location"),
+            Self::DuplicateNullifier => {
+                write!(f, "operation contains the same nullifier more than once")
+            }
             Self::InsufficientConfirmations { have, required } => {
                 write!(f, "anchor has {have} confirmations, need {required}")
             }
@@ -246,6 +252,12 @@ pub fn accept<V: ProofVerifier, C: AnchorChain>(
         .locate(&consignment.anchor_ref)
         .ok_or_else(|| from_kernel_rejection(accept_kernel::RejectReason::AnchorNotFound))?;
 
+    // A repeated input would count the same coin value more than once in a
+    // fixed-width transfer circuit. Reject it before doing expensive proof
+    // verification and retain the same observation in the pure kernel input.
+    let has_distinct_nullifiers = nullifiers_are_distinct(&consignment.nullifiers);
+    reject_if(accept_kernel::structure_rejection(has_distinct_nullifiers))?;
+
     // Step 2 — proof check.
     let x = public_input(&record, &ctx, openings);
     let proof_valid = verifier.verify(params.vk, &x, &consignment.proof);
@@ -324,6 +336,7 @@ pub fn accept<V: ProofVerifier, C: AnchorChain>(
             binds_nullifiers,
             occurrences,
         },
+        has_distinct_nullifiers,
         proof_valid,
         required_confirmations: params.required_confirmations,
         has_owned_output: !coins.is_empty(),
@@ -350,6 +363,7 @@ fn from_kernel_rejection(reason: accept_kernel::RejectReason) -> RejectReason {
         accept_kernel::RejectReason::GenesisMismatch => RejectReason::GenesisMismatch,
         accept_kernel::RejectReason::UnknownAsset => RejectReason::UnknownAsset,
         accept_kernel::RejectReason::AnchorNotFound => RejectReason::AnchorNotFound,
+        accept_kernel::RejectReason::DuplicateNullifier => RejectReason::DuplicateNullifier,
         accept_kernel::RejectReason::InsufficientConfirmations { have, required } => {
             RejectReason::InsufficientConfirmations { have, required }
         }
@@ -377,6 +391,9 @@ fn record_binds_nullifiers(
     ctx: &[u8; 32],
     raw_nullifiers: &[Digest],
 ) -> bool {
+    if !nullifiers_are_distinct(raw_nullifiers) {
+        return false;
+    }
     let bound = |nf: &Digest| binding(nf, ctx).to_anchor();
     match record {
         // Batch headers bind no nullifiers on-chain (witness envelope).
@@ -401,4 +418,8 @@ fn record_binds_nullifiers(
             !nfs.is_empty() && slots == nfs
         }
     }
+}
+
+fn nullifiers_are_distinct(raw_nullifiers: &[Digest]) -> bool {
+    raw_nullifiers.iter().collect::<HashSet<_>>().len() == raw_nullifiers.len()
 }

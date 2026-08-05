@@ -83,6 +83,8 @@ pub struct TransferProof {
 pub enum TransferError {
     /// Not all coins are denominated in the stated asset.
     AssetMismatch,
+    /// The same coin or nullifier was supplied in more than one input slot.
+    DuplicateInput,
     /// Circuit construction failed.
     Builder(CircuitBuilderError),
     /// Witness generation / circuit execution failed (e.g. unbalanced
@@ -98,6 +100,7 @@ impl std::fmt::Display for TransferError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::AssetMismatch => write!(f, "coin asset does not match the stated asset"),
+            Self::DuplicateInput => write!(f, "transfer input coin is duplicated"),
             Self::Builder(e) => write!(f, "circuit build error: {e}"),
             Self::Circuit(e) => write!(f, "circuit execution error: {e}"),
             Self::Prover(e) => write!(f, "STARK prover error: {e}"),
@@ -245,10 +248,16 @@ pub fn prove_transfer(
     {
         return Err(TransferError::AssetMismatch);
     }
+    if inputs[0].0.commitment() == inputs[1].0.commitment() {
+        return Err(TransferError::DuplicateInput);
+    }
     let nullifiers = std::array::from_fn(|i| {
         let (coin, osk) = &inputs[i];
         opencsv_core::coin::nullifier(osk, &coin.commitment())
     });
+    if nullifiers[0] == nullifiers[1] {
+        return Err(TransferError::DuplicateInput);
+    }
 
     let mut public_values = Vec::with_capacity(TRANSFER_PUBLIC_ELEMS);
     public_values.extend(asset_id.to_elems().iter().map(|&x| EF::from(x)));

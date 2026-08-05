@@ -510,6 +510,9 @@ fn legacy_accept(input: &AcceptInput) -> AcceptDecision {
     else {
         return AcceptDecision::Reject(KernelRejectReason::AnchorNotFound);
     };
+    if !input.has_distinct_nullifiers {
+        return AcceptDecision::Reject(KernelRejectReason::DuplicateNullifier);
+    }
     if !input.proof_valid {
         return AcceptDecision::Reject(KernelRejectReason::InvalidProof);
     }
@@ -581,6 +584,7 @@ fn generated_accept_observations_match_legacy_precedence() {
             has_openings: generator.usize(5) != 0,
             asset,
             anchor,
+            has_distinct_nullifiers: generator.usize(5) != 0,
             proof_valid: generator.usize(4) != 0,
             required_confirmations: generator.next() % 12,
             has_owned_output: generator.usize(4) != 0,
@@ -619,6 +623,10 @@ fn public_rejection_codes_match_the_kernel_boundary() {
         (
             CoreRejectReason::AnchorNotFound,
             KernelRejectReason::AnchorNotFound,
+        ),
+        (
+            CoreRejectReason::DuplicateNullifier,
+            KernelRejectReason::DuplicateNullifier,
         ),
         (
             CoreRejectReason::InsufficientConfirmations {

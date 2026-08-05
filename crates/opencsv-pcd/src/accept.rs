@@ -218,6 +218,9 @@ fn statement_matches_public_input(mode: NodeMode, st: &NodeStatement, x: &[u8]) 
                 )
             };
             let slots = [slot(0), slot(24)];
+            let distinct_nullifiers = st.nullifiers[0] == zero
+                || st.nullifiers[1] == zero
+                || st.nullifiers[0] != st.nullifiers[1];
             let direct = st.nullifiers.iter().zip(slots).all(|(nf, s)| {
                 if *nf == zero {
                     s == zero_td
@@ -230,6 +233,7 @@ fn statement_matches_public_input(mode: NodeMode, st: &NodeStatement, x: &[u8]) 
             st.value == 0
                 && st.mint_commit == zero
                 && outputs_match(&openings)
+                && distinct_nullifiers
                 && (direct || compressed)
         }
         _ => false,
@@ -322,5 +326,48 @@ mod tests {
         assert!(crate::verify_coin_proof(&legacy.statement, &legacy).is_err());
         // Garbage does not decode.
         assert!(decode_coin_proof(&bytes[..bytes.len() / 2]).is_none());
+    }
+
+    #[test]
+    fn duplicate_transfer_nullifiers_do_not_project_to_accept_input() {
+        let asset_id = Digest::from_bytes([0x11; 32]);
+        let nullifier = Digest::from_bytes([0x22; 32]);
+        let ctx = [0x33; 32];
+        let openings = [
+            CoinOpening {
+                asset_id,
+                value: 6,
+                owner: Digest::from_bytes([0x44; 32]),
+                randomness: Digest::from_bytes([0x55; 32]),
+            },
+            CoinOpening {
+                asset_id,
+                value: 4,
+                owner: Digest::from_bytes([0x66; 32]),
+                randomness: Digest::from_bytes([0x77; 32]),
+            },
+        ];
+        let statement = NodeStatement {
+            asset_id,
+            value: 0,
+            mint_commit: Digest::from_bytes([0u8; 32]),
+            nullifiers: [nullifier, nullifier],
+            output_commitments: [openings[0].commitment(), openings[1].commitment()],
+        };
+
+        for record in [
+            AnchorRecord::xfer(&[nullifier, nullifier], &ctx),
+            AnchorRecord::xfer_compressed(
+                &opencsv_core::anchor::nullifier_commit(&[nullifier, nullifier]),
+                &ctx,
+            ),
+        ] {
+            let x = opencsv_core::accept::public_input(&record, &ctx, &openings);
+            assert!(!statement_matches_public_input(
+                NodeMode::Transfer,
+                &statement,
+                &x
+            ));
+        }
     }
 }

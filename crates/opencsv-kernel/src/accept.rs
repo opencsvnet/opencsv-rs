@@ -53,6 +53,8 @@ pub struct AcceptInput {
     pub asset: AssetObservation,
     /// Referenced anchor and chain observations.
     pub anchor: AnchorObservation,
+    /// Whether every supplied raw nullifier is unique within this operation.
+    pub has_distinct_nullifiers: bool,
     /// Result already returned by the configured proof verifier.
     pub proof_valid: bool,
     /// Confirmation policy supplied by the host.
@@ -72,6 +74,8 @@ pub enum RejectReason {
     UnknownAsset,
     /// Record, context, location or required occurrence lookup failed.
     AnchorNotFound,
+    /// The same nullifier was supplied more than once in one operation.
+    DuplicateNullifier,
     /// The anchor has insufficient confirmation depth.
     InsufficientConfirmations {
         /// Observed confirmation depth.
@@ -102,6 +106,7 @@ impl RejectReason {
             Self::GenesisMismatch => "genesis_mismatch",
             Self::UnknownAsset => "unknown_asset",
             Self::AnchorNotFound => "anchor_not_found",
+            Self::DuplicateNullifier => "duplicate_nullifier",
             Self::InsufficientConfirmations { .. } => "insufficient_confirmations",
             Self::NullifierConflict { .. } => "nullifier_conflict",
             Self::IllFormedAnchor => "ill_formed_anchor",
@@ -141,6 +146,15 @@ pub fn anchor_rejection(anchor_present: bool) -> Option<RejectReason> {
         None
     } else {
         Some(RejectReason::AnchorNotFound)
+    }
+}
+
+/// Reject a malformed operation before invoking the proof verifier.
+pub fn structure_rejection(has_distinct_nullifiers: bool) -> Option<RejectReason> {
+    if has_distinct_nullifiers {
+        None
+    } else {
+        Some(RejectReason::DuplicateNullifier)
     }
 }
 
@@ -209,6 +223,9 @@ pub fn decide(input: &AcceptInput) -> AcceptDecision {
     else {
         return AcceptDecision::Reject(RejectReason::AnchorNotFound);
     };
+    if let Some(reason) = structure_rejection(input.has_distinct_nullifiers) {
+        return AcceptDecision::Reject(reason);
+    }
     if let Some(reason) = proof_rejection(input.proof_valid) {
         return AcceptDecision::Reject(reason);
     }
@@ -250,6 +267,7 @@ mod tests {
                     first: Some(anchor),
                 }],
             },
+            has_distinct_nullifiers: true,
             proof_valid: true,
             required_confirmations: 6,
             has_owned_output: true,
@@ -289,6 +307,13 @@ mod tests {
         assert_eq!(
             decide(&input),
             AcceptDecision::Reject(RejectReason::AnchorNotFound)
+        );
+
+        input.anchor = accepted_input().anchor;
+        input.has_distinct_nullifiers = false;
+        assert_eq!(
+            decide(&input),
+            AcceptDecision::Reject(RejectReason::DuplicateNullifier)
         );
     }
 
@@ -371,6 +396,7 @@ mod tests {
             RejectReason::GenesisMismatch,
             RejectReason::UnknownAsset,
             RejectReason::AnchorNotFound,
+            RejectReason::DuplicateNullifier,
             RejectReason::InsufficientConfirmations {
                 have: 0,
                 required: 1,
