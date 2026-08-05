@@ -458,10 +458,50 @@ pub unsafe extern "C" fn opencsv_account_cross_check(
     })
 }
 
-/// Prepare an OpenCSV transfer and reserve its Bitcoin fee input. The strict
-/// request is `{"asset_id":"<hex>","to_owner":"<hex>","amount":N}`;
+/// Durably plan an OpenCSV transfer without reserving or proving it. The
+/// strict request is `{"asset_id":"<hex>","to_owner":"<hex>","amount":N}`.
+/// This is the fast interactive boundary: the returned operation can be
+/// advanced idempotently with `opencsv_operation_prove` in the background.
+///
+/// # Safety
+/// `request_json` must be a valid NUL-terminated UTF-8 string.
+#[no_mangle]
+pub unsafe extern "C" fn opencsv_transfer_plan(
+    handle: u64,
+    request_json: *const c_char,
+) -> *mut c_char {
+    guarded(|| {
+        let request = match unsafe { in_str(request_json, "request_json") } {
+            Ok(value) => value,
+            Err(error) => return err(error),
+        };
+        with_account(handle, |account| account.transfer_plan(request))
+    })
+}
+
+/// Reserve the fee input and generate the OpenCSV proof for one durable
+/// planned transfer. Re-entering from `planned`, `fee_reserved`, or
+/// `proof_ready` is safe and returns the same logical operation.
+///
+/// # Safety
+/// `operation_id` must be a valid NUL-terminated UTF-8 string.
+#[no_mangle]
+pub unsafe extern "C" fn opencsv_operation_prove(
+    handle: u64,
+    operation_id: *const c_char,
+) -> *mut c_char {
+    guarded(|| {
+        let operation_id = match unsafe { in_str(operation_id, "operation_id") } {
+            Ok(value) => value,
+            Err(error) => return err(error),
+        };
+        with_account(handle, |account| account.prove_operation(operation_id))
+    })
+}
+
+/// Compatibility one-shot: plan, reserve, and prove an OpenCSV transfer.
 /// Rust selects both OpenCSV coins, all Bitcoin inputs, and both kinds of
-/// change.
+/// change. Interactive clients should use the split plan/prove API above.
 ///
 /// # Safety
 /// `request_json` must be a valid NUL-terminated UTF-8 string.

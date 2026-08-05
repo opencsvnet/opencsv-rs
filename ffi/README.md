@@ -6,6 +6,10 @@ Signal boundary is the persistent `opencsv_account_*` API documented in
 `../SIGNAL_ACCOUNT_WALLET.md`: Rust owns keys, asset/Bitcoin coin selection,
 reservations, proofs, signing, P2P relay, and crash recovery while Swift sends
 action intent. Full ABI contract is in `src/lib.rs` and `include/opencsv.h`.
+The interactive send path journals through `opencsv_transfer_plan` and returns
+to Signal immediately; `opencsv_operation_prove` advances that exact id in a
+resumable background pass. Only proof-ready operations may be signed, so fast
+pending presentation never weakens double-spend or lineage checks.
 
 The older in-memory compatibility model is retained temporarily:
 `opencsv_wallet_create` returns a small secrets

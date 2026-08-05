@@ -63,8 +63,12 @@ char *opencsv_account_cross_check(uint64_t handle,
 /* Signal is an owner wallet, not an issuer. This production header exposes
  * no asset-definition, issuer-key, or mint-preparation API. */
 /* request_json is exactly
- * {"asset_id":"<hex>","to_owner":"<hex>","amount":N}; Rust selects the
- * OpenCSV coins, Bitcoin inputs, and change. */
+ * {"asset_id":"<hex>","to_owner":"<hex>","amount":N}. Planning is the
+ * fast durable UI boundary; proof generation resumes the same operation in
+ * background. Swift never supplies OpenCSV coins, Bitcoin inputs, or change. */
+char *opencsv_transfer_plan(uint64_t handle, const char *request_json);
+char *opencsv_operation_prove(uint64_t handle, const char *operation_id);
+/* Compatibility one-shot for non-interactive callers. */
 char *opencsv_transfer_prepare(uint64_t handle, const char *request_json);
 char *opencsv_operation_ack_backup(uint64_t handle,
                                    const char *operation_id,

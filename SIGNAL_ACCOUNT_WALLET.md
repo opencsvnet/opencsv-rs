@@ -110,6 +110,16 @@ the database restores fee and OpenCSV reservations plus pending proof state.
 Every transaction is fully signed and committed before any socket or HTTP
 write. `resume` rebroadcasts the exact persisted bytes and is idempotent.
 
+Interactive sends split the first three states across two calls. Signal calls
+`opencsv_transfer_plan` to validate and durably journal the exact asset,
+recipient, and amount, then immediately returns to the conversation. A
+background worker calls `opencsv_operation_prove` on that operation id; Rust
+selects and reserves both asset coins and the fee outpoint and produces the
+proof. Re-entry from `planned`, `fee_reserved`, or `proof_ready` is
+idempotent, so suspension during proving resumes instead of creating a second
+spend. The pending UI is an authenticated intent, not value: the recipient
+cannot spend it until the proof and exact parent transaction verify.
+
 Signal attachment delivery and Bitcoin settlement are recorded independently.
 Acknowledging a consignment while its anchor is in the mempool sets an
 idempotent receipt flag but leaves the operation in `mempool`, so the
@@ -163,7 +173,8 @@ The action-oriented surface is:
 - `opencsv_account_open/close/status/sync`
 - `opencsv_account_set_backup_state/checkpoint/restore_checkpoint`
 - `opencsv_account_verify_consignment/scan_verify/cross_check`
-- `opencsv_transfer_prepare`
+- `opencsv_transfer_plan` / `opencsv_operation_prove`
+- `opencsv_transfer_prepare` (one-shot compatibility wrapper)
 - `opencsv_operation_ack_backup`
 - `opencsv_operation_sign_and_broadcast`
 - `opencsv_operation_status/resume/cancel`

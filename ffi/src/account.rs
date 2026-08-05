@@ -451,7 +451,7 @@ struct InstrumentCreateRequest {
     terms: InstrumentTermsV1,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct TransferRequest {
     asset_id: String,
@@ -1375,35 +1375,92 @@ impl AccountWallet {
         }
     }
 
-    /// Prepare an OpenCSV asset transfer. There is deliberately no Bitcoin
-    /// recipient or arbitrary-send field at this boundary.
-    pub fn transfer_prepare(&mut self, request_json: &str) -> Result<Value, AccountError> {
+    /// Journal an exact OpenCSV transfer intent without doing expensive proof
+    /// work. Signal can return to the conversation as soon as this durable
+    /// `planned` receipt exists; `prove_operation` advances the same operation
+    /// in a background task. There is deliberately no Bitcoin recipient or
+    /// arbitrary-send field at this boundary.
+    pub fn transfer_plan(&mut self, request_json: &str) -> Result<Value, AccountError> {
         self.require_write_enabled()?;
         let request: TransferRequest = serde_json::from_str(request_json).map_err(|error| {
             AccountError::new("invalid_request", format!("transfer request: {error}"))
         })?;
+        decode_hex_32(&request.asset_id, "asset id")?;
+        decode_hex_32(&request.to_owner, "recipient owner")?;
+        if request.amount == 0 {
+            return Err(AccountError::new(
+                "invalid_request",
+                "transfer amount must be positive",
+            ));
+        }
+        let normalized_request = serde_json::to_string(&request)
+            .map_err(|error| AccountError::new("database_error", error.to_string()))?;
         let operation_id = random_id(16);
         let delivery_nonce = random_id(16);
-        self.insert_planned_operation(&operation_id, "transfer", request_json, &delivery_nonce)?;
-        let funding = match self.reserve_fee_utxo(&operation_id) {
-            Ok(funding) => funding,
-            Err(error) => {
-                self.reject_prebroadcast_operation(&operation_id, error.code)?;
-                return Err(error);
+        self.insert_planned_operation(
+            &operation_id,
+            "transfer",
+            &normalized_request,
+            &delivery_nonce,
+        )?;
+        operation_json(&self.operation(&operation_id)?)
+    }
+
+    /// Reserve, verify, and prove one previously planned transfer. The
+    /// transition is crash-resumable from both `planned` and `fee_reserved`;
+    /// a repeated call after `proof_ready` returns the exact stored receipt.
+    pub fn prove_operation(&mut self, operation_id: &str) -> Result<Value, AccountError> {
+        self.require_write_enabled()?;
+        let operation = self.operation(operation_id)?;
+        if operation.kind != "transfer" {
+            return Err(AccountError::new(
+                "invalid_operation_kind",
+                format!("operation is {}", operation.kind),
+            ));
+        }
+        if operation.state == OperationState::ProofReady.as_str() {
+            return self.prepared_operation_receipt(&operation);
+        }
+        let funding = match operation.state.as_str() {
+            "planned" => match self.reserve_fee_utxo(operation_id) {
+                Ok(funding) => funding,
+                Err(error) => {
+                    self.reject_prebroadcast_operation(operation_id, error.code)?;
+                    return Err(error);
+                }
+            },
+            "fee_reserved" => match self.reserved_funding_for_operation(&operation) {
+                Ok(funding) => funding,
+                Err(error) => return self.fail_prebroadcast(operation_id, error),
+            },
+            state => {
+                return Err(AccountError::new(
+                    "invalid_operation_state",
+                    format!("operation is {state}"),
+                ));
             }
         };
         let verification = match self.verify_funding(&funding) {
             Ok(receipt) => receipt,
             Err(error) => {
-                self.reject_prebroadcast_operation(&operation_id, error.code)?;
+                self.reject_prebroadcast_operation(operation_id, error.code)?;
                 return Err(error);
+            }
+        };
+        let request: TransferRequest = match serde_json::from_str(&operation.request_json) {
+            Ok(request) => request,
+            Err(error) => {
+                return self.fail_prebroadcast(
+                    operation_id,
+                    AccountError::new("database_corrupt", format!("transfer request: {error}")),
+                );
             }
         };
         let ctx = funding_context(funding.outpoint);
         let proved = {
             let protocol = match self.primary_protocol_mut() {
                 Ok(protocol) => protocol,
-                Err(error) => return self.fail_prebroadcast(&operation_id, error),
+                Err(error) => return self.fail_prebroadcast(operation_id, error),
             };
             match protocol.prove_transfer_amount(
                 &request.asset_id,
@@ -1413,7 +1470,7 @@ impl AccountWallet {
                 Ok(proved) => proved,
                 Err(error) => {
                     return self.fail_prebroadcast(
-                        &operation_id,
+                        operation_id,
                         AccountError::new("unavailable_assets", error),
                     );
                 }
@@ -1425,17 +1482,17 @@ impl AccountWallet {
             if let Ok(protocol) = self.primary_protocol_mut() {
                 protocol.cancel_pending(proved.pending_id);
             }
-            return self.fail_prebroadcast(&operation_id, error);
+            return self.fail_prebroadcast(operation_id, error);
         }
         self.pending_by_operation
-            .insert(operation_id.clone(), proved.pending_id);
+            .insert(operation_id.to_owned(), proved.pending_id);
         let record = match self.primary_protocol_mut().and_then(|protocol| {
             protocol
                 .rebind_pending(proved.pending_id, ctx)
                 .map_err(|error| AccountError::new("protocol_layout_violation", error))
         }) {
             Ok(record) => record,
-            Err(error) => return self.fail_prebroadcast(&operation_id, error),
+            Err(error) => return self.fail_prebroadcast(operation_id, error),
         };
         let pending_json = match self.primary_protocol_mut().and_then(|protocol| {
             protocol
@@ -1443,10 +1500,10 @@ impl AccountWallet {
                 .map_err(|error| AccountError::new("database_error", error))
         }) {
             Ok(pending_json) => pending_json,
-            Err(error) => return self.fail_prebroadcast(&operation_id, error),
+            Err(error) => return self.fail_prebroadcast(operation_id, error),
         };
         if let Err(error) = self.mark_proof_ready(
-            &operation_id,
+            operation_id,
             &json!({
                 "asset_id": request.asset_id,
                 "to_owner": request.to_owner,
@@ -1455,12 +1512,23 @@ impl AccountWallet {
             &pending_json,
             &hex_encode(&record),
         ) {
-            return self.fail_prebroadcast(&operation_id, error);
+            return self.fail_prebroadcast(operation_id, error);
         }
-        match self.prepared_receipt(&operation_id, funding, &verification, &record) {
+        match self.prepared_receipt(operation_id, funding, &verification, &record) {
             Ok(receipt) => Ok(receipt),
-            Err(error) => self.fail_prebroadcast(&operation_id, error),
+            Err(error) => self.fail_prebroadcast(operation_id, error),
         }
+    }
+
+    /// Compatibility one-shot used by existing callers. New interactive
+    /// clients should call `transfer_plan`, return to the UI, and advance the
+    /// returned operation with `prove_operation` in the background.
+    pub fn transfer_prepare(&mut self, request_json: &str) -> Result<Value, AccountError> {
+        let planned = self.transfer_plan(request_json)?;
+        let operation_id = planned["operation_id"].as_str().ok_or_else(|| {
+            AccountError::new("database_error", "planned transfer has no operation id")
+        })?;
+        self.prove_operation(operation_id)
     }
 
     /// Acknowledge that Signal Secure Backup durably accepted the exact
@@ -2749,6 +2817,30 @@ impl AccountWallet {
         ))
     }
 
+    fn reserved_funding_for_operation(
+        &self,
+        operation: &OperationRow,
+    ) -> Result<ReservedFunding, AccountError> {
+        let outpoint = operation_outpoint(operation)?;
+        if !self.bitcoin.is_outpoint_locked(outpoint) {
+            return Err(AccountError::new(
+                "conflicting_operation",
+                "funding outpoint lost its durable reservation",
+            ));
+        }
+        let output = self
+            .bitcoin
+            .list_unspent()
+            .find(|output| output.outpoint == outpoint)
+            .ok_or_else(|| {
+                AccountError::new(
+                    "stale_chain_state",
+                    "reserved funding outpoint is no longer unspent",
+                )
+            })?;
+        ReservedFunding::from_local(output)
+    }
+
     fn release_fee_reservation(&mut self, operation_id: &str) -> Result<(), AccountError> {
         let operation = self.operation(operation_id)?;
         if let (Some(txid), Some(vout)) = (operation.funding_txid, operation.funding_vout) {
@@ -2995,6 +3087,22 @@ impl AccountWallet {
             ],
         )?;
         Ok(receipt)
+    }
+
+    fn prepared_operation_receipt(&self, operation: &OperationRow) -> Result<Value, AccountError> {
+        operation
+            .receipt_json
+            .as_deref()
+            .ok_or_else(|| {
+                AccountError::new(
+                    "database_corrupt",
+                    "proof-ready operation has no prepared receipt",
+                )
+            })
+            .and_then(|encoded| {
+                serde_json::from_str(encoded)
+                    .map_err(|error| AccountError::new("database_corrupt", error.to_string()))
+            })
     }
 
     fn reobserve_unconfirmed_dependencies(
@@ -4489,6 +4597,31 @@ mod tests {
         (format!("http://{address}"), server)
     }
 
+    fn observed_raw_transaction_server(
+        transaction: Transaction,
+    ) -> (String, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let body = serialize(&transaction);
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 2048];
+            let length = stream.read(&mut request).unwrap();
+            let request = std::str::from_utf8(&request[..length]).unwrap();
+            assert!(request.starts_with("GET /tx/"));
+            assert!(request.contains("/raw HTTP/1.1"));
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len(),
+            )
+            .unwrap();
+            stream.write_all(&body).unwrap();
+            stream.flush().unwrap();
+        });
+        (format!("http://{address}"), server)
+    }
+
     fn fund(wallet: &mut AccountWallet, value_sats: u64) -> OutPoint {
         let address = wallet
             .bitcoin
@@ -4994,7 +5127,7 @@ mod tests {
         assert_eq!(error.code, "invalid_request");
 
         let error = wallet
-            .transfer_prepare(
+            .transfer_plan(
                 &json!({
                     "asset_id": hex_encode(&[8u8; 32]),
                     "to_owner": hex_encode(&[9u8; 32]),
@@ -5006,6 +5139,106 @@ mod tests {
             )
             .unwrap_err();
         assert_eq!(error.code, "invalid_request");
+    }
+
+    #[test]
+    fn planned_transfer_is_durable_before_background_proving() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wallet.sqlite");
+        let key = [67u8; 32];
+        let cfg = config(AccountRole::Primary, true);
+        let mut wallet = AccountWallet::open(&cfg, &key, path.to_str().unwrap()).unwrap();
+        let planned = wallet
+            .transfer_plan(
+                &json!({
+                    "asset_id": hex_encode(&[68u8; 32]),
+                    "to_owner": hex_encode(&[69u8; 32]),
+                    "amount": 1,
+                })
+                .to_string(),
+            )
+            .unwrap();
+        let operation_id = planned["operation_id"].as_str().unwrap().to_owned();
+        assert_eq!(planned["state"], OperationState::Planned.as_str());
+        assert!(planned["funding_txid"].is_null());
+        drop(wallet);
+
+        let mut reopened = AccountWallet::open(&cfg, &key, path.to_str().unwrap()).unwrap();
+        let restored = reopened.operation_status(&operation_id).unwrap();
+        assert_eq!(restored["state"], OperationState::Planned.as_str());
+        assert_eq!(restored["request"]["amount"], 1);
+        assert_eq!(
+            reopened.cancel_operation(&operation_id).unwrap()["state"],
+            OperationState::Cancelled.as_str(),
+        );
+    }
+
+    #[test]
+    #[ignore = "slow recursive receipt; run explicitly with --release --ignored"]
+    fn planned_transfer_resumes_proving_after_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wallet.sqlite");
+        let key = [68u8; 32];
+        let observed_parent = Transaction {
+            version: transaction::Version::TWO,
+            lock_time: absolute::LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::new(Txid::from_byte_array([70u8; 32]), 0),
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(1_000),
+                script_pubkey: ScriptBuf::new(),
+            }],
+        };
+        let parent_txid = observed_parent.compute_txid();
+        let (esplora_url, server) = observed_raw_transaction_server(observed_parent);
+        let mut config_value: Value =
+            serde_json::from_str(&config(AccountRole::Primary, true)).unwrap();
+        config_value["esplora_url"] = json!(esplora_url);
+        let cfg = config_value.to_string();
+        let mut wallet = AccountWallet::open(&cfg, &key, path.to_str().unwrap()).unwrap();
+        allow_funding_verification(&mut wallet);
+        fund(&mut wallet, 50_000);
+        let minted = prepare_test_issuance(&mut wallet, "ASY", &[60, 40]).unwrap();
+        let asset_id = minted["asset_id"].as_str().unwrap().to_owned();
+        let mint_operation = minted["operation_id"].as_str().unwrap().to_owned();
+        finalize_test_operation(&mut wallet, &mint_operation, parent_txid);
+        fund(&mut wallet, 40_000);
+
+        let planned = wallet
+            .transfer_plan(
+                &json!({
+                    "asset_id": asset_id,
+                    "to_owner": hex_encode(&[72u8; 32]),
+                    "amount": 70,
+                })
+                .to_string(),
+            )
+            .unwrap();
+        let operation_id = planned["operation_id"].as_str().unwrap().to_owned();
+        assert_eq!(planned["state"], OperationState::Planned.as_str());
+        assert!(planned["funding_txid"].is_null());
+        assert!(!wallet.pending_by_operation.contains_key(&operation_id));
+
+        let reserved = wallet.reserve_fee_utxo(&operation_id).unwrap().outpoint;
+        assert_eq!(
+            wallet.operation(&operation_id).unwrap().state,
+            OperationState::FeeReserved.as_str(),
+        );
+        drop(wallet);
+
+        let mut reopened = AccountWallet::open(&cfg, &key, path.to_str().unwrap()).unwrap();
+        allow_funding_verification(&mut reopened);
+        assert!(reopened.bitcoin.is_outpoint_locked(reserved));
+        let prepared = reopened.prove_operation(&operation_id).unwrap();
+        assert_eq!(prepared["operation_id"], operation_id);
+        assert_eq!(prepared["state"], OperationState::ProofReady.as_str());
+        assert!(reopened.pending_by_operation.contains_key(&operation_id));
+        assert_eq!(reopened.prove_operation(&operation_id).unwrap(), prepared);
+        server.join().unwrap();
     }
 
     #[test]
