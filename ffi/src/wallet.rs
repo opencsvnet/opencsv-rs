@@ -20,6 +20,7 @@
 
 use std::collections::HashMap;
 
+use opencsv_bitcoin::MEMPOOL_LOCATION;
 use opencsv_core::accept::{accept, AcceptParams};
 use opencsv_core::chain::{AnchorChain, AnchorRef};
 use opencsv_core::consignment::{CoinOpening, Consignment};
@@ -846,7 +847,52 @@ impl MemWallet {
                 c.status = CoinStatus::Spent;
             }
         }
+        // This consignment was produced from a pending proof created by this
+        // wallet. Apply any outputs addressed back to us (normally change)
+        // immediately, while retaining the exact unconfirmed parent txid.
+        // Account reopen deterministically replays the same pending export
+        // and compares these bytes with the durable operation receipt.
+        self.credit_local_outputs(&consignment)?;
         Ok((consignment.to_bytes(), pending.spent_ids))
+    }
+
+    /// Credit outputs of a locally-proved consignment without pretending it
+    /// has passed receive-side chain acceptance. The proof and openings came
+    /// from this wallet's pending journal; the account layer separately
+    /// requires exact transaction observation before finalization and replays
+    /// the journal byte-for-byte on restart.
+    fn credit_local_outputs(&mut self, consignment: &Consignment) -> Result<(), OpError> {
+        let unconfirmed_anchor = (consignment.anchor_ref.location == MEMPOOL_LOCATION)
+            .then(|| to_hex(&consignment.anchor_ref.txid));
+        let mut local_outputs = Vec::new();
+        for (selector, opening) in consignment.coin_openings.iter().enumerate() {
+            let coin = opening.to_coin();
+            if self.secret_for(&coin.owner).is_none() {
+                continue;
+            }
+            local_outputs.push(StoredCoin {
+                coin,
+                status: CoinStatus::Unspent,
+                proof: consignment.proof.clone(),
+                selector,
+                unconfirmed_anchor: unconfirmed_anchor.clone(),
+            });
+        }
+        for mut stored in local_outputs {
+            match self.coins.iter_mut().find(|coin| coin.id() == stored.id()) {
+                Some(existing) => {
+                    // Deterministic replay must never resurrect an output
+                    // already spent by a later local operation.
+                    stored.status = existing.status;
+                    if existing.unconfirmed_anchor.is_none() {
+                        stored.unconfirmed_anchor = None;
+                    }
+                    *existing = stored;
+                }
+                None => self.coins.push(stored),
+            }
+        }
+        Ok(())
     }
 
     /// Export a pending transaction as a JSON string capturing everything
@@ -876,6 +922,54 @@ impl MemWallet {
             unconfirmed_dependencies: pending.unconfirmed_dependencies.clone(),
         };
         serde_json::to_string(&export).map_err(|e| e.to_string())
+    }
+
+    /// Install a deterministic pending fixture without invoking the prover.
+    /// Account replay tests exercise journal ordering and coin-state recovery;
+    /// proof construction and verification have their own test surface.
+    #[cfg(test)]
+    pub(crate) fn install_replay_fixture(
+        &mut self,
+        asset_id_hex: &str,
+        outputs: &[(u64, String)],
+        spent_ids: Vec<String>,
+        tag: u8,
+    ) -> Result<(u64, String), OpError> {
+        let asset_id = parse_digest(asset_id_hex, "asset id")?;
+        let openings = outputs
+            .iter()
+            .enumerate()
+            .map(|(index, (value, owner))| {
+                Ok(CoinOpening {
+                    asset_id,
+                    value: *value,
+                    owner: parse_digest(owner, "owner")?,
+                    randomness: Digest::from_bytes([tag.wrapping_add(index as u8); 32]),
+                })
+            })
+            .collect::<Result<Vec<_>, OpError>>()?;
+        let nullifiers = spent_ids
+            .iter()
+            .enumerate()
+            .map(|(index, _)| Digest::from_bytes([tag.wrapping_add(index as u8); 32]))
+            .collect::<Vec<_>>();
+        let pending_id = self.next_pending;
+        self.next_pending += 1;
+        self.pending.insert(
+            pending_id,
+            Pending {
+                shape: RecordShape::Xfer {
+                    nullifiers: nullifiers.clone(),
+                },
+                openings,
+                nullifiers,
+                proof: vec![tag],
+                aux: None,
+                spent_ids,
+                unconfirmed_dependencies: Vec::new(),
+            },
+        );
+        Ok((pending_id, self.export_pending(pending_id)?))
     }
 
     /// Import a previously exported pending transaction, returning its
@@ -1004,15 +1098,14 @@ impl MemWallet {
             };
             // Redelivery must not resurrect a coin we have spent since.
             if let Some(existing) = self.coins.iter().find(|c| c.id() == stored.id()) {
-                stored.status = if unconfirmed_anchor.is_none()
-                    && existing.status == CoinStatus::Frozen
-                {
-                    // A normal settled replay is the only path that may thaw
-                    // a coin whose provisional parent disappeared.
-                    CoinStatus::Unspent
-                } else {
-                    existing.status
-                };
+                stored.status =
+                    if unconfirmed_anchor.is_none() && existing.status == CoinStatus::Frozen {
+                        // A normal settled replay is the only path that may thaw
+                        // a coin whose provisional parent disappeared.
+                        CoinStatus::Unspent
+                    } else {
+                        existing.status
+                    };
                 // A weaker provisional replay cannot downgrade a coin that
                 // already met settlement policy. The normal settled path
                 // does promote an unconfirmed coin by clearing its parent.
@@ -1051,6 +1144,16 @@ impl MemWallet {
         self.pending
             .get(&pending_id)
             .map(|pending| pending.unconfirmed_dependencies.clone())
+            .ok_or_else(|| format!("no pending transaction {pending_id}"))
+    }
+
+    /// Coin ids named by one imported pending journal entry. The account
+    /// recovery layer uses this before finalization to detect a duplicate
+    /// local spend without mutating wallet state.
+    pub fn pending_spends(&self, pending_id: u64) -> Result<Vec<String>, OpError> {
+        self.pending
+            .get(&pending_id)
+            .map(|pending| pending.spent_ids.clone())
             .ok_or_else(|| format!("no pending transaction {pending_id}"))
     }
 

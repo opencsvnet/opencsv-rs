@@ -48,8 +48,7 @@ use zeroize::Zeroizing;
 
 use crate::wallet::MemWallet;
 use crate::{
-    crosscheck,
-    scan,
+    crosscheck, scan,
     snapshot::{Snapshot, SnapshotChain, SnapshotEntry},
 };
 
@@ -410,6 +409,9 @@ pub enum OperationState {
     Confirmed,
     /// Signal attachment delivery completed.
     ConsignmentDelivered,
+    /// Bitcoin transaction exists, but the OpenCSV transition lost a
+    /// confirmed first-occurrence conflict and must never be resumed.
+    ProtocolRejected,
     /// Cancelled before broadcast.
     Cancelled,
 }
@@ -426,6 +428,7 @@ impl OperationState {
             Self::Mempool => "mempool",
             Self::Confirmed => "confirmed",
             Self::ConsignmentDelivered => "consignment_delivered",
+            Self::ProtocolRejected => "protocol_rejected",
             Self::Cancelled => "cancelled",
         }
     }
@@ -897,6 +900,7 @@ impl AccountWallet {
         #[cfg(any(test, feature = "issuer-tools"))]
         account.restore_issuers()?;
         account.restore_consignment_state()?;
+        account.restore_finalized_operations()?;
         account.restore_fee_reservations()?;
         account.restore_pending_operations()?;
         Ok(account)
@@ -1121,11 +1125,8 @@ impl AccountWallet {
                 format!("unconfirmed anchor {anchor_txid} is not currently observed"),
             ));
         };
-        let provisional_snapshot = snapshot_with_unconfirmed_anchor(
-            confirmed_snapshot_json,
-            &consignment,
-            &transaction,
-        )?;
+        let provisional_snapshot =
+            snapshot_with_unconfirmed_anchor(confirmed_snapshot_json, &consignment, &transaction)?;
         let provisional_snapshot_json = serde_json::to_string(&provisional_snapshot)
             .map_err(|error| AccountError::new("invalid_chain_view", error.to_string()))?;
         let chain = SnapshotChain::from_snapshot(&provisional_snapshot)
@@ -1736,6 +1737,7 @@ impl AccountWallet {
         if operation.txid.is_some()
             && operation.state != OperationState::Cancelled.as_str()
             && operation.state != OperationState::ConsignmentDelivered.as_str()
+            && operation.state != OperationState::ProtocolRejected.as_str()
         {
             return self.refresh_operation(operation_id);
         }
@@ -1892,6 +1894,7 @@ impl AccountWallet {
                 | "mempool"
                 | "confirmed"
                 | "consignment_delivered"
+                | "protocol_rejected"
         ) {
             return Err(AccountError::new(
                 "cancellation_forbidden",
@@ -2222,7 +2225,7 @@ impl AccountWallet {
                                 'checkpoint_hash', checkpoint_hash,
                                 'backup_acked', backup_acked)
              FROM opencsv_operations
-             WHERE state NOT IN ('cancelled') ORDER BY created_at",
+             WHERE state NOT IN ('cancelled') ORDER BY created_at, rowid",
         )?;
         // Backup acknowledgement metadata cannot be part of the checkpoint it
         // acknowledges. Likewise, the receipt's copy of checkpoint_hash is a
@@ -3473,13 +3476,34 @@ impl AccountWallet {
         let Some(protocol) = self.protocol.as_mut() else {
             return Ok(());
         };
+        // Local outgoing consignments are restored from their complete
+        // operation journals below. Re-verifying one here as incoming would
+        // both depend on an unnecessary receive snapshot and risk applying
+        // the same change output twice.
+        let local_consignment_ids = {
+            let mut statement = self.db.conn.prepare(
+                "SELECT receipt_json FROM opencsv_operations
+                 WHERE receipt_json IS NOT NULL ORDER BY created_at, rowid",
+            )?;
+            let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+            let mut ids = HashSet::new();
+            for row in rows {
+                let receipt: Value = serde_json::from_str(&row?).map_err(|error| {
+                    AccountError::new("database_corrupt", format!("operation receipt: {error}"))
+                })?;
+                if let Some(id) = receipt.get("consignment_id").and_then(Value::as_str) {
+                    ids.insert(id.to_owned());
+                }
+            }
+            ids
+        };
         let mut statement = self.db.conn.prepare(
-            "SELECT c.consignment_base64, c.spent_state_json, s.snapshot_json,
+            "SELECT c.consignment_id, c.consignment_base64, c.spent_state_json, s.snapshot_json,
                     COALESCE(f.finality, 'settled'), f.anchor_txid
              FROM opencsv_consignments c
              JOIN opencsv_consignment_snapshots s USING(consignment_id)
              LEFT JOIN opencsv_consignment_finality f USING(consignment_id)
-             ORDER BY c.created_at",
+             ORDER BY c.created_at, c.rowid",
         )?;
         let rows = statement.query_map([], |row| {
             Ok((
@@ -3487,12 +3511,16 @@ impl AccountWallet {
                 row.get::<_, String>(1)?,
                 row.get::<_, String>(2)?,
                 row.get::<_, String>(3)?,
-                row.get::<_, Option<String>>(4)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, Option<String>>(5)?,
             ))
         })?;
         let mut spent = Vec::new();
         for row in rows {
-            let (encoded, spent_state, snapshot, finality, anchor_txid) = row?;
+            let (consignment_id, encoded, spent_state, snapshot, finality, anchor_txid) = row?;
+            if local_consignment_ids.contains(&consignment_id) {
+                continue;
+            }
             if finality == "frozen" {
                 continue;
             }
@@ -3532,6 +3560,249 @@ impl AccountWallet {
             protocol
                 .mark_spent(&[coin_id])
                 .map_err(|error| AccountError::new("database_corrupt", error))?;
+        }
+        Ok(())
+    }
+
+    /// Reapply every finalized local operation in creation order. A pending
+    /// export contains the exact proof, openings, input ids, and bound record;
+    /// finalizing it against the durable txid reconstructs both spent inputs
+    /// and locally-owned change. The reconstructed consignment must match the
+    /// receipt and consignment table byte-for-byte or account open fails
+    /// closed instead of resurrecting stale coins.
+    fn restore_finalized_operations(&mut self) -> Result<(), AccountError> {
+        let Some(protocol) = self.protocol.as_mut() else {
+            return Ok(());
+        };
+        let mut replayed_spends: HashMap<String, (String, String)> = HashMap::new();
+        let mut quarantines = Vec::new();
+        let rows = {
+            let mut statement = self.db.conn.prepare(
+                "SELECT operation_id, state, pending_json, txid, receipt_json
+                 FROM opencsv_operations
+                 WHERE state IN ('mempool', 'confirmed', 'consignment_delivered')
+                 ORDER BY created_at, rowid",
+            )?;
+            let mapped = statement.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                ))
+            })?;
+            mapped.collect::<Result<Vec<_>, _>>()?
+        };
+        for (operation_id, state, pending_json, txid, receipt_json) in rows {
+            let pending_json = pending_json.ok_or_else(|| {
+                AccountError::new(
+                    "database_corrupt",
+                    format!("finalized operation {operation_id} has no pending export"),
+                )
+            })?;
+            let txid = txid
+                .ok_or_else(|| {
+                    AccountError::new(
+                        "database_corrupt",
+                        format!("finalized operation {operation_id} has no txid"),
+                    )
+                })?
+                .parse::<Txid>()
+                .map_err(|error| {
+                    AccountError::new(
+                        "database_corrupt",
+                        format!("finalized operation {operation_id} txid: {error}"),
+                    )
+                })?;
+            let mut receipt: Value =
+                serde_json::from_str(receipt_json.as_deref().ok_or_else(|| {
+                    AccountError::new(
+                        "database_corrupt",
+                        format!("finalized operation {operation_id} has no receipt"),
+                    )
+                })?)
+                .map_err(|error| {
+                    AccountError::new(
+                        "database_corrupt",
+                        format!("finalized operation {operation_id} receipt: {error}"),
+                    )
+                })?;
+            if receipt.get("delivery_ready") != Some(&Value::Bool(true)) {
+                return Err(AccountError::new(
+                    "database_corrupt",
+                    format!("finalized operation {operation_id} is not delivery-ready"),
+                ));
+            }
+            let expected_id = receipt
+                .get("consignment_id")
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    AccountError::new(
+                        "database_corrupt",
+                        format!("finalized operation {operation_id} has no consignment id"),
+                    )
+                })?
+                .to_owned();
+            let expected_base64 = receipt
+                .get("consignment_base64")
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    AccountError::new(
+                        "database_corrupt",
+                        format!("finalized operation {operation_id} has no consignment bytes"),
+                    )
+                })?
+                .to_owned();
+            let stored_spent_state: String = self.db.conn.query_row(
+                "SELECT spent_state_json FROM opencsv_consignments
+                 WHERE consignment_id = ?1",
+                [&expected_id],
+                |row| row.get(0),
+            )?;
+            let stored_spent_state: Value =
+                serde_json::from_str(&stored_spent_state).map_err(|error| {
+                    AccountError::new(
+                        "database_corrupt",
+                        format!("finalized operation {operation_id} spend state: {error}"),
+                    )
+                })?;
+            let stored_spends = stored_spent_state
+                .get("spends")
+                .and_then(Value::as_array)
+                .ok_or_else(|| {
+                    AccountError::new(
+                        "database_corrupt",
+                        format!("finalized operation {operation_id} has no spend list"),
+                    )
+                })?
+                .iter()
+                .map(|value| {
+                    value.as_str().map(str::to_owned).ok_or_else(|| {
+                        AccountError::new(
+                            "database_corrupt",
+                            format!("finalized operation {operation_id} has a non-string spend"),
+                        )
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let pending_id = protocol.import_pending(&pending_json).map_err(|error| {
+                AccountError::new(
+                    "database_corrupt",
+                    format!("finalized operation {operation_id} pending export: {error}"),
+                )
+            })?;
+            let pending_spends = protocol.pending_spends(pending_id).map_err(|error| {
+                AccountError::new(
+                    "database_corrupt",
+                    format!("finalized operation {operation_id} pending spend list: {error}"),
+                )
+            })?;
+            if pending_spends != stored_spends {
+                protocol.cancel_pending(pending_id);
+                return Err(AccountError::new(
+                    "database_corrupt",
+                    format!("finalized operation {operation_id} spend list mismatch"),
+                ));
+            }
+            let mut conflicts = stored_spends
+                .iter()
+                .filter_map(|coin_id| replayed_spends.get(coin_id))
+                .cloned()
+                .collect::<Vec<_>>();
+            conflicts.sort();
+            conflicts.dedup();
+            if !conflicts.is_empty() {
+                let confirmed_winners = conflicts.iter().all(|(_, winner_state)| {
+                    matches!(winner_state.as_str(), "confirmed" | "consignment_delivered")
+                });
+                if state == OperationState::Mempool.as_str() && confirmed_winners {
+                    protocol.cancel_pending(pending_id);
+                    let winner_operations = conflicts
+                        .iter()
+                        .map(|(winner_id, _)| winner_id)
+                        .collect::<Vec<_>>();
+                    receipt["protocol_rejection"] = json!({
+                        "code": "duplicate_protocol_spend",
+                        "conflicts_with": winner_operations,
+                        "detected_at": unix_time()?,
+                        "bitcoin_transaction_preserved": true,
+                        "backup_refresh_required": true,
+                    });
+                    quarantines.push((operation_id, receipt.to_string(), unix_time()?));
+                    continue;
+                }
+                protocol.cancel_pending(pending_id);
+                return Err(AccountError::new(
+                    "protocol_state_conflict",
+                    format!(
+                        "finalized operation {operation_id} reuses coins from {:?}; no confirmed winner can be quarantined safely",
+                        conflicts
+                            .iter()
+                            .map(|(winner_id, _)| winner_id)
+                            .collect::<Vec<_>>()
+                    ),
+                ));
+            }
+            let (actual, actual_spends) = protocol
+                .finalize(
+                    pending_id,
+                    AnchorRef {
+                        txid: txid.to_byte_array(),
+                        location: MEMPOOL_LOCATION,
+                    },
+                )
+                .map_err(|error| {
+                    AccountError::new(
+                        "database_corrupt",
+                        format!("finalized operation {operation_id} replay: {error}"),
+                    )
+                })?;
+            let actual_id = sha256::Hash::hash(&actual).to_string();
+            let actual_base64 = base64::engine::general_purpose::STANDARD.encode(&actual);
+            if actual_id != expected_id || actual_base64 != expected_base64 {
+                return Err(AccountError::new(
+                    "database_corrupt",
+                    format!("finalized operation {operation_id} does not match its receipt"),
+                ));
+            }
+            if stored_spends != actual_spends {
+                return Err(AccountError::new(
+                    "database_corrupt",
+                    format!("finalized operation {operation_id} spend list mismatch"),
+                ));
+            }
+            for coin_id in actual_spends {
+                replayed_spends.insert(coin_id, (operation_id.clone(), state.clone()));
+            }
+        }
+        if !quarantines.is_empty() {
+            let transaction = self
+                .db
+                .conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)?;
+            for (operation_id, receipt_json, detected_at) in quarantines {
+                transaction.execute(
+                    "UPDATE opencsv_operations
+                     SET state = ?2, rejection_reason = ?3, receipt_json = ?4,
+                         updated_at = ?5
+                     WHERE operation_id = ?1",
+                    params![
+                        operation_id,
+                        OperationState::ProtocolRejected.as_str(),
+                        "duplicate_protocol_spend",
+                        receipt_json,
+                        detected_at,
+                    ],
+                )?;
+            }
+            transaction.execute(
+                "INSERT INTO opencsv_account_meta(key, value)
+                 VALUES('backup_verified', '0')
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                [],
+            )?;
+            transaction.commit()?;
         }
         Ok(())
     }
@@ -3576,7 +3847,7 @@ impl AccountWallet {
              WHERE pending_json IS NOT NULL
                AND state IN ('proof_ready', 'signed_persisted',
                              'broadcast_unobserved', 'broadcast')
-             ORDER BY created_at",
+             ORDER BY created_at, rowid",
         )?;
         let rows = statement.query_map([], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
@@ -4261,6 +4532,60 @@ mod tests {
             .list_unspent()
             .any(|utxo| utxo.outpoint == outpoint));
         outpoint
+    }
+
+    fn finalize_test_operation(wallet: &mut AccountWallet, operation_id: &str, txid: Txid) {
+        wallet
+            .db
+            .conn
+            .execute(
+                "UPDATE opencsv_operations SET txid = ?2 WHERE operation_id = ?1",
+                params![operation_id, txid.to_string()],
+            )
+            .unwrap();
+        wallet
+            .finalize_observed_operation(operation_id, txid)
+            .unwrap();
+    }
+
+    fn install_replay_operation(
+        wallet: &mut AccountWallet,
+        operation_id: &str,
+        outputs: &[(u64, String)],
+        spent_ids: Vec<String>,
+        asset_id: &str,
+        tag: u8,
+    ) {
+        wallet
+            .insert_planned_operation(
+                operation_id,
+                "test-replay",
+                "{}",
+                &format!("{operation_id}-delivery"),
+            )
+            .unwrap();
+        let (pending_id, pending_json) = wallet
+            .primary_protocol_mut()
+            .unwrap()
+            .install_replay_fixture(asset_id, outputs, spent_ids, tag)
+            .unwrap();
+        wallet
+            .pending_by_operation
+            .insert(operation_id.to_owned(), pending_id);
+        wallet
+            .db
+            .conn
+            .execute(
+                "UPDATE opencsv_operations
+                 SET state = ?2, pending_json = ?3, receipt_json = '{}'
+                 WHERE operation_id = ?1",
+                params![
+                    operation_id,
+                    OperationState::ProofReady.as_str(),
+                    pending_json,
+                ],
+            )
+            .unwrap();
     }
 
     #[test]
@@ -5196,7 +5521,7 @@ mod tests {
     }
 
     #[test]
-    fn every_durable_operation_state_reopens_with_expected_material() {
+    fn prebroadcast_states_reopen_and_incomplete_finalized_state_fails_closed() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("wallet.sqlite");
         let key = [24u8; 32];
@@ -5256,39 +5581,200 @@ mod tests {
             assert!(reopened.bitcoin.is_outpoint_locked(proof_outpoint));
         }
 
-        for state in [
-            OperationState::Mempool,
-            OperationState::Confirmed,
-            OperationState::ConsignmentDelivered,
-        ] {
-            reopened
-                .db
-                .conn
-                .execute(
-                    "UPDATE opencsv_operations SET state = ?2 WHERE operation_id = ?1",
-                    params![&proof_operation, state.as_str()],
-                )
-                .unwrap();
-            drop(reopened);
-            reopened = AccountWallet::open(&cfg, &key, path.to_str().unwrap()).unwrap();
-            assert_eq!(
-                reopened.operation(&proof_operation).unwrap().state,
-                state.as_str()
-            );
-            assert!(!reopened.pending_by_operation.contains_key(&proof_operation));
-            assert!(reopened.bitcoin.is_outpoint_locked(proof_outpoint));
-        }
-
         assert_eq!(
             reopened.cancel_operation("planned-op").unwrap()["state"],
             OperationState::Cancelled.as_str()
         );
+        reopened
+            .db
+            .conn
+            .execute(
+                "UPDATE opencsv_operations SET state = ?2 WHERE operation_id = ?1",
+                params![&proof_operation, OperationState::Mempool.as_str()],
+            )
+            .unwrap();
         drop(reopened);
-        let reopened = AccountWallet::open(&cfg, &key, path.to_str().unwrap()).unwrap();
+        let error = AccountWallet::open(&cfg, &key, path.to_str().unwrap())
+            .err()
+            .unwrap();
         assert_eq!(
-            reopened.operation("planned-op").unwrap().state,
-            OperationState::Cancelled.as_str()
+            error.code, "database_corrupt",
+            "a finalized state without an exact txid and receipt is impossible"
         );
+    }
+
+    #[test]
+    fn finalized_local_operations_restore_spends_and_change_without_reuse() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wallet.sqlite");
+        let key = [52u8; 32];
+        let cfg = config(AccountRole::Primary, true);
+        let mut wallet = AccountWallet::open(&cfg, &key, path.to_str().unwrap()).unwrap();
+        let asset_id = hex_encode(&[57u8; 32]);
+        let own_owner = wallet.status().unwrap()["owners"][0]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let recipient_owner = hex_encode(&[58u8; 32]);
+        let mint_operation = "fixture-mint";
+        install_replay_operation(
+            &mut wallet,
+            mint_operation,
+            &[(60, own_owner.clone()), (40, own_owner.clone())],
+            Vec::new(),
+            &asset_id,
+            59,
+        );
+        finalize_test_operation(
+            &mut wallet,
+            mint_operation,
+            Txid::from_byte_array([60u8; 32]),
+        );
+        assert_eq!(wallet.status().unwrap()["assets"][0]["amount"], 100);
+
+        let spent_ids = wallet
+            .primary_protocol_mut()
+            .unwrap()
+            .list_coins()
+            .into_iter()
+            .filter(|coin| coin.unspent)
+            .map(|coin| coin.id)
+            .collect::<Vec<_>>();
+        assert_eq!(spent_ids.len(), 2);
+        let transfer_operation = "fixture-transfer";
+        install_replay_operation(
+            &mut wallet,
+            transfer_operation,
+            &[(70, recipient_owner.clone()), (30, own_owner)],
+            spent_ids,
+            &asset_id,
+            61,
+        );
+        finalize_test_operation(
+            &mut wallet,
+            transfer_operation,
+            Txid::from_byte_array([62u8; 32]),
+        );
+        assert_eq!(wallet.status().unwrap()["assets"][0]["amount"], 30);
+        drop(wallet);
+
+        let mut reopened = AccountWallet::open(&cfg, &key, path.to_str().unwrap()).unwrap();
+        assert_eq!(reopened.status().unwrap()["assets"][0]["amount"], 30);
+        assert!(reopened
+            .primary_protocol_mut()
+            .unwrap()
+            .prove_transfer_amount(&asset_id, &recipient_owner, 1)
+            .is_err());
+        reopened
+            .db
+            .conn
+            .execute(
+                "UPDATE opencsv_operations SET state = ?2 WHERE operation_id = ?1",
+                params![
+                    transfer_operation,
+                    OperationState::ConsignmentDelivered.as_str(),
+                ],
+            )
+            .unwrap();
+        reopened
+            .db
+            .conn
+            .execute(
+                "INSERT INTO opencsv_operations(
+                     operation_id, kind, state, request_json, funding_txid, funding_vout,
+                     funding_value_sats, pending_json, psbt_base64, signed_tx_hex, txid,
+                     receipt_json, rejection_reason, delivery_nonce, checkpoint_hash,
+                     backup_acked, created_at, updated_at
+                 )
+                 SELECT 'duplicate-finalized-op', kind, 'mempool', request_json, funding_txid,
+                        funding_vout, funding_value_sats, pending_json, psbt_base64,
+                        signed_tx_hex, txid, receipt_json, rejection_reason,
+                        'duplicate-delivery', checkpoint_hash, backup_acked,
+                        created_at + 1, updated_at + 1
+                 FROM opencsv_operations WHERE operation_id = ?1",
+                [transfer_operation],
+            )
+            .unwrap();
+        drop(reopened);
+
+        let mut repaired = AccountWallet::open(&cfg, &key, path.to_str().unwrap()).unwrap();
+        assert_eq!(repaired.status().unwrap()["assets"][0]["amount"], 30);
+        assert_eq!(repaired.status().unwrap()["backup_verified"], false);
+        let rejected = repaired.operation("duplicate-finalized-op").unwrap();
+        assert_eq!(rejected.state, OperationState::ProtocolRejected.as_str());
+        assert_eq!(
+            rejected.rejection_reason.as_deref(),
+            Some("duplicate_protocol_spend")
+        );
+
+        repaired
+            .db
+            .conn
+            .execute(
+                "UPDATE opencsv_operations SET state = 'mempool'
+                 WHERE operation_id IN (?1, 'duplicate-finalized-op')",
+                [transfer_operation],
+            )
+            .unwrap();
+        drop(repaired);
+        let error = AccountWallet::open(&cfg, &key, path.to_str().unwrap())
+            .err()
+            .unwrap();
+        assert_eq!(error.code, "protocol_state_conflict");
+        assert!(error.message.contains("no confirmed winner"));
+    }
+
+    #[test]
+    fn finalized_replay_rejects_tampered_consignment_receipt() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wallet.sqlite");
+        let key = [63u8; 32];
+        let cfg = config(AccountRole::Primary, true);
+        let mut wallet = AccountWallet::open(&cfg, &key, path.to_str().unwrap()).unwrap();
+        let asset_id = hex_encode(&[64u8; 32]);
+        let own_owner = wallet.status().unwrap()["owners"][0]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        install_replay_operation(
+            &mut wallet,
+            "tampered-receipt",
+            &[(100, own_owner)],
+            Vec::new(),
+            &asset_id,
+            65,
+        );
+        finalize_test_operation(
+            &mut wallet,
+            "tampered-receipt",
+            Txid::from_byte_array([66u8; 32]),
+        );
+        let encoded: String = wallet
+            .db
+            .conn
+            .query_row(
+                "SELECT receipt_json FROM opencsv_operations WHERE operation_id = ?1",
+                ["tampered-receipt"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let mut receipt: Value = serde_json::from_str(&encoded).unwrap();
+        receipt["consignment_base64"] = json!("dishonest replacement");
+        wallet
+            .db
+            .conn
+            .execute(
+                "UPDATE opencsv_operations SET receipt_json = ?2 WHERE operation_id = ?1",
+                params!["tampered-receipt", receipt.to_string()],
+            )
+            .unwrap();
+        drop(wallet);
+
+        let error = AccountWallet::open(&cfg, &key, path.to_str().unwrap())
+            .err()
+            .unwrap();
+        assert_eq!(error.code, "database_corrupt");
+        assert!(error.message.contains("does not match its receipt"));
     }
 
     #[test]

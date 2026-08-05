@@ -265,3 +265,49 @@ Focused warnings-denied validation after the checkpoint repair:
 - headless issuer CLI tests: 4 passed, 0 failed;
 - `rustfmt --edition 2021 --check ffi/src/account.rs`: passed;
 - `git diff --check`: passed.
+
+## 2026-08-05 — restart replay resurrected spent protocol coins
+
+The first two-simulator Carol-to-Bob transfer found a real persistence defect,
+not a transport or verifier failure. Carol's first local transfer operation
+`94e778bca55ad34c46cc1506d612b9a8` anchored transaction
+`0bf4bd8a07c0caa575fba0ced6ed47f70c6353b7b839c0fe788ff80804b2f5b8`,
+which confirmed at signet height 316341. After restart, a second operation
+`74c70871ebae832fb715ba160df00aad` anchored transaction
+`90c075530160160ccf7f4259f8046f2e5611c3e2bd86868771be9ffeca8e4d0b`.
+Both durable pending exports named the same two protocol coin ids and carried
+the same proof and nullifiers. Bob therefore rejected the second attachment
+with the earlier nullifier occurrence at height 316341. Signal attachment
+delivery and Bitcoin relay worked; OpenCSV asset acceptance correctly failed.
+
+The account reopen path had restored received consignments only. Locally
+finalized outgoing consignments have no receive snapshot, so their spent inputs
+and wallet-owned change were omitted. The in-memory finalize path also marked
+inputs spent without crediting locally-owned outputs. Restart therefore
+resurrected the original inputs and discarded valid change.
+
+The accepted repair replays each complete local operation journal in stable
+creation/row order, reconstructs its exact consignment at the durable txid,
+and compares id, canonical bytes, and spend list with SQLite before accepting
+the state. Finalization now credits locally-owned outputs with their exact
+unconfirmed parent while preserving later spent state during deterministic
+replay. Duplicate local spends fail closed. One narrow migration is allowed:
+if an earlier conflicting local operation is already durably confirmed and
+the later duplicate is only in mempool, the later operation becomes the
+terminal `protocol_rejected` audit record. Its Bitcoin transaction and receipt
+are retained, its OpenCSV outputs are never credited or redelivered, and a new
+Secure Backup is required. Ambiguous mempool-vs-mempool and confirmed-vs-
+confirmed conflicts still fail closed as `protocol_state_conflict`.
+
+Regression receipts cover restored change, non-reuse of the spent inputs,
+tampered consignment bytes, confirmed-winner quarantine, ambiguous-conflict
+failure, and incomplete finalized journals. The complete `opencsv-ffi` test
+target passes: 39 unit tests, 12 integration tests, and doc tests, with zero
+failures. The failed simulator recording is retained as evidence; no return
+hop, destructive wallet reset, mainnet action, or verifier bypass was used.
+The complete workspace's non-ignored tests also pass. In that debug run the
+recursive transfer test took 804.28 seconds and mint-to-redeem took 402.07
+seconds; the repository's pre-existing explicitly ignored proof benchmarks
+remained ignored. `opencsv-ffi --all-targets --no-deps` Clippy passes with
+warnings denied, both changed Rust files pass `rustfmt --check`, and
+`git diff --check` passes.
