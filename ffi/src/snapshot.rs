@@ -138,7 +138,25 @@ impl AnchorChain for SnapshotChain {
     }
 
     fn first_nullifier_occurrence(&self, raw_nf: &Digest) -> Option<AnchorLocation> {
-        self.nullifier_occurrences(raw_nf).into_iter().next()
+        // A confirmed occurrence always wins: it is canonically ordered and
+        // proves the provisional transaction is a conflict. If settled
+        // history contains none, the exact transaction injected by
+        // `snapshot_with_unconfirmed_anchor` is the provisional first
+        // occurrence. Returning `None` in that case makes every valid
+        // zero-confirmation transfer look like `AnchorNotFound`; mint
+        // consignments did not expose the bug because they carry no
+        // occurrence keys.
+        self.nullifier_occurrences(raw_nf)
+            .into_iter()
+            .next()
+            .or_else(|| {
+                self.entries
+                    .iter()
+                    .find(|e| {
+                        e.location == MEMPOOL_LOCATION && e.record.well_formed(&e.ctx, raw_nf)
+                    })
+                    .map(|e| e.location)
+            })
     }
 
     fn nullifier_occurrences(&self, raw_nf: &Digest) -> Vec<AnchorLocation> {
@@ -184,5 +202,85 @@ pub fn entry_json(
         txid: to_hex(txid),
         ctx: to_hex(ctx),
         record: to_hex(&record.to_bytes()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn digest(byte: u8) -> Digest {
+        Digest::from_bytes([byte; 32])
+    }
+
+    fn location(height: u64, position: u32) -> AnchorLocation {
+        AnchorLocation { height, position }
+    }
+
+    #[test]
+    fn exact_mempool_transfer_is_provisional_first_occurrence() {
+        let raw_nf = digest(7);
+        let ctx = [8_u8; 32];
+        let record = AnchorRecord::xfer(&[raw_nf], &ctx);
+        let chain = SnapshotChain::from_snapshot(&Snapshot {
+            tip_height: 100,
+            entries: vec![entry_json(MEMPOOL_LOCATION, &[9_u8; 32], &record, &ctx)],
+        })
+        .unwrap();
+
+        assert_eq!(
+            chain.first_nullifier_occurrence(&raw_nf),
+            Some(MEMPOOL_LOCATION),
+        );
+        assert!(chain.nullifier_occurrences(&raw_nf).is_empty());
+    }
+
+    #[test]
+    fn settled_occurrence_wins_over_provisional_transfer() {
+        let raw_nf = digest(10);
+        let settled_ctx = [11_u8; 32];
+        let provisional_ctx = [12_u8; 32];
+        let settled_location = location(90, 2);
+        let chain = SnapshotChain::from_snapshot(&Snapshot {
+            tip_height: 100,
+            entries: vec![
+                entry_json(
+                    MEMPOOL_LOCATION,
+                    &[13_u8; 32],
+                    &AnchorRecord::xfer(&[raw_nf], &provisional_ctx),
+                    &provisional_ctx,
+                ),
+                entry_json(
+                    settled_location,
+                    &[14_u8; 32],
+                    &AnchorRecord::xfer(&[raw_nf], &settled_ctx),
+                    &settled_ctx,
+                ),
+            ],
+        })
+        .unwrap();
+
+        assert_eq!(
+            chain.first_nullifier_occurrence(&raw_nf),
+            Some(settled_location),
+        );
+    }
+
+    #[test]
+    fn unrelated_mempool_record_is_not_an_occurrence() {
+        let raw_nf = digest(15);
+        let ctx = [16_u8; 32];
+        let chain = SnapshotChain::from_snapshot(&Snapshot {
+            tip_height: 100,
+            entries: vec![entry_json(
+                MEMPOOL_LOCATION,
+                &[17_u8; 32],
+                &AnchorRecord::xfer(&[digest(18)], &ctx),
+                &ctx,
+            )],
+        })
+        .unwrap();
+
+        assert_eq!(chain.first_nullifier_occurrence(&raw_nf), None);
     }
 }

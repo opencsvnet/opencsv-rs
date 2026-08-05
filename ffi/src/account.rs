@@ -3819,7 +3819,13 @@ fn snapshot_with_unconfirmed_anchor(
     let mut snapshot: Snapshot = serde_json::from_str(confirmed_snapshot_json)
         .map_err(|error| AccountError::new("invalid_chain_view", error.to_string()))?;
     let txid_hex = hex_encode(&consignment.anchor_ref.txid);
-    snapshot.entries.retain(|entry| entry.txid != txid_hex);
+    // The provisional capability names one exact mempool transaction.
+    // Settled scan snapshots should not contain sentinel entries at all,
+    // but discard any supplied ones so occurrence lookup cannot accidentally
+    // select an unrelated, non-canonically ordered mempool record.
+    snapshot.entries.retain(|entry| {
+        entry.height != MEMPOOL_LOCATION.height || entry.position != MEMPOOL_LOCATION.position
+    });
     snapshot.entries.push(SnapshotEntry {
         height: MEMPOOL_LOCATION.height,
         position: MEMPOOL_LOCATION.position,
@@ -4377,12 +4383,28 @@ mod tests {
             },
             aux: None,
         };
+        let supplied_sentinel = SnapshotEntry {
+            height: MEMPOOL_LOCATION.height,
+            position: MEMPOOL_LOCATION.position,
+            txid: hex_encode(&[99_u8; 32]),
+            ctx: hex_encode(&[98_u8; 32]),
+            record: hex_encode(&[97_u8; 64]),
+        };
         let snapshot = snapshot_with_unconfirmed_anchor(
-            r#"{"tip_height":100,"entries":[]}"#,
+            &serde_json::to_string(&Snapshot {
+                tip_height: 100,
+                entries: vec![supplied_sentinel],
+            })
+            .unwrap(),
             &consignment,
             &transaction,
         )
         .unwrap();
+        assert_eq!(snapshot.entries.len(), 1);
+        assert_eq!(
+            snapshot.entries[0].txid,
+            hex_encode(&consignment.anchor_ref.txid)
+        );
         let chain = SnapshotChain::from_snapshot(&snapshot).unwrap();
         assert_eq!(
             opencsv_core::chain::AnchorChain::confirmations_at(&chain, 0),
