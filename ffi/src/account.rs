@@ -5400,6 +5400,26 @@ fn validate_esplora_url(url: &str) -> Result<(), AccountError> {
     }
 }
 
+const MEMPOOL_SPACE_SIGNET_CHAIN_PINS: [&str; 2] = [
+    // Sectigo Public Server Authentication CA OV R36.
+    "6542d176bed50f193c0ce297ae44ecd8a0a86bec2ede682769344059b4e78530",
+    // Sectigo Public Server Authentication Root R46, USERTrust cross-certificate.
+    "92f351bf3d54164dfa8dd8f9e1139d3150349786485d2b9eecd00e2971c1e6c5",
+];
+
+const BLOCKSTREAM_SIGNET_CHAIN_PINS: [&str; 4] = [
+    // Let's Encrypt YR1 and YR2 intermediates.
+    "13949634d99cd6fd6aa80bc034fefacceb1969feef986586713ecdbb05758d3f",
+    "238b85a0099c65b970477d5724f1a1d475ce5058cffe4efa8733899bdb863c47",
+    // Root YR self-signed and its ISRG Root X1 cross-certificate.
+    "e57b7e6f150c419102e8d5c055729ff967b9d1a829bf00cec89ca604ebf4a86f",
+    "072639d0b140d5bffae16ad9c3f6cc6086040621f51ee61a6d46a8915c07cf76",
+];
+
+fn owned_chain_pins<const N: usize>(pins: [&str; N]) -> Vec<String> {
+    pins.into_iter().map(str::to_owned).collect()
+}
+
 fn default_observation_checks(network: &str) -> Vec<ObservationCheck> {
     let mut checks = Vec::new();
     if network == "signet" {
@@ -5409,7 +5429,7 @@ fn default_observation_checks(network: &str) -> Vec<ObservationCheck> {
             endpoint: Some("https://mempool.space/signet/api".into()),
             mode: ObservationMode::Require,
             pin_profile: Some("sectigo_r46".into()),
-            chain_fingerprints_sha256: Vec::new(),
+            chain_fingerprints_sha256: owned_chain_pins(MEMPOOL_SPACE_SIGNET_CHAIN_PINS),
             max_age_seconds: default_observation_max_age_seconds(),
         });
         checks.push(ObservationCheck {
@@ -5418,7 +5438,7 @@ fn default_observation_checks(network: &str) -> Vec<ObservationCheck> {
             endpoint: Some("https://blockstream.info/signet/api".into()),
             mode: ObservationMode::Require,
             pin_profile: Some("lets_encrypt_yr".into()),
-            chain_fingerprints_sha256: Vec::new(),
+            chain_fingerprints_sha256: owned_chain_pins(BLOCKSTREAM_SIGNET_CHAIN_PINS),
             max_age_seconds: default_observation_max_age_seconds(),
         });
     }
@@ -5495,7 +5515,8 @@ fn validate_observation_checks(config: &AccountConfig) -> Result<(), AccountErro
                     || check.kind != ObservationKind::RawTransactionApi
                     || check.endpoint.as_deref() != Some("https://mempool.space/signet/api")
                     || check.pin_profile.as_deref() != Some("sectigo_r46")
-                    || !check.chain_fingerprints_sha256.is_empty()
+                    || check.chain_fingerprints_sha256
+                        != owned_chain_pins(MEMPOOL_SPACE_SIGNET_CHAIN_PINS)
                 {
                     return Err(AccountError::new(
                         "invalid_config",
@@ -5508,7 +5529,8 @@ fn validate_observation_checks(config: &AccountConfig) -> Result<(), AccountErro
                     || check.kind != ObservationKind::RawTransactionApi
                     || check.endpoint.as_deref() != Some("https://blockstream.info/signet/api")
                     || check.pin_profile.as_deref() != Some("lets_encrypt_yr")
-                    || !check.chain_fingerprints_sha256.is_empty()
+                    || check.chain_fingerprints_sha256
+                        != owned_chain_pins(BLOCKSTREAM_SIGNET_CHAIN_PINS)
                 {
                     return Err(AccountError::new(
                         "invalid_config",
@@ -6216,9 +6238,17 @@ mod tests {
         assert_eq!(policy[0]["id"], "mempool_space_signet");
         assert_eq!(policy[0]["mode"], "require");
         assert_eq!(policy[0]["pin_profile"], "sectigo_r46");
+        assert_eq!(
+            policy[0]["chain_fingerprints_sha256"],
+            json!(MEMPOOL_SPACE_SIGNET_CHAIN_PINS)
+        );
         assert_eq!(policy[1]["id"], "blockstream_signet");
         assert_eq!(policy[1]["mode"], "require");
         assert_eq!(policy[1]["pin_profile"], "lets_encrypt_yr");
+        assert_eq!(
+            policy[1]["chain_fingerprints_sha256"],
+            json!(BLOCKSTREAM_SIGNET_CHAIN_PINS)
+        );
         assert_eq!(policy[2]["mode"], "observe");
         assert_eq!(policy[3]["mode"], "off");
         assert_eq!(policy[4]["mode"], "observe");
@@ -6245,7 +6275,7 @@ mod tests {
                     "completed_at_ms": now - 5,
                     "cached_at_ms": now - 5,
                     "certificate_profile": "sectigo_r46",
-                    "certificate_chain_fingerprints_sha256": ["11".repeat(32)],
+                    "certificate_chain_fingerprints_sha256": [MEMPOOL_SPACE_SIGNET_CHAIN_PINS[0]],
                     "raw_transaction_hex": "0102"
                 },
                 {
@@ -6256,7 +6286,7 @@ mod tests {
                     "completed_at_ms": now - 4,
                     "cached_at_ms": now - 4,
                     "certificate_profile": "lets_encrypt_yr",
-                    "certificate_chain_fingerprints_sha256": ["22".repeat(32)],
+                    "certificate_chain_fingerprints_sha256": [BLOCKSTREAM_SIGNET_CHAIN_PINS[1]],
                     "raw_transaction_hex": "0102"
                 }
             ]
@@ -6267,6 +6297,13 @@ mod tests {
         assert_eq!(receipts.len(), 2);
         assert_eq!(receipts[0]["raw_byte_match"], true);
         assert_eq!(receipts[1]["raw_byte_match"], true);
+
+        let mut wrong_pin = evidence.clone();
+        wrong_pin["observations"][0]["certificate_chain_fingerprints_sha256"] =
+            json!(["11".repeat(32)]);
+        let (_, failure) =
+            evaluate_observation_evidence(&policy, &[1, 2], &wrong_pin.to_string()).unwrap();
+        assert_eq!(failure.unwrap().code, "required_observation_failed");
 
         let mut wrong = evidence;
         wrong["observations"][1]["raw_transaction_hex"] = json!("0103");
