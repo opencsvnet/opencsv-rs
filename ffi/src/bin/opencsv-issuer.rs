@@ -13,6 +13,7 @@ use std::process::ExitCode;
 #[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
+use base64::Engine;
 use clap::{Args, Parser, Subcommand};
 use opencsv_ffi::account::{AccountError, AccountWallet};
 use serde_json::{json, Value};
@@ -110,6 +111,14 @@ enum MintCommand {
 enum OperationCommand {
     /// Print one durable operation and its current state.
     Status(OperationId),
+    /// Export a delivery-ready consignment as an owner-only binary attachment.
+    ExportConsignment {
+        #[command(flatten)]
+        operation: OperationId,
+        /// Create this file without overwriting an existing attachment.
+        #[arg(long)]
+        output: PathBuf,
+    },
     /// Acknowledge the exact checkpoint emitted by mint preparation.
     AcknowledgeBackup {
         #[command(flatten)]
@@ -262,6 +271,10 @@ fn run(cli: Cli) -> Result<Value, CliError> {
         Command::Operation(OperationCommand::Status(operation)) => wallet
             .operation_status(&operation.operation_id)
             .map_err(Into::into),
+        Command::Operation(OperationCommand::ExportConsignment { operation, output }) => {
+            let status = wallet.operation_status(&operation.operation_id)?;
+            write_consignment(&output, &status)
+        }
         Command::Operation(OperationCommand::AcknowledgeBackup {
             operation,
             checkpoint_hash,
@@ -380,6 +393,83 @@ fn write_checkpoint(path: &Path, checkpoint: &Value) -> Result<Value, CliError> 
         "checkpoint_hash": checkpoint_hash,
         "output": path.display().to_string(),
         "bytes": encoded.len(),
+    }))
+}
+
+fn write_consignment(path: &Path, operation: &Value) -> Result<Value, CliError> {
+    let operation_id = operation
+        .get("operation_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| CliError::new("consignment_unavailable", "operation has no id"))?;
+    let receipt = operation
+        .get("receipt")
+        .and_then(Value::as_object)
+        .ok_or_else(|| {
+            CliError::new(
+                "consignment_unavailable",
+                "operation has no delivery-ready receipt",
+            )
+        })?;
+    if receipt.get("delivery_ready").and_then(Value::as_bool) != Some(true) {
+        return Err(CliError::new(
+            "consignment_unavailable",
+            "operation receipt is not delivery-ready",
+        ));
+    }
+    let consignment_id = receipt
+        .get("consignment_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| CliError::new("consignment_unavailable", "receipt has no consignment id"))?;
+    let encoded = receipt
+        .get("consignment_base64")
+        .and_then(Value::as_str)
+        .ok_or_else(|| CliError::new("consignment_unavailable", "receipt has no consignment"))?;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .map_err(|error| CliError::new("consignment_decode_failed", error.to_string()))?;
+
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let mut file = options.open(path).map_err(|error| {
+        if error.kind() == ErrorKind::AlreadyExists {
+            CliError::new(
+                "consignment_output_exists",
+                format!("refusing to overwrite {}", path.display()),
+            )
+        } else {
+            CliError::new(
+                "consignment_write_failed",
+                format!("could not create {}: {error}", path.display()),
+            )
+        }
+    })?;
+    if let Err(error) = file.write_all(&bytes).and_then(|()| file.sync_all()) {
+        drop(file);
+        let _ = fs::remove_file(path);
+        return Err(CliError::new(
+            "consignment_write_failed",
+            format!("could not durably write {}: {error}", path.display()),
+        ));
+    }
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    fs::File::open(parent)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|error| {
+            CliError::new(
+                "consignment_write_failed",
+                format!("could not sync {}: {error}", parent.display()),
+            )
+        })?;
+    Ok(json!({
+        "operation_id": operation_id,
+        "consignment_id": consignment_id,
+        "output": path.display().to_string(),
+        "bytes": bytes.len(),
     }))
 }
 
@@ -531,6 +621,35 @@ mod tests {
         assert_eq!(
             write_checkpoint(&path, &checkpoint).unwrap_err().reason,
             "checkpoint_output_exists"
+        );
+    }
+
+    #[test]
+    fn consignment_output_is_owner_only_and_never_overwritten() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("opencsv-consignment.bin");
+        let operation = json!({
+            "operation_id": "mint-1",
+            "receipt": {
+                "delivery_ready": true,
+                "consignment_id": "exact-id",
+                "consignment_base64": "AQIDBA==",
+            }
+        });
+
+        let receipt = write_consignment(&path, &operation).unwrap();
+        assert_eq!(receipt["operation_id"], "mint-1");
+        assert_eq!(receipt["consignment_id"], "exact-id");
+        assert_eq!(fs::read(&path).unwrap(), [1, 2, 3, 4]);
+        #[cfg(unix)]
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+
+        assert_eq!(
+            write_consignment(&path, &operation).unwrap_err().reason,
+            "consignment_output_exists"
         );
     }
 }
