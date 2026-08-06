@@ -248,8 +248,8 @@ invalid OpenCSV transition. Receivers validate the exact envelope.
 `bitcoin-cli getblockhash 0`; the CLI converts it to the transaction-
 serialization order committed by the C1 wire protocol.
 
-The `signal` subcommands live behind the cargo feature `signal` (default
-ON); build with `--no-default-features` for a lean, Signal-free binary. The
+The legacy `signal` subcommands live behind the cargo feature `signal`, which
+is off by default. Opt in explicitly with `--features signal`. The
 Signal store defaults to `<wallet-dir>/signal`. Recipient `<dest>` is
 `self` (Note to Self), an ACI uuid, or an E.164 phone number. See
 [`crates/opencsv-signal/README.md`](../opencsv-signal/README.md) for the
