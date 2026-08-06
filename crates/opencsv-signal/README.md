@@ -26,10 +26,9 @@ compromise.
 - The sled store was dropped upstream; `presage-store-sqlite` (in-tree,
   SQLCipher-backed) is the only maintained persistent store, so that is what
   we use. We open it **without** a passphrase.
-- presage is **AGPL-3.0-only**. The base `opencsv` binary stays MIT/Apache;
-  building with the default `signal` feature links AGPL code, so treat
-  distributed binaries accordingly. Build without it via
-  `cargo build -p opencsv-cli --no-default-features`.
+- presage is **AGPL-3.0-only**. The default `opencsv` binary stays
+  MIT/Apache and does not compile this adapter. Building explicitly with
+  `--features signal` links AGPL code, so treat that binary as AGPL.
 
 ### Build requirement: protoc
 

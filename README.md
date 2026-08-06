@@ -75,18 +75,19 @@ wallet fee-bump APIs are not protocol-safe.
 ## Build & test
 
 ```sh
-cargo build --locked --release -p opencsv-cli  # needs protoc for Signal
+cargo build --locked --release -p opencsv-cli  # permissive default build
 cargo build --locked --release -p opencsv-ffi --features issuer-tools --bin opencsv-issuer
 cargo test --locked --workspace               # slow proving tests are #[ignore]d
 ./scripts/reproducible-build.sh --verify dist/reproducible
 ```
 
-`protoc`: `apt-get install protobuf-compiler`, or set `PROTOC=/path/to/protoc`.
-The Signal feature is on by default; build without it via
-`cargo build --locked --no-default-features -p opencsv-cli` (MIT/Apache only — the
-`signal` feature pulls in AGPL-licensed presage).
+The default CLI build is MIT/Apache-only and does not compile the legacy
+presage transport. That linked-device adapter is an explicit opt-in via
+`--features signal`. It pulls in AGPL-3.0-only presage and needs `protoc`; it
+is not used by the OpenCSV protocol, wallet FFI, or native Signal-iOS
+integration.
 
 ## License
 
-MIT OR Apache-2.0, except where the optional `signal` feature's dependencies
-(presage, AGPL-3.0) apply.
+MIT OR Apache-2.0. The separately opt-in legacy `signal` feature links
+AGPL-3.0-only presage and must be distributed under the applicable AGPL terms.
