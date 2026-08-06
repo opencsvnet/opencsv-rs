@@ -1054,12 +1054,7 @@ impl AccountProofJob {
         if !proved.unconfirmed_dependencies.is_empty() {
             let client = esplora_client::Builder::new(&self.esplora_url).build_blocking();
             for dependency in &proved.unconfirmed_dependencies {
-                let txid = dependency.parse::<Txid>().map_err(|error| {
-                    AccountError::new(
-                        "database_corrupt",
-                        format!("invalid unconfirmed dependency {dependency}: {error}"),
-                    )
-                })?;
+                let txid = unconfirmed_dependency_txid(dependency)?;
                 match client.get_tx(&txid).map_err(|error| {
                     AccountError::new(
                         "unconfirmed_dependency_unavailable",
@@ -1067,10 +1062,19 @@ impl AccountProofJob {
                     )
                 })? {
                     Some(transaction) if transaction.compute_txid() == txid => {}
-                    _ => {
+                    Some(transaction) => {
                         return Err(AccountError::new(
                             "unconfirmed_dependency_changed",
-                            format!("zero-confirmation parent {dependency} disappeared or changed"),
+                            format!(
+                                "zero-confirmation parent {dependency} changed to {}",
+                                hex_encode(&transaction.compute_txid().to_byte_array())
+                            ),
+                        ));
+                    }
+                    None => {
+                        return Err(AccountError::new(
+                            "unconfirmed_dependency_changed",
+                            format!("zero-confirmation parent {dependency} disappeared"),
                         ));
                     }
                 }
@@ -1159,12 +1163,7 @@ impl AccountBatchProofJob {
                 )
                 .map_err(|error| AccountError::new("unavailable_assets", error))?;
             for dependency in &proved.unconfirmed_dependencies {
-                let txid = dependency.parse::<Txid>().map_err(|error| {
-                    AccountError::new(
-                        "database_corrupt",
-                        format!("invalid unconfirmed dependency {dependency}: {error}"),
-                    )
-                })?;
+                let txid = unconfirmed_dependency_txid(dependency)?;
                 match client.get_tx(&txid).map_err(|error| {
                     AccountError::new(
                         "unconfirmed_dependency_unavailable",
@@ -1172,10 +1171,19 @@ impl AccountBatchProofJob {
                     )
                 })? {
                     Some(transaction) if transaction.compute_txid() == txid => {}
-                    _ => {
+                    Some(transaction) => {
                         return Err(AccountError::new(
                             "unconfirmed_dependency_changed",
-                            format!("zero-confirmation parent {dependency} disappeared or changed"),
+                            format!(
+                                "zero-confirmation parent {dependency} changed to {}",
+                                hex_encode(&transaction.compute_txid().to_byte_array())
+                            ),
+                        ));
+                    }
+                    None => {
+                        return Err(AccountError::new(
+                            "unconfirmed_dependency_changed",
+                            format!("zero-confirmation parent {dependency} disappeared"),
                         ));
                     }
                 }
@@ -7368,12 +7376,7 @@ impl AccountWallet {
         }
         let client = esplora_client::Builder::new(&self.config.esplora_url).build_blocking();
         for dependency in dependencies {
-            let txid = dependency.parse::<Txid>().map_err(|error| {
-                AccountError::new(
-                    "database_corrupt",
-                    format!("invalid unconfirmed dependency {dependency}: {error}"),
-                )
-            })?;
+            let txid = unconfirmed_dependency_txid(dependency)?;
             let observed = client.get_tx(&txid).map_err(|error| {
                 AccountError::new(
                     "unconfirmed_dependency_unavailable",
@@ -9213,6 +9216,14 @@ fn decode_hex_32(value: &str, what: &str) -> Result<[u8; 32], AccountError> {
     Ok(output)
 }
 
+/// Protocol anchor references preserve consensus hash bytes, while Bitcoin's
+/// human-readable txid parser reverses those bytes. Reconstruct the txid from
+/// the stored bytes so an exact Esplora transaction is not mistaken for its
+/// byte-reversed id after checkpoint restore.
+fn unconfirmed_dependency_txid(value: &str) -> Result<Txid, AccountError> {
+    decode_hex_32(value, "unconfirmed dependency").map(Txid::from_byte_array)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -9521,6 +9532,32 @@ mod tests {
             .list_unspent()
             .any(|utxo| utxo.outpoint == outpoint));
         outpoint
+    }
+
+    #[test]
+    fn unconfirmed_dependency_reconstructs_consensus_txid_bytes() {
+        let transaction = Transaction {
+            version: transaction::Version::TWO,
+            lock_time: absolute::LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::new(Txid::from_byte_array([70u8; 32]), 0),
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(1_000),
+                script_pubkey: ScriptBuf::new(),
+            }],
+        };
+        let expected = transaction.compute_txid();
+        let dependency = hex_encode(&expected.to_byte_array());
+
+        assert_eq!(
+            unconfirmed_dependency_txid(&dependency).unwrap(),
+            expected
+        );
+        assert_ne!(dependency.parse::<Txid>().unwrap(), expected);
     }
 
     fn finalize_test_operation(wallet: &mut AccountWallet, operation_id: &str, txid: Txid) {
