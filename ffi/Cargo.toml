@@ -30,6 +30,22 @@ required-features = ["issuer-tools"]
 name = "zero_conf_simulator_fixture"
 required-features = ["issuer-tools"]
 
+[[test]]
+name = "export_snapshot"
+required-features = ["issuer-tools"]
+
+[[test]]
+name = "pending_crosscheck"
+required-features = ["issuer-tools"]
+
+[[test]]
+name = "roundtrip"
+required-features = ["issuer-tools"]
+
+[[test]]
+name = "scan_e2e"
+required-features = ["issuer-tools"]
+
 [dependencies]
 opencsv-core = { path = "../crates/opencsv-core" }
 opencsv-pcd = { path = "../crates/opencsv-pcd" }

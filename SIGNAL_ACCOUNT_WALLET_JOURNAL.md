@@ -24,6 +24,32 @@ databases are permanently network-bound, the preview manifest declares
 set is empty. The acceptance receipts must therefore name this asset as test
 USD and must never imply dollar or USDT redemption or future mainnet continuity.
 
+## 2026-08-06 — reviewed-issuer spend gate and issuer binary split
+
+Signal's `USD` presentation is now authorized by exact asset identity, not by
+the three-byte unit code or by possession of a manifest. Transfer planning
+checks the configured `usd_issuers` registry before creating an operation, then
+checks it again before proof generation, proof commit, and signing. Removing an
+issuer cancels an unsigned solo operation or the entire unsigned frozen batch
+with stable rejection `asset_not_reviewed`. A signed or already-broadcast
+operation remains recoverable because changing product review cannot erase a
+signature that has already escaped.
+
+Privileged issuance remains available to the opt-in `opencsv-issuer` operator,
+but the default Signal static library and public header no longer contain
+`opencsv_wallet_init_issuer` or `opencsv_prove_mint`. CI builds the default
+archive and checks those symbols are absent, then separately compiles and tests
+the `issuer-tools` feature and checks the symbols are present there. This is a
+binary-boundary guarantee in addition to the absence of mint UI.
+
+Operation receipts now report phase timings separately for funding
+verification, local proving, zero-confirmation dependency observation,
+pre-sign verification, local signing/persistence, relay submission, pinned
+observer evaluation, and CBF/SPV confirmation. In particular,
+`proof_ready -> signed_persisted` does not call the prover; any delay in that
+transition can now be attributed honestly instead of being published as proof
+time.
+
 ## Persistence decision
 
 Enabling BDK's optional SQLite feature failed dependency resolution because it

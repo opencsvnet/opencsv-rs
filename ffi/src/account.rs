@@ -11,7 +11,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use base64::Engine as _;
 use bdk_esplora::{esplora_client, EsploraExt};
@@ -237,7 +237,7 @@ struct ObservationEvidenceEnvelope {
 /// One exact issuer-specific USD instrument trusted by the Signal product.
 /// Trust comes from the reviewed app configuration, never from the `USD`
 /// display code alone.
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct UsdIssuerPolicy {
     /// Full terms/genesis manifest whose asset id is admitted as USD.
@@ -248,7 +248,7 @@ pub struct UsdIssuerPolicy {
 }
 
 /// Account configuration supplied by Signal. It contains no secret key.
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct AccountConfig {
     /// Schema version, currently one.
@@ -978,6 +978,7 @@ pub(crate) struct CompletedProofJob {
     pending_json: String,
     record: [u8; 64],
     unconfirmed_dependencies: Vec<String>,
+    phase_timings_ms: Value,
 }
 
 /// Result of the short locked phase for a frozen multi-recipient batch.
@@ -1028,6 +1029,7 @@ pub(crate) struct CompletedBatchProofJob {
     proposal: BatchProposal,
     manifest: BatchManifest,
     members: Vec<CompletedBatchProofMember>,
+    phase_timings_ms: Value,
 }
 
 impl AccountProofJob {
@@ -1036,12 +1038,16 @@ impl AccountProofJob {
     }
 
     pub(crate) fn run(mut self) -> Result<CompletedProofJob, AccountError> {
+        let total_started = Instant::now();
+        let funding_verification_started = Instant::now();
         let verification = self.verifier.verify(&FundingVerificationRequest {
             outpoint: self.funding.outpoint,
             txout: self.funding.txout.clone(),
             birth_height: self.funding.birth_height,
         })?;
+        let funding_verification_ms = elapsed_millis(funding_verification_started);
         let ctx = funding_context(self.funding.outpoint);
+        let local_proving_started = Instant::now();
         let proved = self
             .protocol_snapshot
             .prove_transfer_amount(
@@ -1050,7 +1056,9 @@ impl AccountProofJob {
                 self.request.amount,
             )
             .map_err(|error| AccountError::new("unavailable_assets", error))?;
+        let local_proving_ms = elapsed_millis(local_proving_started);
 
+        let dependency_observation_started = Instant::now();
         if !proved.unconfirmed_dependencies.is_empty() {
             let client = esplora_client::Builder::new(&self.esplora_url).build_blocking();
             for dependency in &proved.unconfirmed_dependencies {
@@ -1080,6 +1088,7 @@ impl AccountProofJob {
                 }
             }
         }
+        let dependency_observation_ms = elapsed_millis(dependency_observation_started);
         let record = self
             .protocol_snapshot
             .rebind_pending(proved.pending_id, ctx)
@@ -1096,6 +1105,12 @@ impl AccountProofJob {
             pending_json,
             record,
             unconfirmed_dependencies: proved.unconfirmed_dependencies,
+            phase_timings_ms: json!({
+                "funding_verification": funding_verification_ms,
+                "local_proving": local_proving_ms,
+                "dependency_observation": dependency_observation_ms,
+                "proof_total": elapsed_millis(total_started),
+            }),
         })
     }
 }
@@ -1106,9 +1121,11 @@ impl AccountBatchProofJob {
     }
 
     pub(crate) fn run(mut self) -> Result<CompletedBatchProofJob, AccountError> {
+        let total_started = Instant::now();
         let secp = Secp256k1::new();
         let stock_pubkey = PublicKey::from_secret_key(&secp, &self.stock_secret);
         let stock_script = stock_witness_script(stock_pubkey, self.members.len()).to_p2wsh();
+        let funding_verification_started = Instant::now();
         let stock_verification = self.verifier.verify(&FundingVerificationRequest {
             outpoint: self.stock.outpoint,
             txout: bdk_wallet::bitcoin::TxOut {
@@ -1128,6 +1145,7 @@ impl AccountBatchProofJob {
             checked_through = checked_through.max(verification.checked_through);
             funding_verifications.push(verification);
         }
+        let funding_verification_ms = elapsed_millis(funding_verification_started);
         let observed_tip_height = u32::try_from(checked_through).map_err(|_| {
             AccountError::new("stale_chain_state", "verified tip height exceeds u32")
         })?;
@@ -1153,7 +1171,10 @@ impl AccountBatchProofJob {
         let client = esplora_client::Builder::new(&self.esplora_url).build_blocking();
         let mut completed_members = Vec::with_capacity(self.members.len());
         let mut commitments = Vec::with_capacity(self.members.len());
+        let mut local_proving_ms = 0_u64;
+        let mut dependency_observation_ms = 0_u64;
         for (member, funding_verification) in self.members.into_iter().zip(funding_verifications) {
+            let local_proving_started = Instant::now();
             let proved = self
                 .protocol_snapshot
                 .prove_transfer_amount(
@@ -1162,14 +1183,20 @@ impl AccountBatchProofJob {
                     member.request.amount,
                 )
                 .map_err(|error| AccountError::new("unavailable_assets", error))?;
+            local_proving_ms =
+                local_proving_ms.saturating_add(elapsed_millis(local_proving_started));
             for dependency in &proved.unconfirmed_dependencies {
                 let txid = unconfirmed_dependency_txid(dependency)?;
-                match client.get_tx(&txid).map_err(|error| {
+                let dependency_observation_started = Instant::now();
+                let observed = client.get_tx(&txid).map_err(|error| {
                     AccountError::new(
                         "unconfirmed_dependency_unavailable",
                         format!("could not re-observe parent {dependency}: {error}"),
                     )
-                })? {
+                })?;
+                dependency_observation_ms = dependency_observation_ms
+                    .saturating_add(elapsed_millis(dependency_observation_started));
+                match observed {
                     Some(transaction) if transaction.compute_txid() == txid => {}
                     Some(transaction) => {
                         return Err(AccountError::new(
@@ -1249,6 +1276,12 @@ impl AccountBatchProofJob {
             proposal,
             manifest,
             members: completed_members,
+            phase_timings_ms: json!({
+                "funding_verification": funding_verification_ms,
+                "local_proving": local_proving_ms,
+                "dependency_observation": dependency_observation_ms,
+                "proof_total": elapsed_millis(total_started),
+            }),
         })
     }
 }
@@ -2215,6 +2248,7 @@ impl AccountWallet {
                 "observer transaction id differs from the signed operation",
             ));
         }
+        let observer_evaluation_started = Instant::now();
         let (receipts, policy_failure) = evaluate_observation_evidence(
             &self.config.observation_checks,
             raw_transaction,
@@ -2239,6 +2273,19 @@ impl AccountWallet {
         if operation.state != OperationState::Mempool.as_str() {
             self.finalize_observed_operation(operation_id, txid)?;
         }
+        let observer_evaluation_ms = elapsed_millis(observer_evaluation_started);
+        let mut durable_receipt: Value = self
+            .operation(operation_id)?
+            .receipt_json
+            .as_deref()
+            .and_then(|encoded| serde_json::from_str(encoded).ok())
+            .unwrap_or_else(|| json!({}));
+        durable_receipt["phase_timings_ms"]["observer_evaluation"] = json!(observer_evaluation_ms);
+        self.db.conn.execute(
+            "UPDATE opencsv_operations SET receipt_json = ?2, updated_at = ?3
+             WHERE operation_id = ?1",
+            params![operation_id, durable_receipt.to_string(), unix_time()?],
+        )?;
         let mut value = operation_json(&self.operation(operation_id)?)?;
         if let Some(object) = value.as_object_mut() {
             object.insert("observations".into(), json!(receipts));
@@ -2945,6 +2992,7 @@ impl AccountWallet {
     /// explicitly featured issuer harness, separate from Signal's FFI.
     #[cfg(any(test, feature = "issuer-tools"))]
     pub fn mint_prepare(&mut self, request_json: &str) -> Result<Value, AccountError> {
+        let total_started = Instant::now();
         self.require_write_enabled()?;
         let request: IssuanceRequest = serde_json::from_str(request_json).map_err(|error| {
             AccountError::new("invalid_request", format!("issuance request: {error}"))
@@ -2979,6 +3027,7 @@ impl AccountWallet {
                 return Err(error);
             }
         };
+        let funding_verification_started = Instant::now();
         let verification = match self.verify_funding(&funding) {
             Ok(receipt) => receipt,
             Err(error) => {
@@ -2986,8 +3035,10 @@ impl AccountWallet {
                 return Err(error);
             }
         };
+        let funding_verification_ms = elapsed_millis(funding_verification_started);
         let ctx = funding_context(funding.outpoint);
 
+        let local_proving_started = Instant::now();
         let (to_owner, proved) = {
             let protocol = match self.primary_protocol_mut() {
                 Ok(protocol) => protocol,
@@ -3025,6 +3076,7 @@ impl AccountWallet {
             Ok(pending_json) => pending_json,
             Err(error) => return self.fail_prebroadcast(&operation_id, error),
         };
+        let local_proving_ms = elapsed_millis(local_proving_started);
         let normalized_request = json!({
             "asset_id": asset_id,
             "to_owner": to_owner,
@@ -3038,7 +3090,19 @@ impl AccountWallet {
         ) {
             return self.fail_prebroadcast(&operation_id, error);
         }
-        match self.prepared_receipt(&operation_id, funding, &verification, &record) {
+        let phase_timings_ms = json!({
+            "funding_verification": funding_verification_ms,
+            "local_proving": local_proving_ms,
+            "dependency_observation": 0,
+            "proof_total": elapsed_millis(total_started),
+        });
+        match self.prepared_receipt(
+            &operation_id,
+            funding,
+            &verification,
+            &record,
+            &phase_timings_ms,
+        ) {
             Ok(receipt) => Ok(receipt),
             Err(error) => self.fail_prebroadcast(&operation_id, error),
         }
@@ -3051,7 +3115,8 @@ impl AccountWallet {
     /// arbitrary-send field at this boundary.
     pub fn transfer_plan(&mut self, request_json: &str) -> Result<Value, AccountError> {
         self.require_write_enabled()?;
-        let (_, normalized_request) = normalize_transfer_request(request_json)?;
+        let (request, normalized_request) = normalize_transfer_request(request_json)?;
+        self.require_reviewed_usd_asset(&request.asset_id)?;
         let operation_id = random_id(16);
         let delivery_nonce = random_id(16);
         self.insert_planned_operation(
@@ -3089,7 +3154,8 @@ impl AccountWallet {
         requested_batch: Option<&str>,
     ) -> Result<Value, AccountError> {
         self.require_write_enabled()?;
-        let (_, normalized_request) = normalize_transfer_request(request_json)?;
+        let (request, normalized_request) = normalize_transfer_request(request_json)?;
+        self.require_reviewed_usd_asset(&request.asset_id)?;
         let now_ms = unix_time_millis()?;
         let operation_created_at = unix_time()?;
         let existing = match requested_batch {
@@ -3361,6 +3427,21 @@ impl AccountWallet {
             }
         }
 
+        // Review every exact instrument before reserving Bitcoin or protocol
+        // inputs. A registry change on reopen invalidates the complete
+        // unsigned batch; it can never leave a subset looking sendable.
+        for member in &members {
+            let operation = self.operation(&member.operation_id)?;
+            let request: TransferRequest =
+                serde_json::from_str(&operation.request_json).map_err(|error| {
+                    AccountError::new("database_corrupt", format!("transfer request: {error}"))
+                })?;
+            if let Err(error) = self.require_reviewed_usd_asset(&request.asset_id) {
+                self.cancel_send_batch(batch_local_id)?;
+                return Err(error);
+            }
+        }
+
         let stock = self.reserve_batch_stock(batch_local_id, participant_count)?;
         let mut jobs = Vec::with_capacity(members.len());
         for member in members {
@@ -3512,6 +3593,10 @@ impl AccountWallet {
         })?;
         let mut pending_ids = Vec::with_capacity(completed.members.len());
         for member in &completed.members {
+            if let Err(error) = self.require_reviewed_usd_asset(&member.request.asset_id) {
+                self.cancel_send_batch(&completed.batch_local_id)?;
+                return Err(error);
+            }
             let operation = self.operation(&member.operation_id)?;
             if operation.state != "fee_reserved"
                 || operation_outpoint(&operation)? != member.funding.outpoint
@@ -3592,6 +3677,7 @@ impl AccountWallet {
                     "funding_value_sats": member.funding.value_sats(),
                     "funding_verification": member.funding_verification,
                     "backup_ack_required": true,
+                    "phase_timings_ms": completed.phase_timings_ms.clone(),
                 });
                 self.db.conn.execute(
                     "UPDATE opencsv_operations
@@ -3620,6 +3706,7 @@ impl AccountWallet {
                 "miner_fee_sats": completed.manifest.miner_fee(),
                 "charges_sats": completed.manifest.charges(),
                 "backup_ack_required": true,
+                "phase_timings_ms": completed.phase_timings_ms.clone(),
             });
             self.db.conn.execute(
                 "UPDATE opencsv_send_batches
@@ -3768,6 +3855,25 @@ impl AccountWallet {
         })?;
         let proposal = BatchProposal::from_wire(proposal_wire).map_err(batch_protocol_error)?;
         let members = self.send_batch_members(batch_local_id)?;
+        for member in &members {
+            let operation = self.operation(&member.operation_id)?;
+            let request: TransferRequest =
+                serde_json::from_str(&operation.request_json).map_err(|error| {
+                    AccountError::new("database_corrupt", format!("transfer request: {error}"))
+                })?;
+            if let Err(error) = self.require_reviewed_usd_asset(&request.asset_id) {
+                self.cancel_send_batch(batch_local_id)?;
+                return Err(error);
+            }
+        }
+        let mut phase_timings_ms = batch
+            .receipt_json
+            .as_deref()
+            .and_then(|encoded| serde_json::from_str::<Value>(encoded).ok())
+            .and_then(|receipt| receipt.get("phase_timings_ms").cloned())
+            .filter(Value::is_object)
+            .unwrap_or_else(|| json!({}));
+        let pre_sign_verification_started = Instant::now();
         let stock = self
             .batch_stock_reserved_by(batch_local_id)?
             .ok_or_else(|| AccountError::new("conflicting_operation", "batch stock is unlocked"))?;
@@ -3880,6 +3986,9 @@ impl AccountWallet {
             .map_err(batch_protocol_error)?;
         let manifest = BatchManifest::from_wire(&proposal, commitments, manifest_wire)
             .map_err(batch_protocol_error)?;
+        phase_timings_ms["pre_sign_verification"] =
+            json!(elapsed_millis(pre_sign_verification_started));
+        let local_signing_persistence_started = Instant::now();
         let stock_signature = manifest
             .sign_stock(&proposal, &self.batch_stock_secret()?)
             .map_err(batch_protocol_error)?;
@@ -3917,6 +4026,7 @@ impl AccountWallet {
             batch_receipt["txid"] = json!(txid.to_string());
             batch_receipt["signed_at"] = json!(now);
             batch_receipt["stock_verification"] = json!(stock_verification);
+            batch_receipt["phase_timings_ms"] = phase_timings_ms.clone();
             self.db.conn.execute(
                 "UPDATE opencsv_send_batches
                  SET state = 'signed_persisted', signed_tx_hex = ?2,
@@ -3950,6 +4060,7 @@ impl AccountWallet {
                         "database_corrupt",
                         "missing member verification"
                     ))?);
+                receipt["phase_timings_ms"] = phase_timings_ms.clone();
                 self.db.conn.execute(
                     "UPDATE opencsv_operations
                      SET state = 'signed_persisted', signed_tx_hex = ?2,
@@ -3997,6 +4108,26 @@ impl AccountWallet {
         self.bitcoin
             .apply_unconfirmed_txs([(Arc::new(transaction.clone()), seen_at)]);
         self.bitcoin.persist(&mut self.db)?;
+        phase_timings_ms["local_signing_persistence"] =
+            json!(elapsed_millis(local_signing_persistence_started));
+        let phase_timings_json = phase_timings_ms.to_string();
+        self.db.conn.execute(
+            "UPDATE opencsv_send_batches
+             SET receipt_json = json_set(receipt_json, '$.phase_timings_ms', json(?2)),
+                 updated_at = ?3 WHERE batch_local_id = ?1",
+            params![batch_local_id, phase_timings_json, unix_time()?],
+        )?;
+        self.db.conn.execute(
+            "UPDATE opencsv_operations
+             SET receipt_json = json_set(receipt_json, '$.phase_timings_ms', json(?2)),
+                 updated_at = ?3
+             WHERE operation_id IN (
+                 SELECT operation_id FROM opencsv_send_batch_members
+                 WHERE batch_local_id = ?1
+             )",
+            params![batch_local_id, phase_timings_ms.to_string(), unix_time()?],
+        )?;
+        let relay_submission_started = Instant::now();
         let (p2p_submissions, relay_peers) = self.submit_direct_p2p(&transaction)?;
         let client = esplora_client::Builder::new(&self.config.esplora_url).build_blocking();
         let fallback = relay_via_esplora_if_unobserved(&client, &transaction);
@@ -4012,6 +4143,8 @@ impl AccountWallet {
         if let Err(error) = &fallback {
             receipt["generic_relay_error"] = json!(error.to_string());
         }
+        receipt["phase_timings_ms"]["relay_submission"] =
+            json!(elapsed_millis(relay_submission_started));
         let updated = unix_time()?;
         let transaction = self
             .db
@@ -4030,6 +4163,19 @@ impl AccountWallet {
                  WHERE batch_local_id = ?1
              )",
             params![batch_local_id, updated],
+        )?;
+        transaction.execute(
+            "UPDATE opencsv_operations
+             SET receipt_json = json_set(
+                     receipt_json,
+                     '$.phase_timings_ms.relay_submission',
+                     json_extract(?2, '$.phase_timings_ms.relay_submission')
+                 )
+             WHERE operation_id IN (
+                 SELECT operation_id FROM opencsv_send_batch_members
+                 WHERE batch_local_id = ?1
+             )",
+            params![batch_local_id, receipt.to_string()],
         )?;
         transaction.commit()?;
         self.send_batch_json(batch_local_id)
@@ -4076,6 +4222,7 @@ impl AccountWallet {
                 "observer txid differs from the persisted batch",
             ));
         }
+        let observer_evaluation_started = Instant::now();
         let (receipts, policy_failure) = evaluate_observation_evidence(
             &self.config.observation_checks,
             raw_transaction,
@@ -4106,6 +4253,36 @@ impl AccountWallet {
                 params![batch_local_id, unix_time()?],
             )?;
         }
+        let observer_evaluation_ms = elapsed_millis(observer_evaluation_started);
+        let mut durable_receipt: Value = self
+            .send_batch(batch_local_id)?
+            .receipt_json
+            .as_deref()
+            .and_then(|encoded| serde_json::from_str(encoded).ok())
+            .unwrap_or_else(|| json!({}));
+        durable_receipt["phase_timings_ms"]["observer_evaluation"] = json!(observer_evaluation_ms);
+        self.db.conn.execute(
+            "UPDATE opencsv_send_batches SET receipt_json = ?2, updated_at = ?3
+             WHERE batch_local_id = ?1",
+            params![batch_local_id, durable_receipt.to_string(), unix_time()?],
+        )?;
+        self.db.conn.execute(
+            "UPDATE opencsv_operations
+             SET receipt_json = json_set(
+                     receipt_json,
+                     '$.phase_timings_ms.observer_evaluation',
+                     ?2
+                 ), updated_at = ?3
+             WHERE operation_id IN (
+                 SELECT operation_id FROM opencsv_send_batch_members
+                 WHERE batch_local_id = ?1
+             )",
+            params![
+                batch_local_id,
+                i64::try_from(observer_evaluation_ms).unwrap_or(i64::MAX),
+                unix_time()?
+            ],
+        )?;
         let mut value = self.send_batch_json(batch_local_id)?;
         value["observations"] = json!(receipts);
         Ok(value)
@@ -4661,6 +4838,18 @@ impl AccountWallet {
                 ));
             }
         }
+        let request: TransferRequest = match serde_json::from_str(&operation.request_json) {
+            Ok(request) => request,
+            Err(error) => {
+                return self.fail_prebroadcast(
+                    operation_id,
+                    AccountError::new("database_corrupt", format!("transfer request: {error}")),
+                );
+            }
+        };
+        if let Err(error) = self.require_reviewed_usd_asset(&request.asset_id) {
+            return self.fail_prebroadcast(operation_id, error);
+        }
         let funding = match operation.state.as_str() {
             "planned" => match self.reserve_fee_utxo(operation_id) {
                 Ok(funding) => funding,
@@ -4678,15 +4867,6 @@ impl AccountWallet {
                     "invalid_operation_state",
                     format!("operation is {state}"),
                 ));
-            }
-        };
-        let request: TransferRequest = match serde_json::from_str(&operation.request_json) {
-            Ok(request) => request,
-            Err(error) => {
-                return self.fail_prebroadcast(
-                    operation_id,
-                    AccountError::new("database_corrupt", format!("transfer request: {error}")),
-                );
             }
         };
         let protocol_snapshot = self.protocol.as_ref().cloned().ok_or_else(|| {
@@ -4737,6 +4917,9 @@ impl AccountWallet {
             .map_err(|error| {
                 AccountError::new("database_corrupt", format!("transfer request: {error}"))
             })?;
+        if let Err(error) = self.require_reviewed_usd_asset(&current_request.asset_id) {
+            return self.fail_proof_job(&completed.operation_id, error);
+        }
         if current_request.asset_id != completed.request.asset_id
             || current_request.to_owner != completed.request.to_owner
             || current_request.amount != completed.request.amount
@@ -4818,6 +5001,7 @@ impl AccountWallet {
             completed.funding,
             &completed.verification,
             &completed.record,
+            &completed.phase_timings_ms,
         ) {
             Ok(receipt) => Ok(receipt),
             Err(error) => self.fail_prebroadcast(&completed.operation_id, error),
@@ -4929,6 +5113,23 @@ impl AccountWallet {
                 "the prepared checkpoint has not been acknowledged by Secure Backup",
             ));
         }
+        if operation.kind == "transfer" {
+            let request: TransferRequest =
+                serde_json::from_str(&operation.request_json).map_err(|error| {
+                    AccountError::new("database_corrupt", format!("transfer request: {error}"))
+                })?;
+            if let Err(error) = self.require_reviewed_usd_asset(&request.asset_id) {
+                return self.fail_prebroadcast(operation_id, error);
+            }
+        }
+        let mut phase_timings_ms = operation
+            .receipt_json
+            .as_deref()
+            .and_then(|encoded| serde_json::from_str::<Value>(encoded).ok())
+            .and_then(|receipt| receipt.get("phase_timings_ms").cloned())
+            .filter(Value::is_object)
+            .unwrap_or_else(|| json!({}));
+        let pre_sign_verification_started = Instant::now();
         let outpoint = operation_outpoint(&operation)?;
         let funding_output = self
             .bitcoin
@@ -4971,7 +5172,10 @@ impl AccountWallet {
             .primary_protocol_mut()?
             .rebind_pending(pending_id, ctx)
             .map_err(|error| AccountError::new("protocol_layout_violation", error))?;
+        phase_timings_ms["pre_sign_verification"] =
+            json!(elapsed_millis(pre_sign_verification_started));
 
+        let local_signing_persistence_started = Instant::now();
         let change_address = self
             .bitcoin
             .next_unused_address(KeychainKind::Internal)
@@ -5038,6 +5242,7 @@ impl AccountWallet {
             "marker_vout": 1,
             "change_vout": 2,
             "delivery_nonce": operation.delivery_nonce,
+            "phase_timings_ms": phase_timings_ms,
         });
         self.db.conn.execute(
             "UPDATE opencsv_operations
@@ -5058,7 +5263,15 @@ impl AccountWallet {
         self.bitcoin
             .apply_unconfirmed_txs([(Arc::new(tx.clone()), seen_at)]);
         self.bitcoin.persist(&mut self.db)?;
+        receipt["phase_timings_ms"]["local_signing_persistence"] =
+            json!(elapsed_millis(local_signing_persistence_started));
+        self.db.conn.execute(
+            "UPDATE opencsv_operations SET receipt_json = ?2, updated_at = ?3
+             WHERE operation_id = ?1",
+            params![operation_id, receipt.to_string(), unix_time()?],
+        )?;
 
+        let relay_submission_started = Instant::now();
         let (p2p_submissions, relay_peers) = self.submit_direct_p2p(&tx)?;
         let client = esplora_client::Builder::new(&self.config.esplora_url).build_blocking();
         // A completed P2P socket write proves submission only. Core can
@@ -5076,6 +5289,8 @@ impl AccountWallet {
                 object.insert("generic_relay_error".into(), json!(error.to_string()));
             }
         }
+        receipt["phase_timings_ms"]["relay_submission"] =
+            json!(elapsed_millis(relay_submission_started));
         self.db.conn.execute(
             "UPDATE opencsv_operations SET state = ?2,
              rejection_reason = 'broadcast_unobserved', receipt_json = ?3, updated_at = ?4
@@ -5139,8 +5354,11 @@ impl AccountWallet {
         let consignment = base64::engine::general_purpose::STANDARD
             .decode(consignment_base64)
             .map_err(|error| AccountError::new("database_corrupt", error.to_string()))?;
+        let spv_started = Instant::now();
         let verdict = self.scan_verify(&hex_encode(&consignment))?;
+        let spv_ms = elapsed_millis(spv_started);
         let now_ms = unix_time_millis()?;
+        let spv_started_at_ms = now_ms.saturating_sub(i64::try_from(spv_ms).unwrap_or(i64::MAX));
         let txid = operation.txid.as_deref().ok_or_else(|| {
             AccountError::new(
                 "invalid_operation_state",
@@ -5163,9 +5381,9 @@ impl AccountWallet {
                 "mode": check.as_ref().map(|check| check.mode).unwrap_or(ObservationMode::Observe),
                 "endpoint": Value::Null,
                 "result": if verified { ObservationResult::Observed } else { ObservationResult::Unavailable },
-                "started_at_ms": now_ms,
+                "started_at_ms": spv_started_at_ms,
                 "completed_at_ms": now_ms,
-                "latency_ms": 0,
+                "latency_ms": spv_ms,
                 "cached_at_ms": now_ms,
                 "cache_age_ms": 0,
                 "certificate_profile": Value::Null,
@@ -5174,6 +5392,12 @@ impl AccountWallet {
                 "detail": verdict,
                 "failures": failures,
             })],
+        )?;
+        receipt["phase_timings_ms"]["spv_confirmation"] = json!(spv_ms);
+        self.db.conn.execute(
+            "UPDATE opencsv_operations SET receipt_json = ?2, updated_at = ?3
+             WHERE operation_id = ?1",
+            params![operation_id, receipt.to_string(), unix_time()?],
         )?;
 
         if verified {
@@ -6727,6 +6951,26 @@ impl AccountWallet {
         Ok(())
     }
 
+    /// Require the exact asset identity to be present in the reviewed USD
+    /// registry supplied by Signal. A ticker, received manifest, or prior
+    /// balance never grants spend authority by itself.
+    fn require_reviewed_usd_asset(&self, asset_id: &str) -> Result<(), AccountError> {
+        if let Ok(requested) = decode_hex_32(asset_id, "asset id") {
+            if self
+                .config
+                .usd_issuers
+                .iter()
+                .any(|issuer| issuer.manifest.genesis.asset_id().as_bytes() == &requested)
+            {
+                return Ok(());
+            }
+        }
+        Err(AccountError::new(
+            "asset_not_reviewed",
+            "the exact asset is not in Signal's reviewed USD issuer registry",
+        ))
+    }
+
     fn primary_protocol_mut(&mut self) -> Result<&mut MemWallet, AccountError> {
         self.protocol.as_mut().ok_or_else(|| {
             AccountError::new("primary_required", "linked devices cannot sign or mint")
@@ -7307,6 +7551,7 @@ impl AccountWallet {
         funding: ReservedFunding,
         verification: &FundingVerificationReceipt,
         record: &[u8; 64],
+        phase_timings_ms: &Value,
     ) -> Result<Value, AccountError> {
         let normalized_request: String = self.db.conn.query_row(
             "SELECT request_json FROM opencsv_operations WHERE operation_id = ?1",
@@ -7325,6 +7570,7 @@ impl AccountWallet {
             "asset_id": normalized_request.get("asset_id"),
             "to_owner": normalized_request.get("to_owner"),
             "backup_ack_required": true,
+            "phase_timings_ms": phase_timings_ms,
         });
         self.db.conn.execute(
             "UPDATE opencsv_operations SET checkpoint_hash = NULL,
@@ -9160,6 +9406,10 @@ fn unix_time_millis() -> Result<i64, AccountError> {
         })
 }
 
+fn elapsed_millis(started: Instant) -> u64 {
+    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
 fn random_id(bytes: usize) -> String {
     let random: [u8; 32] = rand::rng().random();
     hex_encode(&random[..bytes.min(random.len())])
@@ -9386,11 +9636,28 @@ mod tests {
         value.to_string()
     }
 
+    fn reviewed_test_config(seed_byte: u8) -> (String, String) {
+        let policy = test_usd_issuer_policy(seed_byte, "OpenCSV reviewed test issuer", 0);
+        let manifest =
+            serde_json::from_value::<InstrumentManifestV1>(policy["manifest"].clone()).unwrap();
+        let asset_id = hex_encode(manifest.genesis.asset_id().as_bytes());
+        (config_with_usd_issuers(vec![policy]), asset_id)
+    }
+
     fn create_test_instrument(wallet: &mut AccountWallet, unit_code: &str) -> String {
         let created = wallet
             .instrument_create(&test_instrument_request(unit_code))
             .unwrap();
         assert_eq!(created["backup_required"], true);
+        if unit_code == "USD" {
+            let manifest =
+                serde_json::from_value::<InstrumentManifestV1>(created["manifest"].clone())
+                    .unwrap();
+            wallet.config.usd_issuers.push(UsdIssuerPolicy {
+                manifest,
+                priority: 0,
+            });
+        }
         wallet.set_backup_state(true, CHECKPOINT_VERSION).unwrap();
         created["asset_id"].as_str().unwrap().to_owned()
     }
@@ -9553,10 +9820,7 @@ mod tests {
         let expected = transaction.compute_txid();
         let dependency = hex_encode(&expected.to_byte_array());
 
-        assert_eq!(
-            unconfirmed_dependency_txid(&dependency).unwrap(),
-            expected
-        );
+        assert_eq!(unconfirmed_dependency_txid(&dependency).unwrap(), expected);
         assert_ne!(dependency.parse::<Txid>().unwrap(), expected);
     }
 
@@ -10265,12 +10529,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("wallet.sqlite");
         let key = [67u8; 32];
-        let cfg = config(AccountRole::Primary, true);
+        let (cfg, asset_id) = reviewed_test_config(68);
         let mut wallet = AccountWallet::open(&cfg, &key, path.to_str().unwrap()).unwrap();
         let planned = wallet
             .transfer_plan(
                 &json!({
-                    "asset_id": hex_encode(&[68u8; 32]),
+                    "asset_id": asset_id,
                     "to_owner": hex_encode(&[69u8; 32]),
                     "amount": 1,
                 })
@@ -10297,10 +10561,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("wallet.sqlite");
         let key = [73u8; 32];
-        let cfg = config(AccountRole::Primary, true);
+        let (cfg, asset_id) = reviewed_test_config(74);
         let request = |recipient: u8| {
             json!({
-                "asset_id": hex_encode(&[74u8; 32]),
+                "asset_id": asset_id,
                 "to_owner": hex_encode(&[recipient; 32]),
                 "amount": u64::from(recipient),
             })
@@ -10359,14 +10623,15 @@ mod tests {
     #[test]
     fn expired_add_recipient_creates_nothing_and_automatic_send_starts_next_batch() {
         let dir = tempfile::tempdir().unwrap();
+        let (cfg, asset_id) = reviewed_test_config(76);
         let mut wallet = AccountWallet::open(
-            &config(AccountRole::Primary, true),
+            &cfg,
             &[75u8; 32],
             dir.path().join("wallet.sqlite").to_str().unwrap(),
         )
         .unwrap();
         let request = json!({
-            "asset_id": hex_encode(&[76u8; 32]),
+            "asset_id": asset_id,
             "to_owner": hex_encode(&[77u8; 32]),
             "amount": 1,
         })
@@ -10415,15 +10680,16 @@ mod tests {
     #[test]
     fn cancelling_collecting_batch_cancels_every_member_and_is_idempotent() {
         let dir = tempfile::tempdir().unwrap();
+        let (cfg, asset_id) = reviewed_test_config(79);
         let mut wallet = AccountWallet::open(
-            &config(AccountRole::Primary, true),
+            &cfg,
             &[78u8; 32],
             dir.path().join("wallet.sqlite").to_str().unwrap(),
         )
         .unwrap();
         let request = |recipient: u8| {
             json!({
-                "asset_id": hex_encode(&[79u8; 32]),
+                "asset_id": asset_id,
                 "to_owner": hex_encode(&[recipient; 32]),
                 "amount": u64::from(recipient),
             })
@@ -10557,8 +10823,9 @@ mod tests {
         let mut wallet = AccountWallet::open(&cfg, &key, path.to_str().unwrap()).unwrap();
         allow_funding_verification(&mut wallet);
         fund(&mut wallet, 50_000);
-        let minted = prepare_test_issuance(&mut wallet, "ASY", &[60, 40]).unwrap();
+        let minted = prepare_test_issuance(&mut wallet, "USD", &[60, 40]).unwrap();
         let asset_id = minted["asset_id"].as_str().unwrap().to_owned();
+        let cfg = serde_json::to_string(&wallet.config).unwrap();
         let mint_operation = minted["operation_id"].as_str().unwrap().to_owned();
         finalize_test_operation(&mut wallet, &mint_operation, parent_txid);
         fund(&mut wallet, 40_000);
@@ -10608,7 +10875,7 @@ mod tests {
         .unwrap();
         allow_funding_verification(&mut wallet);
         fund(&mut wallet, 60_000);
-        let minted = prepare_test_issuance(&mut wallet, "BTT", &[60, 40]).unwrap();
+        let minted = prepare_test_issuance(&mut wallet, "USD", &[60, 40]).unwrap();
         let asset_id = minted["asset_id"].as_str().unwrap().to_owned();
         let mint_operation = minted["operation_id"].as_str().unwrap().to_owned();
         let mint_pending = wallet.pending_by_operation.remove(&mint_operation).unwrap();
@@ -10873,6 +11140,137 @@ mod tests {
     }
 
     #[test]
+    fn transfer_intents_require_the_exact_reviewed_asset_and_recheck_revocation() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut unreviewed = AccountWallet::open(
+            &config(AccountRole::Primary, true),
+            &[45u8; 32],
+            dir.path().join("unreviewed.sqlite").to_str().unwrap(),
+        )
+        .unwrap();
+        let request = json!({
+            "asset_id": hex_encode(&[46u8; 32]),
+            "to_owner": hex_encode(&[47u8; 32]),
+            "amount": 1,
+        })
+        .to_string();
+        let error = unreviewed.transfer_plan(&request).unwrap_err();
+        assert_eq!(error.code, "asset_not_reviewed");
+        let operation_count: u32 = unreviewed
+            .db
+            .conn
+            .query_row("SELECT COUNT(*) FROM opencsv_operations", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(operation_count, 0);
+
+        let (cfg, asset_id) = reviewed_test_config(48);
+        let mut reviewed = AccountWallet::open(
+            &cfg,
+            &[49u8; 32],
+            dir.path().join("reviewed.sqlite").to_str().unwrap(),
+        )
+        .unwrap();
+        let planned = reviewed
+            .transfer_plan(
+                &json!({
+                    "asset_id": asset_id,
+                    "to_owner": hex_encode(&[50u8; 32]),
+                    "amount": 1,
+                })
+                .to_string(),
+            )
+            .unwrap();
+        let operation_id = planned["operation_id"].as_str().unwrap();
+        reviewed.config.usd_issuers.clear();
+        let error = reviewed.prove_operation(operation_id).unwrap_err();
+        assert_eq!(error.code, "asset_not_reviewed");
+        let operation = reviewed.operation(operation_id).unwrap();
+        assert_eq!(operation.state, OperationState::Cancelled.as_str());
+        assert_eq!(
+            operation.rejection_reason.as_deref(),
+            Some("asset_not_reviewed")
+        );
+    }
+
+    #[test]
+    fn reviewed_asset_revocation_blocks_signing_and_cancels_unsigned_batch() {
+        let dir = tempfile::tempdir().unwrap();
+        let (cfg, asset_id) = reviewed_test_config(51);
+        let mut wallet = AccountWallet::open(
+            &cfg,
+            &[52u8; 32],
+            dir.path().join("wallet.sqlite").to_str().unwrap(),
+        )
+        .unwrap();
+        let request = |recipient: u8| {
+            json!({
+                "asset_id": asset_id,
+                "to_owner": hex_encode(&[recipient; 32]),
+                "amount": 1,
+            })
+            .to_string()
+        };
+
+        let planned = wallet.transfer_plan(&request(53)).unwrap();
+        let operation_id = planned["operation_id"].as_str().unwrap();
+        wallet
+            .db
+            .conn
+            .execute(
+                "UPDATE opencsv_operations SET state = 'proof_ready', backup_acked = 1
+                 WHERE operation_id = ?1",
+                [operation_id],
+            )
+            .unwrap();
+        wallet.config.usd_issuers.clear();
+        let error = wallet
+            .sign_and_broadcast(operation_id, r#"{"target_sat_per_vb":1}"#)
+            .unwrap_err();
+        assert_eq!(error.code, "asset_not_reviewed");
+        let operation = wallet.operation(operation_id).unwrap();
+        assert_eq!(operation.state, OperationState::Cancelled.as_str());
+        assert_eq!(
+            operation.rejection_reason.as_deref(),
+            Some("asset_not_reviewed")
+        );
+
+        let (cfg, asset_id) = reviewed_test_config(54);
+        let mut batch = AccountWallet::open(
+            &cfg,
+            &[55u8; 32],
+            dir.path().join("batch.sqlite").to_str().unwrap(),
+        )
+        .unwrap();
+        let request = |recipient: u8| {
+            json!({
+                "asset_id": asset_id,
+                "to_owner": hex_encode(&[recipient; 32]),
+                "amount": 1,
+            })
+            .to_string()
+        };
+        let first = batch.transfer_batch_plan(&request(56)).unwrap();
+        let batch_id = first["batch"]["batch_local_id"].as_str().unwrap();
+        batch
+            .transfer_batch_add_recipient(batch_id, &request(57))
+            .unwrap();
+        batch.freeze_send_batch(batch_id).unwrap();
+        batch.config.usd_issuers.clear();
+        let error = match batch.begin_send_batch_proof(batch_id) {
+            Err(error) => error,
+            Ok(_) => panic!("revoked batch unexpectedly began proving"),
+        };
+        assert_eq!(error.code, "asset_not_reviewed");
+        let status = batch.send_batch_status(batch_id).unwrap();
+        assert_eq!(status["state"], "cancelled");
+        for member in status["operations"].as_array().unwrap() {
+            assert_eq!(member["state"], "cancelled");
+        }
+    }
+
+    #[test]
     fn usd_issuer_policy_rejects_ticker_only_trust_and_duplicate_ids() {
         let dir = tempfile::tempdir().unwrap();
         let issuer = test_usd_issuer_policy(43, "OpenCSV test issuer", 10);
@@ -10955,7 +11353,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let key = [81u8; 32];
         let binding = [82u8; 32];
-        let cfg = config(AccountRole::Primary, true);
+        let (cfg, asset_id) = reviewed_test_config(83);
         let mut original = AccountWallet::open_device_bound(
             &cfg,
             &key,
@@ -10965,7 +11363,7 @@ mod tests {
         .unwrap();
         let request = |recipient: u8| {
             json!({
-                "asset_id": hex_encode(&[83u8; 32]),
+                "asset_id": asset_id,
                 "to_owner": hex_encode(&[recipient; 32]),
                 "amount": u64::from(recipient),
             })
@@ -11297,6 +11695,9 @@ mod tests {
         fund(&mut wallet, 50_000);
 
         let prepared = prepare_test_issuance(&mut wallet, "TCP", &[100]).unwrap();
+        assert!(prepared["phase_timings_ms"]["funding_verification"].is_number());
+        assert!(prepared["phase_timings_ms"]["local_proving"].is_number());
+        assert!(prepared["phase_timings_ms"]["proof_total"].is_number());
         let operation_id = prepared["operation_id"].as_str().unwrap();
         let prepared_hash = prepared["checkpoint_hash"].as_str().unwrap();
         assert_eq!(
@@ -11372,6 +11773,9 @@ mod tests {
             OperationState::BroadcastUnobserved.as_str()
         );
         assert_eq!(pending["receipt"]["generic_relay_fallback"], false);
+        assert!(pending["receipt"]["phase_timings_ms"]["pre_sign_verification"].is_number());
+        assert!(pending["receipt"]["phase_timings_ms"]["local_signing_persistence"].is_number());
+        assert!(pending["receipt"]["phase_timings_ms"]["relay_submission"].is_number());
         let operation = wallet.operation(operation_id).unwrap();
         assert_eq!(
             operation.state,
@@ -11413,6 +11817,7 @@ mod tests {
             .observe_operation_unconfirmed(operation_id, &raw, &evidence.to_string())
             .unwrap();
         assert_eq!(observed["state"], OperationState::Mempool.as_str());
+        assert!(observed["receipt"]["phase_timings_ms"]["observer_evaluation"].is_number());
         assert!(transaction.output[0].script_pubkey.is_op_return());
         assert_eq!(transaction.output[1].script_pubkey.as_bytes(), MARKER_SPK);
         assert!(!transaction.output[2].script_pubkey.is_op_return());

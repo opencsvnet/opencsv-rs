@@ -1380,6 +1380,7 @@ pub extern "C" fn opencsv_wallet_keygen(handle: u64) -> *mut c_char {
 ///
 /// # Safety
 /// `currency` must be a valid NUL-terminated C string.
+#[cfg(feature = "issuer-tools")]
 #[no_mangle]
 pub unsafe extern "C" fn opencsv_wallet_init_issuer(
     handle: u64,
@@ -1405,6 +1406,7 @@ pub unsafe extern "C" fn opencsv_wallet_init_issuer(
 ///
 /// # Safety
 /// All pointer arguments must be valid NUL-terminated C strings.
+#[cfg(feature = "issuer-tools")]
 #[no_mangle]
 pub unsafe extern "C" fn opencsv_prove_mint(
     handle: u64,
@@ -1431,7 +1433,7 @@ pub unsafe extern "C" fn opencsv_prove_mint(
 
 /// Prove a transfer spending `coin_ids_json` (exactly 2 ids). `amounts_json`
 /// is `[pay]` or `[pay, change]`; the change output returns to this wallet.
-/// Returns the same shape as [`opencsv_prove_mint`], with `spends` listing
+/// Returns the same shape as the issuer-only mint proof, with `spends` listing
 /// the coin ids the transaction consumes (marked spent at finalize).
 /// Proving takes ~0.5–1 s on phone hardware; call from a background queue.
 ///
@@ -1462,7 +1464,7 @@ pub unsafe extern "C" fn opencsv_prove_transfer(
 }
 
 /// Prove a redeem (burn) of one coin. Same return shape as
-/// [`opencsv_prove_mint`]. The finalized consignment carries no openings —
+/// the issuer-only mint proof. The finalized consignment carries no openings —
 /// deliver it to the issuer.
 ///
 /// # Safety

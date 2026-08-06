@@ -28,11 +28,15 @@ jobs:
         env:
           RUSTFLAGS: -D warnings
         run: cargo test --locked -p opencsv-ffi --lib --features test-wallet-recovery
-      - name: Verify test rebind symbol is feature-gated
+      - name: Verify recovery and issuer symbols are feature-gated
         run: |
           cargo build --locked --release -p opencsv-ffi
           if nm -g target/release/libopencsv_ffi.a | grep -q opencsv_account_rebind_test_device; then
             echo "test rebind symbol leaked into the default release build" >&2
+            exit 1
+          fi
+          if nm -g target/release/libopencsv_ffi.a | grep -Eq 'opencsv_wallet_init_issuer|opencsv_prove_mint'; then
+            echo "issuer symbol leaked into the default Signal release build" >&2
             exit 1
           fi
           cargo build --locked --release -p opencsv-ffi --features test-wallet-recovery
@@ -41,7 +45,10 @@ jobs:
         env:
           RUSTFLAGS: -D warnings
         run: |
-          cargo test --locked -p opencsv-ffi --features issuer-tools --bin opencsv-issuer
-          cargo check --locked -p opencsv-ffi --features issuer-tools --bin opencsv-issuer --example signet_account_acceptance
+          cargo test --locked -p opencsv-ffi --features issuer-tools --tests
+          cargo check --locked -p opencsv-ffi --features issuer-tools --bin opencsv-issuer --examples
+          cargo build --locked --release -p opencsv-ffi --features issuer-tools
+          nm -g target/release/libopencsv_ffi.a | grep -q opencsv_wallet_init_issuer
+          nm -g target/release/libopencsv_ffi.a | grep -q opencsv_prove_mint
       - name: Verify reproducible reference binaries
         run: ./scripts/reproducible-build.sh --verify dist/reproducible
