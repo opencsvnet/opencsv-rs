@@ -10,6 +10,20 @@
   migration inputs. Superseded the remote anchor provider and Swift-owned fee
   key/UTXO/change boundary.
 
+## 2026-08-06 — Signal USD testnet identity is permanent
+
+The owner confirmed that the USD instrument currently reviewed into Signal is
+the permanent testnet asset and always uses the signet Bitcoin fee tree. It is
+not a staging identity that can later be promoted. Production USD will be a
+separate instrument and issuer review over a separately initialized mainnet
+account, backup namespace, and BIP84 fee tree.
+
+The existing implementation already enforces the important mechanics: account
+databases are permanently network-bound, the preview manifest declares
+`network = signet` and `test_only = true`, and Signal's reviewed mainnet issuer
+set is empty. The acceptance receipts must therefore name this asset as test
+USD and must never imply dollar or USDT redemption or future mainnet continuity.
+
 ## Persistence decision
 
 Enabling BDK's optional SQLite feature failed dependency resolution because it
