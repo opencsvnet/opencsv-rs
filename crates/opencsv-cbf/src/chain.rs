@@ -287,11 +287,10 @@ impl FilterHeaderChain {
         if height >= self.len() {
             return None;
         }
-        let mut header = [0u8; 32];
-        for filter_hash in &self.filter_hashes[..=height as usize] {
-            header = crate::gcs::filter_header(filter_hash, &header);
-        }
-        Some(header)
+        Some(advance_filter_header(
+            [0u8; 32],
+            &self.filter_hashes[..=height as usize],
+        ))
     }
 
     /// Verify a downloaded filter for `height` against the committed
@@ -321,23 +320,26 @@ impl FilterHeaderChain {
     ) -> Result<Vec<[u8; 32]>, Error> {
         let mut out: Vec<[u8; 32]> = Vec::new();
         let mut start = self.len();
+        // Compute the held prefix once. Each response then advances this
+        // rolling header by only its newly fetched hashes. Re-folding the
+        // complete held + fetched prefix for every 2,000-height page makes a
+        // full signet/mainnet re-attestation quadratic in chain length.
+        let mut expected_prev = if start == 0 {
+            [0u8; 32]
+        } else {
+            self.filter_header_at(start - 1).ok_or_else(|| {
+                Error::Filter(format!(
+                    "no preceding filter header at height {}",
+                    start - 1
+                ))
+            })?
+        };
         while start <= stop_height {
             let stop = (start + 1999).min(stop_height);
             let stop_hash = chain
                 .hash_at(stop)
                 .ok_or_else(|| Error::Filter(format!("no block hash at height {stop}")))?;
             let response = peer.get_cfheaders(start as u32, &stop_hash)?;
-            // The filter header preceding the range: chained over all
-            // hashes up to `start - 1` (held + fetched this call).
-            let expected_prev = if start == 0 {
-                [0u8; 32]
-            } else {
-                let mut header = [0u8; 32];
-                for filter_hash in self.filter_hashes.iter().chain(out.iter()) {
-                    header = crate::gcs::filter_header(filter_hash, &header);
-                }
-                header
-            };
             if response.previous_filter_header != expected_prev {
                 return Err(Error::Filter(format!(
                     "filter-header linkage broken at height {start}"
@@ -350,6 +352,7 @@ impl FilterHeaderChain {
                     response.filter_hashes.len()
                 )));
             }
+            expected_prev = advance_filter_header(expected_prev, &response.filter_hashes);
             out.extend_from_slice(&response.filter_hashes);
             start = stop + 1;
         }
@@ -368,7 +371,36 @@ impl FilterHeaderChain {
     }
 }
 
+fn advance_filter_header(mut header: [u8; 32], filter_hashes: &[[u8; 32]]) -> [u8; 32] {
+    for filter_hash in filter_hashes {
+        header = crate::gcs::filter_header(filter_hash, &header);
+    }
+    header
+}
+
 /// The consensus parameters for a network (re-export for clients).
 pub fn network_params(network: opencsv_bitcoin::Network) -> Params {
     params(network)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{advance_filter_header, FilterHeaderChain};
+
+    #[test]
+    fn rolling_filter_header_matches_one_shot_chain() {
+        let hashes = (0u32..5_005)
+            .map(|height| {
+                let mut hash = [0u8; 32];
+                hash[..4].copy_from_slice(&height.to_le_bytes());
+                hash
+            })
+            .collect::<Vec<_>>();
+        let chain = FilterHeaderChain::from_verified(hashes.clone());
+        let one_shot = chain.filter_header_at((hashes.len() - 1) as u64).unwrap();
+
+        let rolling = hashes.chunks(2_000).fold([0u8; 32], advance_filter_header);
+
+        assert_eq!(rolling, one_shot);
+    }
 }
