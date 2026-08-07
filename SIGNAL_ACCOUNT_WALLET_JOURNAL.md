@@ -621,3 +621,35 @@ mutation, and unchanged solo behavior. The complete warnings-as-errors FFI
 library suite passes 64 tests with zero failures and two deliberately ignored
 slow proof cases. Live recipient credit and duplicate-delivery checks remain
 acceptance gates rather than claims in this entry.
+
+## 2026-08-07 — batch acceptance projects the committed member proof
+
+After the provisional parser learned the exact batching-v2 layout, Bob retried
+Carol's real two-recipient transaction
+`771aefc62e38dae80b4fdeec5ebb183c5c4c53c7902b559991aa55679103c4c3`.
+The witness envelope and both pinned raw-transaction observations succeeded,
+but the recipient rejected the consignment as `InvalidProof`. This exposed a
+second independent receiver bug: `Accept` reconstructed the recursive proof's
+public input from the on-chain batch header. The sender had correctly authored
+each member proof against that member's single-XFER record, while the header
+commits to the complete envelope and is not itself any member's proof
+statement.
+
+The rejected approach was to weaken proof verification or special-case
+`InvalidProof`. The accepted boundary instead gives an `AnchorChain` an
+explicit fail-closed member-projection operation. Snapshot and verified CBF
+backends first prove that the consignment's private raw nullifier selects an
+exact payload in the versioned envelope committed by the batch header. Only
+then do they reconstruct the canonical single-XFER record used by the proof.
+A backend that discarded or cannot authenticate the envelope returns no proof
+record and the consignment is rejected as an ill-formed anchor. First-
+occurrence checks now also apply to the selected batch member's raw nullifier,
+preserving the solo-transfer exclusion rule.
+
+Focused regressions cover exact member projection, receiver acceptance against
+the projected statement, an unknown member failing closed, a header/envelope
+mismatch, and unchanged solo behavior. The complete warnings-as-errors FFI
+library suite passes 65 tests with two deliberate slow-proof cases ignored;
+the DEBUG recovery-feature suite passes 67 with the same two ignored. A live
+recipient retry and duplicate-delivery check remain acceptance gates rather
+than claims in this entry.

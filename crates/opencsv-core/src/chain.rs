@@ -61,6 +61,27 @@ pub trait AnchorChain {
     /// position").
     fn anchor_at(&self, anchor_ref: &AnchorRef) -> Option<AnchorRecord>;
 
+    /// Reconstruct the record-shaped public input for one consignment proof.
+    ///
+    /// Solo anchors use their on-chain record directly. A batch header only
+    /// commits to the complete witness envelope, while each recursive proof
+    /// still projects onto its own single XFER payload. Envelope-aware chain
+    /// backends therefore override this method, prove that
+    /// `raw_nullifiers` selects exactly one committed member payload, and
+    /// return the corresponding synthetic XFER record. The fail-closed
+    /// default refuses batch headers so a backend that discarded the witness
+    /// envelope can never accept a batch consignment from the header alone.
+    fn proof_record_at(
+        &self,
+        anchor_ref: &AnchorRef,
+        _raw_nullifiers: &[Digest],
+    ) -> Option<AnchorRecord> {
+        match self.anchor_at(anchor_ref)? {
+            AnchorRecord::BatchHeader { .. } => None,
+            record => Some(record),
+        }
+    }
+
     /// The 32-byte transaction context of the anchor at the referenced
     /// location (in production: the funding input's outpoint of the anchor
     /// transaction), needed to evaluate [`AnchorRecord::well_formed`].

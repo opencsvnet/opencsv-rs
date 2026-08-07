@@ -179,6 +179,31 @@ impl AnchorChain for SnapshotChain {
         self.find(anchor_ref).map(|e| e.record)
     }
 
+    fn proof_record_at(
+        &self,
+        anchor_ref: &AnchorRef,
+        raw_nullifiers: &[Digest],
+    ) -> Option<AnchorRecord> {
+        let entry = self.find(anchor_ref)?;
+        match entry.record {
+            AnchorRecord::BatchHeader { .. } => {
+                let [raw_nf] = raw_nullifiers else {
+                    return None;
+                };
+                let (version, payloads) = entry.batch.as_ref()?;
+                versioned_envelope_occurrence(
+                    *version,
+                    &entry.record,
+                    payloads,
+                    &entry.ctx,
+                    raw_nf,
+                )?;
+                Some(AnchorRecord::xfer(raw_nullifiers, &entry.ctx))
+            }
+            record => Some(record),
+        }
+    }
+
     fn ctx_at(&self, anchor_ref: &AnchorRef) -> Option<[u8; 32]> {
         self.find(anchor_ref).map(|e| e.ctx)
     }
@@ -275,6 +300,12 @@ fn entry_matches_nullifier(entry: &Entry, raw_nf: &Digest) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use opencsv_core::accept::public_input;
+    use opencsv_core::{
+        accept, AcceptParams, AssetGenesis, CoinOpening, Consignment, MockVerifier, OwnerSecret,
+    };
+
+    const TEST_VK: &[u8] = b"snapshot-batch-projection-vk";
 
     fn digest(byte: u8) -> Digest {
         Digest::from_bytes([byte; 32])
@@ -329,7 +360,94 @@ mod tests {
             chain.first_nullifier_occurrence(&raw_nf),
             Some(MEMPOOL_LOCATION),
         );
+        assert_eq!(
+            chain.proof_record_at(
+                &AnchorRef {
+                    txid: [23_u8; 32],
+                    location: MEMPOOL_LOCATION,
+                },
+                &[raw_nf],
+            ),
+            Some(AnchorRecord::xfer(&[raw_nf], &ctx)),
+        );
         assert_eq!(chain.first_nullifier_occurrence(&digest(24)), None);
+        assert_eq!(
+            chain.proof_record_at(
+                &AnchorRef {
+                    txid: [23_u8; 32],
+                    location: MEMPOOL_LOCATION,
+                },
+                &[digest(24)],
+            ),
+            None,
+        );
+    }
+
+    #[test]
+    fn accept_projects_exact_batch_member_into_its_proof_statement() {
+        let raw_nf = digest(30);
+        let ctx = [31_u8; 32];
+        let recipient = OwnerSecret::from_bytes([32_u8; 32]);
+        let genesis = AssetGenesis {
+            issuer_pk: [33_u8; 32],
+            currency_code: *b"USD",
+            terms_hash: digest(34),
+            nonce: 35,
+        };
+        let asset_id = genesis.asset_id();
+        let opening = CoinOpening {
+            asset_id,
+            value: 5,
+            owner: recipient.owner(),
+            randomness: digest(36),
+        };
+        let other_nf = digest(37);
+        let payloads = vec![
+            opencsv_core::binding(&other_nf, &ctx).to_anchor(),
+            opencsv_core::binding(&raw_nf, &ctx).to_anchor(),
+        ];
+        let batch_header = AnchorRecord::batch_header_v2(&payloads, &ctx);
+        let txid = [38_u8; 32];
+        let mut entry = entry_json(MEMPOOL_LOCATION, &txid, &batch_header, &ctx);
+        entry.batch = Some(SnapshotBatchEnvelope {
+            version: 2,
+            payloads: payloads
+                .iter()
+                .map(|payload| to_hex(payload.as_bytes()))
+                .collect(),
+        });
+        let chain = SnapshotChain::from_snapshot(&Snapshot {
+            tip_height: 100,
+            entries: vec![entry],
+        })
+        .unwrap();
+        let proof_record = AnchorRecord::xfer(&[raw_nf], &ctx);
+        let consignment = Consignment {
+            coin_openings: vec![opening],
+            nullifiers: vec![raw_nf],
+            proof: MockVerifier::prove(TEST_VK, &public_input(&proof_record, &ctx, &[opening])),
+            anchor_ref: AnchorRef {
+                txid,
+                location: MEMPOOL_LOCATION,
+            },
+            aux: None,
+        };
+
+        let accepted = accept(
+            &consignment,
+            &chain,
+            &MockVerifier,
+            &AcceptParams {
+                vk: TEST_VK,
+                required_confirmations: 0,
+                recipient_secrets: &[recipient],
+                known_assets: &[asset_id],
+            },
+        )
+        .unwrap();
+
+        assert_eq!(accepted.anchor, MEMPOOL_LOCATION);
+        assert_eq!(accepted.coins, vec![opening.to_coin()]);
     }
 
     #[test]

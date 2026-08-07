@@ -278,6 +278,34 @@ impl AnchorChain for FullScanChain {
         self.find(anchor_ref).map(|e| e.record)
     }
 
+    fn proof_record_at(
+        &self,
+        anchor_ref: &AnchorRef,
+        raw_nullifiers: &[Digest],
+    ) -> Option<AnchorRecord> {
+        let [raw_nf] = raw_nullifiers else {
+            return self
+                .find(anchor_ref)
+                .filter(|entry| !matches!(entry.record, AnchorRecord::BatchHeader { .. }))
+                .map(|entry| entry.record);
+        };
+        let mempool = AnchorLocation {
+            height: 0,
+            position: 0,
+        };
+        let entry = self.entries.iter().find(|entry| {
+            entry.txid == anchor_ref.txid
+                && (entry.location == anchor_ref.location || anchor_ref.location == mempool)
+                && entry.binds(raw_nf)
+        })?;
+        match entry.record {
+            AnchorRecord::BatchHeader { .. } => {
+                Some(AnchorRecord::xfer(raw_nullifiers, &entry.ctx))
+            }
+            record => Some(record),
+        }
+    }
+
     fn ctx_at(&self, anchor_ref: &AnchorRef) -> Option<[u8; 32]> {
         self.find(anchor_ref).map(|e| e.ctx)
     }

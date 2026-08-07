@@ -118,6 +118,20 @@ impl AnchorChain for CrossCheckedChain {
         self.members.iter().find_map(|m| m.anchor_at(anchor_ref))
     }
 
+    fn proof_record_at(
+        &self,
+        anchor_ref: &AnchorRef,
+        raw_nullifiers: &[Digest],
+    ) -> Option<AnchorRecord> {
+        // Presence direction follows `anchor_at`: one backend that can
+        // authenticate the batch envelope is sufficient to reconstruct the
+        // proof statement. Exclusion remains conservative across every
+        // member through `first_nullifier_occurrence` below.
+        self.members
+            .iter()
+            .find_map(|member| member.proof_record_at(anchor_ref, raw_nullifiers))
+    }
+
     fn ctx_at(&self, anchor_ref: &AnchorRef) -> Option<[u8; 32]> {
         self.members.iter().find_map(|m| m.ctx_at(anchor_ref))
     }

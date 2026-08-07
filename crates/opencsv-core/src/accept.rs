@@ -258,8 +258,15 @@ pub fn accept<V: ProofVerifier, C: AnchorChain>(
     let has_distinct_nullifiers = nullifiers_are_distinct(&consignment.nullifiers);
     reject_if(accept_kernel::structure_rejection(has_distinct_nullifiers))?;
 
-    // Step 2 — proof check.
-    let x = public_input(&record, &ctx, openings);
+    // Step 2 — proof check. A batching-v2 header commits to the complete
+    // witness envelope, not to one proof statement. Envelope-aware chain
+    // backends project the member selected by this consignment's private
+    // nullifier into the same single-XFER record shape used when the proof
+    // was authored. Backends without the exact envelope fail closed.
+    let proof_record = chain
+        .proof_record_at(&consignment.anchor_ref, &consignment.nullifiers)
+        .ok_or_else(|| from_kernel_rejection(accept_kernel::RejectReason::IllFormedAnchor))?;
+    let x = public_input(&proof_record, &ctx, openings);
     let proof_valid = verifier.verify(params.vk, &x, &consignment.proof);
     reject_if(accept_kernel::proof_rejection(proof_valid))?;
 
@@ -280,7 +287,7 @@ pub fn accept<V: ProofVerifier, C: AnchorChain>(
     // occurrence check by omitting one of the record's nullifiers). A
     // byte-copy of the record under a different ctx fails here: the copy's
     // payloads are bound to the victim's ctx, not the copier's.
-    let binds_nullifiers = record_binds_nullifiers(&record, &ctx, &consignment.nullifiers);
+    let binds_nullifiers = record_binds_nullifiers(&proof_record, &ctx, &consignment.nullifiers);
     reject_if(accept_kernel::chain_prefix_rejection(
         have,
         params.required_confirmations,
@@ -292,11 +299,11 @@ pub fn accept<V: ProofVerifier, C: AnchorChain>(
     // `crate::chain`) must be this anchor. Compressed transfers are
     // recognized under their nullifier commitment, like on-chain.
     let occurrence_keys: Vec<Digest> = match &record {
-        // Batch headers carry no on-chain payload slots: their
-        // occurrences live in the witness envelope (see `crate::batch`),
-        // which the consignment format does not yet name — a consignment
-        // pointing at a batch header has no occurrence keys to check.
-        AnchorRecord::Mint { .. } | AnchorRecord::BatchHeader { .. } => vec![],
+        AnchorRecord::Mint { .. } => vec![],
+        // Envelope-aware chain backends expose each batching-v2 payload as
+        // an occurrence of its private raw nullifier. This preserves the
+        // same first-occurrence rule as solo transfers.
+        AnchorRecord::BatchHeader { .. } => consignment.nullifiers.clone(),
         AnchorRecord::Xfer { .. } | AnchorRecord::Redeem { .. } => consignment.nullifiers.clone(),
         AnchorRecord::XferCompressed { .. } => {
             vec![nullifier_commit(&consignment.nullifiers)]
@@ -396,8 +403,11 @@ fn record_binds_nullifiers(
     }
     let bound = |nf: &Digest| binding(nf, ctx).to_anchor();
     match record {
-        // Batch headers bind no nullifiers on-chain (witness envelope).
-        AnchorRecord::Mint { .. } | AnchorRecord::BatchHeader { .. } => raw_nullifiers.is_empty(),
+        // The accept driver substitutes an envelope-authenticated member
+        // XFER record before calling this helper. A raw batch header reaching
+        // here means the backend could not prove a member projection.
+        AnchorRecord::Mint { .. } => raw_nullifiers.is_empty(),
+        AnchorRecord::BatchHeader { .. } => false,
         AnchorRecord::Redeem { payload, .. } => {
             raw_nullifiers.len() == 1 && bound(&raw_nullifiers[0]) == *payload
         }
