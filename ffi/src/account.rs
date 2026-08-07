@@ -199,6 +199,10 @@ fn default_observation_max_age_seconds() -> u64 {
     120
 }
 
+fn default_required_raw_observer_quorum() -> u32 {
+    1
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 enum ObservationResult {
@@ -295,6 +299,12 @@ pub struct AccountConfig {
     /// fail-closed signet defaults for the two built-in API observers.
     #[serde(default)]
     pub observation_checks: Vec<ObservationCheck>,
+    /// Number of `require` raw-transaction observers that must return the
+    /// exact transaction bytes under their configured certificate pins. All
+    /// enabled observers are still queried and recorded; this quorum avoids
+    /// making one unavailable public API a liveness dependency.
+    #[serde(default = "default_required_raw_observer_quorum")]
+    pub required_raw_observer_quorum: u32,
     /// Required for linked devices; public external descriptor.
     #[serde(default)]
     pub watch_external_descriptor: Option<String>,
@@ -1899,6 +1909,7 @@ impl AccountWallet {
                 "last_sync_tip": self.db.meta("last_sync_tip")?,
             },
             "observation_policy": self.config.observation_checks,
+            "required_raw_observer_quorum": self.config.required_raw_observer_quorum,
             "observation_receipts": query_json_rows(
                 &self.db.conn,
                 "SELECT receipt_json FROM opencsv_observation_receipts
@@ -2177,6 +2188,7 @@ impl AccountWallet {
         }
         let (receipts, policy_failure) = evaluate_observation_evidence(
             &self.config.observation_checks,
+            self.config.required_raw_observer_quorum,
             raw_transaction,
             observations_json,
         )?;
@@ -2323,6 +2335,7 @@ impl AccountWallet {
         let observer_evaluation_started = Instant::now();
         let (receipts, policy_failure) = evaluate_observation_evidence(
             &self.config.observation_checks,
+            self.config.required_raw_observer_quorum,
             raw_transaction,
             observations_json,
         )?;
@@ -2790,6 +2803,7 @@ impl AccountWallet {
         }
         let (receipts, policy_failure) = evaluate_observation_evidence(
             &self.config.observation_checks,
+            self.config.required_raw_observer_quorum,
             raw_transaction,
             observations_json,
         )?;
@@ -4307,6 +4321,7 @@ impl AccountWallet {
         let observer_evaluation_started = Instant::now();
         let (receipts, policy_failure) = evaluate_observation_evidence(
             &self.config.observation_checks,
+            self.config.required_raw_observer_quorum,
             raw_transaction,
             observations_json,
         )?;
@@ -9193,6 +9208,7 @@ fn snapshot_with_unconfirmed_anchor(
 
 fn evaluate_observation_evidence(
     policy: &[ObservationCheck],
+    required_raw_observer_quorum: u32,
     exact_raw_transaction: &[u8],
     observations_json: &str,
 ) -> Result<(Vec<Value>, Option<AccountError>), AccountError> {
@@ -9218,7 +9234,14 @@ fn evaluate_observation_evidence(
 
     let now_ms = unix_time_millis()?;
     let mut receipts = Vec::new();
-    let mut first_required_failure = None;
+    let required_raw_observer_count = policy
+        .iter()
+        .filter(|check| {
+            check.kind == ObservationKind::RawTransactionApi
+                && check.mode == ObservationMode::Require
+        })
+        .count();
+    let mut successful_required_raw_observers = 0u32;
     for check in policy {
         // Raw host evidence is supplied by Signal. Direct relay submission
         // and multi-peer confirmation have separate Rust-owned receipts and
@@ -9339,25 +9362,11 @@ fn evaluate_observation_evidence(
             "failures": failures,
         });
         if check.mode == ObservationMode::Require
-            && !receipt["failures"]
+            && receipt["failures"]
                 .as_array()
                 .is_some_and(|failures| failures.is_empty())
-            && first_required_failure.is_none()
         {
-            first_required_failure = Some(AccountError::new(
-                "required_observation_failed",
-                format!(
-                    "required observer {} failed: {}",
-                    check.id,
-                    receipt["failures"]
-                        .as_array()
-                        .unwrap()
-                        .iter()
-                        .filter_map(Value::as_str)
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                ),
-            ));
+            successful_required_raw_observers += 1;
         }
         receipts.push(receipt);
     }
@@ -9374,7 +9383,17 @@ fn evaluate_observation_evidence(
             ),
         ));
     }
-    Ok((receipts, first_required_failure))
+    let required_failure = (required_raw_observer_count > 0
+        && successful_required_raw_observers < required_raw_observer_quorum)
+        .then(|| {
+            AccountError::new(
+                "required_observation_failed",
+                format!(
+                    "required raw observer quorum failed: {successful_required_raw_observers} of {required_raw_observer_quorum} exact pinned observations succeeded"
+                ),
+            )
+        });
+    Ok((receipts, required_failure))
 }
 
 fn derive<const N: usize>(
@@ -9590,6 +9609,24 @@ fn validate_observation_checks(config: &AccountConfig) -> Result<(), AccountErro
                 }
             }
         }
+    }
+    let required_raw_observers = config
+        .observation_checks
+        .iter()
+        .filter(|check| {
+            check.kind == ObservationKind::RawTransactionApi
+                && check.mode == ObservationMode::Require
+        })
+        .count();
+    if required_raw_observers > 0
+        && (config.required_raw_observer_quorum == 0
+            || usize::try_from(config.required_raw_observer_quorum)
+                .map_or(true, |quorum| quorum > required_raw_observers))
+    {
+        return Err(AccountError::new(
+            "invalid_config",
+            format!("required raw observer quorum must be between 1 and {required_raw_observers}"),
+        ));
     }
     Ok(())
 }
@@ -10416,7 +10453,7 @@ mod tests {
     }
 
     #[test]
-    fn fresh_signet_defaults_require_both_pinned_api_observers() {
+    fn fresh_signet_defaults_use_one_of_two_pinned_api_observers() {
         let dir = tempfile::tempdir().unwrap();
         let cfg = json!({
             "version": 1,
@@ -10452,6 +10489,7 @@ mod tests {
         assert_eq!(policy[2]["mode"], "observe");
         assert_eq!(policy[3]["mode"], "off");
         assert_eq!(policy[4]["mode"], "observe");
+        assert_eq!(status["required_raw_observer_quorum"], 1);
         assert_eq!(
             wallet
                 .verify_consignment_unconfirmed(&[1], r#"{"tip_height":0,"entries":[]}"#)
@@ -10492,24 +10530,70 @@ mod tests {
             ]
         });
         let (receipts, failure) =
-            evaluate_observation_evidence(&policy, &[1, 2], &evidence.to_string()).unwrap();
+            evaluate_observation_evidence(&policy, 1, &[1, 2], &evidence.to_string()).unwrap();
         assert!(failure.is_none());
         assert_eq!(receipts.len(), 2);
         assert_eq!(receipts[0]["raw_byte_match"], true);
         assert_eq!(receipts[1]["raw_byte_match"], true);
 
+        let mut blockstream_only = evidence.clone();
+        blockstream_only["observations"]
+            .as_array_mut()
+            .unwrap()
+            .remove(0);
+        let (receipts, failure) =
+            evaluate_observation_evidence(&policy, 1, &[1, 2], &blockstream_only.to_string())
+                .unwrap();
+        assert!(failure.is_none());
+        assert_eq!(receipts.len(), 2);
+        assert_eq!(receipts[0]["result"], "not_checked");
+        assert_eq!(receipts[1]["raw_byte_match"], true);
+
+        let (_, failure) =
+            evaluate_observation_evidence(&policy, 2, &[1, 2], &blockstream_only.to_string())
+                .unwrap();
+        assert_eq!(failure.unwrap().code, "required_observation_failed");
+
         let mut wrong_pin = evidence.clone();
         wrong_pin["observations"][0]["certificate_chain_fingerprints_sha256"] =
             json!(["11".repeat(32)]);
         let (_, failure) =
-            evaluate_observation_evidence(&policy, &[1, 2], &wrong_pin.to_string()).unwrap();
-        assert_eq!(failure.unwrap().code, "required_observation_failed");
+            evaluate_observation_evidence(&policy, 1, &[1, 2], &wrong_pin.to_string()).unwrap();
+        assert!(failure.is_none());
 
         let mut wrong = evidence;
         wrong["observations"][1]["raw_transaction_hex"] = json!("0103");
         let (_, failure) =
-            evaluate_observation_evidence(&policy, &[1, 2], &wrong.to_string()).unwrap();
+            evaluate_observation_evidence(&policy, 1, &[1, 2], &wrong.to_string()).unwrap();
+        assert!(failure.is_none());
+
+        wrong["observations"][0]["certificate_chain_fingerprints_sha256"] =
+            json!(["11".repeat(32)]);
+        let (_, failure) =
+            evaluate_observation_evidence(&policy, 1, &[1, 2], &wrong.to_string()).unwrap();
         assert_eq!(failure.unwrap().code, "required_observation_failed");
+    }
+
+    #[test]
+    fn raw_observer_quorum_cannot_exceed_required_candidates() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = json!({
+            "version": 1,
+            "network": "signet",
+            "esplora_url": "https://mempool.space/signet/api",
+            "role": "primary",
+            "backup_verified": false,
+            "required_raw_observer_quorum": 3,
+        });
+        let error = AccountWallet::open_device_bound(
+            &cfg.to_string(),
+            &[91u8; 32],
+            &[92u8; 32],
+            dir.path().join("wallet.sqlite").to_str().unwrap(),
+        )
+        .err()
+        .unwrap();
+        assert_eq!(error.code, "invalid_config");
     }
 
     #[test]
@@ -11074,7 +11158,10 @@ mod tests {
         assert_eq!(acknowledged["checkpoint_hash"], current_hash);
         let after = wallet.send_batch(&batch_id).unwrap();
         assert!(after.backup_acked);
-        assert_eq!(after.checkpoint_hash.as_deref(), Some(current_hash.as_str()));
+        assert_eq!(
+            after.checkpoint_hash.as_deref(),
+            Some(current_hash.as_str())
+        );
         assert_eq!(after.proposal_wire, before.proposal_wire);
         assert_eq!(after.manifest_wire, before.manifest_wire);
         for member in wallet.send_batch_members(&batch_id).unwrap() {
@@ -11336,6 +11423,16 @@ mod tests {
         assert!(reopened.pending_by_operation.contains_key(&operation_id));
         assert_eq!(reopened.prove_operation(&operation_id).unwrap(), prepared);
         server.join().unwrap();
+        let pending_id = reopened.pending_by_operation[&operation_id];
+        let dependencies = reopened
+            .primary_protocol_mut()
+            .unwrap()
+            .pending_unconfirmed_dependencies(pending_id)
+            .unwrap();
+        assert_eq!(dependencies.len(), 1);
+        assert!(reopened
+            .dependency_reobservation_is_fresh(&dependencies[0])
+            .unwrap());
     }
 
     #[test]

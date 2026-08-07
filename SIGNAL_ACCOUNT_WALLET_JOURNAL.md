@@ -497,8 +497,20 @@ zero failures. The recovery-feature target passes 59 unit tests plus 2
 integration tests with the same 2 deliberate ignores and zero failures.
 
 Carol's durable attachment retry also ran twice without a restart-only gap. It
-remains correctly uncredited because the local network could not establish TCP
-to any `mempool.space` address while Blockstream returned the exact 309-byte
-transaction. Both observers are still `Require`; this is an external
-availability receipt, not permission to weaken policy, and no unconfirmed-child
-acceptance claim is made yet.
+remained uncredited because the local network could not establish TCP to any
+`mempool.space` address while Blockstream returned the exact 309-byte
+transaction. This demonstrated that requiring every public observer made one
+provider outage a global wallet liveness failure.
+
+The owner selected an availability quorum: Signal still queries both pinned
+APIs and persists every success and failure, but one fresh pinned observer must
+return the exact transaction bytes. Zero matching observers still fail closed;
+stale evidence, pin mismatch, wrong bytes, cryptographic proof failure,
+transaction-layout failure, and protocol-context failure do not count toward
+the quorum. Confirmation and settlement still require the phone-owned
+headers/BIP158/full-block/Merkle path. Focused regressions prove Blockstream-only
+success at quorum one, failure for the same evidence at quorum two, survival of
+one provider's pin or byte failure when the other succeeds, failure when both
+are invalid, and rejection of configurations whose quorum exceeds their
+required candidates. Live Carol acceptance and the zero-confirmation return hop
+remain acceptance gates rather than claims in this entry.
