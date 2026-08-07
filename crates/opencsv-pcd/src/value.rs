@@ -13,6 +13,7 @@
 
 use p3_baby_bear::BabyBear;
 use p3_circuit::{CircuitBuilder, CircuitBuilderError, ExprId};
+use p3_field::PrimeCharacteristicRing;
 
 use crate::EF;
 
@@ -55,9 +56,10 @@ pub(crate) fn range_check_value(
 /// lhs[0][i] + lhs[1][i] + c_i = rhs[0][i] + rhs[1][i] + 2^24 · c_{i+1}
 /// ```
 ///
-/// where each `c_{i+1}` is constrained to `{0, 1}` by a 1-bit decomposition
-/// (a non-boolean carry fails at witness generation) and the final carry is
-/// pinned to zero, so a sum that would overflow `u64` fails proving.
+/// where each `c_{i+1}` is constrained to `{-1, 0, 1}`. Negative carry is a
+/// real borrow: for example, the low limbs of `25_000_000 = 10_000_000 +
+/// 15_000_000` differ by exactly `-2^24`. The final carry is pinned to zero,
+/// so a sum that would overflow `u64` still fails proving.
 ///
 /// Soundness: all limbs must already be range-checked
 /// ([`range_check_value`]). Then every per-limb difference `t` lies in
@@ -66,13 +68,14 @@ pub(crate) fn range_check_value(
 /// wrap-around can fake balance. (Using a uniform radix `2^24` on the 16-bit
 /// top limb is deliberate: it treats values as 72-bit for the carry
 /// arithmetic, which is still exact, and any top-limb overflow yields a
-/// non-boolean final carry.)
+/// non-zero final carry.)
 pub(crate) fn enforce_sum_eq(
     builder: &mut CircuitBuilder<EF>,
     lhs: [&[ExprId; VALUE_LIMBS]; 2],
     rhs: [&[ExprId; VALUE_LIMBS]; 2],
 ) -> Result<(), CircuitBuilderError> {
     let radix = builder.alloc_const(EF::from(BabyBear::new(1 << 24)), "radix");
+    let one = builder.define_const(EF::ONE);
     let mut carry: Option<ExprId> = None;
     for i in 0..VALUE_LIMBS {
         let mut t = builder.add(lhs[0][i], lhs[1][i]);
@@ -81,9 +84,15 @@ pub(crate) fn enforce_sum_eq(
         }
         t = builder.sub(t, rhs[0][i]);
         t = builder.sub(t, rhs[1][i]);
-        // The difference must be exactly `2^24 · carry` with `carry ∈ {0,1}`.
+        // The difference must be exactly `2^24 · carry`. Both sides contain
+        // two checked limbs, so the only valid carry/borrow values are
+        // {-1, 0, 1}. Enforce membership with c(c-1)(c+1) = 0.
         let next = builder.div(t, radix);
-        builder.decompose_to_bits::<BabyBear>(next, 1)?;
+        let next_minus_one = builder.sub(next, one);
+        let next_plus_one = builder.add(next, one);
+        let roots = builder.mul(next, next_minus_one);
+        let roots = builder.mul(roots, next_plus_one);
+        builder.assert_zero(roots);
         carry = Some(next);
     }
     // No overflow past the top limb.

@@ -131,6 +131,47 @@ fn one_input_transfer_spending_mint_output_verifies() {
     println!("one-input transfer verify: {:?}", started.elapsed());
 }
 
+/// A received one-input output can itself be forwarded. This is the exact
+/// zero-confirmation wallet shape: mint -> sender transfer -> recipient
+/// transfer. It guards the recursive verifier's public-input relay against
+/// double-assigning extension-field witness coefficients.
+#[test]
+#[ignore = "slow regression: two recursive one-input proofs"]
+fn one_input_transfer_spending_one_input_output_verifies() {
+    let coins = [coin(25_000_000, 0x22, 0x33), coin(0, 0x44, 0x55)];
+    let mint = prove_genesis_mint(
+        &asset_genesis(),
+        &ISSUER_SECRET,
+        &Digest::from_bytes([0xaa; 32]),
+        &coins,
+    )
+    .expect("mint proving");
+
+    let first_input = (coins[0].clone(), osk(0x22));
+    let first_outputs = [coin(25_000_000, 0x66, 0x77), coin(0, 0x22, 0x99)];
+    let started = Instant::now();
+    let first = prove_one_input_transfer(&asset_id(), &first_input, &first_outputs, &mint, 0)
+        .expect("first one-input transfer proving");
+    println!("first one-input hop prove: {:?}", started.elapsed());
+    verify_coin_proof(&first.statement, &first).expect("first one-input hop verifies");
+
+    let second_input = (first_outputs[0].clone(), osk(0x66));
+    let second_outputs = [coin(10_000_000, 0x44, 0x12), coin(15_000_000, 0x66, 0x13)];
+    let started = Instant::now();
+    let second = prove_one_input_transfer(&asset_id(), &second_input, &second_outputs, &first, 0)
+        .expect("forwarded one-input transfer proving");
+    println!("second one-input hop prove: {:?}", started.elapsed());
+    verify_coin_proof(&second.statement, &second).expect("forwarded one-input hop verifies");
+    assert_eq!(
+        second.statement.nullifiers[0],
+        second_input.0.nullifier(&second_input.1)
+    );
+    assert_eq!(
+        second.statement.nullifiers[1],
+        Digest::from_bytes([0u8; 32])
+    );
+}
+
 #[test]
 #[ignore = "release benchmark: two recursive one-input proofs"]
 fn one_input_transfer_cold_warm_benchmark() {

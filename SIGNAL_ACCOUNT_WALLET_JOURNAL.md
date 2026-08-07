@@ -50,6 +50,112 @@ observer evaluation, and CBF/SPV confirmation. In particular,
 transition can now be attributed honestly instead of being published as proof
 time.
 
+## 2026-08-07 — real Signal forwarding exposed value-carry and chain-state defects
+
+A real simulator payment, not a mocked UI, anchored 25 Test USD in transaction
+`e5ffe6076052e4bf98ba117d7122d79e21de14ed0992070c0dbe85da22dd9ee9`.
+The recipient verified and credited the Signal attachment while the parent was
+unconfirmed. Forwarding 10 Test USD then failed deterministically during local
+proof generation. An exact reproducer loaded Bob's persisted consignment and
+derived owner branch without printing either secret. It identified the
+conflicting field value `2013265920` as BabyBear `-1` in the value-conservation
+gadget—not a recursion or attachment defect.
+
+Values use 24/24/16-bit limbs. The valid split `25_000_000 = 10_000_000 +
+15_000_000` requires a `-1` borrow from the low limb, but the gadget had
+incorrectly constrained every intermediate carry to the Boolean set `{0, 1}`.
+The repair constrains each intermediate carry to `{-1, 0, 1}` with
+`c(c-1)(c+1) = 0` and still pins the final carry to zero. A fast exact-split
+regression passes, the full transfer target passes six tests, and the
+release-mode mint -> one-input transfer -> forwarded one-input transfer proves
+in 6.522 seconds and 7.226 seconds on this Mac. The persisted-consignment
+reproducer also completes and verifies. These are development-host receipts,
+not iPhone product performance claims.
+
+Signet confirmed the parent before the next receive scan. That scan exposed a
+second defect: the provisional snapshot helper appended a mempool-sentinel
+copy even when the confirmed snapshot already contained the exact txid. The
+kernel correctly reported the transaction as conflicting with itself. The
+helper now resolves the consignment's sentinel reference to the single
+canonical confirmed entry, validates that entry's record and funding context,
+and injects a sentinel only while the exact transaction is genuinely absent
+from confirmed history. The focused confirmed-parent regression passes.
+
+The same acceptance run found one corrupt rebuildable BIP158 filter returned
+by a public peer and cached at signet height 316586. Its bytes did not match the
+cross-peer-committed filter hash. Invalid cached candidates are now deleted and
+refetched, and an invalid response from one peer no longer prevents trying the
+remaining independent peers. The complete `opencsv-cbf` suite passes: 48 tests
+across unit and non-live integration targets, zero failures. No wallet secret,
+asset checkpoint, transaction, or confirmed-chain commitment is rewritten by
+that cache repair.
+
+The repaired framework then resumed the same real Signal flow successfully.
+Bob's durable operation `052f6e79210ca3a847cca6eded9871ca` spent 10 Test USD
+from the received 25 Test USD coin and retained 15 Test USD change. It signed
+and persisted signet transaction
+`a3a3f4b12f71e3423801cea069e5251260aeae70fb9cfd133cd7aaefce12dc0a`,
+submitted the complete bytes to two of two configured Bitcoin peers, and
+delivered the 786,326-byte Signal attachment. The required pinned Blockstream
+observer returned identical raw bytes in 347 ms under the
+`lets_encrypt_yr` profile. The optional mempool.space observer timed out after
+8.025 seconds and was recorded as unavailable; it was not silently counted as
+success. Carol verified the proof, ownership, anchor binding, and exact
+mempool transaction, then credited `+10 USD` as **available before
+confirmation · replacement risk**. This is the first live forwarding receipt
+for the negative-carry split; it remains a signet Test USD receipt with no
+monetary or redemption claim. The anchor subsequently confirmed at signet
+height 316620 in block
+`0000000897a36fd043cb0c061f4f66b7575cfc1ac166cd0f67a6d81b24e3b5e3`.
+
+The unmodified simulator captures are retained under
+`receipts/ios/2026-08-07/real-signal-usd/`. The 38.067-second consumer cut uses
+only those real Signal recordings and removes waiting time; it does not
+reconstruct or fabricate application screens. Its file is
+`opencsv-real-signal-test-usd-quick-demo.mp4` and its SHA-256 is
+`ca859b8e130c2960b7541b92ca60fc83d29da6c2f9e5aab9fd42f931871808e0`.
+
+## 2026-08-07 — authoritative verification reduced from minutes to seconds
+
+The instrumented return receipt separated a 6.237-second proof and 42 ms of
+signing/persistence from 77.861 seconds of funding verification and 93.163
+seconds of pre-sign verification. The delay was not Bitcoin confirmation and
+was not proof generation. Each phase opened a new CBF client, re-requested the
+complete 316k-height filter-hash chain from every peer, and the paged linkage
+loop re-folded the growing prefix on every page.
+
+The accepted repair has three layers:
+
+1. filter-header paging carries one rolling linkage value, making a cold full
+   attestation linear rather than quadratic;
+2. a new connection re-derives the filter header over the complete persisted
+   prefix and asks every peer to re-attest an exact 144-block tail plus its
+   preceding header, then fetches only new hashes; changing any earlier cached
+   hash changes that linkage unless SHA256d second-preimage resistance fails;
+3. the account wallet retains that independently attested CBF session across
+   the proof and pre-sign phases, resyncs it to the current agreed header tip,
+   and rechecks the exact outpoint instead of reconnecting. Failed public peers
+   are pruned, but signet/mainnet signing still requires two surviving peers
+   that agree. A TCP handshake or advertised service bit is not sufficient.
+
+Using a copy of Bob's rebuildable public-chain cache and five independently
+addressed public signet peers, the release readiness probe reached tip 316628
+with five completed attestations in 1.837 seconds. A second same-session tip
+sync took 417 ms without another handshake; scanning the newest filter took
+124 ms. Parallel connection and attestation mean an unavailable peer consumes
+one timeout budget rather than serially delaying every healthy peer. The
+connection transferred 11,425 bytes out and 30,757 bytes in, rather than
+replaying megabytes of historical filter hashes. The complete CBF target (50
+unit/non-live integration tests), exact sign-time recently-spent rejection,
+formatting, and warnings-denied crate Clippy pass.
+
+This optimization does not call an unconfirmed transaction confirmed, remove
+the pre-sign outpoint check, trust the disk cache, or weaken the two-peer
+minimum. It removes redundant computation so a small payment can become
+explicitly `available before confirmation` promptly under its separately
+configured observer policy. A continuous Bob/Carol operation still has to
+measure the full Signal path before this becomes a product-latency claim.
+
 ## Persistence decision
 
 Enabling BDK's optional SQLite feature failed dependency resolution because it

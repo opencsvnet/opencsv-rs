@@ -61,6 +61,21 @@ fn prove_and_verify_transfer() {
     println!("verify_transfer: {:?}", t.elapsed());
 }
 
+/// A valid split may borrow across the 24-bit limb boundary. In BabyBear,
+/// the first carry for 25_000_000 = 10_000_000 + 15_000_000 is `-1`.
+#[test]
+fn transfer_split_with_negative_limb_carry_verifies() {
+    let inputs = [
+        (coin(25_000_000, 0x22, 0x33), osk(0x22)),
+        (coin(0, 0x44, 0x55), osk(0x44)),
+    ];
+    let outputs = [coin(10_000_000, 0x66, 0x77), coin(15_000_000, 0x88, 0x99)];
+
+    let transfer = prove_transfer(&asset_id(), &inputs, &outputs)
+        .expect("a balanced split with a negative limb carry must prove");
+    verify_transfer(&transfer.statement, &transfer).expect("negative-carry split proof verifies");
+}
+
 /// Negative test: Σ v_in ≠ Σ v_out must fail proving (at witness generation,
 /// on the carry constraints).
 #[test]

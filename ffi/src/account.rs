@@ -10,7 +10,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use base64::Engine as _;
@@ -472,6 +472,12 @@ struct CbfFundingVerifier {
     cache_dir: PathBuf,
     timeout: Duration,
     max_blocks: u64,
+    // One independently attested peer session is shared by the proof and
+    // pre-sign phases. The first call performs the complete cross-peer
+    // filter-header attestation; later calls resync only the appended range
+    // before rechecking the exact outpoint. Reconnecting here would replay the
+    // full public chain for every phase of one payment.
+    client: Mutex<Option<CbfClient>>,
 }
 
 impl FundingVerifier for CbfFundingVerifier {
@@ -492,19 +498,54 @@ impl FundingVerifier for CbfFundingVerifier {
                 "signet/mainnet fee validation requires at least two compact-filter peers",
             ));
         }
-        let config = CbfConfig {
-            network,
-            peers: self.peers.clone(),
-            cache_dir: self.cache_dir.clone(),
-            timeout: self.timeout,
-        };
-        let mut client = CbfClient::connect(&config).map_err(|error| {
+        let mut client_guard = self.client.lock().map_err(|_| {
             AccountError::new(
                 "stale_chain_state",
-                format!("authoritative fee-outpoint sync: {error}"),
+                "authoritative fee-outpoint verifier lock was poisoned",
             )
         })?;
-        let verdict = client
+        if let Some(client) = client_guard.as_mut() {
+            if let Err(error) = client.sync() {
+                // A failed live session is never reused. This call still
+                // fails closed; a later operation may establish a fresh,
+                // independently attested session.
+                *client_guard = None;
+                return Err(AccountError::new(
+                    "stale_chain_state",
+                    format!("authoritative fee-outpoint resync: {error}"),
+                ));
+            }
+            if network != OpenCsvNetwork::Regtest && client.connected_peer_count() < 2 {
+                *client_guard = None;
+                return Err(AccountError::new(
+                    "stale_chain_state",
+                    "authoritative fee-outpoint resync retained fewer than two independent peers",
+                ));
+            }
+        } else {
+            let config = CbfConfig {
+                network,
+                peers: self.peers.clone(),
+                cache_dir: self.cache_dir.clone(),
+                timeout: self.timeout,
+            };
+            let client = CbfClient::connect(&config).map_err(|error| {
+                AccountError::new(
+                    "stale_chain_state",
+                    format!("authoritative fee-outpoint sync: {error}"),
+                )
+            })?;
+            if network != OpenCsvNetwork::Regtest && client.connected_peer_count() < 2 {
+                return Err(AccountError::new(
+                    "stale_chain_state",
+                    "authoritative fee-outpoint sync retained fewer than two independent peers",
+                ));
+            }
+            *client_guard = Some(client);
+        }
+        let verdict = client_guard
+            .as_mut()
+            .expect("client established above")
             .verify_outpoint_unspent(
                 CbfOutPoint {
                     txid: request.outpoint.txid.to_byte_array(),
@@ -1537,6 +1578,7 @@ impl AccountWallet {
             cache_dir: PathBuf::from(format!("{database_path}.cbf")),
             timeout: Duration::from_secs(config.verification_timeout_secs),
             max_blocks: config.max_verification_blocks,
+            client: Mutex::new(None),
         });
         let mut account = Self {
             config,
@@ -5493,9 +5535,16 @@ impl AccountWallet {
                     }
                 }
                 self.db.conn.execute(
-                    "UPDATE opencsv_operations SET receipt_json = ?2,
-                     updated_at = ?3 WHERE operation_id = ?1",
-                    params![operation_id, receipt.to_string(), unix_time()?],
+                    "UPDATE opencsv_operations SET state = ?2,
+                     rejection_reason = 'broadcast_unobserved',
+                     receipt_json = ?3, updated_at = ?4
+                     WHERE operation_id = ?1",
+                    params![
+                        operation_id,
+                        OperationState::BroadcastUnobserved.as_str(),
+                        receipt.to_string(),
+                        unix_time()?
+                    ],
                 )?;
                 operation_json(&self.operation(operation_id)?)
             }
@@ -8944,11 +8993,26 @@ fn snapshot_with_unconfirmed_anchor(
     snapshot.entries.retain(|entry| {
         entry.height != MEMPOOL_LOCATION.height || entry.position != MEMPOOL_LOCATION.position
     });
+    let expected_ctx = funding_context(funding);
+    if let Some(confirmed) = snapshot.entries.iter().find(|entry| entry.txid == txid_hex) {
+        if confirmed.ctx != hex_encode(&expected_ctx) || confirmed.record != hex_encode(&record) {
+            return Err(AccountError::new(
+                "unconfirmed_anchor_mismatch",
+                "confirmed anchor with the expected txid does not match the exact transaction context and record",
+            ));
+        }
+        // The consignment still carries the mempool sentinel, but
+        // SnapshotChain resolves that reference by txid to this canonical
+        // confirmed location. Injecting a second sentinel entry would make
+        // the transaction conflict with itself during first-occurrence
+        // checks.
+        return Ok(snapshot);
+    }
     snapshot.entries.push(SnapshotEntry {
         height: MEMPOOL_LOCATION.height,
         position: MEMPOOL_LOCATION.position,
         txid: txid_hex,
-        ctx: hex_encode(&funding_context(funding)),
+        ctx: hex_encode(&expected_ctx),
         record: hex_encode(&record),
     });
     Ok(snapshot)
@@ -10038,6 +10102,39 @@ mod tests {
             error.code,
             "unconfirmed_anchor_mismatch" | "protocol_layout_violation"
         ));
+
+        let confirmed_location = opencsv_core::chain::AnchorLocation {
+            height: 101,
+            position: 4,
+        };
+        let confirmed_snapshot = Snapshot {
+            tip_height: 102,
+            entries: vec![SnapshotEntry {
+                height: confirmed_location.height,
+                position: confirmed_location.position,
+                txid: hex_encode(&consignment.anchor_ref.txid),
+                ctx: hex_encode(&funding_context(funding)),
+                record: hex_encode(&record),
+            }],
+        };
+        let settled = snapshot_with_unconfirmed_anchor(
+            &serde_json::to_string(&confirmed_snapshot).unwrap(),
+            &consignment,
+            &transaction,
+        )
+        .unwrap();
+        assert_eq!(
+            settled.entries.len(),
+            1,
+            "do not duplicate a confirmed anchor"
+        );
+        assert_eq!(settled.entries[0].height, confirmed_location.height);
+        assert_eq!(settled.entries[0].position, confirmed_location.position);
+        let settled_chain = SnapshotChain::from_snapshot(&settled).unwrap();
+        assert_eq!(
+            opencsv_core::chain::AnchorChain::locate(&settled_chain, &consignment.anchor_ref),
+            Some(confirmed_location)
+        );
     }
 
     #[test]

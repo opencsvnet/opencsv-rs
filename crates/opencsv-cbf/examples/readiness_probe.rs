@@ -18,18 +18,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Err("readiness probe requires at least two configured peers".into());
     }
 
+    let timeout_seconds = std::env::var("OPENCSV_CBF_TIMEOUT_SECS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(60);
     let started = Instant::now();
     let mut client = CbfClient::connect(&Config {
         network: Network::Signet,
         peers,
         cache_dir,
-        timeout: Duration::from_secs(60),
+        timeout: Duration::from_secs(timeout_seconds),
     })?;
     let connection_sync_ms = elapsed_ms(started);
     if client.connected_peer_count() < 2 {
         return Err(format!(
-            "only {} compact-filter peer(s) connected; readiness requires two",
-            client.connected_peer_count()
+            "only {} compact-filter peer(s) completed synchronization ({:?}); readiness requires two",
+            client.connected_peer_count(),
+            client.connected_peer_addresses(),
         )
         .into());
     }

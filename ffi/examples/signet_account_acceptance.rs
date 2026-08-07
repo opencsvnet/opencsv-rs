@@ -17,7 +17,7 @@ use opencsv_ffi::account::AccountWallet;
 use serde_json::{json, Value};
 
 const DEFAULT_ESPLORA: &str = "https://mempool.space/signet/api";
-const DEFAULT_PEERS: &str = "172.233.20.188:38333,15.204.114.107:38333";
+const DEFAULT_PEERS: &str = "15.204.114.107:38333,206.168.190.147:38333,172.233.20.188:38333,116.202.84.94:38333,208.68.4.50:38333";
 
 fn decode_secret(name: &str) -> Result<[u8; 32], Box<dyn Error>> {
     let encoded = env::var(name).map_err(|_| format!("{name} must be set"))?;

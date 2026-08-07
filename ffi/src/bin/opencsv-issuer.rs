@@ -128,6 +128,17 @@ enum OperationCommand {
     },
     /// Resume an interrupted operation idempotently.
     Resume(OperationId),
+    /// Admit exact unconfirmed bytes after independent pinned observation.
+    Observe {
+        #[command(flatten)]
+        operation: OperationId,
+        /// File containing the exact raw Bitcoin transaction bytes.
+        #[arg(long)]
+        raw_transaction: PathBuf,
+        /// JSON file containing observation evidence from the pinned client.
+        #[arg(long)]
+        observations: PathBuf,
+    },
     /// Cancel an operation that has not been broadcast.
     Cancel(OperationId),
     /// Replace an OpenCSV-created unconfirmed transaction without changing its protocol layout.
@@ -274,6 +285,26 @@ fn run(cli: Cli) -> Result<Value, CliError> {
         Command::Operation(OperationCommand::Resume(operation)) => wallet
             .resume_operation(&operation.operation_id)
             .map_err(Into::into),
+        Command::Operation(OperationCommand::Observe {
+            operation,
+            raw_transaction,
+            observations,
+        }) => {
+            let raw_transaction = fs::read(&raw_transaction).map_err(|error| {
+                CliError::new(
+                    "raw_transaction_read_failed",
+                    format!("{}: {error}", raw_transaction.display()),
+                )
+            })?;
+            let observations = read_text(&observations, "observation_evidence_read_failed")?;
+            wallet
+                .observe_operation_unconfirmed(
+                    &operation.operation_id,
+                    &raw_transaction,
+                    &observations,
+                )
+                .map_err(Into::into)
+        }
         Command::Operation(OperationCommand::Cancel(operation)) => wallet
             .cancel_operation(&operation.operation_id)
             .map_err(Into::into),

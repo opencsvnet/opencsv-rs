@@ -17,6 +17,8 @@ use crate::gcs::{filter_key, GcsFilter, BASIC_FILTER_M, BASIC_FILTER_P};
 use crate::network::{params, Params};
 use crate::peer::Peer;
 
+const FILTER_CACHE_REATTEST_BLOCKS: u64 = 144;
+
 /// Client configuration.
 #[derive(Clone, Debug)]
 pub struct Config {
@@ -219,6 +221,7 @@ impl CbfClient {
         let mut peers = Vec::new();
         let mut failures = Vec::new();
         let mut resolved_peers = HashSet::new();
+        let mut connect_tasks = Vec::new();
         for peer in &config.peers {
             let addr = match resolve(peer, params.default_port) {
                 Ok(addr) => addr,
@@ -232,9 +235,17 @@ impl CbfClient {
                 continue;
             }
             let tip = chain.tip_height().unwrap_or(0);
-            match Peer::connect(addr, &params, config.timeout, tip) {
-                Ok(peer) => peers.push(peer),
-                Err(e) => failures.push(format!("{peer}: {e}")),
+            let timeout = config.timeout;
+            connect_tasks.push((
+                peer.clone(),
+                std::thread::spawn(move || Peer::connect(addr, &params, timeout, tip)),
+            ));
+        }
+        for (name, task) in connect_tasks {
+            match task.join() {
+                Ok(Ok(peer)) => peers.push(peer),
+                Ok(Err(error)) => failures.push(format!("{name}: {error}")),
+                Err(_) => failures.push(format!("{name}: connection worker panicked")),
             }
         }
         if peers.is_empty() {
@@ -264,15 +275,45 @@ impl CbfClient {
         // merely observe the first peer's result instead of attesting it.
         let base_chain = self.chain.clone();
         let mut candidates = Vec::with_capacity(self.peers.len());
-        for peer in &mut self.peers {
+        let mut header_peers = Vec::with_capacity(self.peers.len());
+        let mut header_failures = Vec::new();
+        let mut header_tasks = Vec::new();
+        for mut peer in std::mem::take(&mut self.peers) {
+            let address = peer.addr();
             let mut candidate = base_chain.clone();
-            candidate.sync(peer)?;
+            header_tasks.push((
+                address,
+                std::thread::spawn(move || {
+                    let result = candidate.sync(&mut peer);
+                    (peer, candidate, result)
+                }),
+            ));
+        }
+        for (address, task) in header_tasks {
+            let (peer, candidate, result) = match task.join() {
+                Ok(result) => result,
+                Err(_) => {
+                    header_failures.push(format!("{address}: header worker panicked"));
+                    continue;
+                }
+            };
+            if let Err(error) = result {
+                header_failures.push(format!("{address}: {error}"));
+                continue;
+            }
             let tip = (
                 candidate.tip_height(),
                 candidate.tip_height().and_then(|h| candidate.hash_at(h)),
                 candidate.tip_work(),
             );
-            candidates.push((peer.addr(), tip, candidate));
+            candidates.push((address, tip, candidate));
+            header_peers.push(peer);
+        }
+        if candidates.is_empty() {
+            return Err(Error::NoPeers(format!(
+                "no peer completed header synchronization: {}",
+                header_failures.join("; ")
+            )));
         }
         let first_tip = candidates[0].1;
         if candidates.iter().any(|(_, tip, _)| *tip != first_tip) {
@@ -284,23 +325,58 @@ impl CbfClient {
             return Err(Error::DivergentPeers(format!("header tips: {detail}")));
         }
         let agreed_chain = candidates.remove(0).2;
+        self.peers = header_peers;
         let common_prefix = self.chain.common_prefix_len(&agreed_chain);
         self.chain = agreed_chain;
         self.filter_chain.truncate(common_prefix);
 
-        // On every new connection, re-fetch the complete filter-hash chain
-        // from each peer. Filter hashes are not committed in block headers,
-        // so a disk cache cannot be authoritative. Later syncs on these same
-        // authenticated connections fetch only the newly appended range.
+        // On a new connection, each peer re-attests the cached tail and the
+        // preceding filter header derived from the complete local prefix.
+        // This detects any cache mutation under SHA256d second-preimage
+        // resistance without replaying every historical cfheaders page.
+        // Fresh installs still fetch and cross-check the complete chain.
         let stop = self.chain.tip_height().expect("genesis synced");
-        let base_filters = if revalidate_filter_cache {
-            FilterHeaderChain::empty()
-        } else {
-            self.filter_chain.clone()
-        };
+        let base_filters = self.filter_chain.clone();
         let mut reference: Option<Vec<[u8; 32]>> = None;
-        for peer in &mut self.peers {
-            let fetched = base_filters.fetch_range(peer, &self.chain, stop)?;
+        let mut filter_peers = Vec::with_capacity(self.peers.len());
+        let mut filter_failures = Vec::new();
+        let mut filter_tasks = Vec::new();
+        for mut peer in std::mem::take(&mut self.peers) {
+            let address = peer.addr();
+            let filters = base_filters.clone();
+            let chain = self.chain.clone();
+            filter_tasks.push((
+                address,
+                std::thread::spawn(move || {
+                    let result = (|| {
+                        if revalidate_filter_cache && !filters.is_empty() {
+                            filters.reattest_tail(
+                                &mut peer,
+                                &chain,
+                                FILTER_CACHE_REATTEST_BLOCKS,
+                            )?;
+                        }
+                        filters.fetch_range(&mut peer, &chain, stop)
+                    })();
+                    (peer, result)
+                }),
+            ));
+        }
+        for (address, task) in filter_tasks {
+            let (peer, result) = match task.join() {
+                Ok(result) => result,
+                Err(_) => {
+                    filter_failures.push(format!("{address}: filter worker panicked"));
+                    continue;
+                }
+            };
+            let fetched = match result {
+                Ok(fetched) => fetched,
+                Err(error) => {
+                    filter_failures.push(format!("{address}: {error}"));
+                    continue;
+                }
+            };
             match &reference {
                 None => reference = Some(fetched),
                 Some(expected) => {
@@ -311,13 +387,17 @@ impl CbfClient {
                     }
                 }
             }
+            filter_peers.push(peer);
         }
+        if filter_peers.is_empty() {
+            return Err(Error::NoPeers(format!(
+                "no peer completed filter-header synchronization: {}",
+                filter_failures.join("; ")
+            )));
+        }
+        self.peers = filter_peers;
         if let Some(new_hashes) = reference {
-            if revalidate_filter_cache {
-                self.filter_chain = FilterHeaderChain::from_verified(new_hashes);
-            } else {
-                self.filter_chain.extend(&new_hashes);
-            }
+            self.filter_chain.extend(&new_hashes);
         }
         self.chain.persist(&self.cache_dir)?;
         self.filter_chain.persist(&self.cache_dir)?;
@@ -339,6 +419,13 @@ impl CbfClient {
     /// Number of independently connected peers participating in agreement.
     pub fn connected_peer_count(&self) -> usize {
         self.peers.len()
+    }
+
+    /// Addresses of peers that completed the current header and filter-header
+    /// agreement pass. Peers that merely completed TCP/version negotiation but
+    /// failed synchronization are not included.
+    pub fn connected_peer_addresses(&self) -> Vec<SocketAddr> {
+        self.peers.iter().map(Peer::addr).collect()
     }
 
     /// Complete P2P wire bytes sent and received by this client.
@@ -374,30 +461,50 @@ impl CbfClient {
             .cache_dir
             .join("filters")
             .join(format!("{height:08}.filter"));
-        if let Ok(bytes) = std::fs::read(&path) {
-            self.filter_chain.verify_filter(height, &bytes)?;
-            return Ok(bytes);
+        let mut last_err = None;
+        match std::fs::read(&path) {
+            Ok(bytes) => match self.filter_chain.verify_filter(height, &bytes) {
+                Ok(()) => return Ok(bytes),
+                Err(error) => {
+                    // Compact filters are rebuildable public-chain cache.
+                    // A truncated or dishonest cached candidate must not
+                    // permanently brick synchronization at this height.
+                    let _ = std::fs::remove_file(&path);
+                    last_err = Some(error);
+                }
+            },
+            Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+                last_err = Some(error.into());
+            }
+            Err(_) => {}
         }
         let block_hash = self
             .chain
             .hash_at(height)
             .ok_or_else(|| Error::Filter(format!("no block at height {height}")))?;
-        let mut last_err = None;
         for peer in &mut self.peers {
             match peer.get_cfilter(height as u32, &block_hash) {
-                Ok(cfilter) => {
-                    self.filter_chain
-                        .verify_filter(height, &cfilter.filter_bytes)?;
-                    if let Some(parent) = path.parent() {
-                        std::fs::create_dir_all(parent)?;
+                Ok(cfilter) => match self
+                    .filter_chain
+                    .verify_filter(height, &cfilter.filter_bytes)
+                {
+                    Ok(()) => {
+                        if let Some(parent) = path.parent() {
+                            std::fs::create_dir_all(parent)?;
+                        }
+                        std::fs::write(&path, &cfilter.filter_bytes)?;
+                        return Ok(cfilter.filter_bytes);
                     }
-                    std::fs::write(&path, &cfilter.filter_bytes)?;
-                    return Ok(cfilter.filter_bytes);
-                }
+                    // An invalid response is one bad peer, not a reason to
+                    // skip the remaining independently connected peers.
+                    Err(error) => last_err = Some(error),
+                },
                 Err(e) => last_err = Some(e),
             }
         }
-        Err(last_err.expect("at least one peer"))
+        Err(last_err.unwrap_or_else(|| {
+            Error::NoPeers(format!("no peer supplied filter at height {height}"))
+        }))
     }
 
     /// Does the BIP158 basic filter of the block at `height` match

@@ -38,8 +38,13 @@ position proves the claim false — `AnchorVerdict::NotPresent(_)`.
 hashes, and fetched filters are persisted in `Config::cache_dir` — a
 rebuildable cache: deleting it only forces a resync, and cached data is
 re-validated on load (headers). Because filter hashes are not committed in
-block headers, every new connection re-fetches their complete chain from all
-peers before use; later syncs on those same connections fetch only the suffix.
+block headers, a fresh cache fetches their complete chain from all peers. A
+later connection locally re-derives the linkage over the complete cached
+prefix, asks every peer to re-attest the exact 144-block tail and its preceding
+filter header, and then fetches only the suffix. Later syncs on those same
+connections also fetch only the suffix. This keeps the cache rebuildable and
+detects an altered prefix under SHA256d second-preimage resistance without
+replaying hundreds of thousands of filter hashes before every wallet action.
 
 ## The filter layer — and an honest caveat
 
@@ -171,9 +176,11 @@ inclusion, **not** transaction or block validity. Its security rests on:
   peers you don't all reach through one network path.
 - **Filter-header chain agreement.** Filter headers are not committed
   in block headers, so a malicious peer could serve wrong filters
-  (hiding filter matches). The client fetches the filter-header chain
-  from every peer and requires byte-identical filter hashes before use
-  (BIP157's one-honest-peer model). Note this protects only the
+  (hiding filter matches). For a fresh cache, the client fetches the complete
+  filter-header chain from every peer and requires byte-identical filter
+  hashes. For a persisted cache, it re-derives the complete local prefix
+  commitment and requires every peer to attest the exact tail and any new
+  suffix (BIP157's one-honest-peer model). Note this protects only the
   *filter* layer — the anchor verdict itself never depends on a filter
   match (see the caveat above), so filter misbehavior alone cannot
   forge or hide an anchor.
