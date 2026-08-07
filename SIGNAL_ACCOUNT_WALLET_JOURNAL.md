@@ -653,3 +653,37 @@ library suite passes 65 tests with two deliberate slow-proof cases ignored;
 the DEBUG recovery-feature suite passes 67 with the same two ignored. A live
 recipient retry and duplicate-delivery check remain acceptance gates rather
 than claims in this entry.
+
+## 2026-08-07 — chain views use the unified account identity
+
+The next Bob retry passed the corrected batch-proof check and then failed at
+the ownership step with `NoOwnedOutput`. The attachment did contain the owner
+address Carol selected for Bob. The mismatch came from Signal's read-only
+self-scan and cross-check preflight still using the retired prototype wallet's
+independent owner seed, while sending and durable crediting had already moved
+to the Rust-owned account wallet. A correct payment was therefore tested
+against an unrelated public owner before the account wallet could see it.
+
+The product chain-view path now calls the account-scoped scan and cross-check
+FFI boundaries, which keep the account's private owner material inside Rust.
+The legacy wallet overloads remain only for compatibility tests and old state;
+they are not used to decide current account payments. Cross-check tip
+disagreement retains its structured tips and remains a hard failure.
+
+Confirmed batching-v2 credits also need the exact envelope after the read-only
+scan accepts them. The CBF snapshot export now includes one deduplicated batch
+entry with the exact version and full payload envelope recovered from the
+independently fetched block. The account's snapshot verifier revalidates that
+envelope against the header before projecting any member proof. It never
+accepts a header-only batch record.
+
+Stored verdict version 3 creates a bounded repair path: pre-version-2
+`InvalidProof` and pre-version-3 `NoOwnedOutput` results are retried once under
+the corrected verifier. Current invalid proofs and genuinely third-party
+outputs remain final instead of replaying on every activation. Focused tests
+cover the exact exported envelope, transaction-level deduplication, structured
+tip disagreement, and version-scoped verdict retry. Live credit and duplicate
+delivery remain acceptance gates rather than claims in this entry. The full
+warnings-as-errors FFI library suite passes 67 tests with two deliberate slow
+proof cases ignored; the DEBUG recovery-feature suite passes 69 with the same
+two ignored.

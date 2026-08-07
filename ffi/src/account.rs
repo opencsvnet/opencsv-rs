@@ -3060,21 +3060,22 @@ impl AccountWallet {
 
     /// Read-only N-of-M chain-view decision using this account's identities.
     pub fn cross_check(&self, request_json: &str) -> Result<Value, AccountError> {
-        crosscheck::run_cross_check(
+        match crosscheck::run_cross_check(
             request_json,
             &self.owner_secrets()?,
             &self.known_asset_ids()?,
             &opencsv_pcd::CoinProofVerifier,
-        )
-        .map_err(|failure| match failure {
-            crosscheck::CrossCheckFailure::TipDisagreement(tips) => AccountError::new(
-                "tip_disagreement",
-                format!("anchor backends disagree on tip height: {tips:?}"),
-            ),
-            crosscheck::CrossCheckFailure::Other(message) => {
-                AccountError::new("cross_check_failed", message)
+        ) {
+            Ok(value) => Ok(value),
+            Err(crosscheck::CrossCheckFailure::TipDisagreement(tips)) => Ok(json!({
+                "error": format!("anchor backends disagree on tip height: {tips:?}"),
+                "kind": "tip_disagreement",
+                "tips": tips,
+            })),
+            Err(crosscheck::CrossCheckFailure::Other(message)) => {
+                Err(AccountError::new("cross_check_failed", message))
             }
-        })
+        }
     }
 
     /// Opt-in issuer-tool manifest constructor. Signal's production FFI has no
@@ -10190,6 +10191,30 @@ mod tests {
         let mut value: Value = serde_json::from_str(&config(AccountRole::Primary, true)).unwrap();
         value["usd_issuers"] = Value::Array(issuers);
         value.to_string()
+    }
+
+    #[test]
+    fn account_cross_check_preserves_tip_disagreement_evidence() {
+        let dir = tempfile::tempdir().unwrap();
+        let wallet = AccountWallet::open(
+            &config(AccountRole::Primary, true),
+            &[49_u8; 32],
+            dir.path().join("wallet.sqlite").to_str().unwrap(),
+        )
+        .unwrap();
+        let request = json!({
+            "backends": [
+                {"type": "snapshot", "snapshot": {"tip_height": 50, "entries": []}},
+                {"type": "snapshot", "snapshot": {"tip_height": 51, "entries": []}},
+            ],
+            "consignment_base64": "",
+            "required_confirmations": 6,
+        });
+
+        let verdict = wallet.cross_check(&request.to_string()).unwrap();
+
+        assert_eq!(verdict["kind"], "tip_disagreement");
+        assert_eq!(verdict["tips"], json!([50, 51]));
     }
 
     #[test]

@@ -280,30 +280,48 @@ fn registered_required_confirmations() -> u64 {
 /// and location is PoW-verified already. Local-only — no network.
 ///
 /// Batch anchors contribute one snapshot entry per *transaction*
-/// (deduplicated by `(location, txid)`): the snapshot contract models
-/// on-chain records, and batch payloads ride the witness envelope,
-/// which the snapshot consumer's occurrence rules intentionally do not
-/// see (consistent with the accept driver).
+/// (deduplicated by `(location, txid)`) plus the exact versioned witness
+/// envelope read from the independently fetched full block. The account
+/// verifier needs that authenticated envelope to project the selected member
+/// into the single-XFER statement its proof was authored against.
 pub fn export_snapshot_json() -> Result<Value, String> {
     let index = registered_index()?;
+    let entries = snapshot_entries(index.occurrences());
+    Ok(json!({
+        "tip_height": index.synced_tip(),
+        "entries": entries,
+    }))
+}
+
+fn snapshot_entries(occurrences: &[opencsv_cbf::ScannedAnchor]) -> Vec<Value> {
     let mut seen = std::collections::BTreeSet::new();
     let mut entries = Vec::new();
-    for e in index.occurrences() {
+    for e in occurrences {
         if seen.insert((e.location, e.txid)) {
-            entries.push(json!({
+            let mut entry = json!({
                 "height": e.location.height,
                 "position": e.location.position,
                 "txid": to_hex(&e.txid),
                 "ctx": to_hex(&e.ctx),
                 "record": to_hex(&e.record.to_bytes()),
-            }));
+            });
+            if let Some(batch) = &e.batch {
+                let version = match batch.version {
+                    opencsv_core::BatchVersion::V1 => 1,
+                    opencsv_core::BatchVersion::V2 => 2,
+                };
+                entry["batch"] = json!({
+                    "version": version,
+                    "payloads": batch.envelope.iter()
+                        .map(|payload| to_hex(payload.as_bytes()))
+                        .collect::<Vec<_>>(),
+                });
+            }
+            entries.push(entry);
         }
     }
     entries.sort_by_key(|e| (e["height"].as_u64(), e["position"].as_u64()));
-    Ok(json!({
-        "tip_height": index.synced_tip(),
-        "entries": entries,
-    }))
+    entries
 }
 
 /// The occurrence-check request:
@@ -379,5 +397,54 @@ pub fn verify_json<V: ProofVerifier>(
             "reason": format!("{reason:?}"),
             "tip_height": tip,
         })),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use opencsv_cbf::fullscan::BatchCandidate;
+    use opencsv_cbf::ScannedAnchor;
+    use opencsv_core::chain::AnchorLocation;
+    use opencsv_core::{binding, AnchorRecord, BatchVersion, Digest};
+
+    #[test]
+    fn exported_scan_snapshot_retains_one_exact_batch_envelope() {
+        let ctx = [41_u8; 32];
+        let payloads = vec![
+            binding(&Digest::from_bytes([42_u8; 32]), &ctx).to_anchor(),
+            binding(&Digest::from_bytes([43_u8; 32]), &ctx).to_anchor(),
+        ];
+        let record = AnchorRecord::batch_header_v2(&payloads, &ctx);
+        let location = AnchorLocation {
+            height: 44,
+            position: 45,
+        };
+        let txid = [46_u8; 32];
+        let occurrences = (0..2)
+            .map(|index| ScannedAnchor {
+                location,
+                txid,
+                record,
+                ctx,
+                batch: Some(BatchCandidate {
+                    version: BatchVersion::V2,
+                    index,
+                    envelope: payloads.clone(),
+                }),
+            })
+            .collect::<Vec<_>>();
+
+        let exported = snapshot_entries(&occurrences);
+
+        assert_eq!(exported.len(), 1);
+        assert_eq!(exported[0]["batch"]["version"], 2);
+        assert_eq!(
+            exported[0]["batch"]["payloads"],
+            json!(payloads
+                .iter()
+                .map(|payload| to_hex(payload.as_bytes()))
+                .collect::<Vec<_>>()),
+        );
     }
 }
