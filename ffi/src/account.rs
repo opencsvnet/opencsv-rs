@@ -69,6 +69,7 @@ const DEFAULT_MAX_VERIFICATION_BLOCKS: u64 = 10_000;
 const MIN_FEE_RESERVE_SATS: u64 = 2_500;
 const SEND_BATCH_WINDOW_MILLIS: i64 = 2_000;
 const MAX_LOCAL_BATCH_RECIPIENTS: usize = opencsv_core::MAX_BATCH_V2_PARTICIPANTS;
+const DEPENDENCY_REOBSERVATION_CHECK_ID: &str = "dependency_esplora_reobserve";
 
 /// Stable account-wallet failure crossing the JSON/FFI boundary.
 #[derive(Debug)]
@@ -1019,6 +1020,7 @@ pub(crate) struct CompletedProofJob {
     pending_json: String,
     record: [u8; 64],
     unconfirmed_dependencies: Vec<String>,
+    dependency_observed_at: Option<i64>,
     phase_timings_ms: Value,
 }
 
@@ -1061,6 +1063,7 @@ struct CompletedBatchProofMember {
     pending_json: String,
     payload: TruncatedDigest,
     unconfirmed_dependencies: Vec<String>,
+    dependency_observed_at: Option<i64>,
 }
 
 pub(crate) struct CompletedBatchProofJob {
@@ -1100,6 +1103,7 @@ impl AccountProofJob {
         let local_proving_ms = elapsed_millis(local_proving_started);
 
         let dependency_observation_started = Instant::now();
+        let mut dependency_observed_at = None;
         if !proved.unconfirmed_dependencies.is_empty() {
             let client = esplora_client::Builder::new(&self.esplora_url).build_blocking();
             for dependency in &proved.unconfirmed_dependencies {
@@ -1110,7 +1114,13 @@ impl AccountProofJob {
                         format!("could not re-observe parent {dependency}: {error}"),
                     )
                 })? {
-                    Some(transaction) if transaction.compute_txid() == txid => {}
+                    Some(transaction) if transaction.compute_txid() == txid => {
+                        let observed_at = unix_time()?;
+                        dependency_observed_at = Some(
+                            dependency_observed_at
+                                .map_or(observed_at, |earliest: i64| earliest.min(observed_at)),
+                        );
+                    }
                     Some(transaction) => {
                         return Err(AccountError::new(
                             "unconfirmed_dependency_changed",
@@ -1146,6 +1156,7 @@ impl AccountProofJob {
             pending_json,
             record,
             unconfirmed_dependencies: proved.unconfirmed_dependencies,
+            dependency_observed_at,
             phase_timings_ms: json!({
                 "funding_verification": funding_verification_ms,
                 "local_proving": local_proving_ms,
@@ -1226,6 +1237,7 @@ impl AccountBatchProofJob {
                 .map_err(|error| AccountError::new("unavailable_assets", error))?;
             local_proving_ms =
                 local_proving_ms.saturating_add(elapsed_millis(local_proving_started));
+            let mut dependency_observed_at = None;
             for dependency in &proved.unconfirmed_dependencies {
                 let txid = unconfirmed_dependency_txid(dependency)?;
                 let dependency_observation_started = Instant::now();
@@ -1238,7 +1250,13 @@ impl AccountBatchProofJob {
                 dependency_observation_ms = dependency_observation_ms
                     .saturating_add(elapsed_millis(dependency_observation_started));
                 match observed {
-                    Some(transaction) if transaction.compute_txid() == txid => {}
+                    Some(transaction) if transaction.compute_txid() == txid => {
+                        let observed_at = unix_time()?;
+                        dependency_observed_at = Some(
+                            dependency_observed_at
+                                .map_or(observed_at, |earliest: i64| earliest.min(observed_at)),
+                        );
+                    }
                     Some(transaction) => {
                         return Err(AccountError::new(
                             "unconfirmed_dependency_changed",
@@ -1306,6 +1324,7 @@ impl AccountBatchProofJob {
                 pending_json,
                 payload,
                 unconfirmed_dependencies: proved.unconfirmed_dependencies,
+                dependency_observed_at,
             });
         }
         let manifest =
@@ -2034,7 +2053,7 @@ impl AccountWallet {
             .map_err(|error| AccountError::new("mempool_observation_failed", error.to_string()))?;
         let Some(transaction) = transaction else {
             self.freeze_unconfirmed_dependency(
-                &anchor_txid.to_string(),
+                &unconfirmed_dependency_key(anchor_txid),
                 "exact parent transaction is no longer observed",
             )?;
             return Err(AccountError::new(
@@ -2050,7 +2069,11 @@ impl AccountWallet {
             .map_err(|error| AccountError::new("invalid_chain_view", error))?;
         let verdict = self
             .primary_protocol_mut()?
-            .verify_unconfirmed(&canonical_blob, &chain, &anchor_txid.to_string())
+            .verify_unconfirmed(
+                &canonical_blob,
+                &chain,
+                &unconfirmed_dependency_key(anchor_txid),
+            )
             .map_err(|error| AccountError::new("invalid_consignment", error))?;
         match verdict {
             Ok(verified) => {
@@ -2159,7 +2182,10 @@ impl AccountWallet {
         )?;
         self.persist_observation_receipts(&anchor_txid.to_string(), &receipts)?;
         if let Some(error) = policy_failure {
-            self.freeze_unconfirmed_dependency(&anchor_txid.to_string(), &error.message)?;
+            self.freeze_unconfirmed_dependency(
+                &unconfirmed_dependency_key(anchor_txid),
+                &error.message,
+            )?;
             return Err(error);
         }
         self.enforce_unconfirmed_non_host_policy(&anchor_txid.to_string(), false)?;
@@ -2172,7 +2198,11 @@ impl AccountWallet {
             .map_err(|error| AccountError::new("invalid_chain_view", error))?;
         let verdict = self
             .primary_protocol_mut()?
-            .verify_unconfirmed(&canonical_blob, &chain, &anchor_txid.to_string())
+            .verify_unconfirmed(
+                &canonical_blob,
+                &chain,
+                &unconfirmed_dependency_key(anchor_txid),
+            )
             .map_err(|error| AccountError::new("invalid_consignment", error))?;
         match verdict {
             Ok(verified) => {
@@ -3690,14 +3720,10 @@ impl AccountWallet {
         let installed = (|| -> Result<Value, AccountError> {
             let now = unix_time()?;
             for member in &completed.members {
-                for dependency in &member.unconfirmed_dependencies {
-                    self.db.conn.execute(
-                        "UPDATE opencsv_consignment_finality
-                         SET last_checked_at = ?2, last_error = NULL
-                         WHERE anchor_txid = ?1 AND finality = 'unconfirmed'",
-                        params![dependency, now],
-                    )?;
-                }
+                self.persist_dependency_reobservations_at(
+                    &member.unconfirmed_dependencies,
+                    member.dependency_observed_at,
+                )?;
                 let envelope_position = completed
                     .manifest
                     .commitments()
@@ -5031,14 +5057,10 @@ impl AccountWallet {
         }
         self.pending_by_operation
             .insert(completed.operation_id.clone(), pending_id);
-        for dependency in &completed.unconfirmed_dependencies {
-            self.db.conn.execute(
-                "UPDATE opencsv_consignment_finality
-                 SET last_checked_at = ?2, last_error = NULL
-                 WHERE anchor_txid = ?1 AND finality = 'unconfirmed'",
-                params![dependency, unix_time()?],
-            )?;
-        }
+        self.persist_dependency_reobservations_at(
+            &completed.unconfirmed_dependencies,
+            completed.dependency_observed_at,
+        )?;
         if let Err(error) = self.mark_proof_ready(
             &completed.operation_id,
             &json!({
@@ -5490,8 +5512,11 @@ impl AccountWallet {
             // Reorgs do not erase history. They demote settlement, freeze
             // descendants through the exact parent dependency, and require a
             // refreshed backup before any new write.
+            let dependency_txid = txid.parse::<Txid>().map_err(|error| {
+                AccountError::new("database_corrupt", format!("operation txid: {error}"))
+            })?;
             self.freeze_unconfirmed_dependency(
-                txid,
+                &unconfirmed_dependency_key(dependency_txid),
                 "previously settled transaction is no longer in the verified scan",
             )?;
             let delivered = receipt["consignment_delivered"] == true;
@@ -7700,6 +7725,9 @@ impl AccountWallet {
         }
         let client = esplora_client::Builder::new(&self.config.esplora_url).build_blocking();
         for dependency in dependencies {
+            if self.dependency_reobservation_is_fresh(dependency)? {
+                continue;
+            }
             let txid = unconfirmed_dependency_txid(dependency)?;
             let observed = client.get_tx(&txid).map_err(|error| {
                 AccountError::new(
@@ -7708,25 +7736,134 @@ impl AccountWallet {
                 )
             })?;
             let now = unix_time()?;
-            if observed.is_none() {
-                self.freeze_unconfirmed_dependency(
-                    dependency,
-                    "exact parent transaction is no longer observed",
-                )?;
-                return Err(AccountError::new(
-                    "unconfirmed_dependency_changed",
-                    format!(
-                        "zero-confirmation parent {dependency} disappeared or was replaced; dependent signing is frozen"
-                    ),
-                ));
+            match observed {
+                Some(transaction) if transaction.compute_txid() == txid => {}
+                Some(transaction) => {
+                    let detail = format!("exact parent changed to {}", transaction.compute_txid());
+                    self.freeze_unconfirmed_dependency(dependency, &detail)?;
+                    return Err(AccountError::new(
+                        "unconfirmed_dependency_changed",
+                        format!(
+                            "zero-confirmation parent {dependency} changed; dependent signing is frozen"
+                        ),
+                    ));
+                }
+                None => {
+                    self.freeze_unconfirmed_dependency(
+                        dependency,
+                        "exact parent transaction is no longer observed",
+                    )?;
+                    return Err(AccountError::new(
+                        "unconfirmed_dependency_changed",
+                        format!(
+                            "zero-confirmation parent {dependency} disappeared or was replaced; dependent signing is frozen"
+                        ),
+                    ));
+                }
             }
-            self.db.conn.execute(
-                "UPDATE opencsv_consignment_finality
-                 SET last_checked_at = ?2, last_error = NULL
-                 WHERE anchor_txid = ?1 AND finality = 'unconfirmed'",
-                params![dependency, now],
-            )?;
+            self.persist_dependency_reobservation(dependency, now)?;
         }
+        Ok(())
+    }
+
+    fn dependency_reobservation_max_age_seconds(&self) -> u64 {
+        self.config
+            .observation_checks
+            .iter()
+            .filter(|check| {
+                check.kind == ObservationKind::RawTransactionApi
+                    && check.mode != ObservationMode::Off
+            })
+            .map(|check| check.max_age_seconds)
+            .min()
+            .unwrap_or_else(default_observation_max_age_seconds)
+    }
+
+    fn dependency_reobservation_is_fresh(&self, dependency: &str) -> Result<bool, AccountError> {
+        let txid = unconfirmed_dependency_txid(dependency)?.to_string();
+        let observed_at = self
+            .db
+            .conn
+            .query_row(
+                "SELECT observed_at FROM opencsv_observation_receipts
+                 WHERE subject_txid = ?1 AND check_id = ?2",
+                params![txid, DEPENDENCY_REOBSERVATION_CHECK_ID],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?;
+        let Some(observed_at) = observed_at else {
+            return Ok(false);
+        };
+        let now = unix_time()?;
+        let max_age =
+            i64::try_from(self.dependency_reobservation_max_age_seconds()).unwrap_or(i64::MAX);
+        Ok(now >= observed_at && now.saturating_sub(observed_at) <= max_age)
+    }
+
+    fn persist_dependency_reobservations_at(
+        &self,
+        dependencies: &[String],
+        observed_at: Option<i64>,
+    ) -> Result<(), AccountError> {
+        if dependencies.is_empty() {
+            return Ok(());
+        }
+        let observed_at = observed_at.ok_or_else(|| {
+            AccountError::new(
+                "stale_proof_job",
+                "proof completed without dependency-observation time",
+            )
+        })?;
+        for dependency in dependencies {
+            self.persist_dependency_reobservation(dependency, observed_at)?;
+        }
+        Ok(())
+    }
+
+    fn persist_dependency_reobservation(
+        &self,
+        dependency: &str,
+        observed_at: i64,
+    ) -> Result<(), AccountError> {
+        let txid = unconfirmed_dependency_txid(dependency)?.to_string();
+        let observed_at_ms = observed_at.saturating_mul(1_000);
+        let receipt = json!({
+            "check_id": DEPENDENCY_REOBSERVATION_CHECK_ID,
+            "kind": ObservationKind::RawTransactionApi,
+            "mode": ObservationMode::Observe,
+            "endpoint": self.config.esplora_url,
+            "result": ObservationResult::Observed,
+            "started_at_ms": observed_at_ms,
+            "completed_at_ms": observed_at_ms,
+            "latency_ms": 0,
+            "cached_at_ms": observed_at_ms,
+            "cache_age_ms": 0,
+            "certificate_profile": Value::Null,
+            "certificate_chain_fingerprints_sha256": [],
+            "raw_byte_match": true,
+            "detail": "exact dependency txid re-observed during proof or pre-sign",
+            "failures": [],
+        });
+        self.db.conn.execute(
+            "INSERT INTO opencsv_observation_receipts(
+                 subject_txid, check_id, receipt_json, observed_at
+             ) VALUES(?1, ?2, ?3, ?4)
+             ON CONFLICT(subject_txid, check_id) DO UPDATE SET
+                 receipt_json = excluded.receipt_json,
+                 observed_at = excluded.observed_at",
+            params![
+                txid,
+                DEPENDENCY_REOBSERVATION_CHECK_ID,
+                receipt.to_string(),
+                observed_at
+            ],
+        )?;
+        self.db.conn.execute(
+            "UPDATE opencsv_consignment_finality
+             SET last_checked_at = ?2, last_error = NULL
+             WHERE anchor_txid = ?1 AND finality = 'unconfirmed'",
+            params![txid, observed_at],
+        )?;
         Ok(())
     }
 
@@ -7735,11 +7872,12 @@ impl AccountWallet {
         dependency: &str,
         reason: &str,
     ) -> Result<(), AccountError> {
+        let txid = unconfirmed_dependency_txid(dependency)?.to_string();
         self.db.conn.execute(
             "UPDATE opencsv_consignment_finality
              SET finality = 'frozen', last_checked_at = ?2, last_error = ?3
              WHERE anchor_txid = ?1 AND finality != 'settled'",
-            params![dependency, unix_time()?, reason],
+            params![txid, unix_time()?, reason],
         )?;
         if let Some(protocol) = self.protocol.as_mut() {
             protocol.freeze_unconfirmed_anchor(dependency);
@@ -8374,7 +8512,13 @@ impl AccountWallet {
                         "unconfirmed consignment has no anchor txid",
                     )
                 })?;
-                protocol.verify_unconfirmed(&blob, &chain, &anchor_txid)
+                let anchor_txid = anchor_txid.parse::<Txid>().map_err(|error| {
+                    AccountError::new(
+                        "database_corrupt",
+                        format!("unconfirmed anchor txid: {error}"),
+                    )
+                })?;
+                protocol.verify_unconfirmed(&blob, &chain, &unconfirmed_dependency_key(anchor_txid))
             } else {
                 protocol.verify(&blob, &chain, u64::from(self.config.required_confirmations))
             }
@@ -9567,6 +9711,10 @@ fn unconfirmed_dependency_txid(value: &str) -> Result<Txid, AccountError> {
     decode_hex_32(value, "unconfirmed dependency").map(Txid::from_byte_array)
 }
 
+fn unconfirmed_dependency_key(txid: Txid) -> String {
+    hex_encode(&txid.to_byte_array())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -9913,8 +10061,89 @@ mod tests {
         let expected = transaction.compute_txid();
         let dependency = hex_encode(&expected.to_byte_array());
 
+        assert_eq!(unconfirmed_dependency_key(expected), dependency);
         assert_eq!(unconfirmed_dependency_txid(&dependency).unwrap(), expected);
         assert_ne!(dependency.parse::<Txid>().unwrap(), expected);
+    }
+
+    #[test]
+    fn fresh_dependency_reobservation_skips_a_second_network_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut wallet = AccountWallet::open(
+            &config_with_url(AccountRole::Primary, true, "http://127.0.0.1:1"),
+            &[71u8; 32],
+            dir.path().join("wallet.sqlite").to_str().unwrap(),
+        )
+        .unwrap();
+        let dependency = unconfirmed_dependency_key(Txid::from_byte_array([72u8; 32]));
+
+        wallet
+            .persist_dependency_reobservation(&dependency, unix_time().unwrap())
+            .unwrap();
+        wallet
+            .reobserve_unconfirmed_dependencies(std::slice::from_ref(&dependency))
+            .unwrap();
+
+        wallet
+            .persist_dependency_reobservation(&dependency, unix_time().unwrap() - 121)
+            .unwrap();
+        assert_eq!(
+            wallet
+                .reobserve_unconfirmed_dependencies(&[dependency])
+                .unwrap_err()
+                .code,
+            "unconfirmed_dependency_unavailable"
+        );
+    }
+
+    #[test]
+    fn freezing_consensus_dependency_updates_display_txid_finality() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut wallet = AccountWallet::open(
+            &config(AccountRole::Primary, true),
+            &[73u8; 32],
+            dir.path().join("wallet.sqlite").to_str().unwrap(),
+        )
+        .unwrap();
+        let txid = Txid::from_byte_array([74u8; 32]);
+        let dependency = unconfirmed_dependency_key(txid);
+        wallet
+            .db
+            .conn
+            .execute(
+                "INSERT INTO opencsv_consignments(
+                     consignment_id, consignment_base64, spent_state_json, created_at
+                 ) VALUES('dependency-test', '', '{}', 1)",
+                [],
+            )
+            .unwrap();
+        wallet
+            .db
+            .conn
+            .execute(
+                "INSERT INTO opencsv_consignment_finality(
+                     consignment_id, anchor_txid, finality, observed_at,
+                     last_checked_at, last_error
+                 ) VALUES('dependency-test', ?1, 'unconfirmed', 1, 1, NULL)",
+                [txid.to_string()],
+            )
+            .unwrap();
+
+        wallet
+            .freeze_unconfirmed_dependency(&dependency, "parent disappeared")
+            .unwrap();
+        let (finality, reason): (String, Option<String>) = wallet
+            .db
+            .conn
+            .query_row(
+                "SELECT finality, last_error FROM opencsv_consignment_finality
+                 WHERE consignment_id = 'dependency-test'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(finality, "frozen");
+        assert_eq!(reason.as_deref(), Some("parent disappeared"));
     }
 
     fn finalize_test_operation(wallet: &mut AccountWallet, operation_id: &str, txid: Txid) {

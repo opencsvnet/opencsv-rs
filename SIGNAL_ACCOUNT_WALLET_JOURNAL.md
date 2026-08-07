@@ -457,3 +457,48 @@ seconds; the repository's pre-existing explicitly ignored proof benchmarks
 remained ignored. `opencsv-ffi --all-targets --no-deps` Clippy passes with
 warnings denied, both changed Rust files pass `rustfmt --check`, and
 `git diff --check` passes.
+
+## 2026-08-07 — zero-confirmation parent identity and duplicate pre-sign lookup
+
+The first post-crash Bob-to-Carol Test USD send exposed two distinct issues.
+The send itself recovered without re-proving, signed in 25 ms, attempted five
+ordinary Bitcoin peers with four complete submissions, and was independently
+observed as transaction
+`cb66620d4268add8843c802731180f15e33ed86a3010f83aab2a19d8085a920f`.
+Its pre-sign phase nevertheless took 194 seconds because it repeated a blocking
+Esplora lookup for an unconfirmed OpenCSV parent immediately after the proof
+job had already performed the same exact-parent check.
+
+Tracing that lookup found a more serious representation defect. Locally
+created change retained the anchor's 32 consensus bytes as hexadecimal, while
+received provisional coins retained Bitcoin's reversed display txid. The
+dependency resolver intentionally interprets its input as consensus bytes.
+An actual received-coin child could therefore request the byte-reversed parent,
+and finality/freeze SQL could miss the display-txid row even when the protocol
+coin was frozen in memory.
+
+The accepted invariant is now one representation at the protocol boundary:
+every provisional coin stores the anchor's consensus bytes. Receive, restore,
+local-change, proof, batch, reorg, freeze, and SQLite-finality paths explicitly
+convert at their boundary. A proof job records the real time at which each
+exact parent was observed. Signing may reuse only that receipt and only while
+it is no older than the strictest enabled raw-transaction observer's configured
+maximum age (120 seconds for the signet defaults). A stale or absent receipt
+performs the network lookup again and fails closed if the exact parent is no
+longer available. The fee UTXO remains independently CBF-reverified at signing;
+the recently-spent-funding regression still requires and observes both verifier
+calls.
+
+Regression receipts prove consensus-byte round-trip, display-txid finality
+freeze, fresh-receipt reuse without a second network request, and mandatory
+network re-observation after 121 seconds. The complete default FFI target passes
+57 unit tests plus 2 integration tests with 2 deliberate slow-test ignores and
+zero failures. The recovery-feature target passes 59 unit tests plus 2
+integration tests with the same 2 deliberate ignores and zero failures.
+
+Carol's durable attachment retry also ran twice without a restart-only gap. It
+remains correctly uncredited because the local network could not establish TCP
+to any `mempool.space` address while Blockstream returned the exact 309-byte
+transaction. Both observers are still `Require`; this is an external
+availability receipt, not permission to weaken policy, and no unconfirmed-child
+acceptance claim is made yet.
