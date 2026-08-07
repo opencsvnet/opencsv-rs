@@ -1221,6 +1221,41 @@ impl MemWallet {
             .ok_or_else(|| format!("no pending transaction {pending_id}"))
     }
 
+    /// Raw nullifiers committed by one pending transfer. The account layer
+    /// compares these private spend identifiers with its independently
+    /// verified compact-filter index before proving is accepted and again
+    /// immediately before signing. This catches a restored checkpoint that
+    /// predates an already-confirmed spend without exposing the nullifiers to
+    /// Swift or any remote service.
+    pub fn pending_nullifiers(&self, pending_id: u64) -> Result<Vec<Digest>, OpError> {
+        self.pending
+            .get(&pending_id)
+            .map(|pending| pending.nullifiers.clone())
+            .ok_or_else(|| format!("no pending transaction {pending_id}"))
+    }
+
+    /// Nullifiers for the exact deterministic coin selection that an
+    /// action-level transfer would consume. Computing these needs only the
+    /// locally held coin openings and owner secrets, so rollback conflicts
+    /// can be rejected before the expensive recursive proof begins.
+    pub fn selected_transfer_nullifiers(
+        &self,
+        asset_id_hex: &str,
+        amount: u64,
+    ) -> Result<Vec<Digest>, OpError> {
+        let (coin_ids, _) = self.select_transfer_inputs(asset_id_hex, amount)?;
+        coin_ids
+            .iter()
+            .map(|coin_id| {
+                let stored = self.find_coin(coin_id)?;
+                let owner_secret = self
+                    .secret_for(&stored.coin.owner)
+                    .ok_or_else(|| format!("no secret for owner of coin {coin_id}"))?;
+                Ok(stored.coin.nullifier(&owner_secret))
+            })
+            .collect()
+    }
+
     /// Whether one pending operation consumes any coin already reserved by a
     /// different pending operation. Used by the account layer when a proof
     /// generated from a snapshot is atomically committed back into the live
@@ -1558,6 +1593,41 @@ mod tests {
         );
         assert!(wallet.select_transfer_inputs(&asset_hex, 9).is_err());
         assert!(wallet.select_transfer_inputs(&asset_hex, 0).is_err());
+    }
+
+    #[test]
+    fn action_selection_exposes_only_local_nullifiers_for_spend_preflight() {
+        let mut wallet = MemWallet::from_owner_seed([7u8; 32]);
+        let asset_id = Digest::from_bytes([9u8; 32]);
+        store_coin(&mut wallet, asset_id, 7, 1);
+        store_coin(&mut wallet, asset_id, 5, 2);
+        let asset_hex = to_hex(asset_id.as_bytes());
+
+        let (selected, _) = wallet.select_transfer_inputs(&asset_hex, 7).unwrap();
+        let selected_coin = wallet.find_coin(&selected[0]).unwrap();
+        let expected = selected_coin
+            .coin
+            .nullifier(&wallet.secret_for(&selected_coin.coin.owner).unwrap());
+        assert_eq!(
+            wallet.selected_transfer_nullifiers(&asset_hex, 7).unwrap(),
+            vec![expected]
+        );
+
+        wallet.pending.insert(
+            1,
+            Pending {
+                shape: RecordShape::Xfer {
+                    nullifiers: vec![expected],
+                },
+                openings: Vec::new(),
+                nullifiers: vec![expected],
+                proof: Vec::new(),
+                aux: None,
+                spent_ids: selected,
+                unconfirmed_dependencies: Vec::new(),
+            },
+        );
+        assert_eq!(wallet.pending_nullifiers(1).unwrap(), vec![expected]);
     }
 
     #[test]

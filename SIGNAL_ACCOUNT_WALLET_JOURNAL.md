@@ -514,3 +514,51 @@ one provider's pin or byte failure when the other succeeds, failure when both
 are invalid, and rejection of configurations whose quorum exceeds their
 required candidates. Live Carol acceptance and the zero-confirmation return hop
 remain acceptance gates rather than claims in this entry.
+
+## 2026-08-07 — rollback spend preflight and terminal batch state
+
+A read-only APFS simulator snapshot reproduced a second rollback class that
+normal operation-journal replay cannot repair: the restored checkpoint itself
+predated a confirmed spend. Bob's restored wallet selected raw nullifier
+`23e30b7053bf25346710fa02a9109150641e265d22e5e35d8cfe7d26616bbb44`;
+the phone-owned PoW/BIP158 scan index already recorded its first occurrence at
+signet height 316656, transaction position 43.
+
+Four diagnostic retries ran through an older linked framework before the
+actual CocoaPods XCFramework input path was identified. They created Bitcoin
+transactions
+`b50e442447d8e8641bb533dbc197f2ac52a7edb155465e535dc0bc858bf8a007`,
+`fd4e1b1a85c6d4cd9ce5ab3e64b89beb5c2ded373d5565100180b6ef80d0e236`,
+`faf9c3e69378aa0cf2ae93abe2df8ad79e486e6c0d416a90bff49384f7ea3042`,
+and
+`ad451a80afcc4e99abb7b8d21aec3269611d5673cab2fae12b8b8076dd2d17f4`.
+Those are failed rollback diagnostics, not valid OpenCSV payment receipts:
+each reused the already-confirmed protocol nullifier and must never appear in
+product performance or payment evidence.
+
+The accepted gate derives the exact selected input nullifiers inside Rust and
+compares them with the registered confirmed-chain index before recursive
+proving, after proof import, and immediately before signing. It is mandatory
+on signet and mainnet and is deliberately independent of the configurable
+Off/Observe/Require API-observation policy. The raw nullifiers never cross FFI
+or leave the device. A missing or stale scan fails closed as
+`stale_chain_state` rather than blessing a rollback-created duplicate spend.
+
+Pre-broadcast failure now cancels the complete enclosing batch, including the
+one-member `solo` representation, and preserves the member's stable rejection
+reason. This prevents Signal from treating a cancelled operation inside an
+orphaned resumable batch as permanently pending.
+
+The exact signed simulator build linked archive SHA-256
+`16601bcfd715ff9d98a058d1847cf4403ffc67366388f23d4df0b76d5fd282b6`.
+Against the restored database SHA-256
+`16231b2d71003dbe64b4d0702575b846e2b963f2308995a6898735a96b5fc0eb`,
+operation `a05bed708749b0559aba3a7cf27a0cf3` failed in three seconds with
+`stale_chain_state`. Both operation and batch became `cancelled`; no pending
+proof, signed transaction, or txid was written, and Signal emitted a terminal
+failure message after the nonspendable intent.
+
+The complete default FFI target passes 61 unit tests plus 2 integration tests,
+with 2 deliberate proof benchmarks ignored and zero failures. The recovery
+feature passes 63 unit tests plus the same 2 integration tests, with 2 ignored
+and zero failures. The warnings-as-errors Signal simulator build also passes.

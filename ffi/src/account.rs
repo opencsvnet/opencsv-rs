@@ -44,7 +44,7 @@ use opencsv_core::chain::AnchorRef;
 use opencsv_core::consignment::Consignment;
 #[cfg(any(test, feature = "issuer-tools"))]
 use opencsv_core::{AssetGenesis, InstrumentTermsV1, PoseidonIssuerAuthorization};
-use opencsv_core::{AssetId, InstrumentManifestV1, OwnerSecret, TruncatedDigest};
+use opencsv_core::{AssetId, Digest, InstrumentManifestV1, OwnerSecret, TruncatedDigest};
 use rand::RngExt as _;
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde::{Deserialize, Serialize};
@@ -318,6 +318,12 @@ pub struct AccountConfig {
     /// product. This list contains public manifests only, never issuer keys.
     #[serde(default)]
     pub usd_issuers: Vec<UsdIssuerPolicy>,
+    /// Unit tests that exercise unrelated account transitions can opt out of
+    /// the live confirmed-chain dependency. This field does not exist in
+    /// normal or feature builds and therefore cannot weaken a shipped wallet.
+    #[cfg(test)]
+    #[serde(default)]
+    pub test_skip_protocol_spend_preflight: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1020,6 +1026,7 @@ pub(crate) struct AccountProofJob {
     verifier: Arc<dyn FundingVerifier>,
     protocol_snapshot: MemWallet,
     esplora_url: String,
+    require_protocol_spend_preflight: bool,
 }
 
 pub(crate) struct CompletedProofJob {
@@ -1100,6 +1107,15 @@ impl AccountProofJob {
             birth_height: self.funding.birth_height,
         })?;
         let funding_verification_ms = elapsed_millis(funding_verification_started);
+        let selected_nullifiers = self
+            .protocol_snapshot
+            .selected_transfer_nullifiers(&self.request.asset_id, self.request.amount)
+            .map_err(|error| AccountError::new("unavailable_assets", error))?;
+        verify_protocol_inputs_unspent(
+            &selected_nullifiers,
+            verification.checked_through,
+            self.require_protocol_spend_preflight,
+        )?;
         let ctx = funding_context(self.funding.outpoint);
         let local_proving_started = Instant::now();
         let proved = self
@@ -4977,6 +4993,7 @@ impl AccountWallet {
             verifier: self.funding_verifier.clone(),
             protocol_snapshot,
             esplora_url: self.config.esplora_url.clone(),
+            require_protocol_spend_preflight: protocol_spend_preflight_required(&self.config),
         })))
     }
 
@@ -5031,6 +5048,20 @@ impl AccountWallet {
             .primary_protocol_mut()?
             .import_pending(&completed.pending_json)
             .map_err(|error| AccountError::new("database_error", error))?;
+        let pending_nullifiers = self
+            .primary_protocol_mut()?
+            .pending_nullifiers(pending_id)
+            .map_err(|error| AccountError::new("database_error", error))?;
+        if let Err(error) = verify_protocol_inputs_unspent(
+            &pending_nullifiers,
+            completed.verification.checked_through,
+            protocol_spend_preflight_required(&self.config),
+        ) {
+            if let Some(protocol) = self.protocol.as_mut() {
+                protocol.cancel_pending(pending_id);
+            }
+            return self.fail_proof_job(&completed.operation_id, error);
+        }
         let validation = self.primary_protocol_mut().and_then(|protocol| {
             if protocol
                 .pending_spend_conflicts(pending_id)
@@ -5267,6 +5298,17 @@ impl AccountWallet {
             .pending_by_operation
             .get(operation_id)
             .ok_or_else(|| AccountError::new("operation_not_resumable", "missing pending proof"))?;
+        let pending_nullifiers = self
+            .primary_protocol_mut()?
+            .pending_nullifiers(pending_id)
+            .map_err(|error| AccountError::new("operation_not_resumable", error))?;
+        if let Err(error) = verify_protocol_inputs_unspent(
+            &pending_nullifiers,
+            verification.checked_through,
+            protocol_spend_preflight_required(&self.config),
+        ) {
+            return self.fail_prebroadcast(operation_id, error);
+        }
         let unconfirmed_dependencies = self
             .primary_protocol_mut()?
             .pending_unconfirmed_dependencies(pending_id)
@@ -7914,6 +7956,45 @@ impl AccountWallet {
         operation_id: &str,
         reason: &str,
     ) -> Result<(), AccountError> {
+        let batch_local_id = self
+            .db
+            .conn
+            .query_row(
+                "SELECT batch_local_id FROM opencsv_send_batch_members
+                 WHERE operation_id = ?1",
+                [operation_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        if let Some(batch_local_id) = batch_local_id {
+            // A solo timeout is still represented by a one-member batch, and
+            // a frozen multi-recipient proposal is atomic. If any member
+            // fails before signature release, close the complete batch so
+            // callers never keep presenting an orphaned `solo`/`frozen`
+            // container as resumable after its operation was cancelled.
+            self.cancel_send_batch(&batch_local_id)?;
+            let now = unix_time()?;
+            self.db.conn.execute(
+                "UPDATE opencsv_operations
+                 SET rejection_reason = ?2, updated_at = ?3
+                 WHERE operation_id IN (
+                     SELECT operation_id FROM opencsv_send_batch_members
+                     WHERE batch_local_id = ?1
+                 )",
+                params![batch_local_id, reason, now],
+            )?;
+            self.db.conn.execute(
+                "UPDATE opencsv_send_batches
+                 SET receipt_json = ?2, updated_at = ?3
+                 WHERE batch_local_id = ?1",
+                params![
+                    batch_local_id,
+                    json!({"prebroadcast_error": reason}).to_string(),
+                    now,
+                ],
+            )?;
+            return Ok(());
+        }
         if let Some(pending_id) = self.pending_by_operation.remove(operation_id) {
             if let Some(protocol) = self.protocol.as_mut() {
                 protocol.cancel_pending(pending_id);
@@ -9752,6 +9833,65 @@ fn unconfirmed_dependency_key(txid: Txid) -> String {
     hex_encode(&txid.to_byte_array())
 }
 
+fn protocol_spend_preflight_required(config: &AccountConfig) -> bool {
+    // This is protocol conflict detection, not an optional observation. Do
+    // not let the user-selectable Off/Observe/Require presentation policy—or
+    // an empty transient relay-peer list—disable rollback protection.
+    #[cfg(test)]
+    if config.test_skip_protocol_spend_preflight {
+        return false;
+    }
+    matches!(config.network.as_str(), "signet" | "mainnet")
+}
+
+/// Reject a restored checkpoint whose selected OpenCSV inputs have already
+/// appeared in the independently verified confirmed-chain index. This is a
+/// local privacy-preserving check: raw nullifiers never leave Rust. Requiring
+/// the scan to cover the funding verifier's tip prevents a stale index from
+/// blessing a rollback-created duplicate spend.
+fn verify_protocol_inputs_unspent(
+    nullifiers: &[Digest],
+    minimum_tip: u64,
+    required: bool,
+) -> Result<(), AccountError> {
+    if !required {
+        return Ok(());
+    }
+    if nullifiers.is_empty() {
+        return Err(AccountError::new(
+            "stale_chain_state",
+            "transfer proof contains no OpenCSV input nullifiers",
+        ));
+    }
+    for nullifier in nullifiers {
+        let (scan_tip, occurrence) =
+            scan::registered_nullifier_occurrence(nullifier).map_err(|error| {
+                AccountError::new(
+                    "stale_chain_state",
+                    format!("confirmed OpenCSV spend scan is unavailable: {error}"),
+                )
+            })?;
+        if scan_tip < minimum_tip {
+            return Err(AccountError::new(
+                "stale_chain_state",
+                format!(
+                    "confirmed OpenCSV spend scan tip {scan_tip} is behind verified funding tip {minimum_tip}"
+                ),
+            ));
+        }
+        if let Some(location) = occurrence {
+            return Err(AccountError::new(
+                "stale_chain_state",
+                format!(
+                    "selected OpenCSV input was already spent at {}:{}; the wallet checkpoint is behind the verified chain",
+                    location.height, location.position
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -9860,6 +10000,7 @@ mod tests {
                 "endpoint": esplora_url,
                 "mode": "observe",
             }],
+            "test_skip_protocol_spend_preflight": true,
         }))
         .unwrap()
     }
@@ -9912,6 +10053,22 @@ mod tests {
         let mut value: Value = serde_json::from_str(&config(AccountRole::Primary, true)).unwrap();
         value["usd_issuers"] = Value::Array(issuers);
         value.to_string()
+    }
+
+    #[test]
+    fn protocol_spend_preflight_is_independent_of_observation_mode() {
+        let mut value: Value = serde_json::from_str(&config(AccountRole::Primary, true)).unwrap();
+        value["peers"] = json!(["127.0.0.1:38333"]);
+        value["verification_peers"] = json!(["127.0.0.2:38333"]);
+        value["observation_checks"] = json!([{
+            "id": "multi_peer_spv_confirmation",
+            "kind": "confirmed_spv",
+            "mode": "off",
+        }]);
+        value["test_skip_protocol_spend_preflight"] = json!(false);
+        let config: AccountConfig = serde_json::from_value(value).unwrap();
+
+        assert!(protocol_spend_preflight_required(&config));
     }
 
     fn reviewed_test_config(seed_byte: u8) -> (String, String) {
@@ -11285,6 +11442,52 @@ mod tests {
         assert_ne!(next["batch"]["batch_local_id"], batch_id);
         assert_ne!(next["operation_id"], first["operation_id"]);
         assert_ne!(next["operation_id"], second["operation_id"]);
+    }
+
+    #[test]
+    fn prebroadcast_member_failure_cancels_the_complete_batch() {
+        let dir = tempfile::tempdir().unwrap();
+        let (cfg, asset_id) = reviewed_test_config(82);
+        let mut wallet = AccountWallet::open(
+            &cfg,
+            &[81u8; 32],
+            dir.path().join("wallet.sqlite").to_str().unwrap(),
+        )
+        .unwrap();
+        let request = |recipient: u8| {
+            json!({
+                "asset_id": asset_id,
+                "to_owner": hex_encode(&[recipient; 32]),
+                "amount": 1,
+            })
+            .to_string()
+        };
+        let first = wallet.transfer_batch_plan(&request(1)).unwrap();
+        let operation_id = first["operation_id"].as_str().unwrap().to_owned();
+        let batch_id = first["batch"]["batch_local_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let second = wallet
+            .transfer_batch_add_recipient(&batch_id, &request(2))
+            .unwrap();
+        let second_id = second["operation_id"].as_str().unwrap().to_owned();
+
+        let error = AccountError::new(
+            "stale_chain_state",
+            "selected OpenCSV input was already confirmed spent",
+        );
+        let result: Result<Value, AccountError> = wallet.fail_prebroadcast(&operation_id, error);
+        assert_eq!(result.unwrap_err().code, "stale_chain_state");
+        assert_eq!(wallet.send_batch(&batch_id).unwrap().state, "cancelled");
+        for member_id in [&operation_id, &second_id] {
+            let operation = wallet.operation(member_id).unwrap();
+            assert_eq!(operation.state, OperationState::Cancelled.as_str());
+            assert_eq!(
+                operation.rejection_reason.as_deref(),
+                Some("stale_chain_state")
+            );
+        }
     }
 
     #[test]

@@ -244,6 +244,21 @@ fn registered_index() -> Result<ScanIndex, String> {
     .map_err(|e| e.to_string())
 }
 
+/// Look up the first confirmed occurrence of one private raw nullifier in
+/// the registered, PoW-verified compact-filter index. The caller also gets
+/// the index tip so it can reject a rollback check performed against a scan
+/// older than its independently verified Bitcoin funding view.
+pub(crate) fn registered_nullifier_occurrence(
+    raw_nf: &Digest,
+) -> Result<(u64, Option<opencsv_core::chain::AnchorLocation>), String> {
+    let index = registered_index()?;
+    let tip = index.synced_tip();
+    let occurrence = index
+        .scan_check(raw_nf, 0, tip)
+        .map(|(location, _)| location);
+    Ok((tip, occurrence))
+}
+
 fn registered_required_confirmations() -> u64 {
     let registry = match LAST_SCAN.lock() {
         Ok(registry) => registry,
