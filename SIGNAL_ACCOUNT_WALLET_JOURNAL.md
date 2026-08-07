@@ -519,10 +519,10 @@ remain acceptance gates rather than claims in this entry.
 
 A read-only APFS simulator snapshot reproduced a second rollback class that
 normal operation-journal replay cannot repair: the restored checkpoint itself
-predated a confirmed spend. Bob's restored wallet selected raw nullifier
-`23e30b7053bf25346710fa02a9109150641e265d22e5e35d8cfe7d26616bbb44`;
-the phone-owned PoW/BIP158 scan index already recorded its first occurrence at
-signet height 316656, transaction position 43.
+predated a confirmed spend. The phone-owned PoW/BIP158 scan index already
+recorded the exact selected input's first occurrence at signet height 316656,
+transaction position 43. The private raw nullifier is intentionally omitted
+from this receipt.
 
 Four diagnostic retries ran through an older linked framework before the
 actual CocoaPods XCFramework input path was identified. They created Bitcoin
