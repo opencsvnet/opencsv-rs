@@ -200,7 +200,7 @@ fn default_observation_max_age_seconds() -> u64 {
 }
 
 fn default_required_raw_observer_quorum() -> u32 {
-    1
+    0
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -300,9 +300,10 @@ pub struct AccountConfig {
     #[serde(default)]
     pub observation_checks: Vec<ObservationCheck>,
     /// Number of `require` raw-transaction observers that must return the
-    /// exact transaction bytes under their configured certificate pins. All
-    /// enabled observers are still queried and recorded; this quorum avoids
-    /// making one unavailable public API a liveness dependency.
+    /// exact transaction bytes under their configured certificate pins. When
+    /// omitted, this is derived as every raw observer marked `require`; an
+    /// explicit value must match that count so `require` never means
+    /// "optional member of a smaller quorum".
     #[serde(default = "default_required_raw_observer_quorum")]
     pub required_raw_observer_quorum: u32,
     /// Required for linked devices; public external descriptor.
@@ -1380,7 +1381,11 @@ impl AccountWallet {
         device_binding_key: &[u8],
         database_path: &str,
     ) -> Result<Self, AccountError> {
-        let mut config: AccountConfig = serde_json::from_str(config_json).map_err(|error| {
+        let config_value: Value = serde_json::from_str(config_json).map_err(|error| {
+            AccountError::new("invalid_config", format!("config JSON: {error}"))
+        })?;
+        let quorum_was_explicit = config_value.get("required_raw_observer_quorum").is_some();
+        let mut config: AccountConfig = serde_json::from_value(config_value).map_err(|error| {
             AccountError::new("invalid_config", format!("config JSON: {error}"))
         })?;
         if config.version != SCHEMA_VERSION {
@@ -1393,6 +1398,24 @@ impl AccountWallet {
         validate_esplora_url(&config.esplora_url)?;
         if config.observation_checks.is_empty() {
             config.observation_checks = default_observation_checks(&config.network);
+        }
+        if !quorum_was_explicit {
+            config.required_raw_observer_quorum = u32::try_from(
+                config
+                    .observation_checks
+                    .iter()
+                    .filter(|check| {
+                        check.kind == ObservationKind::RawTransactionApi
+                            && check.mode == ObservationMode::Require
+                    })
+                    .count(),
+            )
+            .map_err(|_| {
+                AccountError::new(
+                    "invalid_config",
+                    "required raw observer count does not fit in u32",
+                )
+            })?;
         }
         validate_observation_checks(&config)?;
         validate_usd_issuer_policy(&config)?;
@@ -9699,14 +9722,14 @@ fn validate_observation_checks(config: &AccountConfig) -> Result<(), AccountErro
                 && check.mode == ObservationMode::Require
         })
         .count();
-    if required_raw_observers > 0
-        && (config.required_raw_observer_quorum == 0
-            || usize::try_from(config.required_raw_observer_quorum)
-                .map_or(true, |quorum| quorum > required_raw_observers))
+    if usize::try_from(config.required_raw_observer_quorum)
+        .map_or(true, |quorum| quorum != required_raw_observers)
     {
         return Err(AccountError::new(
             "invalid_config",
-            format!("required raw observer quorum must be between 1 and {required_raw_observers}"),
+            format!(
+                "required raw observer quorum must equal all {required_raw_observers} raw observers marked require"
+            ),
         ));
     }
     Ok(())
@@ -10610,7 +10633,7 @@ mod tests {
     }
 
     #[test]
-    fn fresh_signet_defaults_use_one_of_two_pinned_api_observers() {
+    fn fresh_signet_defaults_require_both_pinned_api_observers() {
         let dir = tempfile::tempdir().unwrap();
         let cfg = json!({
             "version": 1,
@@ -10646,7 +10669,7 @@ mod tests {
         assert_eq!(policy[2]["mode"], "observe");
         assert_eq!(policy[3]["mode"], "off");
         assert_eq!(policy[4]["mode"], "observe");
-        assert_eq!(status["required_raw_observer_quorum"], 1);
+        assert_eq!(status["required_raw_observer_quorum"], 2);
         assert_eq!(
             wallet
                 .verify_consignment_unconfirmed(&[1], r#"{"tip_height":0,"entries":[]}"#)
@@ -10687,7 +10710,7 @@ mod tests {
             ]
         });
         let (receipts, failure) =
-            evaluate_observation_evidence(&policy, 1, &[1, 2], &evidence.to_string()).unwrap();
+            evaluate_observation_evidence(&policy, 2, &[1, 2], &evidence.to_string()).unwrap();
         assert!(failure.is_none());
         assert_eq!(receipts.len(), 2);
         assert_eq!(receipts[0]["raw_byte_match"], true);
@@ -10699,40 +10722,35 @@ mod tests {
             .unwrap()
             .remove(0);
         let (receipts, failure) =
-            evaluate_observation_evidence(&policy, 1, &[1, 2], &blockstream_only.to_string())
-                .unwrap();
-        assert!(failure.is_none());
-        assert_eq!(receipts.len(), 2);
-        assert_eq!(receipts[0]["result"], "not_checked");
-        assert_eq!(receipts[1]["raw_byte_match"], true);
-
-        let (_, failure) =
             evaluate_observation_evidence(&policy, 2, &[1, 2], &blockstream_only.to_string())
                 .unwrap();
         assert_eq!(failure.unwrap().code, "required_observation_failed");
+        assert_eq!(receipts.len(), 2);
+        assert_eq!(receipts[0]["result"], "not_checked");
+        assert_eq!(receipts[1]["raw_byte_match"], true);
 
         let mut wrong_pin = evidence.clone();
         wrong_pin["observations"][0]["certificate_chain_fingerprints_sha256"] =
             json!(["11".repeat(32)]);
         let (_, failure) =
-            evaluate_observation_evidence(&policy, 1, &[1, 2], &wrong_pin.to_string()).unwrap();
-        assert!(failure.is_none());
+            evaluate_observation_evidence(&policy, 2, &[1, 2], &wrong_pin.to_string()).unwrap();
+        assert_eq!(failure.unwrap().code, "required_observation_failed");
 
         let mut wrong = evidence;
         wrong["observations"][1]["raw_transaction_hex"] = json!("0103");
         let (_, failure) =
-            evaluate_observation_evidence(&policy, 1, &[1, 2], &wrong.to_string()).unwrap();
-        assert!(failure.is_none());
+            evaluate_observation_evidence(&policy, 2, &[1, 2], &wrong.to_string()).unwrap();
+        assert_eq!(failure.unwrap().code, "required_observation_failed");
 
         wrong["observations"][0]["certificate_chain_fingerprints_sha256"] =
             json!(["11".repeat(32)]);
         let (_, failure) =
-            evaluate_observation_evidence(&policy, 1, &[1, 2], &wrong.to_string()).unwrap();
+            evaluate_observation_evidence(&policy, 2, &[1, 2], &wrong.to_string()).unwrap();
         assert_eq!(failure.unwrap().code, "required_observation_failed");
     }
 
     #[test]
-    fn raw_observer_quorum_cannot_exceed_required_candidates() {
+    fn raw_observer_quorum_must_match_required_candidates() {
         let dir = tempfile::tempdir().unwrap();
         let cfg = json!({
             "version": 1,
@@ -10747,6 +10765,24 @@ mod tests {
             &[91u8; 32],
             &[92u8; 32],
             dir.path().join("wallet.sqlite").to_str().unwrap(),
+        )
+        .err()
+        .unwrap();
+        assert_eq!(error.code, "invalid_config");
+
+        let cfg = json!({
+            "version": 1,
+            "network": "signet",
+            "esplora_url": "https://mempool.space/signet/api",
+            "role": "primary",
+            "backup_verified": false,
+            "required_raw_observer_quorum": 1,
+        });
+        let error = AccountWallet::open_device_bound(
+            &cfg.to_string(),
+            &[93u8; 32],
+            &[94u8; 32],
+            dir.path().join("wallet-lower.sqlite").to_str().unwrap(),
         )
         .err()
         .unwrap();
