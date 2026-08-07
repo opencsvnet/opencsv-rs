@@ -3898,15 +3898,18 @@ impl AccountWallet {
         Err(error)
     }
 
-    /// Acknowledge the exact current checkpoint for the complete frozen batch.
+    /// Acknowledge the exact checkpoint that Signal staged for the complete
+    /// frozen batch.
     ///
-    /// The wallet can legitimately advance after proving because an unrelated
-    /// receive or finality refresh also belongs in Secure Backup. The caller
-    /// therefore backs up the newest checkpoint and supplies that hash here.
-    /// Under an immediate transaction we require the batch to remain
-    /// proof-ready and the supplied hash to still name the complete current
-    /// wallet. Only acknowledgement metadata is rebound; the frozen proposal,
-    /// manifest, and proofs are never regenerated or changed.
+    /// The wallet can legitimately advance while Signal is exporting because
+    /// an unrelated receive or finality refresh also belongs in Secure Backup.
+    /// The caller supplies the hash of the payload that the completed export
+    /// actually contained. Under an immediate transaction we require the
+    /// batch to remain proof-ready and accept only either that batch's exact
+    /// prepared checkpoint or the complete current checkpoint. An arbitrary
+    /// older checkpoint can never unlock signing. Only acknowledgement
+    /// metadata is rebound; the frozen proposal, manifest, and proofs are
+    /// never regenerated or changed.
     pub fn acknowledge_send_batch_backup(
         &mut self,
         batch_local_id: &str,
@@ -3922,10 +3925,12 @@ impl AccountWallet {
                 ));
             }
             let current = self.checkpoint()?;
-            if current["checkpoint_hash"].as_str() != Some(checkpoint_hash) {
+            let prepared_matches = batch.checkpoint_hash.as_deref() == Some(checkpoint_hash);
+            let current_matches = current["checkpoint_hash"].as_str() == Some(checkpoint_hash);
+            if !prepared_matches && !current_matches {
                 return Err(AccountError::new(
                     "backup_checkpoint_mismatch",
-                    "Secure Backup did not acknowledge the exact current wallet checkpoint",
+                    "Secure Backup did not acknowledge this proof-ready batch's staged or current wallet checkpoint",
                 ));
             }
             let now = unix_time()?;
@@ -5186,13 +5191,14 @@ impl AccountWallet {
         self.prove_operation(operation_id)
     }
 
-    /// Acknowledge that Signal Secure Backup durably accepted the exact current
+    /// Acknowledge that Signal Secure Backup durably accepted the exact staged
     /// wallet checkpoint while this operation remained proof-ready.
     ///
-    /// Unrelated receive/finality state may advance the checkpoint after proof
-    /// preparation. Rebinding only the acknowledgement metadata avoids an
-    /// expensive proof retry while the immediate transaction ensures a stale
-    /// backup can never unlock signing.
+    /// Unrelated receive/finality state may advance while Signal exports the
+    /// staged payload. Accepting the operation's exact prepared checkpoint, or
+    /// the complete current checkpoint, avoids an expensive proof retry while
+    /// the immediate transaction ensures an arbitrary stale backup can never
+    /// unlock signing.
     pub fn acknowledge_operation_backup(
         &mut self,
         operation_id: &str,
@@ -5213,10 +5219,11 @@ impl AccountWallet {
                 .ok_or_else(|| {
                     AccountError::new("checkpoint_failed", "current checkpoint has no hash")
                 })?;
-            if current_hash != checkpoint_hash {
+            let prepared_matches = operation.checkpoint_hash.as_deref() == Some(checkpoint_hash);
+            if !prepared_matches && current_hash != checkpoint_hash {
                 return Err(AccountError::new(
                     "backup_checkpoint_mismatch",
-                    "Secure Backup did not acknowledge the exact current wallet checkpoint",
+                    "Secure Backup did not acknowledge this proof-ready operation's staged or current wallet checkpoint",
                 ));
             }
             self.db.conn.execute(
@@ -11253,7 +11260,7 @@ mod tests {
     }
 
     #[test]
-    fn batch_backup_rebinds_every_member_to_the_exact_current_checkpoint() {
+    fn batch_backup_accepts_the_exact_staged_checkpoint_after_unrelated_progress() {
         let dir = tempfile::tempdir().unwrap();
         let (cfg, asset_id) = reviewed_test_config(79);
         let mut wallet = AccountWallet::open(
@@ -11332,28 +11339,28 @@ mod tests {
         wallet
             .insert_planned_operation("later-operation", "transfer", "{}", "later-delivery-nonce")
             .unwrap();
-        assert_eq!(
-            wallet
-                .acknowledge_send_batch_backup(&batch_id, &prepared_hash)
-                .unwrap_err()
-                .code,
-            "backup_checkpoint_mismatch"
-        );
         let current_hash = wallet.checkpoint().unwrap()["checkpoint_hash"]
             .as_str()
             .unwrap()
             .to_owned();
         assert_ne!(current_hash, prepared_hash);
+        assert_eq!(
+            wallet
+                .acknowledge_send_batch_backup(&batch_id, "not-a-checkpoint")
+                .unwrap_err()
+                .code,
+            "backup_checkpoint_mismatch"
+        );
         let acknowledged = wallet
-            .acknowledge_send_batch_backup(&batch_id, &current_hash)
+            .acknowledge_send_batch_backup(&batch_id, &prepared_hash)
             .unwrap();
         assert_eq!(acknowledged["backup_acked"], true);
-        assert_eq!(acknowledged["checkpoint_hash"], current_hash);
+        assert_eq!(acknowledged["checkpoint_hash"], prepared_hash);
         let after = wallet.send_batch(&batch_id).unwrap();
         assert!(after.backup_acked);
         assert_eq!(
             after.checkpoint_hash.as_deref(),
-            Some(current_hash.as_str())
+            Some(prepared_hash.as_str())
         );
         assert_eq!(after.proposal_wire, before.proposal_wire);
         assert_eq!(after.manifest_wire, before.manifest_wire);
@@ -11362,12 +11369,12 @@ mod tests {
             assert!(operation.backup_acked);
             assert_eq!(
                 operation.checkpoint_hash.as_deref(),
-                Some(current_hash.as_str())
+                Some(prepared_hash.as_str())
             );
             let receipt: Value =
                 serde_json::from_str(operation.receipt_json.as_deref().unwrap()).unwrap();
             assert_eq!(receipt["proof_material"], "frozen");
-            assert_eq!(receipt["checkpoint_hash"], current_hash);
+            assert_eq!(receipt["checkpoint_hash"], prepared_hash);
         }
         assert_eq!(
             wallet.checkpoint().unwrap()["checkpoint_hash"],
@@ -12527,7 +12534,7 @@ mod tests {
     }
 
     #[test]
-    fn operation_backup_rebinds_to_the_exact_current_checkpoint_without_reproving() {
+    fn operation_backup_accepts_the_exact_staged_checkpoint_without_reproving() {
         let dir = tempfile::tempdir().unwrap();
         let mut wallet = AccountWallet::open(
             &config(AccountRole::Primary, true),
@@ -12545,35 +12552,35 @@ mod tests {
         wallet
             .insert_planned_operation("later-operation", "transfer", "{}", "later-delivery-nonce")
             .unwrap();
-        assert_eq!(
-            wallet
-                .acknowledge_operation_backup(operation_id, &prepared_hash)
-                .unwrap_err()
-                .code,
-            "backup_checkpoint_mismatch"
-        );
         let current_hash = wallet.checkpoint().unwrap()["checkpoint_hash"]
             .as_str()
             .unwrap()
             .to_owned();
         assert_ne!(current_hash, prepared_hash);
+        assert_eq!(
+            wallet
+                .acknowledge_operation_backup(operation_id, "not-a-checkpoint")
+                .unwrap_err()
+                .code,
+            "backup_checkpoint_mismatch"
+        );
         let acknowledged = wallet
-            .acknowledge_operation_backup(operation_id, &current_hash)
+            .acknowledge_operation_backup(operation_id, &prepared_hash)
             .unwrap();
         assert_eq!(acknowledged["backup_acked"], true);
-        assert_eq!(acknowledged["checkpoint_hash"], current_hash);
+        assert_eq!(acknowledged["checkpoint_hash"], prepared_hash);
         let after = wallet.operation(operation_id).unwrap();
         assert!(after.backup_acked);
         assert_eq!(
             after.checkpoint_hash.as_deref(),
-            Some(current_hash.as_str())
+            Some(prepared_hash.as_str())
         );
         assert_eq!(after.request_json, before.request_json);
         assert_eq!(after.funding_txid, before.funding_txid);
         assert_eq!(after.funding_vout, before.funding_vout);
         let after_receipt: Value =
             serde_json::from_str(after.receipt_json.as_deref().unwrap()).unwrap();
-        assert_eq!(after_receipt["checkpoint_hash"], current_hash);
+        assert_eq!(after_receipt["checkpoint_hash"], prepared_hash);
         assert_eq!(
             wallet.checkpoint().unwrap()["checkpoint_hash"],
             current_hash

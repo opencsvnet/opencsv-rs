@@ -562,3 +562,31 @@ The complete default FFI target passes 61 unit tests plus 2 integration tests,
 with 2 deliberate proof benchmarks ignored and zero failures. The recovery
 feature passes 63 unit tests plus the same 2 integration tests, with 2 ignored
 and zero failures. The warnings-as-errors Signal simulator build also passes.
+
+## 2026-08-07 — Secure Backup export races with unrelated wallet progress
+
+The first live two-recipient Signal batch reached `proof_ready` with two
+durable members, then remained unsigned while Signal completed its mandatory
+manual Secure Backup export. The export itself succeeded, but an unrelated
+receive/finality refresh advanced the wallet checkpoint while the encrypted
+archive was uploading. Rust consequently rejected the hash of the checkpoint
+that Signal had actually staged and uploaded because it was no longer the
+wallet's newest hash. Repeating a complete remote backup until no background
+state changed is not a bounded or useful signing protocol.
+
+The accepted invariant is tied to the exported payload rather than wall-clock
+recency. While the operation or complete batch remains exactly `proof_ready`,
+Rust may acknowledge either its exact prepared checkpoint hash or the exact
+current checkpoint hash. Any unrelated older hash still fails closed. The
+acknowledgement transaction changes only backup metadata; request bytes,
+funding reservation, proposal, manifest, proofs, member ordering, and
+nullifiers remain frozen. This preserves the recovery boundary represented by
+the completed Signal export without forcing proof regeneration or an
+unbounded backup retry when later recoverable wallet state arrives.
+
+Focused regressions cover both solo and multi-recipient operations: unrelated
+wallet progress changes the current hash, an arbitrary hash is rejected, the
+exact staged hash acknowledges every member, proof material and transaction
+inputs remain unchanged, and the newer local checkpoint remains current. Live
+Carol batch completion remains an acceptance gate rather than a claim in this
+entry.
