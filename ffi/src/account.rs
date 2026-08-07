@@ -8368,7 +8368,7 @@ impl AccountWallet {
         }
         transaction.execute(
             "UPDATE opencsv_operations SET state = ?2, receipt_json = ?3,
-             updated_at = ?4 WHERE operation_id = ?1",
+             rejection_reason = NULL, updated_at = ?4 WHERE operation_id = ?1",
             params![
                 operation_id,
                 OperationState::Mempool.as_str(),
@@ -12654,7 +12654,13 @@ mod tests {
             .observe_operation_unconfirmed(operation_id, &raw, &evidence.to_string())
             .unwrap();
         assert_eq!(observed["state"], OperationState::Mempool.as_str());
+        assert!(observed["rejection_reason"].is_null());
         assert!(observed["receipt"]["phase_timings_ms"]["observer_evaluation"].is_number());
+        assert!(wallet
+            .operation(operation_id)
+            .unwrap()
+            .rejection_reason
+            .is_none());
         assert!(transaction.output[0].script_pubkey.is_op_return());
         assert_eq!(transaction.output[1].script_pubkey.as_bytes(), MARKER_SPK);
         assert!(!transaction.output[2].script_pubkey.is_op_return());
