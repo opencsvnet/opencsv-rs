@@ -23,7 +23,10 @@
 
 use opencsv_bitcoin::MEMPOOL_LOCATION;
 use opencsv_core::chain::{AnchorChain, AnchorLocation, AnchorRef};
-use opencsv_core::{AnchorRecord, Digest, ANCHOR_SIZE};
+use opencsv_core::{
+    versioned_batch_commit, versioned_envelope_occurrence, AnchorRecord, BatchVersion, Digest,
+    TruncatedDigest, ANCHOR_SIZE,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::hex::{from_hex_array, to_hex};
@@ -42,6 +45,20 @@ pub struct SnapshotEntry {
     pub ctx: String,
     /// The 64-byte anchor record, hex.
     pub record: String,
+    /// Exact witness envelope for a transaction supplied as unconfirmed raw
+    /// bytes. Confirmed snapshots omit this rebuildable data; the CBF index
+    /// reads it from the independently fetched full block instead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub batch: Option<SnapshotBatchEnvelope>,
+}
+
+/// Fail-closed batch witness data attached only to an exact raw transaction.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SnapshotBatchEnvelope {
+    /// `1` for the legacy `OCSV` hash domain, `2` for signed batching v2.
+    pub version: u8,
+    /// Canonically ordered 24-byte payloads, hex encoded.
+    pub payloads: Vec<String>,
 }
 
 /// Serde form of the whole snapshot.
@@ -58,6 +75,7 @@ struct Entry {
     location: AnchorLocation,
     record: AnchorRecord,
     ctx: [u8; 32],
+    batch: Option<(BatchVersion, Vec<TruncatedDigest>)>,
 }
 
 /// A read-only anchor chain view decoded from a [`Snapshot`].
@@ -82,6 +100,39 @@ impl SnapshotChain {
             let ctx = from_hex_array::<32>(&e.ctx, "snapshot ctx")?;
             let record_bytes = from_hex_array::<ANCHOR_SIZE>(&e.record, "snapshot record")?;
             let record = AnchorRecord::from_bytes(&record_bytes);
+            let batch = e
+                .batch
+                .as_ref()
+                .map(|batch| {
+                    let version = match batch.version {
+                        1 => BatchVersion::V1,
+                        2 => BatchVersion::V2,
+                        version => return Err(format!("snapshot batch version {version}")),
+                    };
+                    let payloads = batch
+                        .payloads
+                        .iter()
+                        .map(|payload| {
+                            from_hex_array::<24>(payload, "snapshot batch payload")
+                                .map(TruncatedDigest)
+                        })
+                        .collect::<Result<Vec<_>, _>>()?;
+                    let AnchorRecord::BatchHeader {
+                        count,
+                        batch_commit,
+                    } = record
+                    else {
+                        return Err("snapshot envelope accompanies a non-batch record".into());
+                    };
+                    if payloads.len() != usize::from(count)
+                        || versioned_batch_commit(version, &payloads, &ctx).to_anchor()
+                            != batch_commit
+                    {
+                        return Err("snapshot batch envelope does not match its record".into());
+                    }
+                    Ok((version, payloads))
+                })
+                .transpose()?;
             entries.push(Entry {
                 txid,
                 location: AnchorLocation {
@@ -90,6 +141,7 @@ impl SnapshotChain {
                 },
                 record,
                 ctx,
+                batch,
             });
         }
         entries.sort_by_key(|e| e.location);
@@ -153,7 +205,7 @@ impl AnchorChain for SnapshotChain {
                 self.entries
                     .iter()
                     .find(|e| {
-                        e.location == MEMPOOL_LOCATION && e.record.well_formed(&e.ctx, raw_nf)
+                        e.location == MEMPOOL_LOCATION && entry_matches_nullifier(e, raw_nf)
                     })
                     .map(|e| e.location)
             })
@@ -167,7 +219,7 @@ impl AnchorChain for SnapshotChain {
         self.entries
             .iter()
             .filter(|e| e.location != MEMPOOL_LOCATION)
-            .filter(|e| e.record.well_formed(&e.ctx, raw_nf))
+            .filter(|e| entry_matches_nullifier(e, raw_nf))
             .map(|e| e.location)
             .collect()
     }
@@ -202,6 +254,21 @@ pub fn entry_json(
         txid: to_hex(txid),
         ctx: to_hex(ctx),
         record: to_hex(&record.to_bytes()),
+        batch: None,
+    }
+}
+
+fn entry_matches_nullifier(entry: &Entry, raw_nf: &Digest) -> bool {
+    match &entry.batch {
+        Some((version, payloads)) => versioned_envelope_occurrence(
+            *version,
+            &entry.record,
+            payloads,
+            &entry.ctx,
+            raw_nf,
+        )
+        .is_some(),
+        None => entry.record.well_formed(&entry.ctx, raw_nf),
     }
 }
 
@@ -233,6 +300,56 @@ mod tests {
             Some(MEMPOOL_LOCATION),
         );
         assert!(chain.nullifier_occurrences(&raw_nf).is_empty());
+    }
+
+    #[test]
+    fn exact_mempool_batch_envelope_is_provisional_first_occurrence() {
+        let raw_nf = digest(20);
+        let ctx = [21_u8; 32];
+        let payloads = vec![
+            opencsv_core::binding(&digest(22), &ctx).to_anchor(),
+            opencsv_core::binding(&raw_nf, &ctx).to_anchor(),
+        ];
+        let record = AnchorRecord::batch_header_v2(&payloads, &ctx);
+        let mut entry = entry_json(MEMPOOL_LOCATION, &[23_u8; 32], &record, &ctx);
+        entry.batch = Some(SnapshotBatchEnvelope {
+            version: 2,
+            payloads: payloads
+                .iter()
+                .map(|payload| to_hex(payload.as_bytes()))
+                .collect(),
+        });
+        let chain = SnapshotChain::from_snapshot(&Snapshot {
+            tip_height: 100,
+            entries: vec![entry],
+        })
+        .unwrap();
+
+        assert_eq!(
+            chain.first_nullifier_occurrence(&raw_nf),
+            Some(MEMPOOL_LOCATION),
+        );
+        assert_eq!(chain.first_nullifier_occurrence(&digest(24)), None);
+    }
+
+    #[test]
+    fn snapshot_rejects_batch_envelope_that_does_not_match_header() {
+        let ctx = [25_u8; 32];
+        let payloads = vec![opencsv_core::binding(&digest(26), &ctx).to_anchor()];
+        let record = AnchorRecord::batch_header_v2(&payloads, &ctx);
+        let mut entry = entry_json(MEMPOOL_LOCATION, &[27_u8; 32], &record, &ctx);
+        entry.batch = Some(SnapshotBatchEnvelope {
+            version: 2,
+            payloads: vec![to_hex(&[28_u8; 24])],
+        });
+
+        let error = SnapshotChain::from_snapshot(&Snapshot {
+            tip_height: 100,
+            entries: vec![entry],
+        })
+        .err()
+        .unwrap();
+        assert!(error.contains("does not match"), "{error}");
     }
 
     #[test]

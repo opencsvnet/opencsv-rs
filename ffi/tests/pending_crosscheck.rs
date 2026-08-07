@@ -87,6 +87,7 @@ impl TestChain {
             txid: txid_hex.clone(),
             ctx: ctx_hex.to_owned(),
             record: record_hex.to_owned(),
+            batch: None,
         });
         format!(
             "{{\"txid\":\"{txid_hex}\",\"height\":{},\"position\":{position}}}",

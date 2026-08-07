@@ -44,7 +44,10 @@ use opencsv_core::chain::AnchorRef;
 use opencsv_core::consignment::Consignment;
 #[cfg(any(test, feature = "issuer-tools"))]
 use opencsv_core::{AssetGenesis, InstrumentTermsV1, PoseidonIssuerAuthorization};
-use opencsv_core::{AssetId, Digest, InstrumentManifestV1, OwnerSecret, TruncatedDigest};
+use opencsv_core::{
+    witness_envelope_decode, AnchorRecord, AssetId, BatchVersion, Digest, InstrumentManifestV1,
+    OwnerSecret, TruncatedDigest,
+};
 use rand::RngExt as _;
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde::{Deserialize, Serialize};
@@ -55,7 +58,7 @@ use zeroize::Zeroizing;
 use crate::wallet::MemWallet;
 use crate::{
     crosscheck, scan,
-    snapshot::{Snapshot, SnapshotChain, SnapshotEntry},
+    snapshot::{Snapshot, SnapshotBatchEnvelope, SnapshotChain, SnapshotEntry},
 };
 
 const SCHEMA_VERSION: u32 = 1;
@@ -9280,7 +9283,14 @@ fn snapshot_with_unconfirmed_anchor(
                 "unconfirmed anchor output 0 is not one canonical 64-byte OP_RETURN",
             )
         })?;
-    validate_initial_anchor(transaction, funding, &record)?;
+    let parsed_record = AnchorRecord::from_bytes(&record);
+    let (ctx, batch) = match parsed_record {
+        AnchorRecord::BatchHeader { .. } => validate_batch_anchor(transaction, &parsed_record)?,
+        _ => {
+            validate_initial_anchor(transaction, funding, &record)?;
+            (funding_context(funding), None)
+        }
+    };
 
     let mut snapshot: Snapshot = serde_json::from_str(confirmed_snapshot_json)
         .map_err(|error| AccountError::new("invalid_chain_view", error.to_string()))?;
@@ -9292,14 +9302,18 @@ fn snapshot_with_unconfirmed_anchor(
     snapshot.entries.retain(|entry| {
         entry.height != MEMPOOL_LOCATION.height || entry.position != MEMPOOL_LOCATION.position
     });
-    let expected_ctx = funding_context(funding);
-    if let Some(confirmed) = snapshot.entries.iter().find(|entry| entry.txid == txid_hex) {
-        if confirmed.ctx != hex_encode(&expected_ctx) || confirmed.record != hex_encode(&record) {
+    if let Some(confirmed) = snapshot
+        .entries
+        .iter_mut()
+        .find(|entry| entry.txid == txid_hex)
+    {
+        if confirmed.ctx != hex_encode(&ctx) || confirmed.record != hex_encode(&record) {
             return Err(AccountError::new(
                 "unconfirmed_anchor_mismatch",
                 "confirmed anchor with the expected txid does not match the exact transaction context and record",
             ));
         }
+        confirmed.batch = batch;
         // The consignment still carries the mempool sentinel, but
         // SnapshotChain resolves that reference by txid to this canonical
         // confirmed location. Injecting a second sentinel entry would make
@@ -9311,10 +9325,103 @@ fn snapshot_with_unconfirmed_anchor(
         height: MEMPOOL_LOCATION.height,
         position: MEMPOOL_LOCATION.position,
         txid: txid_hex,
-        ctx: hex_encode(&expected_ctx),
+        ctx: hex_encode(&ctx),
         record: hex_encode(&record),
+        batch,
     });
     Ok(snapshot)
+}
+
+/// Validate the public, receiver-visible invariants of a signed batching-v2
+/// anchor and retain its exact witness envelope for provisional occurrence
+/// checks. Bitcoin peers and the two required observers establish consensus
+/// validity; this check independently binds the OpenCSV header, stock script,
+/// marker, participant count, and change layout to the received raw bytes.
+fn validate_batch_anchor(
+    transaction: &Transaction,
+    record: &AnchorRecord,
+) -> Result<([u8; 32], Option<SnapshotBatchEnvelope>), AccountError> {
+    let AnchorRecord::BatchHeader { count, .. } = record else {
+        return Err(AccountError::new(
+            "protocol_layout_violation",
+            "batch validation requires a batch header",
+        ));
+    };
+    let count = usize::from(*count);
+    if count == 0
+        || transaction.input.len() != count + 1
+        || transaction.output.len() != count + 3
+        || transaction
+            .input
+            .iter()
+            .any(|input| input.sequence != Sequence::ENABLE_RBF_NO_LOCKTIME)
+    {
+        return Err(AccountError::new(
+            "protocol_layout_violation",
+            "batch input/output counts or RBF sequences are noncanonical",
+        ));
+    }
+    let witness = transaction.input[0]
+        .witness
+        .iter()
+        .map(<[u8]>::to_vec)
+        .collect::<Vec<_>>();
+    let (version, payloads) = witness_envelope_decode(&witness).ok_or_else(|| {
+        AccountError::new(
+            "protocol_layout_violation",
+            "batch input 0 has no canonical witness envelope",
+        )
+    })?;
+    if version != BatchVersion::V2 || payloads.len() != count {
+        return Err(AccountError::new(
+            "protocol_layout_violation",
+            "Signal accepts only signed batching-v2 envelopes with the committed count",
+        ));
+    }
+    let funding = transaction.input[0].previous_output;
+    let ctx = funding_context(funding);
+    if AnchorRecord::batch_header_v2(&payloads, &ctx) != *record {
+        return Err(AccountError::new(
+            "protocol_layout_violation",
+            "batch witness envelope does not match the anchor header and input-0 context",
+        ));
+    }
+    let expected_record = ScriptBuf::new_op_return(
+        PushBytesBuf::try_from(record.to_bytes().to_vec()).expect("64-byte record is pushable"),
+    );
+    let stock_witness_script = ScriptBuf::from_bytes(
+        witness
+            .last()
+            .expect("decoded batching-v2 witness has a script")
+            .clone(),
+    );
+    let stock_output = &transaction.output[2];
+    if transaction.output[0].value != Amount::ZERO
+        || transaction.output[0].script_pubkey != expected_record
+        || transaction.output[1].value.to_sat() != MARKER_DUST_SATS
+        || transaction.output[1].script_pubkey.as_bytes() != MARKER_SPK
+        || stock_output.script_pubkey != stock_witness_script.to_p2wsh()
+        || stock_output.value < stock_output.script_pubkey.minimal_non_dust()
+        || transaction.output[3..].iter().any(|output| {
+            !output.script_pubkey.is_p2wpkh()
+                || output.value < output.script_pubkey.minimal_non_dust()
+        })
+    {
+        return Err(AccountError::new(
+            "protocol_layout_violation",
+            "signed transaction does not preserve batch header/marker/stock/change layout",
+        ));
+    }
+    Ok((
+        ctx,
+        Some(SnapshotBatchEnvelope {
+            version: 2,
+            payloads: payloads
+                .iter()
+                .map(|payload| hex_encode(payload.as_bytes()))
+                .collect(),
+        }),
+    ))
 }
 
 fn evaluate_observation_evidence(
@@ -10550,6 +10657,7 @@ mod tests {
             txid: hex_encode(&[99_u8; 32]),
             ctx: hex_encode(&[98_u8; 32]),
             record: hex_encode(&[97_u8; 64]),
+            batch: None,
         };
         let snapshot = snapshot_with_unconfirmed_anchor(
             &serde_json::to_string(&Snapshot {
@@ -10597,6 +10705,7 @@ mod tests {
                 txid: hex_encode(&consignment.anchor_ref.txid),
                 ctx: hex_encode(&funding_context(funding)),
                 record: hex_encode(&record),
+                batch: None,
             }],
         };
         let settled = snapshot_with_unconfirmed_anchor(
@@ -10617,6 +10726,102 @@ mod tests {
             opencsv_core::chain::AnchorChain::locate(&settled_chain, &consignment.anchor_ref),
             Some(confirmed_location)
         );
+    }
+
+    #[test]
+    fn provisional_snapshot_accepts_exact_batch_v2_layout_and_envelope() {
+        let funding = OutPoint::new(Txid::from_byte_array([41_u8; 32]), 0);
+        let ctx = funding_context(funding);
+        let raw_nf = Digest::from_bytes([42_u8; 32]);
+        let payloads = vec![
+            opencsv_core::binding(&raw_nf, &ctx).to_anchor(),
+            opencsv_core::binding(&Digest::from_bytes([43_u8; 32]), &ctx).to_anchor(),
+        ];
+        let record = AnchorRecord::batch_header_v2(&payloads, &ctx);
+        let stock_script = ScriptBuf::from_bytes(vec![0x51]);
+        let mut stock_witness = vec![b"OCS2".to_vec()];
+        stock_witness.extend(payloads.iter().map(|payload| payload.as_bytes().to_vec()));
+        stock_witness.push(vec![1_u8]);
+        stock_witness.push(stock_script.as_bytes().to_vec());
+        let input = |previous_output| TxIn {
+            previous_output,
+            script_sig: ScriptBuf::new(),
+            sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+            witness: Witness::new(),
+        };
+        let mut transaction = Transaction {
+            version: transaction::Version::TWO,
+            lock_time: absolute::LockTime::ZERO,
+            input: vec![
+                input(funding),
+                input(OutPoint::new(Txid::from_byte_array([44_u8; 32]), 1)),
+                input(OutPoint::new(Txid::from_byte_array([45_u8; 32]), 2)),
+            ],
+            output: vec![
+                TxOut {
+                    value: Amount::ZERO,
+                    script_pubkey: ScriptBuf::new_op_return(
+                        PushBytesBuf::try_from(record.to_bytes().to_vec()).unwrap(),
+                    ),
+                },
+                TxOut {
+                    value: Amount::from_sat(MARKER_DUST_SATS),
+                    script_pubkey: ScriptBuf::from_bytes(MARKER_SPK.to_vec()),
+                },
+                TxOut {
+                    value: Amount::from_sat(546),
+                    script_pubkey: stock_script.to_p2wsh(),
+                },
+                TxOut {
+                    value: Amount::from_sat(2_000),
+                    script_pubkey: ScriptBuf::from_bytes(
+                        [vec![0x00, 0x14], vec![46_u8; 20]].concat(),
+                    ),
+                },
+                TxOut {
+                    value: Amount::from_sat(3_000),
+                    script_pubkey: ScriptBuf::from_bytes(
+                        [vec![0x00, 0x14], vec![47_u8; 20]].concat(),
+                    ),
+                },
+            ],
+        };
+        transaction.input[0].witness = Witness::from_slice(&stock_witness);
+        let consignment = Consignment {
+            coin_openings: Vec::new(),
+            nullifiers: vec![raw_nf],
+            proof: Vec::new(),
+            anchor_ref: AnchorRef {
+                txid: transaction.compute_txid().to_byte_array(),
+                location: MEMPOOL_LOCATION,
+            },
+            aux: None,
+        };
+
+        let snapshot = snapshot_with_unconfirmed_anchor(
+            r#"{"tip_height":100,"entries":[]}"#,
+            &consignment,
+            &transaction,
+        )
+        .unwrap();
+        assert_eq!(snapshot.entries.len(), 1);
+        assert_eq!(snapshot.entries[0].batch.as_ref().unwrap().version, 2);
+        let chain = SnapshotChain::from_snapshot(&snapshot).unwrap();
+        assert_eq!(
+            opencsv_core::chain::AnchorChain::first_nullifier_occurrence(&chain, &raw_nf),
+            Some(MEMPOOL_LOCATION),
+        );
+
+        transaction.output.swap(1, 2);
+        let mut mutated_consignment = consignment.clone();
+        mutated_consignment.anchor_ref.txid = transaction.compute_txid().to_byte_array();
+        let error = snapshot_with_unconfirmed_anchor(
+            r#"{"tip_height":100,"entries":[]}"#,
+            &mutated_consignment,
+            &transaction,
+        )
+        .unwrap_err();
+        assert_eq!(error.code, "protocol_layout_violation");
     }
 
     #[test]

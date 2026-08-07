@@ -590,3 +590,34 @@ exact staged hash acknowledges every member, proof material and transaction
 inputs remain unchanged, and the newer local checkpoint remains current. Live
 Carol batch completion remains an acceptance gate rather than a claim in this
 entry.
+
+## 2026-08-07 — zero-confirmation receiver learns the exact batch envelope
+
+Carol's first explicit two-recipient send survived deliberate crashes after
+proof generation and after broadcast, then reached the mempool as one exact
+transaction. Bob downloaded his consignment and both pinned observers returned
+matching raw bytes, but the receive verifier rejected the anchor with `anchor
+must have record, marker, and change outputs`. The failure was honest but
+incorrect: the provisional snapshot builder still required the three-output
+solo layout and discarded the input-0 witness envelope that makes a batch
+nullifier occurrence verifiable.
+
+The accepted boundary now distinguishes the record class before constructing a
+provisional snapshot. Solo anchors retain their exact three-output validation.
+A batching-v2 anchor must have the committed participant/input/output counts,
+canonical RBF sequences, a canonical `OCS2` input-0 envelope, a header that
+recomputes from that envelope and the input-0 context, the exact marker, a
+stock output locked to the revealed stock witness script, and one non-dust
+P2WPKH change output per participant. The exact envelope is retained only in
+the in-memory/provisional snapshot derived from observer-matched transaction
+bytes; settled CBF verification continues to read witness data from the
+independently fetched full block.
+
+Snapshot occurrence checks now validate the versioned envelope commitment
+before matching a private nullifier. A forged, missing, reordered, wrong-domain,
+or header-mismatched envelope fails closed. Focused tests cover valid batch
+occurrence, unrelated nullifiers, mismatched envelopes, exact v2 layout, layout
+mutation, and unchanged solo behavior. The complete warnings-as-errors FFI
+library suite passes 64 tests with zero failures and two deliberately ignored
+slow proof cases. Live recipient credit and duplicate-delivery checks remain
+acceptance gates rather than claims in this entry.
