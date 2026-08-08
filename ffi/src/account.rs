@@ -1042,6 +1042,7 @@ pub(crate) struct CompletedProofJob {
     record: [u8; 64],
     unconfirmed_dependencies: Vec<String>,
     dependency_observed_at: Option<i64>,
+    reconciled_spent_coin_ids: Vec<String>,
     phase_timings_ms: Value,
 }
 
@@ -1074,6 +1075,7 @@ pub(crate) struct AccountBatchProofJob {
     verifier: Arc<dyn FundingVerifier>,
     protocol_snapshot: MemWallet,
     esplora_url: String,
+    require_protocol_spend_preflight: bool,
 }
 
 struct CompletedBatchProofMember {
@@ -1094,6 +1096,7 @@ pub(crate) struct CompletedBatchProofJob {
     proposal: BatchProposal,
     manifest: BatchManifest,
     members: Vec<CompletedBatchProofMember>,
+    reconciled_spent_coin_ids: Vec<String>,
     phase_timings_ms: Value,
 }
 
@@ -1111,15 +1114,47 @@ impl AccountProofJob {
             birth_height: self.funding.birth_height,
         })?;
         let funding_verification_ms = elapsed_millis(funding_verification_started);
-        let selected_nullifiers = self
-            .protocol_snapshot
-            .selected_transfer_nullifiers(&self.request.asset_id, self.request.amount)
-            .map_err(|error| AccountError::new("unavailable_assets", error))?;
-        verify_protocol_inputs_unspent(
-            &selected_nullifiers,
-            verification.checked_through,
-            self.require_protocol_spend_preflight,
-        )?;
+        let mut reconciled_spent_coin_ids = Vec::new();
+        loop {
+            let selected_nullifiers = self
+                .protocol_snapshot
+                .selected_transfer_nullifiers(&self.request.asset_id, self.request.amount)
+                .map_err(|error| {
+                    if reconciled_spent_coin_ids.is_empty() {
+                        AccountError::new("unavailable_assets", error)
+                    } else {
+                        AccountError::new(
+                            "stale_chain_state",
+                            format!(
+                                "confirmed OpenCSV spends were removed but no alternate input covers the payment: {error}"
+                            ),
+                        )
+                    }
+                })?;
+            let confirmed_spends = confirmed_protocol_input_spends(
+                &selected_nullifiers,
+                verification.checked_through,
+                self.require_protocol_spend_preflight,
+            )?;
+            if confirmed_spends.is_empty() {
+                break;
+            }
+            let confirmed_nullifiers: Vec<Digest> = confirmed_spends
+                .iter()
+                .map(|(nullifier, _)| *nullifier)
+                .collect();
+            let removed = self
+                .protocol_snapshot
+                .mark_confirmed_spent_nullifiers(&confirmed_nullifiers)
+                .map_err(|error| AccountError::new("database_error", error))?;
+            if removed.is_empty() {
+                return Err(AccountError::new(
+                    "stale_chain_state",
+                    "confirmed OpenCSV input could not be reconciled with the wallet snapshot",
+                ));
+            }
+            reconciled_spent_coin_ids.extend(removed);
+        }
         let ctx = funding_context(self.funding.outpoint);
         let local_proving_started = Instant::now();
         let proved = self
@@ -1187,6 +1222,7 @@ impl AccountProofJob {
             record,
             unconfirmed_dependencies: proved.unconfirmed_dependencies,
             dependency_observed_at,
+            reconciled_spent_coin_ids,
             phase_timings_ms: json!({
                 "funding_verification": funding_verification_ms,
                 "local_proving": local_proving_ms,
@@ -1255,7 +1291,48 @@ impl AccountBatchProofJob {
         let mut commitments = Vec::with_capacity(self.members.len());
         let mut local_proving_ms = 0_u64;
         let mut dependency_observation_ms = 0_u64;
+        let mut reconciled_spent_coin_ids = Vec::new();
         for (member, funding_verification) in self.members.into_iter().zip(funding_verifications) {
+            loop {
+                let selected_nullifiers = self
+                    .protocol_snapshot
+                    .selected_transfer_nullifiers(&member.request.asset_id, member.request.amount)
+                    .map_err(|error| {
+                        if reconciled_spent_coin_ids.is_empty() {
+                            AccountError::new("unavailable_assets", error)
+                        } else {
+                            AccountError::new(
+                                "stale_chain_state",
+                                format!(
+                                    "confirmed OpenCSV spends were removed but no alternate batch input covers the payment: {error}"
+                                ),
+                            )
+                        }
+                    })?;
+                let confirmed_spends = confirmed_protocol_input_spends(
+                    &selected_nullifiers,
+                    funding_verification.checked_through,
+                    self.require_protocol_spend_preflight,
+                )?;
+                if confirmed_spends.is_empty() {
+                    break;
+                }
+                let confirmed_nullifiers: Vec<Digest> = confirmed_spends
+                    .iter()
+                    .map(|(nullifier, _)| *nullifier)
+                    .collect();
+                let removed = self
+                    .protocol_snapshot
+                    .mark_confirmed_spent_nullifiers(&confirmed_nullifiers)
+                    .map_err(|error| AccountError::new("database_error", error))?;
+                if removed.is_empty() {
+                    return Err(AccountError::new(
+                        "stale_chain_state",
+                        "confirmed batch input could not be reconciled with the wallet snapshot",
+                    ));
+                }
+                reconciled_spent_coin_ids.extend(removed);
+            }
             let local_proving_started = Instant::now();
             let proved = self
                 .protocol_snapshot
@@ -1366,6 +1443,7 @@ impl AccountBatchProofJob {
             proposal,
             manifest,
             members: completed_members,
+            reconciled_spent_coin_ids,
             phase_timings_ms: json!({
                 "funding_verification": funding_verification_ms,
                 "local_proving": local_proving_ms,
@@ -3694,6 +3772,7 @@ impl AccountWallet {
                 AccountError::new("primary_required", "linked devices cannot prove batches")
             })?,
             esplora_url: self.config.esplora_url.clone(),
+            require_protocol_spend_preflight: protocol_spend_preflight_required(&self.config),
         })))
     }
 
@@ -3750,6 +3829,9 @@ impl AccountWallet {
         let mut protocol_candidate = self.protocol.as_ref().cloned().ok_or_else(|| {
             AccountError::new("primary_required", "linked devices cannot prove batches")
         })?;
+        protocol_candidate
+            .mark_spent(&completed.reconciled_spent_coin_ids)
+            .map_err(|error| AccountError::new("database_error", error))?;
         let mut pending_ids = Vec::with_capacity(completed.members.len());
         for member in &completed.members {
             if let Err(error) = self.require_reviewed_usd_asset(&member.request.asset_id) {
@@ -4093,6 +4175,15 @@ impl AccountWallet {
                         format!("batch member {} has no pending proof", member.operation_id),
                     )
                 })?;
+            let pending_nullifiers = self
+                .primary_protocol_mut()?
+                .pending_nullifiers(pending_id)
+                .map_err(|error| AccountError::new("operation_not_resumable", error))?;
+            verify_protocol_inputs_unspent(
+                &pending_nullifiers,
+                verification.checked_through,
+                protocol_spend_preflight_required(&self.config),
+            )?;
             let dependencies = self
                 .primary_protocol_mut()?
                 .pending_unconfirmed_dependencies(pending_id)
@@ -5162,6 +5253,18 @@ impl AccountWallet {
                 protocol.cancel_pending(pending_id);
             }
             return self.fail_proof_job(&completed.operation_id, error);
+        }
+        if !completed.reconciled_spent_coin_ids.is_empty() {
+            if let Err(error) = self
+                .primary_protocol_mut()?
+                .mark_spent(&completed.reconciled_spent_coin_ids)
+                .map_err(|error| AccountError::new("database_error", error))
+            {
+                if let Some(protocol) = self.protocol.as_mut() {
+                    protocol.cancel_pending(pending_id);
+                }
+                return self.fail_proof_job(&completed.operation_id, error);
+            }
         }
         self.pending_by_operation
             .insert(completed.operation_id.clone(), pending_id);
@@ -10100,8 +10203,26 @@ fn verify_protocol_inputs_unspent(
     minimum_tip: u64,
     required: bool,
 ) -> Result<(), AccountError> {
+    let confirmed_spends = confirmed_protocol_input_spends(nullifiers, minimum_tip, required)?;
+    if let Some((_, location)) = confirmed_spends.first() {
+        return Err(AccountError::new(
+            "stale_chain_state",
+            format!(
+                "selected OpenCSV input was already spent at {}:{}; the wallet checkpoint is behind the verified chain",
+                location.height, location.position
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn confirmed_protocol_input_spends(
+    nullifiers: &[Digest],
+    minimum_tip: u64,
+    required: bool,
+) -> Result<Vec<(Digest, opencsv_core::chain::AnchorLocation)>, AccountError> {
     if !required {
-        return Ok(());
+        return Ok(Vec::new());
     }
     if nullifiers.is_empty() {
         return Err(AccountError::new(
@@ -10109,6 +10230,7 @@ fn verify_protocol_inputs_unspent(
             "transfer proof contains no OpenCSV input nullifiers",
         ));
     }
+    let mut confirmed_spends = Vec::new();
     for nullifier in nullifiers {
         let (scan_tip, occurrence) =
             scan::registered_nullifier_occurrence(nullifier).map_err(|error| {
@@ -10126,16 +10248,10 @@ fn verify_protocol_inputs_unspent(
             ));
         }
         if let Some(location) = occurrence {
-            return Err(AccountError::new(
-                "stale_chain_state",
-                format!(
-                    "selected OpenCSV input was already spent at {}:{}; the wallet checkpoint is behind the verified chain",
-                    location.height, location.position
-                ),
-            ));
+            confirmed_spends.push((*nullifier, location));
         }
     }
-    Ok(())
+    Ok(confirmed_spends)
 }
 
 #[cfg(test)]

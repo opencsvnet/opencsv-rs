@@ -1256,6 +1256,36 @@ impl MemWallet {
             .collect()
     }
 
+    /// Reconcile locally-unspent coins whose private nullifiers have already
+    /// appeared in the verified confirmed-chain index.
+    ///
+    /// The account layer calls this only on its private wallet snapshot after
+    /// consulting the registered PoW-verified scan. Marking the matching
+    /// coins spent lets deterministic selection try the next-best inputs
+    /// without exposing openings or nullifiers across the FFI boundary.
+    pub fn mark_confirmed_spent_nullifiers(
+        &mut self,
+        nullifiers: &[Digest],
+    ) -> Result<Vec<String>, OpError> {
+        let confirmed: std::collections::HashSet<Digest> = nullifiers.iter().copied().collect();
+        let spent_ids: Vec<String> = self
+            .coins
+            .iter()
+            .filter(|stored| stored.status == CoinStatus::Unspent)
+            .filter_map(|stored| {
+                let owner_secret = self.secret_for(&stored.coin.owner)?;
+                confirmed
+                    .contains(&stored.coin.nullifier(&owner_secret))
+                    .then(|| stored.id())
+            })
+            .collect();
+
+        for coin_id in &spent_ids {
+            self.find_coin_mut(coin_id)?.status = CoinStatus::Spent;
+        }
+        Ok(spent_ids)
+    }
+
     /// Whether one pending operation consumes any coin already reserved by a
     /// different pending operation. Used by the account layer when a proof
     /// generated from a snapshot is atomically committed back into the live
@@ -1628,6 +1658,39 @@ mod tests {
             },
         );
         assert_eq!(wallet.pending_nullifiers(1).unwrap(), vec![expected]);
+    }
+
+    #[test]
+    fn confirmed_spend_reconciliation_selects_the_next_best_coin() {
+        let mut wallet = MemWallet::from_owner_seed([7u8; 32]);
+        let asset_id = Digest::from_bytes([9u8; 32]);
+        store_coin(&mut wallet, asset_id, 7, 1);
+        store_coin(&mut wallet, asset_id, 8, 2);
+        let asset_hex = to_hex(asset_id.as_bytes());
+
+        let (first_selection, _) = wallet.select_transfer_inputs(&asset_hex, 7).unwrap();
+        let first_coin = wallet.find_coin(&first_selection[0]).unwrap();
+        assert_eq!(first_coin.coin.value, 7);
+        let first_nullifier = first_coin
+            .coin
+            .nullifier(&wallet.secret_for(&first_coin.coin.owner).unwrap());
+
+        assert_eq!(
+            wallet
+                .mark_confirmed_spent_nullifiers(&[first_nullifier])
+                .unwrap(),
+            first_selection,
+        );
+        let (replacement_selection, total) = wallet.select_transfer_inputs(&asset_hex, 7).unwrap();
+        assert_eq!(total, 8);
+        assert_eq!(
+            wallet
+                .find_coin(&replacement_selection[0])
+                .unwrap()
+                .coin
+                .value,
+            8,
+        );
     }
 
     #[test]
