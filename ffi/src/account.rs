@@ -5925,6 +5925,23 @@ impl AccountWallet {
             .map_err(|reason| AccountError::new(reason.code(), reason.to_string()))?;
         let replacement_txid = replacement.compute_txid();
         let replacement_hex = hex_encode(&serialize(&replacement));
+        let replacement_output_sats =
+            replacement.output.iter().try_fold(0u64, |total, output| {
+                total.checked_add(output.value.to_sat()).ok_or_else(|| {
+                    AccountError::new("database_corrupt", "replacement output value overflow")
+                })
+            })?;
+        let replacement_fee_sats = funding
+            .txout
+            .value
+            .to_sat()
+            .checked_sub(replacement_output_sats)
+            .ok_or_else(|| {
+                AccountError::new(
+                    "protocol_layout_violation",
+                    "replacement outputs exceed the protected funding input",
+                )
+            })?;
         let mut receipt: Value = operation
             .receipt_json
             .as_deref()
@@ -5937,6 +5954,8 @@ impl AccountWallet {
         receipt_object.insert("replaces".into(), json!(original_txid.to_string()));
         receipt_object.insert("txid".into(), json!(replacement_txid.to_string()));
         receipt_object.insert("target_sat_per_vb".into(), json!(target_sat_per_vb));
+        receipt_object.insert("fee_rate_sat_per_vb".into(), json!(target_sat_per_vb));
+        receipt_object.insert("fee_sats".into(), json!(replacement_fee_sats));
         receipt_object.insert(
             "fee_increment_sats".into(),
             json!(validation.fee_increment_sats),
@@ -8437,6 +8456,15 @@ impl AccountWallet {
         let receipt_object = receipt.as_object_mut().ok_or_else(|| {
             AccountError::new("database_corrupt", "operation receipt is not an object")
         })?;
+        // A replacement is a new proof-bearing attachment. Rotate the
+        // transport acknowledgement nonce atomically with its exact bytes so
+        // a delayed acknowledgement for the superseded consignment cannot
+        // mark this replacement delivered before Signal sends it.
+        let replacement_delivery_nonce = random_id(16);
+        receipt_object.insert(
+            "delivery_nonce".into(),
+            json!(replacement_delivery_nonce.clone()),
+        );
         let stale_consignment_id = receipt_object
             .remove("consignment_id")
             .and_then(|value| value.as_str().map(str::to_owned));
@@ -8478,7 +8506,7 @@ impl AccountWallet {
         }
         transaction.execute(
             "UPDATE opencsv_operations SET state = ?2, signed_tx_hex = ?3,
-             txid = ?4, receipt_json = ?5, updated_at = ?6
+             txid = ?4, receipt_json = ?5, delivery_nonce = ?6, updated_at = ?7
              WHERE operation_id = ?1",
             params![
                 operation_id,
@@ -8486,6 +8514,7 @@ impl AccountWallet {
                 replacement_hex,
                 replacement_txid.to_string(),
                 receipt.to_string(),
+                replacement_delivery_nonce,
                 now,
             ],
         )?;
@@ -13452,13 +13481,19 @@ mod tests {
             .unwrap();
 
         let replacement_pending = wallet.operation(&operation_id).unwrap();
+        let replacement_delivery_nonce = replacement_pending.delivery_nonce.clone();
         assert_eq!(
             replacement_pending.state,
             OperationState::SignedPersisted.as_str(),
         );
+        assert_ne!(replacement_delivery_nonce, delivery_nonce);
         assert!(wallet.pending_by_operation.contains_key(&operation_id));
         let replacement_pending_receipt: Value =
             serde_json::from_str(replacement_pending.receipt_json.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            replacement_pending_receipt["delivery_nonce"],
+            replacement_delivery_nonce,
+        );
         assert_eq!(
             replacement_pending_receipt["replacement_delivery_required"],
             true,
@@ -13504,6 +13539,14 @@ mod tests {
         assert!(finalized_receipt
             .get("replacement_delivery_required")
             .is_none());
+        let stale_ack = wallet
+            .mark_consignment_delivered(&operation_id, &delivery_nonce)
+            .unwrap_err();
+        assert_eq!(stale_ack.code, "delivery_nonce_mismatch");
+        let acknowledged = wallet
+            .mark_consignment_delivered(&operation_id, &replacement_delivery_nonce)
+            .unwrap();
+        assert_eq!(acknowledged["receipt"]["consignment_delivered"], true);
     }
 
     #[test]
@@ -13556,6 +13599,14 @@ mod tests {
         let replacement: Transaction =
             deserialize(&hex_decode(&replacement_hex, "replacement tx").unwrap()).unwrap();
         validate_solo_anchor_replacement(&original, &replacement).unwrap();
+        let replacement_fee_sats = 100_000
+            - replacement
+                .output
+                .iter()
+                .map(|output| output.value.to_sat())
+                .sum::<u64>();
+        assert_eq!(bump_pending["receipt"]["fee_rate_sat_per_vb"], 5);
+        assert_eq!(bump_pending["receipt"]["fee_sats"], replacement_fee_sats,);
         let replacement_txid = replacement.compute_txid();
         drop(wallet);
 
