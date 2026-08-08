@@ -379,16 +379,15 @@ fn write_checkpoint(path: &Path, checkpoint: &Value) -> Result<Value, CliError> 
             format!("could not durably write {}: {error}", path.display()),
         ));
     }
-    if let Some(parent) = path.parent() {
-        fs::File::open(parent)
-            .and_then(|directory| directory.sync_all())
-            .map_err(|error| {
-                CliError::new(
-                    "checkpoint_write_failed",
-                    format!("could not sync {}: {error}", parent.display()),
-                )
-            })?;
-    }
+    let parent = durability_parent(path);
+    fs::File::open(parent)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|error| {
+            CliError::new(
+                "checkpoint_write_failed",
+                format!("could not sync {}: {error}", parent.display()),
+            )
+        })?;
     Ok(json!({
         "checkpoint_hash": checkpoint_hash,
         "output": path.display().to_string(),
@@ -453,10 +452,7 @@ fn write_consignment(path: &Path, operation: &Value) -> Result<Value, CliError> 
             format!("could not durably write {}: {error}", path.display()),
         ));
     }
-    let parent = path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
+    let parent = durability_parent(path);
     fs::File::open(parent)
         .and_then(|directory| directory.sync_all())
         .map_err(|error| {
@@ -471,6 +467,12 @@ fn write_consignment(path: &Path, operation: &Value) -> Result<Value, CliError> 
         "output": path.display().to_string(),
         "bytes": bytes.len(),
     }))
+}
+
+fn durability_parent(path: &Path) -> &Path {
+    path.parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
 }
 
 fn read_secret(path: &Path, label: &'static str) -> Result<Zeroizing<[u8; 32]>, CliError> {
@@ -621,6 +623,15 @@ mod tests {
         assert_eq!(
             write_checkpoint(&path, &checkpoint).unwrap_err().reason,
             "checkpoint_output_exists"
+        );
+    }
+
+    #[test]
+    fn bare_output_names_sync_the_current_directory() {
+        assert_eq!(durability_parent(Path::new("checkpoint.json")), Path::new("."));
+        assert_eq!(
+            durability_parent(Path::new("receipts/checkpoint.json")),
+            Path::new("receipts")
         );
     }
 
