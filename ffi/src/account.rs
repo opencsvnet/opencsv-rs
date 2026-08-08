@@ -1998,6 +1998,14 @@ impl AccountWallet {
         snapshot_json: &str,
     ) -> Result<Value, AccountError> {
         let (canonical_blob, consignment_id) = canonical_consignment_identity(blob)?;
+        let consignment = Consignment::from_bytes(&canonical_blob)
+            .map_err(|error| AccountError::new("invalid_consignment", error.to_string()))?;
+        let payment_id = consignment_payment_identity(&consignment)?;
+        let superseded_consignment_ids = matching_payment_consignments(
+            &self.db.conn,
+            &consignment_id,
+            &payment_id,
+        )?;
         let anchor_txid = consignment_anchor_txid(&canonical_blob)?;
         let chain = SnapshotChain::from_json(snapshot_json)
             .map_err(|error| AccountError::new("invalid_chain_view", error))?;
@@ -2045,6 +2053,8 @@ impl AccountWallet {
                     "finality": "settled",
                     "spendable": true,
                     "consignment_id": consignment_id,
+                    "payment_id": payment_id,
+                    "superseded_consignment_ids": superseded_consignment_ids,
                     "credits": verified.credits,
                     "coins": verified.coins,
                     "anchor": {
@@ -2056,6 +2066,7 @@ impl AccountWallet {
             Err(reason) => Ok(json!({
                 "status": "rejected",
                 "consignment_id": consignment_id,
+                "payment_id": payment_id,
                 "reason": reason,
             })),
         }
@@ -2069,6 +2080,7 @@ impl AccountWallet {
             .map_err(|error| AccountError::new("invalid_consignment", error.to_string()))?;
         Ok(json!({
             "consignment_id": consignment_id,
+            "payment_id": consignment_payment_identity(&consignment)?,
             "anchor_txid": Txid::from_byte_array(consignment.anchor_ref.txid).to_string(),
             "anchor_height": consignment.anchor_ref.location.height,
             "anchor_position": consignment.anchor_ref.location.position,
@@ -2099,6 +2111,12 @@ impl AccountWallet {
         let (canonical_blob, consignment_id) = canonical_consignment_identity(blob)?;
         let consignment = Consignment::from_bytes(&canonical_blob)
             .map_err(|error| AccountError::new("invalid_consignment", error.to_string()))?;
+        let payment_id = consignment_payment_identity(&consignment)?;
+        let superseded_consignment_ids = matching_payment_consignments(
+            &self.db.conn,
+            &consignment_id,
+            &payment_id,
+        )?;
         let anchor_txid = Txid::from_byte_array(consignment.anchor_ref.txid);
         let client = esplora_client::Builder::new(&self.config.esplora_url).build_blocking();
         let transaction = client
@@ -2176,6 +2194,8 @@ impl AccountWallet {
                     "spendable": true,
                     "risk": "zero_confirmation_replacement_or_conflict",
                     "consignment_id": consignment_id,
+                    "payment_id": payment_id,
+                    "superseded_consignment_ids": superseded_consignment_ids,
                     "credits": verified.credits,
                     "coins": verified.coins,
                     "anchor": {
@@ -2191,6 +2211,7 @@ impl AccountWallet {
                 "finality": "unconfirmed",
                 "spendable": false,
                 "consignment_id": consignment_id,
+                "payment_id": payment_id,
                 "reason": reason,
             })),
         }
@@ -2212,6 +2233,12 @@ impl AccountWallet {
         let (canonical_blob, consignment_id) = canonical_consignment_identity(blob)?;
         let consignment = Consignment::from_bytes(&canonical_blob)
             .map_err(|error| AccountError::new("invalid_consignment", error.to_string()))?;
+        let payment_id = consignment_payment_identity(&consignment)?;
+        let superseded_consignment_ids = matching_payment_consignments(
+            &self.db.conn,
+            &consignment_id,
+            &payment_id,
+        )?;
         let anchor_txid = Txid::from_byte_array(consignment.anchor_ref.txid);
         let transaction: Transaction = deserialize(raw_transaction).map_err(|error| {
             AccountError::new(
@@ -2306,6 +2333,8 @@ impl AccountWallet {
                     "spendable": true,
                     "risk": "zero_confirmation_replacement_or_conflict",
                     "consignment_id": consignment_id,
+                    "payment_id": payment_id,
+                    "superseded_consignment_ids": superseded_consignment_ids,
                     "credits": verified.credits,
                     "coins": verified.coins,
                     "anchor": {
@@ -2321,6 +2350,7 @@ impl AccountWallet {
                 "finality": "unconfirmed",
                 "spendable": false,
                 "consignment_id": consignment_id,
+                "payment_id": payment_id,
                 "reason": reason,
                 "observations": receipts,
             })),
@@ -9252,6 +9282,49 @@ fn canonical_consignment_identity(blob: &[u8]) -> Result<(Vec<u8>, String), Acco
     Ok((canonical, identity))
 }
 
+/// Stable logical-payment identity. An RBF replacement changes only the
+/// Bitcoin anchor reference; the recipient openings, nullifiers, proof, and
+/// optional genesis remain byte-for-byte identical. Hashing those protected
+/// fields lets clients replace presentation without trusting Signal message
+/// text or treating the new canonical consignment as a second payment.
+fn consignment_payment_identity(consignment: &Consignment) -> Result<String, AccountError> {
+    let mut protected = consignment.clone();
+    protected.anchor_ref.txid = [0; 32];
+    let mut domain_separated = b"OpenCSV/payment-presentation/v1\0".to_vec();
+    domain_separated.extend_from_slice(&protected.to_bytes());
+    Ok(sha256::Hash::hash(&domain_separated).to_string())
+}
+
+/// Find prior canonical consignments for the same protected payment. The
+/// database contains only proof-verified consignments, so this relationship
+/// is derived from protocol bytes rather than untrusted transport metadata.
+fn matching_payment_consignments(
+    conn: &Connection,
+    current_consignment_id: &str,
+    payment_id: &str,
+) -> Result<Vec<String>, AccountError> {
+    let mut statement = conn.prepare(
+        "SELECT consignment_id, consignment_base64 FROM opencsv_consignments
+         WHERE consignment_id != ?1 ORDER BY created_at, consignment_id",
+    )?;
+    let rows = statement.query_map([current_consignment_id], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?;
+    let mut matches = Vec::new();
+    for row in rows {
+        let (consignment_id, encoded) = row?;
+        let blob = base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .map_err(|error| AccountError::new("database_corrupt", error.to_string()))?;
+        let consignment = Consignment::from_bytes(&blob)
+            .map_err(|error| AccountError::new("database_corrupt", error.to_string()))?;
+        if consignment_payment_identity(&consignment)? == payment_id {
+            matches.push(consignment_id);
+        }
+    }
+    Ok(matches)
+}
+
 fn consignment_anchor_txid(blob: &[u8]) -> Result<String, AccountError> {
     let consignment = Consignment::from_bytes(blob)
         .map_err(|error| AccountError::new("invalid_consignment", error.to_string()))?;
@@ -10661,6 +10734,88 @@ mod tests {
         let (normalized_bytes, normalized_id) = canonical_consignment_identity(&overlong).unwrap();
         assert_eq!(normalized_bytes, canonical_bytes);
         assert_eq!(normalized_id, canonical_id);
+    }
+
+    #[test]
+    fn payment_identity_survives_rbf_anchor_replacement_only() {
+        let original = Consignment {
+            coin_openings: Vec::new(),
+            nullifiers: Vec::new(),
+            proof: vec![1, 2, 3],
+            anchor_ref: AnchorRef {
+                txid: [7u8; 32],
+                location: MEMPOOL_LOCATION,
+            },
+            aux: None,
+        };
+        let mut replacement = original.clone();
+        replacement.anchor_ref.txid = [8u8; 32];
+
+        assert_ne!(
+            canonical_consignment_identity(&original.to_bytes()).unwrap().1,
+            canonical_consignment_identity(&replacement.to_bytes())
+                .unwrap()
+                .1,
+        );
+        assert_eq!(
+            consignment_payment_identity(&original).unwrap(),
+            consignment_payment_identity(&replacement).unwrap(),
+        );
+
+        replacement.proof.push(4);
+        assert_ne!(
+            consignment_payment_identity(&original).unwrap(),
+            consignment_payment_identity(&replacement).unwrap(),
+        );
+    }
+
+    #[test]
+    fn matching_payment_consignments_reports_verified_rbf_predecessor() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE opencsv_consignments(
+                consignment_id TEXT PRIMARY KEY,
+                consignment_base64 TEXT NOT NULL,
+                created_at INTEGER NOT NULL
+            );",
+        )
+        .unwrap();
+        let original = Consignment {
+            coin_openings: Vec::new(),
+            nullifiers: Vec::new(),
+            proof: vec![1, 2, 3],
+            anchor_ref: AnchorRef {
+                txid: [7u8; 32],
+                location: MEMPOOL_LOCATION,
+            },
+            aux: None,
+        };
+        let original_id = canonical_consignment_identity(&original.to_bytes())
+            .unwrap()
+            .1;
+        conn.execute(
+            "INSERT INTO opencsv_consignments VALUES(?1, ?2, 1)",
+            params![
+                original_id,
+                base64::engine::general_purpose::STANDARD.encode(original.to_bytes()),
+            ],
+        )
+        .unwrap();
+
+        let mut replacement = original.clone();
+        replacement.anchor_ref.txid = [8u8; 32];
+        let replacement_id = canonical_consignment_identity(&replacement.to_bytes())
+            .unwrap()
+            .1;
+        assert_eq!(
+            matching_payment_consignments(
+                &conn,
+                &replacement_id,
+                &consignment_payment_identity(&replacement).unwrap(),
+            )
+            .unwrap(),
+            vec![original_id],
+        );
     }
 
     #[test]
@@ -13608,6 +13763,30 @@ mod tests {
         assert_eq!(bump_pending["receipt"]["fee_rate_sat_per_vb"], 5);
         assert_eq!(bump_pending["receipt"]["fee_sats"], replacement_fee_sats,);
         let replacement_txid = replacement.compute_txid();
+        wallet
+            .finalize_observed_operation(&operation_id, replacement_txid)
+            .unwrap();
+        let observed_replacement = wallet.operation(&operation_id).unwrap();
+        wallet
+            .mark_consignment_delivered(
+                &operation_id,
+                &observed_replacement.delivery_nonce,
+            )
+            .unwrap();
+
+        let second_bump = wallet.fee_bump(&operation_id, 8).unwrap();
+        let second_replacement_hex = wallet
+            .operation(&operation_id)
+            .unwrap()
+            .signed_tx_hex
+            .unwrap();
+        let second_replacement: Transaction = deserialize(
+            &hex_decode(&second_replacement_hex, "second replacement tx").unwrap(),
+        )
+        .unwrap();
+        validate_solo_anchor_replacement(&replacement, &second_replacement).unwrap();
+        assert_eq!(second_bump["receipt"]["fee_rate_sat_per_vb"], 8);
+        let second_replacement_txid = second_replacement.compute_txid();
         drop(wallet);
 
         let mut reopened = AccountWallet::open(
@@ -13620,9 +13799,9 @@ mod tests {
         assert_eq!(restored.state, OperationState::BroadcastUnobserved.as_str());
         assert_eq!(
             restored.signed_tx_hex.as_deref(),
-            Some(replacement_hex.as_str())
+            Some(second_replacement_hex.as_str())
         );
-        assert!(reopened.bitcoin.get_tx(replacement_txid).is_some());
+        assert!(reopened.bitcoin.get_tx(second_replacement_txid).is_some());
         assert_eq!(
             reopened.resume_operation(&operation_id).unwrap_err().code,
             "sync_failed"
@@ -13633,7 +13812,7 @@ mod tests {
                 .unwrap()
                 .signed_tx_hex
                 .as_deref(),
-            Some(replacement_hex.as_str())
+            Some(second_replacement_hex.as_str())
         );
     }
 

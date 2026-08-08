@@ -687,3 +687,44 @@ delivery remain acceptance gates rather than claims in this entry. The full
 warnings-as-errors FFI library suite passes 67 tests with two deliberate slow
 proof cases ignored; the DEBUG recovery-feature suite passes 69 with the same
 two ignored.
+
+## 2026-08-07 — live batch, fee replacement, and one logical payment
+
+The Bob/Carol acceptance run completed one real two-recipient signet batch.
+Carol authored Bob operation `afcaa691e4a0adb3cfd24a6f986400d0` and her
+Note-to-Self operation `bc1850940e9e8f2c3af747aa60852725` under batch
+`c3d0260082cea04e98a1a56d9e7713fb`. Both consignments share transaction
+`771aefc62e38dae80b4fdeec5ebb183c5c4c53c7902b559991aa55679103c4c3` with
+their exact envelope positions. Three Bitcoin peers recorded complete
+transaction-submission writes; this is not claimed as mempool acceptance.
+the two pinned raw-byte observers matched in 271 ms and 354 ms. Deliberate
+relaunches after proof and broadcast resumed the same operation ids. The
+transaction later settled at signet height 316687, Bob credited exactly 5 Test
+USD, Carol credited her self output once, and repeated relaunches kept the
+stored consignment counts stable.
+
+A separate 1 Test USD Bob-to-Carol operation
+`3d2210aeda489dfa33acbb00c92951b1` exercised fee replacement. Its 2 sat/vB
+transaction `cb32fa1048b83d479fadf4aaa6160664e61170e95036ab5d4d3d57bdd0d98fd5`
+was replaced at 5 sat/vB by
+`4ae0f1c686977cfb270e94dc834043d4609283781b27e3bb47f222dde6cbd7f7`.
+The funding input, record, marker, change destination, protocol context, and
+output positions remained unchanged; the old transaction disappeared from
+both public observers and the replacement remained visible. Carol's ledger
+balance moved from 131 to 132, proving there was no double credit.
+
+The first delivery implementation nevertheless exposed two transport bugs.
+It reused the attachment acknowledgement nonce, so Signal suppressed the
+replacement; rotating the nonce atomically with the replacement fixed exact-
+once redelivery and rejects a stale acknowledgement. Once delivered, Signal
+rendered both canonical consignments as two +1 bubbles even though Rust's coin
+state correctly recognized one payment. Hiding one based on message text was
+rejected: transport metadata is not a protocol fact. Rust now derives a
+domain-separated logical payment id from the canonical proof-protected
+consignment fields after zeroing only the replaceable anchor txid. A verified
+replacement returns that id plus matching prior verified consignment ids.
+Signal can therefore supersede the old bubble and activity row using
+cryptographic bytes, while retaining both attachments as receipts. Tests show
+the id survives anchor replacement, changes when protected proof bytes change,
+discovers the predecessor in the verified-consignment database, and supports
+repeated fee bumps after observation, delivery, and reopen.
