@@ -5362,16 +5362,22 @@ impl AccountWallet {
             .pending_by_operation
             .get(operation_id)
             .ok_or_else(|| AccountError::new("operation_not_resumable", "missing pending proof"))?;
-        let pending_nullifiers = self
-            .primary_protocol_mut()?
-            .pending_nullifiers(pending_id)
-            .map_err(|error| AccountError::new("operation_not_resumable", error))?;
-        if let Err(error) = verify_protocol_inputs_unspent(
-            &pending_nullifiers,
-            verification.checked_through,
-            protocol_spend_preflight_required(&self.config),
-        ) {
-            return self.fail_prebroadcast(operation_id, error);
+        // Mints create protocol coins but consume no OpenCSV input coin. The
+        // confirmed-nullifier rollback check therefore applies only to
+        // transfers; Bitcoin funding freshness remains mandatory for both
+        // operation kinds above.
+        if operation.kind == "transfer" {
+            let pending_nullifiers = self
+                .primary_protocol_mut()?
+                .pending_nullifiers(pending_id)
+                .map_err(|error| AccountError::new("operation_not_resumable", error))?;
+            if let Err(error) = verify_protocol_inputs_unspent(
+                &pending_nullifiers,
+                verification.checked_through,
+                protocol_spend_preflight_required(&self.config),
+            ) {
+                return self.fail_prebroadcast(operation_id, error);
+            }
         }
         let unconfirmed_dependencies = self
             .primary_protocol_mut()?
@@ -10333,6 +10339,47 @@ mod tests {
         let config: AccountConfig = serde_json::from_value(value).unwrap();
 
         assert!(protocol_spend_preflight_required(&config));
+    }
+
+    #[test]
+    fn mint_pre_sign_does_not_require_transfer_nullifiers() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut value: Value =
+            serde_json::from_str(&config(AccountRole::Primary, true)).unwrap();
+        value["test_skip_protocol_spend_preflight"] = json!(false);
+        let mut wallet = AccountWallet::open(
+            &value.to_string(),
+            &[48_u8; 32],
+            dir.path().join("wallet.sqlite").to_str().unwrap(),
+        )
+        .unwrap();
+        allow_funding_verification(&mut wallet);
+        fund(&mut wallet, 50_000);
+        let prepared = prepare_test_issuance(&mut wallet, "TMN", &[10]).unwrap();
+        let operation_id = prepared["operation_id"].as_str().unwrap();
+        wallet
+            .acknowledge_operation_backup(
+                operation_id,
+                prepared["checkpoint_hash"].as_str().unwrap(),
+            )
+            .unwrap();
+
+        let broadcast = wallet
+            .sign_and_broadcast(
+                operation_id,
+                &json!({ "target_sat_per_vb": 1, "max_fee_sats": 5_000 }).to_string(),
+            )
+            .unwrap();
+
+        assert_eq!(
+            broadcast["state"],
+            OperationState::BroadcastUnobserved.as_str()
+        );
+        assert!(wallet
+            .operation(operation_id)
+            .unwrap()
+            .signed_tx_hex
+            .is_some());
     }
 
     fn reviewed_test_config(seed_byte: u8) -> (String, String) {
