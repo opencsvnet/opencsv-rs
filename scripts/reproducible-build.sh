@@ -53,7 +53,7 @@ build_pair() {
         RUSTFLAGS="$target_flags" \
         LC_ALL=C \
         TZ=UTC \
-        cargo build --locked --release -p opencsv-cli
+        cargo build --locked --release -p opencsv-cli --features signal
     )
     cp "$target_dir/release/opencsv" "$destination/opencsv-signal"
     (

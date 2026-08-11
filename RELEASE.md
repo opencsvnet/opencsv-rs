@@ -30,7 +30,7 @@ or transaction receipt. Owner approval is required where stated.
   or replacing it; new batch creation emits protocol version 3.
 - [x] Solo fee replacement passes `validate_solo_anchor_replacement` before
   signing and broadcast; no generic wallet `bumpfee` path is reachable.
-- [ ] Both default and `--no-default-features` CLI configurations pass with
+- [ ] Both `signal` and `--no-default-features` CLI configurations pass with
   warnings denied.
 - [ ] Formal build and axiom/honesty artifacts are green at their pinned
   source revisions.

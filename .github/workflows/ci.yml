@@ -24,6 +24,12 @@ jobs:
         env:
           RUSTFLAGS: -D warnings
         run: cargo test --locked -p opencsv-cli --no-default-features --all-targets
+      - name: Check opt-in Signal CLI configuration
+        env:
+          RUSTFLAGS: -D warnings
+        run: |
+          cargo check --locked -p opencsv-cli --features signal
+          cargo test --locked -p opencsv-cli --features signal --no-run
       - name: Test opt-in wallet recovery feature
         env:
           RUSTFLAGS: -D warnings
