@@ -6689,6 +6689,7 @@ impl AccountWallet {
                     | "mempool"
                     | "confirmed"
                     | "consignment_delivered"
+                    | "protocol_rejected"
                     | "rejected"
                     | "cancelled"
             ) {
@@ -12922,6 +12923,84 @@ mod tests {
         );
         assert_eq!(
             restored_checkpoint["checkpoint_hash"],
+            checkpoint["checkpoint_hash"]
+        );
+    }
+
+    #[test]
+    fn checkpoint_round_trips_protocol_rejected_operations() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = [88u8; 32];
+        let binding = [89u8; 32];
+        let cfg = config(AccountRole::Primary, true);
+        let mut original = AccountWallet::open_device_bound(
+            &cfg,
+            &key,
+            &binding,
+            dir.path().join("original.sqlite").to_str().unwrap(),
+        )
+        .unwrap();
+        let funding = fund(&mut original, 60_000);
+        let funding_transaction = original.bitcoin.get_tx(funding.txid).unwrap();
+        let signed_hex = hex_encode(&serialize(funding_transaction.tx_node.tx.as_ref()));
+        original
+            .insert_planned_operation("quarantined-spend", "transfer", "{}", "delivery")
+            .unwrap();
+        original
+            .db
+            .conn
+            .execute(
+                "UPDATE opencsv_operations
+                 SET state = 'protocol_rejected', funding_txid = ?2,
+                     funding_vout = ?3, funding_value_sats = 60000,
+                     signed_tx_hex = ?4, txid = ?2,
+                     rejection_reason = 'duplicate_protocol_spend'
+                 WHERE operation_id = ?1",
+                params![
+                    "quarantined-spend",
+                    funding.txid.to_string(),
+                    funding.vout,
+                    signed_hex,
+                ],
+            )
+            .unwrap();
+        let checkpoint = original.checkpoint().unwrap();
+        assert_eq!(
+            checkpoint["checkpoint"]["operations"][0]["state"],
+            json!(OperationState::ProtocolRejected.as_str())
+        );
+        let commitment = original.status().unwrap()["device_binding"]["commitment"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        drop(original);
+
+        let mut recovery_config: Value = serde_json::from_str(&cfg).unwrap();
+        recovery_config["expected_device_binding_commitment"] = json!(commitment);
+        let mut restored = AccountWallet::open_device_bound(
+            &recovery_config.to_string(),
+            &key,
+            &[],
+            dir.path().join("restored.sqlite").to_str().unwrap(),
+        )
+        .unwrap();
+        restored
+            .restore_checkpoint(&checkpoint.to_string())
+            .unwrap();
+        let operation = restored.operation("quarantined-spend").unwrap();
+        assert_eq!(operation.state, OperationState::ProtocolRejected.as_str());
+        assert_eq!(
+            operation.rejection_reason.as_deref(),
+            Some("duplicate_protocol_spend")
+        );
+        assert_eq!(
+            restored.cancel_operation("quarantined-spend")
+                .unwrap_err()
+                .code,
+            "cancellation_forbidden"
+        );
+        assert_eq!(
+            restored.checkpoint().unwrap()["checkpoint_hash"],
             checkpoint["checkpoint_hash"]
         );
     }
