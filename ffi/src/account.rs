@@ -5934,6 +5934,12 @@ impl AccountWallet {
         if operation.state == OperationState::Cancelled.as_str() {
             return operation_json(&operation);
         }
+        // A proof job executes outside the wallet lock. Clearing this lease
+        // makes its eventual commit fail as stale; the immutable job may
+        // finish computation but can no longer install or sign anything.
+        if self.db.meta("active_proof_operation")?.as_deref() == Some(operation_id) {
+            self.db.delete_meta("active_proof_operation")?;
+        }
         if let Some(pending_id) = self.pending_by_operation.remove(operation_id) {
             if let Some(protocol) = self.protocol.as_mut() {
                 protocol.cancel_pending(pending_id);
@@ -12068,6 +12074,57 @@ mod tests {
         assert_ne!(next["batch"]["batch_local_id"], batch_id);
         assert_ne!(next["operation_id"], first["operation_id"]);
         assert_ne!(next["operation_id"], second["operation_id"]);
+    }
+
+    #[test]
+    fn cancel_operation_releases_active_proof_lease() {
+        let dir = tempfile::tempdir().unwrap();
+        let (cfg, asset_id) = reviewed_test_config(96);
+        let mut wallet = AccountWallet::open(
+            &cfg,
+            &[95u8; 32],
+            dir.path().join("wallet.sqlite").to_str().unwrap(),
+        )
+        .unwrap();
+        allow_funding_verification(&mut wallet);
+        fund(&mut wallet, 50_000);
+        fund(&mut wallet, 40_000);
+        let request = json!({
+            "asset_id": asset_id,
+            "to_owner": hex_encode(&[97u8; 32]),
+            "amount": 1,
+        })
+        .to_string();
+        wallet
+            .insert_planned_operation("lease-holder", "transfer", &request, "nonce-a")
+            .unwrap();
+        wallet
+            .insert_planned_operation("waiting", "transfer", &request, "nonce-b")
+            .unwrap();
+
+        // A crashed prover leaves its durable lease behind: begin the job and
+        // drop it before finish/fail can clear the reservation.
+        let job = match wallet.begin_proof_job("lease-holder").unwrap() {
+            ProofJobStart::Run(job) => job,
+            ProofJobStart::Ready(_) => panic!("planned operation was already proved"),
+        };
+        drop(job);
+        assert_eq!(
+            wallet.db.meta("active_proof_operation").unwrap().as_deref(),
+            Some("lease-holder")
+        );
+
+        wallet.cancel_operation("lease-holder").unwrap();
+        assert!(wallet.db.meta("active_proof_operation").unwrap().is_none());
+
+        match wallet.begin_proof_job("waiting").unwrap() {
+            ProofJobStart::Run(job) => drop(job),
+            ProofJobStart::Ready(_) => panic!("planned operation was already proved"),
+        }
+        assert_eq!(
+            wallet.db.meta("active_proof_operation").unwrap().as_deref(),
+            Some("waiting")
+        );
     }
 
     #[test]
