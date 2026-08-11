@@ -24,7 +24,6 @@ use opencsv_bitcoin::MEMPOOL_LOCATION;
 use opencsv_core::accept::{accept, AcceptParams};
 use opencsv_core::chain::{AnchorChain, AnchorRef};
 use opencsv_core::consignment::{CoinOpening, Consignment};
-use opencsv_core::digest::BABY_BEAR_P;
 use opencsv_core::{
     mint_commit, AnchorRecord, AssetGenesis, AssetId, Coin, Digest, Owner, OwnerSecret,
     PoseidonIssuerAuthorization,
@@ -43,16 +42,11 @@ pub const COIN_VK: &[u8] = opencsv_pcd::COIN_VK_TAG;
 /// One operation's failure, as a display string for the JSON boundary.
 pub type OpError = String;
 
-/// A fresh random digest with canonical limbs (`< p` per `u32`, reduced
-/// mod p). Digests are consumed as field elements, so the reduction loses
-/// nothing, and only canonical encodings survive the serde boundary.
+/// A fresh digest of eight uniformly sampled canonical BabyBear limbs. The
+/// shared core generator uses rejection sampling, not biased modular
+/// reduction.
 fn random_digest() -> Digest {
-    let mut bytes: [u8; 32] = rand::rng().random();
-    for limb in bytes.chunks_exact_mut(4) {
-        let canonical = u32::from_le_bytes(limb.try_into().expect("4-byte chunk")) % BABY_BEAR_P;
-        limb.copy_from_slice(&canonical.to_le_bytes());
-    }
-    Digest::from_bytes(bytes)
+    Digest::random_canonical()
 }
 
 /// A fresh random anchor transaction context (synthetic outpoint), drawn

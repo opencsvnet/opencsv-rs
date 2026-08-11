@@ -4,6 +4,24 @@ This document describes the Rust boundary intended for Signal-iOS. It replaces
 the earlier caller-owned Bitcoin fee key and OpenCSV-specific anchor-server
 shape. Signal expresses user intent; Rust owns protocol and Bitcoin custody.
 
+## Test USD v2 deployment boundary
+
+The current Signal product is the permanent, valueless **Test USD v2**
+deployment on Bitcoin Signet. It is not an upgrade of the August 2026 Test USD
+v1 wallet. Account config generation 2 fixes the deployment id to
+`opencsv-test-usd-v2`; Secure Backup checkpoints use version 4; the HKDF salt,
+fee-wallet, owner, issuer-tool, batch-stock, fingerprint, and device-binding
+domains are all version 2. The built-in reviewed preview terms also name Test
+USD v2 and `https://opencsv.net/usd-preview/terms-v2`.
+
+An old config, a preexisting database without the exact deployment id, or a
+checkpoint from versions 1–3 fails closed as `testnet_reset_required`. There
+is deliberately no automatic coin, history, address, or backup migration.
+The v1 chain receipts and acceptance media remain archived evidence, while a
+v2 wallet starts with a new root, BIP84 fee tree, owner, asset id, database,
+and backup namespace. Bitcoin Signet and the OpenCSV protocol wire format are
+not reset; only this application deployment is replaced.
+
 ## Custody boundary
 
 A primary phone creates a random 32-byte account root and stores it in the
@@ -197,7 +215,7 @@ The action-oriented surface is:
 The account config may contain reviewed public `usd_issuers` manifests. Rust
 validates each exact genesis/terms pair, network, `USD` unit code, and unique
 asset id. Status groups those issuer-specific identities under the
-`trusted_usd_v1` product profile with deterministic priority, while preserving
+`trusted_test_usd_v2` product profile with deterministic priority, while preserving
 the issuer name and asset id for review and receipts. Unknown or legacy assets
 remain visible but are not promoted by their ticker.
 

@@ -18,6 +18,13 @@ ffi/                    # owner-only Signal C ABI; opt-in `opencsv-issuer` opera
 
 ## Status
 
+The Signal-facing test product is now **Test USD v2**, a clean Signet-only
+deployment. Generation-1 app databases, roots, addresses, assets, and Secure
+Backup checkpoints are archived rather than migrated; generation 2 uses the
+immutable deployment id `opencsv-test-usd-v2` and checkpoint version 4. This
+does not reset Bitcoin Signet or change the protocol wire format. See
+[`TEST_USD_V2.md`](TEST_USD_V2.md) for the exact boundary and acceptance gates.
+
 Working prototype, live-tested end to end on **real Bitcoin** (2026-08-01):
 the CLI anchors to a real `bitcoind` by default (signet/mainnet/regtest) —
 mint/send/redeem broadcast real `OP_RETURN` anchor transactions, and

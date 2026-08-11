@@ -42,12 +42,12 @@ use opencsv_cbf::block::OutPoint as CbfOutPoint;
 use opencsv_cbf::{CbfClient, Config as CbfConfig, OutpointVerdict};
 use opencsv_core::chain::AnchorRef;
 use opencsv_core::consignment::Consignment;
-#[cfg(any(test, feature = "issuer-tools"))]
-use opencsv_core::{AssetGenesis, InstrumentTermsV1, PoseidonIssuerAuthorization};
 use opencsv_core::{
     witness_envelope_decode, AnchorRecord, AssetId, BatchVersion, Digest, InstrumentManifestV1,
     OwnerSecret, TruncatedDigest,
 };
+#[cfg(any(test, feature = "issuer-tools"))]
+use opencsv_core::{AssetGenesis, InstrumentTermsV1, PoseidonIssuerAuthorization};
 use rand::RngExt as _;
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde::{Deserialize, Serialize};
@@ -61,10 +61,13 @@ use crate::{
     snapshot::{Snapshot, SnapshotBatchEnvelope, SnapshotChain, SnapshotEntry},
 };
 
-const SCHEMA_VERSION: u32 = 1;
+const SCHEMA_VERSION: u32 = 2;
 const LEGACY_CHECKPOINT_VERSION: u32 = 1;
 const BATCH_CHECKPOINT_VERSION: u32 = 2;
-const CHECKPOINT_VERSION: u32 = 3;
+const PRE_RESET_CHECKPOINT_VERSION: u32 = 3;
+const CHECKPOINT_VERSION: u32 = 4;
+/// Immutable deployment namespace for the fresh signet/regtest Test USD v2 wallet.
+pub const TEST_USD_V2_DEPLOYMENT_ID: &str = "opencsv-test-usd-v2";
 const DEFAULT_STOP_GAP: usize = 20;
 const DEFAULT_PARALLEL_REQUESTS: usize = 4;
 const DEFAULT_VERIFICATION_TIMEOUT_SECS: u64 = 8;
@@ -259,9 +262,14 @@ pub struct UsdIssuerPolicy {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct AccountConfig {
-    /// Schema version, currently one.
+    /// Account/config generation. Version two is the clean Test USD v2 reset.
     #[serde(default = "schema_version")]
     pub version: u32,
+    /// Application deployment namespace. Signet and regtest are deliberately
+    /// fixed to the Test USD v2 namespace so v1 databases and backups cannot
+    /// be interpreted as current state.
+    #[serde(default = "default_deployment_id")]
+    pub deployment_id: String,
     /// `mainnet`, `signet`, or `regtest`.
     pub network: String,
     /// Esplora endpoint used as a read accelerator and generic relay fallback.
@@ -345,6 +353,8 @@ struct BackupCheckpointEnvelope {
 #[serde(deny_unknown_fields)]
 struct BackupCheckpointPayload {
     version: u32,
+    #[serde(default)]
+    deployment_id: Option<String>,
     network: String,
     root_fingerprint: String,
     device_binding_commitment: Option<String>,
@@ -760,6 +770,10 @@ struct BatchStock {
 
 const fn schema_version() -> u32 {
     SCHEMA_VERSION
+}
+
+fn default_deployment_id() -> String {
+    TEST_USD_V2_DEPLOYMENT_ID.to_owned()
 }
 
 /// SQLite-backed append-only BDK changeset store.
@@ -1474,12 +1488,24 @@ impl AccountWallet {
             AccountError::new("invalid_config", format!("config JSON: {error}"))
         })?;
         if config.version != SCHEMA_VERSION {
+            if config.version < SCHEMA_VERSION
+                && matches!(config.network.as_str(), "signet" | "regtest")
+            {
+                return Err(AccountError::new(
+                    "testnet_reset_required",
+                    format!(
+                        "account config version {} belongs to the archived Test USD v1 deployment; create a fresh Test USD v2 wallet",
+                        config.version
+                    ),
+                ));
+            }
             return Err(AccountError::new(
                 "unsupported_version",
                 format!("account config version {}", config.version),
             ));
         }
         let network = parse_network(&config.network)?;
+        validate_deployment(&config)?;
         validate_esplora_url(&config.esplora_url)?;
         if config.observation_checks.is_empty() {
             config.observation_checks = default_observation_checks(&config.network);
@@ -1535,13 +1561,13 @@ impl AccountWallet {
                         )
                     })?);
                 let bitcoin_seed =
-                    Zeroizing::new(derive::<64>(root.as_ref(), b"bitcoin-fee-wallet-v1", &[])?);
+                    Zeroizing::new(derive::<64>(root.as_ref(), b"bitcoin-fee-wallet-v2", &[])?);
                 let owner_seed =
-                    Zeroizing::new(derive::<32>(root.as_ref(), b"opencsv-owner-v1", &[])?);
+                    Zeroizing::new(derive::<32>(root.as_ref(), b"opencsv-owner-v2", &[])?);
                 let issuer_root =
-                    Zeroizing::new(derive::<32>(root.as_ref(), b"opencsv-issuer-root-v1", &[])?);
+                    Zeroizing::new(derive::<32>(root.as_ref(), b"opencsv-issuer-root-v2", &[])?);
                 let batch_stock_secret =
-                    Zeroizing::new(derive::<32>(root.as_ref(), b"opencsv-batch-stock-v1", &[])?);
+                    Zeroizing::new(derive::<32>(root.as_ref(), b"opencsv-batch-stock-v2", &[])?);
                 SecretKey::from_slice(batch_stock_secret.as_ref()).map_err(|_| {
                     AccountError::new(
                         "key_derivation_failed",
@@ -1555,7 +1581,7 @@ impl AccountWallet {
                 let external = format!("wpkh({xpriv}/84h/{coin_type}h/0h/0/*)");
                 let internal = format!("wpkh({xpriv}/84h/{coin_type}h/0h/1/*)");
                 let fingerprint = sha256::Hash::hash(
-                    &[b"OpenCSV account fingerprint v1".as_slice(), root.as_ref()].concat(),
+                    &[b"OpenCSV account fingerprint v2".as_slice(), root.as_ref()].concat(),
                 )
                 .to_string();
                 let binding_commitment = if device_binding_key.is_empty() {
@@ -1571,7 +1597,7 @@ impl AccountWallet {
                     Some(
                         sha256::Hash::hash(
                             &[
-                                b"OpenCSV device binding v1".as_slice(),
+                                b"OpenCSV device binding v2".as_slice(),
                                 root.as_ref(),
                                 device_binding.as_ref(),
                             ]
@@ -1632,7 +1658,31 @@ impl AccountWallet {
             }
         };
 
-        let mut db = SqlitePersister::open(Path::new(database_path))?;
+        let database_path = Path::new(database_path);
+        let database_preexisted = database_path.exists();
+        let mut db = SqlitePersister::open(database_path)?;
+        let reset_error = |message: String| {
+            if matches!(config.network.as_str(), "signet" | "regtest") {
+                AccountError::new("testnet_reset_required", message)
+            } else {
+                AccountError::new("deployment_mismatch", message)
+            }
+        };
+        match db.meta("deployment_id")? {
+            Some(existing) if existing != config.deployment_id => {
+                return Err(reset_error(format!(
+                        "database deployment {existing} cannot open as {}; create a fresh Test USD v2 wallet",
+                        config.deployment_id
+                    )));
+            }
+            None if database_preexisted => {
+                return Err(reset_error(
+                    "pre-v2 wallet state is archived; create a fresh deployment wallet".to_owned(),
+                ));
+            }
+            None => db.set_meta("deployment_id", &config.deployment_id)?,
+            Some(_) => {}
+        }
         match db.meta("root_fingerprint")? {
             Some(existing) if existing != root_fingerprint => {
                 return Err(AccountError::new(
@@ -1728,7 +1778,7 @@ impl AccountWallet {
         let funding_verifier: Arc<dyn FundingVerifier> = Arc::new(CbfFundingVerifier {
             network: config.network.clone(),
             peers: verification_peers,
-            cache_dir: PathBuf::from(format!("{database_path}.cbf")),
+            cache_dir: PathBuf::from(format!("{}.cbf", database_path.display())),
             timeout: Duration::from_secs(config.verification_timeout_secs),
             max_blocks: config.max_verification_blocks,
             client: Mutex::new(None),
@@ -1798,7 +1848,7 @@ impl AccountWallet {
         })?;
         let new_commitment = sha256::Hash::hash(
             &[
-                b"OpenCSV device binding v1".as_slice(),
+                b"OpenCSV device binding v2".as_slice(),
                 root.as_ref(),
                 binding.as_ref(),
             ]
@@ -1992,6 +2042,7 @@ impl AccountWallet {
         )?;
         Ok(json!({
             "version": SCHEMA_VERSION,
+            "deployment_id": self.config.deployment_id,
             "role": self.config.role,
             "network": self.config.network,
             "owners": owners,
@@ -2083,11 +2134,8 @@ impl AccountWallet {
         let consignment = Consignment::from_bytes(&canonical_blob)
             .map_err(|error| AccountError::new("invalid_consignment", error.to_string()))?;
         let payment_id = consignment_payment_identity(&consignment)?;
-        let superseded_consignment_ids = matching_payment_consignments(
-            &self.db.conn,
-            &consignment_id,
-            &payment_id,
-        )?;
+        let superseded_consignment_ids =
+            matching_payment_consignments(&self.db.conn, &consignment_id, &payment_id)?;
         let anchor_txid = consignment_anchor_txid(&canonical_blob)?;
         let chain = SnapshotChain::from_json(snapshot_json)
             .map_err(|error| AccountError::new("invalid_chain_view", error))?;
@@ -2199,11 +2247,8 @@ impl AccountWallet {
         let consignment = Consignment::from_bytes(&canonical_blob)
             .map_err(|error| AccountError::new("invalid_consignment", error.to_string()))?;
         let payment_id = consignment_payment_identity(&consignment)?;
-        let superseded_consignment_ids = matching_payment_consignments(
-            &self.db.conn,
-            &consignment_id,
-            &payment_id,
-        )?;
+        let superseded_consignment_ids =
+            matching_payment_consignments(&self.db.conn, &consignment_id, &payment_id)?;
         let anchor_txid = Txid::from_byte_array(consignment.anchor_ref.txid);
         let client = esplora_client::Builder::new(&self.config.esplora_url).build_blocking();
         let transaction = client
@@ -2321,11 +2366,8 @@ impl AccountWallet {
         let consignment = Consignment::from_bytes(&canonical_blob)
             .map_err(|error| AccountError::new("invalid_consignment", error.to_string()))?;
         let payment_id = consignment_payment_identity(&consignment)?;
-        let superseded_consignment_ids = matching_payment_consignments(
-            &self.db.conn,
-            &consignment_id,
-            &payment_id,
-        )?;
+        let superseded_consignment_ids =
+            matching_payment_consignments(&self.db.conn, &consignment_id, &payment_id)?;
         let anchor_txid = Txid::from_byte_array(consignment.anchor_ref.txid);
         let transaction: Transaction = deserialize(raw_transaction).map_err(|error| {
             AccountError::new(
@@ -6526,6 +6568,7 @@ impl AccountWallet {
             .unwrap_or_default();
         let payload = json!({
             "version": CHECKPOINT_VERSION,
+            "deployment_id": self.config.deployment_id,
             "network": self.config.network,
             "root_fingerprint": self.root_fingerprint,
             "device_binding_commitment": self.device_binding_commitment,
@@ -6601,15 +6644,26 @@ impl AccountWallet {
                 "Secure Backup checkpoint hash does not match its payload",
             ));
         }
-        if !matches!(
+        if matches!(
             envelope.checkpoint.version,
-            LEGACY_CHECKPOINT_VERSION | BATCH_CHECKPOINT_VERSION | CHECKPOINT_VERSION
+            LEGACY_CHECKPOINT_VERSION | BATCH_CHECKPOINT_VERSION | PRE_RESET_CHECKPOINT_VERSION
         ) {
             return Err(AccountError::new(
+                "testnet_reset_required",
+                "pre-v2 Secure Backup checkpoints are archived and cannot restore into Test USD v2",
+            ));
+        }
+        if envelope.checkpoint.version != CHECKPOINT_VERSION {
+            return Err(AccountError::new(
                 "backup_version_mismatch",
-                format!(
-                    "expected checkpoint version {LEGACY_CHECKPOINT_VERSION}, {BATCH_CHECKPOINT_VERSION}, or {CHECKPOINT_VERSION}"
-                ),
+                format!("expected checkpoint version {CHECKPOINT_VERSION}"),
+            ));
+        }
+        if envelope.checkpoint.deployment_id.as_deref() != Some(self.config.deployment_id.as_str())
+        {
+            return Err(AccountError::new(
+                "testnet_reset_required",
+                "Secure Backup checkpoint belongs to another OpenCSV deployment",
             ));
         }
         if envelope.checkpoint.network != self.config.network {
@@ -7308,9 +7362,8 @@ impl AccountWallet {
         // process is as safe as every later reopen.
         self.restore_fee_reservations()?;
         self.restore_pending_operations()?;
-        // Version-1 backups predate durable send batches. Normalize every
-        // accepted source checkpoint into the current version before the
-        // DEBUG rebind compares hashes or a new Secure Backup is required.
+        // Re-export the exact v2 deployment checkpoint before the DEBUG
+        // rebind compares hashes or a new Secure Backup is required.
         let normalized = self.checkpoint()?;
         let normalized_hash = normalized["checkpoint_hash"].as_str().ok_or_else(|| {
             AccountError::new("checkpoint_failed", "normalized checkpoint has no hash")
@@ -7866,7 +7919,7 @@ impl AccountWallet {
             records.push(json!({
                 "asset_id": asset_id,
                 "trust_state": "trusted_configuration",
-                "profile": "trusted_usd_v1",
+                "profile": "trusted_test_usd_v2",
                 "issuer_priority": issuer.priority,
                 "manifest": issuer.manifest,
             }));
@@ -9870,7 +9923,7 @@ fn derive<const N: usize>(
     label: &[u8],
     context: &[u8],
 ) -> Result<[u8; N], AccountError> {
-    let hk = Hkdf::<Sha256>::new(Some(b"OpenCSV Signal account v1"), root);
+    let hk = Hkdf::<Sha256>::new(Some(b"OpenCSV Signal account v2"), root);
     let mut output = [0u8; N];
     let info = [label, b"\0", context].concat();
     hk.expand(&info, &mut output)
@@ -9890,6 +9943,37 @@ fn parse_network(name: &str) -> Result<Network, AccountError> {
             format!("unsupported account-wallet network `{name}`"),
         )),
     }
+}
+
+fn validate_deployment(config: &AccountConfig) -> Result<(), AccountError> {
+    if config.deployment_id.is_empty()
+        || config.deployment_id.len() > 64
+        || !config
+            .deployment_id
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+    {
+        return Err(AccountError::new(
+            "invalid_config",
+            "deployment_id must be 1..=64 lowercase ASCII letters, digits, or hyphens",
+        ));
+    }
+    match config.network.as_str() {
+        "signet" | "regtest" if config.deployment_id != TEST_USD_V2_DEPLOYMENT_ID => {
+            return Err(AccountError::new(
+                "invalid_config",
+                format!("signet/regtest deployment_id must be {TEST_USD_V2_DEPLOYMENT_ID}"),
+            ));
+        }
+        "mainnet" if config.deployment_id == TEST_USD_V2_DEPLOYMENT_ID => {
+            return Err(AccountError::new(
+                "invalid_config",
+                "the Test USD v2 deployment cannot run on mainnet",
+            ));
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 fn parse_cbf_network(name: &str) -> Result<OpenCsvNetwork, AccountError> {
@@ -10390,7 +10474,7 @@ mod tests {
 
     fn config_with_url(role: AccountRole, backup_verified: bool, esplora_url: &str) -> String {
         serde_json::to_string(&json!({
-            "version": 1,
+            "version": SCHEMA_VERSION,
             "network": "signet",
             "esplora_url": esplora_url,
             "role": role,
@@ -10404,6 +10488,50 @@ mod tests {
             "test_skip_protocol_spend_preflight": true,
         }))
         .unwrap()
+    }
+
+    #[test]
+    fn test_usd_v2_rejects_v1_config_and_preexisting_unnamespaced_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut old_config: Value =
+            serde_json::from_str(&config(AccountRole::Primary, false)).unwrap();
+        old_config["version"] = json!(1);
+        let error = AccountWallet::open_device_bound(
+            &old_config.to_string(),
+            &[1u8; 32],
+            &[2u8; 32],
+            dir.path().join("v1-config.sqlite").to_str().unwrap(),
+        )
+        .err()
+        .unwrap();
+        assert_eq!(error.code, "testnet_reset_required");
+
+        let legacy_path = dir.path().join("legacy.sqlite");
+        drop(SqlitePersister::open(&legacy_path).unwrap());
+        let error = AccountWallet::open_device_bound(
+            &config(AccountRole::Primary, false),
+            &[1u8; 32],
+            &[2u8; 32],
+            legacy_path.to_str().unwrap(),
+        )
+        .err()
+        .unwrap();
+        assert_eq!(error.code, "testnet_reset_required");
+
+        let mut fresh = AccountWallet::open_device_bound(
+            &config(AccountRole::Primary, false),
+            &[1u8; 32],
+            &[2u8; 32],
+            dir.path().join("v2.sqlite").to_str().unwrap(),
+        )
+        .unwrap();
+        let status = fresh.status().unwrap();
+        assert_eq!(status["version"], SCHEMA_VERSION);
+        assert_eq!(status["deployment_id"], TEST_USD_V2_DEPLOYMENT_ID);
+        assert_eq!(
+            fresh.db.meta("deployment_id").unwrap().as_deref(),
+            Some(TEST_USD_V2_DEPLOYMENT_ID),
+        );
     }
 
     fn test_instrument_request(unit_code: &str) -> String {
@@ -10499,8 +10627,7 @@ mod tests {
     #[test]
     fn mint_pre_sign_does_not_require_transfer_nullifiers() {
         let dir = tempfile::tempdir().unwrap();
-        let mut value: Value =
-            serde_json::from_str(&config(AccountRole::Primary, true)).unwrap();
+        let mut value: Value = serde_json::from_str(&config(AccountRole::Primary, true)).unwrap();
         value["test_skip_protocol_spend_preflight"] = json!(false);
         let mut wallet = AccountWallet::open(
             &value.to_string(),
@@ -10954,7 +11081,9 @@ mod tests {
         replacement.anchor_ref.txid = [8u8; 32];
 
         assert_ne!(
-            canonical_consignment_identity(&original.to_bytes()).unwrap().1,
+            canonical_consignment_identity(&original.to_bytes())
+                .unwrap()
+                .1,
             canonical_consignment_identity(&replacement.to_bytes())
                 .unwrap()
                 .1,
@@ -11259,7 +11388,7 @@ mod tests {
     fn fresh_signet_defaults_require_both_pinned_api_observers() {
         let dir = tempfile::tempdir().unwrap();
         let cfg = json!({
-            "version": 1,
+            "version": SCHEMA_VERSION,
             "network": "signet",
             "esplora_url": "https://mempool.space/signet/api",
             "role": "primary",
@@ -11376,7 +11505,7 @@ mod tests {
     fn raw_observer_quorum_must_match_required_candidates() {
         let dir = tempfile::tempdir().unwrap();
         let cfg = json!({
-            "version": 1,
+            "version": SCHEMA_VERSION,
             "network": "signet",
             "esplora_url": "https://mempool.space/signet/api",
             "role": "primary",
@@ -11394,7 +11523,7 @@ mod tests {
         assert_eq!(error.code, "invalid_config");
 
         let cfg = json!({
-            "version": 1,
+            "version": SCHEMA_VERSION,
             "network": "signet",
             "esplora_url": "https://mempool.space/signet/api",
             "role": "primary",
@@ -11416,7 +11545,7 @@ mod tests {
     fn custom_required_observer_needs_a_chain_pin() {
         let dir = tempfile::tempdir().unwrap();
         let cfg = json!({
-            "version": 1,
+            "version": SCHEMA_VERSION,
             "network": "signet",
             "esplora_url": "https://mempool.space/signet/api",
             "role": "primary",
@@ -11689,6 +11818,7 @@ mod tests {
         let mut mainnet: Value =
             serde_json::from_str(&config(AccountRole::Primary, false)).unwrap();
         mainnet["network"] = json!("mainnet");
+        mainnet["deployment_id"] = json!("opencsv-mainnet-rebind-test");
         let mut wallet = AccountWallet::open_device_bound(
             &mainnet.to_string(),
             &[51u8; 32],
@@ -11705,7 +11835,7 @@ mod tests {
     #[test]
     fn linked_device_rejects_private_account_key() {
         let cfg = json!({
-            "version": 1,
+            "version": SCHEMA_VERSION,
             "network": "signet",
             "esplora_url": "https://mempool.space/signet/api",
             "role": "linked",
@@ -12618,10 +12748,16 @@ mod tests {
         assert_eq!(status["assets"].as_array().unwrap().len(), 0);
         assert_eq!(status["instruments"].as_array().unwrap().len(), 2);
         assert_eq!(status["instruments"][0]["asset_id"], second_id);
-        assert_eq!(status["instruments"][0]["profile"], "trusted_usd_v1");
+        assert_eq!(
+            status["instruments"][0]["profile"],
+            "trusted_test_usd_v2"
+        );
         assert_eq!(status["instruments"][0]["issuer_priority"], 10);
         assert_eq!(status["instruments"][1]["asset_id"], first_id);
-        assert_eq!(status["instruments"][1]["profile"], "trusted_usd_v1");
+        assert_eq!(
+            status["instruments"][1]["profile"],
+            "trusted_test_usd_v2"
+        );
     }
 
     #[test]
@@ -13189,7 +13325,8 @@ mod tests {
             Some("duplicate_protocol_spend")
         );
         assert_eq!(
-            restored.cancel_operation("quarantined-spend")
+            restored
+                .cancel_operation("quarantined-spend")
                 .unwrap_err()
                 .code,
             "cancellation_forbidden"
@@ -13201,7 +13338,7 @@ mod tests {
     }
 
     #[test]
-    fn version_one_checkpoint_restores_and_normalizes_to_current_version() {
+    fn pre_reset_checkpoint_requires_a_fresh_test_usd_v2_wallet() {
         let dir = tempfile::tempdir().unwrap();
         let key = [84u8; 32];
         let binding = [85u8; 32];
@@ -13248,25 +13385,18 @@ mod tests {
             dir.path().join("restored.sqlite").to_str().unwrap(),
         )
         .unwrap();
-        restored.restore_checkpoint(&legacy.to_string()).unwrap();
-        let normalized = restored.checkpoint().unwrap();
-        assert_eq!(normalized["checkpoint"]["version"], CHECKPOINT_VERSION);
-        assert_eq!(
-            normalized["checkpoint_hash"],
-            restored
-                .db
-                .meta("restored_checkpoint_hash")
-                .unwrap()
-                .unwrap(),
-        );
         assert_eq!(
             restored
-                .db
-                .meta("restored_checkpoint_source_hash")
-                .unwrap()
-                .unwrap(),
-            legacy["checkpoint_hash"].as_str().unwrap(),
+                .restore_checkpoint(&legacy.to_string())
+                .unwrap_err()
+                .code,
+            "testnet_reset_required",
         );
+        assert!(restored
+            .db
+            .meta("restored_checkpoint_source_hash")
+            .unwrap()
+            .is_none());
     }
 
     #[test]
@@ -14205,10 +14335,7 @@ mod tests {
             .unwrap();
         let observed_replacement = wallet.operation(&operation_id).unwrap();
         wallet
-            .mark_consignment_delivered(
-                &operation_id,
-                &observed_replacement.delivery_nonce,
-            )
+            .mark_consignment_delivered(&operation_id, &observed_replacement.delivery_nonce)
             .unwrap();
 
         let second_bump = wallet.fee_bump(&operation_id, 8).unwrap();
@@ -14217,10 +14344,9 @@ mod tests {
             .unwrap()
             .signed_tx_hex
             .unwrap();
-        let second_replacement: Transaction = deserialize(
-            &hex_decode(&second_replacement_hex, "second replacement tx").unwrap(),
-        )
-        .unwrap();
+        let second_replacement: Transaction =
+            deserialize(&hex_decode(&second_replacement_hex, "second replacement tx").unwrap())
+                .unwrap();
         validate_solo_anchor_replacement(&replacement, &second_replacement).unwrap();
         assert_eq!(second_bump["receipt"]["fee_rate_sat_per_vb"], 8);
         let second_replacement_txid = second_replacement.compute_txid();
@@ -14288,10 +14414,7 @@ mod tests {
             .unwrap();
 
         let below = wallet.fee_bump(&operation_id, 5).unwrap();
-        assert_eq!(
-            below["state"],
-            OperationState::BroadcastUnobserved.as_str()
-        );
+        assert_eq!(below["state"], OperationState::BroadcastUnobserved.as_str());
         let below_fee = below["receipt"]["fee_sats"].as_u64().unwrap();
         assert!(below_fee <= 5_000);
         let bumped_hex = wallet
@@ -14304,8 +14427,14 @@ mod tests {
         assert_eq!(error.code, "fee_limit_exceeded");
         // A rejected bump leaves the last persisted replacement untouched.
         let operation = wallet.operation(&operation_id).unwrap();
-        assert_eq!(operation.state, OperationState::BroadcastUnobserved.as_str());
-        assert_eq!(operation.signed_tx_hex.as_deref(), Some(bumped_hex.as_str()));
+        assert_eq!(
+            operation.state,
+            OperationState::BroadcastUnobserved.as_str()
+        );
+        assert_eq!(
+            operation.signed_tx_hex.as_deref(),
+            Some(bumped_hex.as_str())
+        );
 
         let still_bumpable = wallet.fee_bump(&operation_id, 8).unwrap();
         assert_eq!(

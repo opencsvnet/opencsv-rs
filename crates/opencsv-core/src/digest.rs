@@ -11,6 +11,7 @@
 //! describes nullifiers as "64 pseudorandom bytes"; see the crate docs.
 
 use p3_baby_bear::BabyBear;
+use rand::RngExt as _;
 use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::field::{elems_to_canonical_u32s, felt, DIGEST_ELEMS};
@@ -57,6 +58,24 @@ impl<'de> Deserialize<'de> for Digest {
 pub struct TruncatedDigest(pub [u8; TRUNCATED_DIGEST_BYTES]);
 
 impl Digest {
+    /// Draw eight independent, uniformly distributed canonical BabyBear
+    /// limbs. Rejection sampling avoids the bias introduced by reducing a
+    /// uniform `u32` modulo `p` (because `p` does not divide `2^32`).
+    pub fn random_canonical() -> Self {
+        let mut bytes = [0u8; DIGEST_BYTES];
+        let mut rng = rand::rng();
+        for limb in bytes.chunks_exact_mut(4) {
+            let canonical = loop {
+                let candidate: u32 = rng.random();
+                if candidate < BABY_BEAR_P {
+                    break candidate;
+                }
+            };
+            limb.copy_from_slice(&canonical.to_le_bytes());
+        }
+        Self(bytes)
+    }
+
     /// Wrap raw bytes.
     ///
     /// Infallible and unchecked: the limbs may be non-canonical. Bytes
@@ -177,5 +196,18 @@ mod tests {
         let twin: Result<(Digest, usize), _> =
             bincode::serde::decode_from_slice(twin.as_bytes(), bincode::config::standard());
         assert!(twin.is_err());
+    }
+
+    #[test]
+    fn random_canonical_is_always_strictly_serializable() {
+        for _ in 0..1024 {
+            let digest = Digest::random_canonical();
+            assert!(digest.is_canonical());
+            let bytes = bincode::serde::encode_to_vec(digest, bincode::config::standard()).unwrap();
+            let (decoded, read): (Digest, usize) =
+                bincode::serde::decode_from_slice(&bytes, bincode::config::standard()).unwrap();
+            assert_eq!(decoded, digest);
+            assert_eq!(read, bytes.len());
+        }
     }
 }

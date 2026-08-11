@@ -17,24 +17,24 @@ pub const INSTRUMENT_TERMS_VERSION: u32 = 1;
 pub const MAX_INSTRUMENT_DECIMALS: u8 = 18;
 
 /// Display name of the single built-in instrument in the preview wallet.
-pub const PREVIEW_USD_DISPLAY_NAME: &str = "OpenCSV USD Preview";
+pub const PREVIEW_USD_DISPLAY_NAME: &str = "OpenCSV Test USD v2";
 
 /// Human issuer label for the test-only built-in instrument.
-pub const PREVIEW_USD_ISSUER_NAME: &str = "OpenCSV Preview Issuer";
+pub const PREVIEW_USD_ISSUER_NAME: &str = "OpenCSV Test Issuer v2";
 
 /// Decimal precision chosen to avoid a presentation change if a future,
 /// independently authenticated Tether instrument uses its customary scale.
 pub const PREVIEW_USD_DECIMALS: u8 = 6;
 
 /// Public terms page for the test-only built-in instrument.
-pub const PREVIEW_USD_TERMS_URI: &str = "https://opencsv.net/usd-preview/terms-v1";
+pub const PREVIEW_USD_TERMS_URI: &str = "https://opencsv.net/usd-preview/terms-v2";
 
 /// Return the one instrument definition the preview wallet is allowed to
 /// originate. It is deliberately unavailable on mainnet.
 pub fn preview_usd_terms(network: &str) -> Result<InstrumentTermsV1, InstrumentError> {
     if !matches!(network, "signet" | "regtest") {
         return Err(InstrumentError::new(
-            "OpenCSV USD Preview is available only on signet or regtest",
+            "OpenCSV Test USD v2 is available only on signet or regtest",
         ));
     }
     Ok(InstrumentTermsV1 {
@@ -46,7 +46,8 @@ pub fn preview_usd_terms(network: &str) -> Result<InstrumentTermsV1, InstrumentE
         issuer_name: PREVIEW_USD_ISSUER_NAME.to_owned(),
         terms_uri: PREVIEW_USD_TERMS_URI.to_owned(),
         redemption_summary:
-            "Test-only units with no monetary value; not redeemable for dollars or USDT.".to_owned(),
+            "Test USD v2 has no monetary value and is not redeemable for dollars or USDT."
+                .to_owned(),
         test_only: true,
     })
 }

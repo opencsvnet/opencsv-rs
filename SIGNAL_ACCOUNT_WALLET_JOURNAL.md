@@ -750,3 +750,38 @@ quorum was introduced to avoid: one provider outage again blocks
 zero-confirmation acceptance wallet-wide until the observer recovers or the
 configuration changes. Confirmation and settlement are unaffected; they still
 require the phone-owned headers/BIP158/full-block/Merkle path.
+
+## 2026-08-11 — Test USD v1 retired; canonical v2 starts clean
+
+The canonical field-decoding audit found that historical coin randomness was
+created as unrestricted 32-byte data while the current proof boundary accepts
+only eight canonical BabyBear limbs. Most v1 openings therefore cannot be
+decoded by the strict representation, and silently reducing them modulo the
+field would make multiple byte strings denote the same value. The rejected
+approaches were global permissive decoding and a best-effort in-place wallet
+migration: both would preserve an ambiguous identity boundary and make
+different components disagree about hashes and equality.
+
+The accepted decision is a clean Test USD v2 application deployment on the
+existing Bitcoin Signet. Config generation 2, deployment id
+`opencsv-test-usd-v2`, checkpoint version 4, version-2 derivation domains, a
+fresh BIP84 tree, owner, asset manifest/id, database, and backup namespace form
+one fail-closed boundary. Pre-v2 configs, unnamespaced databases, and checkpoint
+versions 1–3 return `testnet_reset_required`; there is no automatic migration.
+V1 transactions and media remain archived receipts and are never relabeled as
+v2 evidence.
+
+The first canonical generator reduced uniform `u32` values modulo `p`. That
+made every output valid but not uniform because `p` does not divide `2^32`:
+some field elements had three preimages and others two. It was rejected before
+the v2 launch. The accepted core generator rejection-samples each limb below
+`p`; CLI and FFI share that one implementation, and a serialization regression
+checks 1,024 fresh digests.
+
+The same review found that the demo HTTP client's advertised 120-second
+timeout was independently applied to DNS, every resolved address, and each
+blocking I/O call. A slow resolver or byte-drip response could therefore exceed
+the stated bound. DNS, all connection attempts, the request write, and the
+bounded response read now spend from one monotonic deadline. A regression
+server that continuously drips bytes proves the complete request still exits
+at the shared deadline.

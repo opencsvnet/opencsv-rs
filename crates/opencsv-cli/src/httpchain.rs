@@ -19,8 +19,9 @@
 //! and this client stands in for a node RPC.
 
 use std::io::{Read, Write};
-use std::net::{TcpStream, ToSocketAddrs};
-use std::time::Duration;
+use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
+use std::sync::mpsc;
+use std::time::{Duration, Instant};
 
 use opencsv_core::chain::{AnchorChain, AnchorLocation, AnchorRef};
 use opencsv_core::{AnchorRecord, Digest, ANCHOR_SIZE};
@@ -35,21 +36,57 @@ use crate::hexutil::{from_hex, to_hex};
 /// real-chain backends).
 const MAX_CTX_DRAWS: usize = 16;
 
-/// Per-operation network timeout (connect, write, read), mirroring the
-/// bitcoind transport in `opencsv-bitcoin`: a hung or hostile anchor server
-/// must fail the request, not block the CLI forever.
+/// Total network deadline for one request, including DNS, every connection
+/// attempt, the complete write, and the complete response read.
 const IO_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Bound on one HTTP response, matching the CBF wire-frame cap
 /// (`opencsv-cbf`'s `MAX_PAYLOAD`); anchor replies are a few hundred bytes.
 const MAX_RESPONSE_BYTES: u64 = 32 * 1024 * 1024;
 
-/// Connect to `authority` (`host:port`) with [`IO_TIMEOUT`] on each resolved
-/// address; the std `TcpStream::connect` has no timeout of its own.
-fn connect(authority: &str) -> std::io::Result<TcpStream> {
+fn timed_out(phase: &str) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::TimedOut,
+        format!("total HTTP deadline expired during {phase}"),
+    )
+}
+
+fn remaining(deadline: Instant, phase: &str) -> std::io::Result<Duration> {
+    deadline
+        .checked_duration_since(Instant::now())
+        .filter(|duration| !duration.is_zero())
+        .ok_or_else(|| timed_out(phase))
+}
+
+/// Resolve without allowing a blocking system resolver to hold the CLI past
+/// the request deadline. The resolver thread owns no wallet or socket state;
+/// if the platform resolver outlives the deadline, its eventual result is
+/// simply dropped.
+fn resolve(authority: &str, deadline: Instant) -> std::io::Result<Vec<SocketAddr>> {
+    let authority = authority.to_owned();
+    let (sender, receiver) = mpsc::sync_channel(1);
+    std::thread::spawn(move || {
+        let result = authority
+            .to_socket_addrs()
+            .map(|addresses| addresses.collect::<Vec<_>>());
+        let _ = sender.send(result);
+    });
+    receiver
+        .recv_timeout(remaining(deadline, "DNS resolution")?)
+        .map_err(|error| match error {
+            mpsc::RecvTimeoutError::Timeout => timed_out("DNS resolution"),
+            mpsc::RecvTimeoutError::Disconnected => {
+                std::io::Error::other("DNS resolver stopped without a result")
+            }
+        })?
+}
+
+/// Connect to one of the resolved addresses while spending from the same
+/// request deadline used by DNS, writing, and reading.
+fn connect(authority: &str, deadline: Instant) -> std::io::Result<TcpStream> {
     let mut last_err = None;
-    for addr in authority.to_socket_addrs()? {
-        match TcpStream::connect_timeout(&addr, IO_TIMEOUT) {
+    for addr in resolve(authority, deadline)? {
+        match TcpStream::connect_timeout(&addr, remaining(deadline, "connection")?) {
             Ok(stream) => return Ok(stream),
             Err(e) => last_err = Some(e),
         }
@@ -215,15 +252,22 @@ impl HttpAnchorChain {
     }
 
     fn request(&self, method: &str, path: &str, body: Option<&str>) -> Result<String, Error> {
+        self.request_with_timeout(method, path, body, IO_TIMEOUT)
+    }
+
+    fn request_with_timeout(
+        &self,
+        method: &str,
+        path: &str,
+        body: Option<&str>,
+        timeout: Duration,
+    ) -> Result<String, Error> {
         let http_err =
             |what: &str, e: std::io::Error| Error::Parse(format!("anchor server {what}: {e}"));
-        let mut stream = connect(&self.authority).map_err(|e| http_err("connect", e))?;
-        stream
-            .set_read_timeout(Some(IO_TIMEOUT))
-            .map_err(|e| http_err("configure", e))?;
-        stream
-            .set_write_timeout(Some(IO_TIMEOUT))
-            .map_err(|e| http_err("configure", e))?;
+        let deadline = Instant::now()
+            .checked_add(timeout)
+            .ok_or_else(|| Error::Parse("anchor server timeout is too large".into()))?;
+        let mut stream = connect(&self.authority, deadline).map_err(|e| http_err("connect", e))?;
         let body = body.unwrap_or("");
         let request = format!(
             "{method} {path} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\
@@ -231,14 +275,72 @@ impl HttpAnchorChain {
             self.authority,
             body.len(),
         );
-        stream
-            .write_all(request.as_bytes())
-            .map_err(|e| http_err("send", e))?;
-        let mut response = String::new();
-        stream
-            .take(MAX_RESPONSE_BYTES + 1)
-            .read_to_string(&mut response)
-            .map_err(|e| http_err("read", e))?;
+        let mut unwritten = request.as_bytes();
+        while !unwritten.is_empty() {
+            stream
+                .set_write_timeout(Some(
+                    remaining(deadline, "request write")
+                        .map_err(|error| http_err("send", error))?,
+                ))
+                .map_err(|error| http_err("configure", error))?;
+            match stream.write(unwritten) {
+                Ok(0) => {
+                    return Err(http_err(
+                        "send",
+                        std::io::Error::new(
+                            std::io::ErrorKind::WriteZero,
+                            "connection closed during request write",
+                        ),
+                    ));
+                }
+                Ok(written) => unwritten = &unwritten[written..],
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                    ) =>
+                {
+                    return Err(http_err("send", timed_out("request write")));
+                }
+                Err(error) => return Err(http_err("send", error)),
+            }
+        }
+
+        let mut response = Vec::new();
+        let mut chunk = [0u8; 8192];
+        loop {
+            stream
+                .set_read_timeout(Some(
+                    remaining(deadline, "response read")
+                        .map_err(|error| http_err("read", error))?,
+                ))
+                .map_err(|error| http_err("configure", error))?;
+            match stream.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(read) => {
+                    response.extend_from_slice(&chunk[..read]);
+                    if response.len() > MAX_RESPONSE_BYTES as usize {
+                        return Err(Error::Parse(format!(
+                            "anchor server response exceeds the {MAX_RESPONSE_BYTES}-byte cap"
+                        )));
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                    ) =>
+                {
+                    return Err(http_err("read", timed_out("response read")));
+                }
+                Err(error) => return Err(http_err("read", error)),
+            }
+        }
+        let response = String::from_utf8(response).map_err(|error| {
+            Error::Parse(format!("anchor server response is not UTF-8: {error}"))
+        })?;
         if response.len() > MAX_RESPONSE_BYTES as usize {
             return Err(Error::Parse(format!(
                 "anchor server response exceeds the {MAX_RESPONSE_BYTES}-byte cap"
@@ -254,6 +356,41 @@ impl HttpAnchorChain {
             )));
         }
         Ok(reply_body.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::TcpListener;
+
+    #[test]
+    fn one_deadline_bounds_a_slow_drip_response() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let authority = listener.local_addr().unwrap().to_string();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0u8; 1024];
+            let _ = stream.read(&mut request);
+            for byte in b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n{}" {
+                if stream.write_all(&[*byte]).is_err() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        });
+        let chain = HttpAnchorChain {
+            authority,
+            tip_height: 0,
+            entries: Vec::new(),
+        };
+        let started = Instant::now();
+        let error = chain
+            .request_with_timeout("GET", "/slow", None, Duration::from_millis(80))
+            .unwrap_err();
+        assert!(error.to_string().contains("timed out") || error.to_string().contains("deadline"));
+        assert!(started.elapsed() < Duration::from_secs(1));
+        server.join().unwrap();
     }
 }
 

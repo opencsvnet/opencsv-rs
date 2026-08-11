@@ -29,7 +29,8 @@ fn main() -> Result<(), Box<dyn Error>> {
     let device_binding = [0x43_u8; 32];
     let directory = tempfile::tempdir()?;
     let config = json!({
-        "version": 1,
+        "version": 2,
+        "deployment_id": "opencsv-test-usd-v2",
         "network": "regtest",
         "esplora_url": "http://127.0.0.1:1",
         "peers": ["127.0.0.1:19444"],

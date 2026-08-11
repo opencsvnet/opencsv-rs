@@ -44,7 +44,8 @@ fn peer_list(variable: &str) -> Vec<String> {
 
 fn config() -> String {
     json!({
-        "version": 1,
+        "version": 2,
+        "deployment_id": "opencsv-test-usd-v2",
         "network": "signet",
         "esplora_url": env::var("OPENCSV_SIGNET_ESPLORA")
             .unwrap_or_else(|_| DEFAULT_ESPLORA.to_owned()),
