@@ -19,7 +19,8 @@
 //! and this client stands in for a node RPC.
 
 use std::io::{Read, Write};
-use std::net::TcpStream;
+use std::net::{TcpStream, ToSocketAddrs};
+use std::time::Duration;
 
 use opencsv_core::chain::{AnchorChain, AnchorLocation, AnchorRef};
 use opencsv_core::{AnchorRecord, Digest, ANCHOR_SIZE};
@@ -33,6 +34,30 @@ use crate::hexutil::{from_hex, to_hex};
 /// Bound on tag-collision redraws (each costs a UTXO reservation on
 /// real-chain backends).
 const MAX_CTX_DRAWS: usize = 16;
+
+/// Per-operation network timeout (connect, write, read), mirroring the
+/// bitcoind transport in `opencsv-bitcoin`: a hung or hostile anchor server
+/// must fail the request, not block the CLI forever.
+const IO_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Bound on one HTTP response, matching the CBF wire-frame cap
+/// (`opencsv-cbf`'s `MAX_PAYLOAD`); anchor replies are a few hundred bytes.
+const MAX_RESPONSE_BYTES: u64 = 32 * 1024 * 1024;
+
+/// Connect to `authority` (`host:port`) with [`IO_TIMEOUT`] on each resolved
+/// address; the std `TcpStream::connect` has no timeout of its own.
+fn connect(authority: &str) -> std::io::Result<TcpStream> {
+    let mut last_err = None;
+    for addr in authority.to_socket_addrs()? {
+        match TcpStream::connect_timeout(&addr, IO_TIMEOUT) {
+            Ok(stream) => return Ok(stream),
+            Err(e) => last_err = Some(e),
+        }
+    }
+    Err(last_err.unwrap_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "no resolved address")
+    }))
+}
 
 #[derive(Deserialize)]
 struct SnapshotJson {
@@ -192,7 +217,13 @@ impl HttpAnchorChain {
     fn request(&self, method: &str, path: &str, body: Option<&str>) -> Result<String, Error> {
         let http_err =
             |what: &str, e: std::io::Error| Error::Parse(format!("anchor server {what}: {e}"));
-        let mut stream = TcpStream::connect(&self.authority).map_err(|e| http_err("connect", e))?;
+        let mut stream = connect(&self.authority).map_err(|e| http_err("connect", e))?;
+        stream
+            .set_read_timeout(Some(IO_TIMEOUT))
+            .map_err(|e| http_err("configure", e))?;
+        stream
+            .set_write_timeout(Some(IO_TIMEOUT))
+            .map_err(|e| http_err("configure", e))?;
         let body = body.unwrap_or("");
         let request = format!(
             "{method} {path} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\
@@ -205,8 +236,14 @@ impl HttpAnchorChain {
             .map_err(|e| http_err("send", e))?;
         let mut response = String::new();
         stream
+            .take(MAX_RESPONSE_BYTES + 1)
             .read_to_string(&mut response)
             .map_err(|e| http_err("read", e))?;
+        if response.len() > MAX_RESPONSE_BYTES as usize {
+            return Err(Error::Parse(format!(
+                "anchor server response exceeds the {MAX_RESPONSE_BYTES}-byte cap"
+            )));
+        }
         let (head, reply_body) = response
             .split_once("\r\n\r\n")
             .ok_or_else(|| Error::Parse("anchor server: malformed HTTP response".into()))?;
