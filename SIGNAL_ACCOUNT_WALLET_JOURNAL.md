@@ -785,3 +785,30 @@ the stated bound. DNS, all connection attempts, the request write, and the
 bounded response read now spend from one monotonic deadline. A regression
 server that continuously drips bytes proves the complete request still exits
 at the shared deadline.
+
+## 2026-08-11 — receiver admission precedes chain synchronization
+
+The first live v2 install preserved Signal message history as intended, but
+its startup sweep presented archived v1 consignment attachments as payments
+that were still verifying. The receiver tried to locate each old anchor before
+checking whether the recipient openings belonged to Signal's exact reviewed
+Test USD v2 issuer registry. An absent historical anchor therefore looked like
+transient chain lag and could retry indefinitely.
+
+Treating every verification exception as terminal was rejected because pinned
+observer outages, an advancing compact-filter tip, and unsettled SPV evidence
+are genuinely retryable. Editing the simulator database or hiding old messages
+by timestamp was also rejected: neither proves what protocol bytes the
+attachment contains, and either would make the acceptance media depend on
+non-reproducible local cleanup.
+
+The existing read-only consignment inspection now reports its distinct public
+asset ids, the unreviewed subset, and stable `asset_not_reviewed` admission
+result using the same exact manifest-derived predicate enforced at transfer
+planning and signing. Signal can make that local decision before any network
+work. The attachment and its receipt remain visible and nonspendable, while no
+v1 asset or balance is imported or relabeled as v2. A focused test covers both
+an exact reviewed instrument and a mixed reviewed/unreviewed consignment; the
+warnings-denied default FFI suite passes 76 tests and the recovery-feature
+suite passes 78, with the repository's three slow recursive-proof cases still
+explicitly ignored.
