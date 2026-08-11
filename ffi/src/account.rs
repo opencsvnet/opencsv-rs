@@ -2213,12 +2213,29 @@ impl AccountWallet {
         let (canonical, consignment_id) = canonical_consignment_identity(blob)?;
         let consignment = Consignment::from_bytes(&canonical)
             .map_err(|error| AccountError::new("invalid_consignment", error.to_string()))?;
+        let mut asset_ids = consignment
+            .coin_openings
+            .iter()
+            .map(|opening| hex_encode(opening.asset_id.as_bytes()))
+            .collect::<Vec<_>>();
+        asset_ids.sort_unstable();
+        asset_ids.dedup();
+        let unreviewed_asset_ids = asset_ids
+            .iter()
+            .filter(|asset_id| !self.is_reviewed_usd_asset(asset_id))
+            .cloned()
+            .collect::<Vec<_>>();
+        let rejection_reason = (!unreviewed_asset_ids.is_empty()).then_some("asset_not_reviewed");
         Ok(json!({
             "consignment_id": consignment_id,
             "payment_id": consignment_payment_identity(&consignment)?,
             "anchor_txid": Txid::from_byte_array(consignment.anchor_ref.txid).to_string(),
             "anchor_height": consignment.anchor_ref.location.height,
             "anchor_position": consignment.anchor_ref.location.position,
+            "asset_ids": asset_ids,
+            "all_assets_reviewed": unreviewed_asset_ids.is_empty(),
+            "unreviewed_asset_ids": unreviewed_asset_ids,
+            "rejection_reason": rejection_reason,
         }))
     }
 
@@ -7398,16 +7415,19 @@ impl AccountWallet {
     /// Require the exact asset identity to be present in the reviewed USD
     /// registry supplied by Signal. A ticker, received manifest, or prior
     /// balance never grants spend authority by itself.
+    fn is_reviewed_usd_asset(&self, asset_id: &str) -> bool {
+        let Ok(requested) = decode_hex_32(asset_id, "asset id") else {
+            return false;
+        };
+        self.config
+            .usd_issuers
+            .iter()
+            .any(|issuer| issuer.manifest.genesis.asset_id().as_bytes() == &requested)
+    }
+
     fn require_reviewed_usd_asset(&self, asset_id: &str) -> Result<(), AccountError> {
-        if let Ok(requested) = decode_hex_32(asset_id, "asset id") {
-            if self
-                .config
-                .usd_issuers
-                .iter()
-                .any(|issuer| issuer.manifest.genesis.asset_id().as_bytes() == &requested)
-            {
-                return Ok(());
-            }
+        if self.is_reviewed_usd_asset(asset_id) {
+            return Ok(());
         }
         Err(AccountError::new(
             "asset_not_reviewed",
@@ -11063,6 +11083,64 @@ mod tests {
         let (normalized_bytes, normalized_id) = canonical_consignment_identity(&overlong).unwrap();
         assert_eq!(normalized_bytes, canonical_bytes);
         assert_eq!(normalized_id, canonical_id);
+    }
+
+    fn inspection_consignment(asset_ids: impl IntoIterator<Item = AssetId>) -> Consignment {
+        Consignment {
+            coin_openings: asset_ids
+                .into_iter()
+                .enumerate()
+                .map(|(index, asset_id)| opencsv_core::consignment::CoinOpening {
+                    asset_id,
+                    value: u64::try_from(index + 1).unwrap(),
+                    owner: Digest::from_bytes([2; 32]),
+                    randomness: Digest::from_bytes([3; 32]),
+                })
+                .collect(),
+            nullifiers: Vec::new(),
+            proof: Vec::new(),
+            anchor_ref: AnchorRef {
+                txid: [4; 32],
+                location: MEMPOOL_LOCATION,
+            },
+            aux: None,
+        }
+    }
+
+    #[test]
+    fn consignment_inspection_admits_only_exact_reviewed_asset_ids() {
+        let dir = tempfile::tempdir().unwrap();
+        let (reviewed_config, reviewed_asset_id) = reviewed_test_config(19);
+        let wallet = AccountWallet::open(
+            &reviewed_config,
+            &[20; 32],
+            dir.path().join("wallet.sqlite").to_str().unwrap(),
+        )
+        .unwrap();
+        let reviewed_asset =
+            AssetId::from_bytes(decode_hex_32(&reviewed_asset_id, "reviewed asset id").unwrap());
+
+        let reviewed = wallet
+            .inspect_consignment(&inspection_consignment([reviewed_asset]).to_bytes())
+            .unwrap();
+        assert_eq!(reviewed["asset_ids"], json!([reviewed_asset_id]));
+        assert_eq!(reviewed["all_assets_reviewed"], true);
+        assert_eq!(reviewed["unreviewed_asset_ids"], json!([]));
+        assert_eq!(reviewed["rejection_reason"], Value::Null);
+
+        let unreviewed_asset = AssetId::from_bytes([1; 32]);
+        let unreviewed_asset_id = hex_encode(unreviewed_asset.as_bytes());
+        let mixed = wallet
+            .inspect_consignment(
+                &inspection_consignment([reviewed_asset, unreviewed_asset]).to_bytes(),
+            )
+            .unwrap();
+        let inspected_asset_ids = mixed["asset_ids"].as_array().unwrap();
+        assert!(inspected_asset_ids.contains(&json!(reviewed_asset_id)));
+        assert!(inspected_asset_ids.contains(&json!(unreviewed_asset_id)));
+        assert_eq!(mixed["all_assets_reviewed"], false);
+        assert_eq!(mixed["unreviewed_asset_ids"], json!([unreviewed_asset_id]));
+        assert_eq!(mixed["rejection_reason"], "asset_not_reviewed");
     }
 
     #[test]
