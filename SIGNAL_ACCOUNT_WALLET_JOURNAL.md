@@ -728,3 +728,25 @@ cryptographic bytes, while retaining both attachments as receipts. Tests show
 the id survives anchor replacement, changes when protected proof bytes change,
 discovers the predecessor in the verified-consignment database, and supports
 repeated fee bumps after observation, delivery, and reopen.
+
+## 2026-08-11 — addendum: raw-observer availability quorum reversed
+
+The 2026-08-07 availability quorum (one fresh pinned observer must return the
+exact transaction bytes) is reversed by same-day commit cd1e678 ("Require
+every configured raw observer"). `required_raw_observer_quorum` is now derived
+as every raw observer marked `require`, and an explicit value must match that
+count, so `require` can never silently mean an optional member of a smaller
+quorum. The signet defaults again require both pinned API observers to return
+the exact transaction bytes under their configured certificate pins
+(regression: `fresh_signet_defaults_require_both_pinned_api_observers`).
+
+The reversal is fail-closed: under a one-of-N quorum a single observer's
+matching bytes satisfied zero-confirmation acceptance while the other
+observer's pin, byte, or availability failure was only persisted, so one
+compromised or malfunctioning provider could vouch unchallenged. Requiring
+every configured observer means any pin mismatch, wrong bytes, or outage
+blocks zero-confirmation acceptance. The cost is the liveness coupling the
+quorum was introduced to avoid: one provider outage again blocks
+zero-confirmation acceptance wallet-wide until the observer recovers or the
+configuration changes. Confirmation and settlement are unaffected; they still
+require the phone-owned headers/BIP158/full-block/Merkle path.

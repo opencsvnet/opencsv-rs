@@ -12,7 +12,7 @@ independent third-party audit and not mainnet approval.
 | ID | Severity | Finding | Resolution and receipt |
 |---|---|---|---|
 | SR-01 | High | Header sync mutated one shared chain sequentially. A later malicious peer could return no headers and be recorded as agreeing with the chain learned from the first peer without independently serving it. | Each peer now advances a clone of the same validated base chain. Height, tip hash, and accumulated work must all agree before one candidate is adopted. The two-peer cold signet probe independently reached height 316025. |
-| SR-02 | High | A complete on-disk filter-hash cache made every peer return an empty update, so reconnect compared empty vectors and never re-attested the cached chain. Filter headers are not committed by block headers. | Every new connection re-fetches the complete filter-hash chain independently from every peer and compares it before use. Only later syncs on those same connections fetch the suffix. The measured reconnect downloaded 20255556 wire bytes and then the same-session sync downloaded 50 bytes. |
+| SR-02 | High | A complete on-disk filter-hash cache made every peer return an empty update, so reconnect compared empty vectors and never re-attested the cached chain. Filter headers are not committed by block headers. | Every new connection re-attests the cached chain against every peer: the peer must serve the exact cached 144-block filter-hash tail plus the filter header immediately preceding it, which is re-derived from the complete local prefix, so mutating any earlier cached hash breaks the rolling SHA256d linkage short of a second preimage. Fresh installs still fetch and cross-check the complete chain; only later syncs on those same connections fetch the suffix. The initial full-chain re-fetch measured 20255556 wire bytes on reconnect and then 50 bytes for a same-session sync, which motivated bounding re-attestation to the tail. |
 | SR-03 | Critical | The scan index placed `tip` before occurrence rows and used a truncating write without a checksum. A crash could preserve a high tip while losing later occurrence evidence, causing exclusion checks to skip the lost range. Unknown lines were also ignored. | Scan index v2 uses a SHA-256 checksum, strict complete decoding, range/order validation, a uniquely named temporary file, file sync, atomic rename, and parent-directory sync. Corrupt, partial, and v1 files explicitly return `RebuildRequired` and start at height zero. Unit tests corrupt a persisted index and verify rebuild behavior. |
 | SR-04 | Medium | Peers were accepted after handshake without checking witness and compact-filter service bits, deferring an incompatible-peer failure into synchronization. | Handshake now requires both `NODE_WITNESS` and `NODE_COMPACT_FILTERS`. The readiness command requires at least two successfully connected peers. |
 | SR-05 | Critical | The historical P2WSH marker committed to `OP_TRUE`, so any observer could spend its 546 sats and attach a non-replaceable child. External signet transaction `157e3246…b1b7` did exactly that to `e985c098…ead1`; it pinned the parent and both later confirmed in block 316031. | Protocol version 3 anchors commit to `OP_RETURN` inside P2WSH (`0020189f…57b7`), retaining BIP158 visibility while making the witness program unspendable. Version 2 retains its exact historical bytes for read-only migration but cannot be newly constructed or replaced. Unit, scanner, batching, and live signet receipts cover the transition. |
@@ -51,9 +51,13 @@ independent third-party audit and not mainnet approval.
   Duplicate resolved addresses are rejected, but that does not prove operator
   independence. A release configuration must use at least two diverse peers;
   peer discovery, rotation, and operator diversity remain deployment work.
-- Reconnect now re-attests the full filter-hash chain. The measured bandwidth
-  cost is material and must not be hidden; checkpointing it safely would need
-  an authenticated/versioned design.
+- Reconnect now re-attests only the 144-block filter-hash tail plus the
+  preceding header rather than the full chain. Earlier cached hashes are
+  authenticated through the rolling SHA256d linkage, so detecting a deep cache
+  mutation rests on second-preimage resistance, not on re-downloading history.
+  Fresh installs still fetch and cross-check the complete chain; that
+  bandwidth cost is material and must not be hidden, and checkpointing it
+  safely would need an authenticated/versioned design.
 - Batching gossip authenticates messages but raw TCP does not provide traffic
   confidentiality or metadata privacy. There is no global admission control,
   reputation system, or Sybil resistance.

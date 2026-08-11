@@ -57,9 +57,9 @@ ids, or caller-constructed asset change. A transfer request is exactly:
 {"asset_id":"<32-byte hex>","to_owner":"<32-byte hex>","amount":100}
 ```
 
-Rust selects an unreserved two-coin protocol input set, minimizing asset
-change deterministically, then independently reserves a fee UTXO and derives
-Bitcoin change.
+Rust selects the best unreserved one- or two-coin protocol input set,
+deterministically minimizing asset change, then input count, then coin ids,
+then independently reserves a fee UTXO and derives Bitcoin change.
 
 ## Persistence and recovery
 
@@ -172,12 +172,25 @@ The action-oriented surface is:
 
 - `opencsv_account_open/close/status/sync`
 - `opencsv_account_set_backup_state/checkpoint/restore_checkpoint`
-- `opencsv_account_verify_consignment/scan_verify/cross_check`
+- `opencsv_account_rebind_test_device` (DEBUG signet/regtest builds only,
+  behind the non-default `test-wallet-recovery` feature)
+- `opencsv_account_verify_consignment/inspect_consignment/scan_verify/cross_check`
+- `opencsv_account_verify_consignment_unconfirmed` /
+  `opencsv_account_verify_consignment_unconfirmed_observed` (zero-confirmation
+  acceptance against pinned raw-transaction observer evidence)
 - `opencsv_transfer_plan` / `opencsv_operation_prove`
+- `opencsv_transfer_batch_plan/add_recipient` and the `opencsv_send_batch_*`
+  family (`freeze/status/cancel/prove/ack_backup/sign_and_broadcast` /
+  `observe_unconfirmed/resume/fee_bump/refresh_spv`)
+- `opencsv_account_prepare_batch_reserves` /
+  `opencsv_account_observe_batch_reserves` /
+  `opencsv_account_resume_batch_reserves` /
+  `opencsv_account_refresh_batch_reserves`
 - `opencsv_transfer_prepare` (one-shot compatibility wrapper)
 - `opencsv_operation_ack_backup`
 - `opencsv_operation_sign_and_broadcast`
-- `opencsv_operation_status/resume/cancel`
+- `opencsv_operation_observe_unconfirmed`
+- `opencsv_operation_status/refresh_spv/resume/cancel`
 - `opencsv_fee_bump`
 - `opencsv_operation_mark_delivered`
 
