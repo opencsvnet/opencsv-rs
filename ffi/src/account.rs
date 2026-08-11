@@ -2094,7 +2094,12 @@ impl AccountWallet {
             .map_err(|error| AccountError::new("invalid_consignment", error))?;
         match verdict {
             Ok(verified) => {
-                self.db.conn.execute(
+                let now = unix_time()?;
+                let db_tx = self
+                    .db
+                    .conn
+                    .transaction_with_behavior(TransactionBehavior::Immediate)?;
+                db_tx.execute(
                     "INSERT INTO opencsv_consignments(
                          consignment_id, consignment_base64, spent_state_json, created_at
                      ) VALUES(?1, ?2, '{}', ?3)
@@ -2103,18 +2108,17 @@ impl AccountWallet {
                     params![
                         consignment_id,
                         base64::engine::general_purpose::STANDARD.encode(&canonical_blob),
-                        unix_time()?,
+                        now,
                     ],
                 )?;
-                self.db.conn.execute(
+                db_tx.execute(
                     "INSERT INTO opencsv_consignment_snapshots(consignment_id, snapshot_json)
                      VALUES(?1, ?2)
                      ON CONFLICT(consignment_id) DO UPDATE SET
                          snapshot_json = excluded.snapshot_json",
                     params![consignment_id, snapshot_json],
                 )?;
-                let now = unix_time()?;
-                self.db.conn.execute(
+                db_tx.execute(
                     "INSERT INTO opencsv_consignment_finality(
                          consignment_id, anchor_txid, finality, observed_at,
                          last_checked_at, last_error
@@ -2126,6 +2130,7 @@ impl AccountWallet {
                          last_error = NULL",
                     params![consignment_id, anchor_txid, now],
                 )?;
+                db_tx.commit()?;
                 Ok(json!({
                     "status": "verified",
                     "finality": "settled",
