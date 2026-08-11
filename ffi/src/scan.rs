@@ -340,6 +340,9 @@ pub fn check_json(request_json: &str) -> Result<Value, String> {
     let request: ScanCheckRequestJson =
         serde_json::from_str(request_json).map_err(|e| format!("scan check JSON: {e}"))?;
     let raw_nf = Digest::from_bytes(from_hex_array::<32>(&request.raw_nf_hex, "raw nullifier")?);
+    if !raw_nf.is_canonical() {
+        return Err("raw nullifier is not a canonical digest encoding".to_string());
+    }
     let index = registered_index()?;
     match index.scan_check(&raw_nf, request.birth, request.spend) {
         Some((location, ctx)) => Ok(json!({

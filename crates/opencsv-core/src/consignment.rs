@@ -101,3 +101,42 @@ impl Consignment {
         Ok(consignment)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::chain::AnchorLocation;
+    use crate::digest::BABY_BEAR_P;
+
+    fn consignment_with_nullifiers(nullifiers: Vec<Digest>) -> Consignment {
+        Consignment {
+            coin_openings: vec![],
+            nullifiers,
+            proof: vec![],
+            anchor_ref: AnchorRef {
+                txid: [0u8; 32],
+                location: AnchorLocation {
+                    height: 1,
+                    position: 0,
+                },
+            },
+            aux: None,
+        }
+    }
+
+    /// A nullifier digest with one limb bumped by `p` is a non-canonical
+    /// twin encoding of another field element: decoding must reject it.
+    #[test]
+    fn from_bytes_rejects_non_canonical_nullifier_limb() {
+        let mut twin = [7u8; 32];
+        let bumped = u32::from_le_bytes(twin[0..4].try_into().unwrap()) + BABY_BEAR_P;
+        twin[0..4].copy_from_slice(&bumped.to_le_bytes());
+        let forged = consignment_with_nullifiers(vec![Digest::from_bytes(twin)]);
+        assert!(Consignment::from_bytes(&forged.to_bytes()).is_err());
+
+        // The canonical encoding of the same consignment still decodes.
+        let canonical = consignment_with_nullifiers(vec![Digest::from_bytes([7u8; 32])]);
+        let bytes = canonical.to_bytes();
+        assert_eq!(Consignment::from_bytes(&bytes).unwrap(), canonical);
+    }
+}

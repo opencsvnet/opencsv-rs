@@ -24,6 +24,7 @@ use opencsv_bitcoin::MEMPOOL_LOCATION;
 use opencsv_core::accept::{accept, AcceptParams};
 use opencsv_core::chain::{AnchorChain, AnchorRef};
 use opencsv_core::consignment::{CoinOpening, Consignment};
+use opencsv_core::digest::BABY_BEAR_P;
 use opencsv_core::{
     mint_commit, AnchorRecord, AssetGenesis, AssetId, Coin, Digest, Owner, OwnerSecret,
     PoseidonIssuerAuthorization,
@@ -42,8 +43,16 @@ pub const COIN_VK: &[u8] = opencsv_pcd::COIN_VK_TAG;
 /// One operation's failure, as a display string for the JSON boundary.
 pub type OpError = String;
 
+/// A fresh random digest with canonical limbs (`< p` per `u32`, reduced
+/// mod p). Digests are consumed as field elements, so the reduction loses
+/// nothing, and only canonical encodings survive the serde boundary.
 fn random_digest() -> Digest {
-    Digest::from_bytes(rand::rng().random())
+    let mut bytes: [u8; 32] = rand::rng().random();
+    for limb in bytes.chunks_exact_mut(4) {
+        let canonical = u32::from_le_bytes(limb.try_into().expect("4-byte chunk")) % BABY_BEAR_P;
+        limb.copy_from_slice(&canonical.to_le_bytes());
+    }
+    Digest::from_bytes(bytes)
 }
 
 /// A fresh random anchor transaction context (synthetic outpoint), drawn
@@ -260,6 +269,19 @@ fn shape_to_json(shape: &RecordShape) -> ShapeJson {
     }
 }
 
+/// Host-supplied raw nullifiers must be canonical digest encodings: a
+/// non-canonical limb (`>= p`) is a twin encoding of the same field
+/// element and would smuggle a second encoding of one spend past
+/// byte-level identity checks.
+fn canonical_nullifier(bytes: [u8; 32], what: &str) -> Result<Digest, OpError> {
+    let digest = Digest::from_bytes(bytes);
+    if digest.is_canonical() {
+        Ok(digest)
+    } else {
+        Err(format!("{what} is not a canonical digest encoding"))
+    }
+}
+
 fn shape_from_json(shape: &ShapeJson) -> Result<RecordShape, OpError> {
     match shape {
         ShapeJson::Fixed { record_hex } => {
@@ -269,7 +291,7 @@ fn shape_from_json(shape: &ShapeJson) -> Result<RecordShape, OpError> {
         ShapeJson::Xfer { nullifiers } => Ok(RecordShape::Xfer {
             nullifiers: nullifiers
                 .iter()
-                .map(|nf| from_hex_array::<32>(nf, "nullifier").map(Digest::from_bytes))
+                .map(|nf| canonical_nullifier(from_hex_array::<32>(nf, "nullifier")?, "nullifier"))
                 .collect::<Result<_, _>>()?,
         }),
         ShapeJson::Redeem {
@@ -279,7 +301,10 @@ fn shape_from_json(shape: &ShapeJson) -> Result<RecordShape, OpError> {
         } => Ok(RecordShape::Redeem {
             asset_id: Digest::from_bytes(from_hex_array::<32>(asset_id, "asset id")?).to_anchor(),
             value: *value,
-            raw_nf: Digest::from_bytes(from_hex_array::<32>(raw_nf, "raw nullifier")?),
+            raw_nf: canonical_nullifier(
+                from_hex_array::<32>(raw_nf, "raw nullifier")?,
+                "raw nullifier",
+            )?,
         }),
     }
 }
@@ -1060,7 +1085,7 @@ impl MemWallet {
             nullifiers: export
                 .nullifiers
                 .iter()
-                .map(|nf| from_hex_array::<32>(nf, "nullifier").map(Digest::from_bytes))
+                .map(|nf| canonical_nullifier(from_hex_array::<32>(nf, "nullifier")?, "nullifier"))
                 .collect::<Result<_, _>>()?,
             proof: base64::engine::general_purpose::STANDARD
                 .decode(&export.proof_base64)

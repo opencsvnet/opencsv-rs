@@ -526,6 +526,41 @@ fn accept_rejects_duplicate_nullifier_in_direct_and_compressed_transfers() {
 }
 
 #[test]
+fn accept_rejects_twin_encoded_nullifier_before_proof_verification() {
+    let g = genesis();
+    let asset_id = g.asset_id();
+    // A canonical nullifier and its non-canonical twin (limb 0 bumped by
+    // `p`): different byte strings reducing to the same field elements,
+    // hence the same spend.
+    let nf = d(39);
+    let mut twin = *nf.as_bytes();
+    let bumped = u32::from_le_bytes(twin[0..4].try_into().unwrap()) + digest::BABY_BEAR_P;
+    twin[0..4].copy_from_slice(&bumped.to_le_bytes());
+    let twin = Digest::from_bytes(twin);
+    assert_ne!(nf, twin);
+
+    let nfs = vec![nf, twin];
+    let openings = vec![opening_for(asset_id, 60, 3, 4)];
+    let mut chain = MockAnchorChain::new();
+    let (record, ctx) = xfer_for(&chain, &nfs);
+    let anchor_ref = chain.append_with_ctx(record, ctx);
+    let mut consignment = consignment_for(&chain, anchor_ref, nfs, openings, None);
+    chain.advance_blocks(5);
+    // Corrupt the proof: the rejection must still be DuplicateNullifier,
+    // proving the distinctness check runs before proof verification.
+    consignment.proof = vec![0u8];
+    assert_eq!(
+        accept(
+            &consignment,
+            &chain,
+            &MockVerifier,
+            &params(&[secret(3)], &[asset_id]),
+        ),
+        Err(RejectReason::DuplicateNullifier)
+    );
+}
+
+#[test]
 fn accept_rejects_consignment_missing_a_nullifier() {
     let g = genesis();
     let asset_id = g.asset_id();

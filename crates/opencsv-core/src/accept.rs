@@ -431,5 +431,38 @@ fn record_binds_nullifiers(
 }
 
 fn nullifiers_are_distinct(raw_nullifiers: &[Digest]) -> bool {
-    raw_nullifiers.iter().collect::<HashSet<_>>().len() == raw_nullifiers.len()
+    // Compare field-level identity, not byte identity: a non-canonical
+    // limb encoding (`c + p`, see `crate::digest::BABY_BEAR_P`) is a
+    // different byte string that reduces to the same field elements, so
+    // the statement layer treats the two as the same spend. Byte-level
+    // comparison would let a canonical nullifier and its twin pass as two
+    // distinct spends.
+    raw_nullifiers
+        .iter()
+        .map(Digest::to_elems)
+        .collect::<HashSet<_>>()
+        .len()
+        == raw_nullifiers.len()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::digest::BABY_BEAR_P;
+
+    #[test]
+    fn nullifiers_are_distinct_compares_field_identity() {
+        let nf = Digest::from_bytes([7u8; 32]);
+        let mut twin = *nf.as_bytes();
+        let bumped = u32::from_le_bytes(twin[0..4].try_into().unwrap()) + BABY_BEAR_P;
+        twin[0..4].copy_from_slice(&bumped.to_le_bytes());
+        let twin = Digest::from_bytes(twin);
+        // Distinct byte strings, one nullifier.
+        assert_ne!(nf, twin);
+        assert!(!nullifiers_are_distinct(&[nf, twin]));
+        assert!(nullifiers_are_distinct(&[
+            nf,
+            Digest::from_bytes([8u8; 32])
+        ]));
+    }
 }

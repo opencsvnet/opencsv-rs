@@ -1,6 +1,6 @@
 //! Coins, commitments, nullifiers, and owner keys (paper §4.3).
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::asset::AssetId;
 use crate::digest::Digest;
@@ -15,8 +15,23 @@ pub type Owner = Digest;
 
 /// Owner secret key. 32 bytes of entropy; the corresponding public key is
 /// `owner = H(osk)` (paper §4.3).
-#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct OwnerSecret(pub Digest);
+
+impl<'de> Deserialize<'de> for OwnerSecret {
+    /// Same wire format as the inner digest, but without `Digest`'s
+    /// canonical-limb rejection: an osk is local secret entropy, never an
+    /// untrusted encoding, and existing key files predate the canonicality
+    /// rule. Identity-bearing digests must keep the strict `Digest` path.
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Ok(Self(Digest::from_bytes(<[u8; 32]>::deserialize(
+            deserializer,
+        )?)))
+    }
+}
 
 impl OwnerSecret {
     /// Wrap 32 bytes of secret entropy.
