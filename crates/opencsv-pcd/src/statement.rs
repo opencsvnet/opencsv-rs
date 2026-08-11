@@ -1,72 +1,37 @@
 //! Statement table: a non-primitive op (NPO) that exposes the unified node
-//! Statement table: a non-primitive op (NPO) that exposes the unified node
-//! circuit's public statement as **STARK instance public values**, closing the
 //! circuit's public statement as **STARK instance public values**, closing the
 //! public-input binding gap of the pinned upstream stack (see `README.md`).
-//! public-input binding gap of the pinned upstream stack (see `README.md`).
-//!
 //!
 //! # Why this exists
-//! # Why this exists
-//!
 //!
 //! At the pinned upstream commit, a circuit's "public inputs" ride the
-//! At the pinned upstream commit, a circuit's "public inputs" ride the
-//! witness bus: the Public table sends them but no AIR constrains them and no
 //! witness bus: the Public table sends them but no AIR constrains them and no
 //! table exposes STARK instance public values, so a batch-STARK circuit proof
-//! table exposes STARK instance public values, so a batch-STARK circuit proof
-//! only attests satisfiability for *some* public inputs. That is fine for the
 //! only attests satisfiability for *some* public inputs. That is fine for the
 //! standalone stage-1/2 circuits (the statement is carried in the proof
-//! standalone stage-1/2 circuits (the statement is carried in the proof
-//! struct and compared), but PCD chaining needs a successor circuit to
 //! struct and compared), but PCD chaining needs a successor circuit to
 //! *cryptographically* bind a predecessor's statement in-circuit.
-//! *cryptographically* bind a predecessor's statement in-circuit.
-//!
 //!
 //! Non-primitive tables *can* carry instance public values
-//! Non-primitive tables *can* carry instance public values
-//! (`NonPrimitiveTableEntry.public_values`): they are observed into the
 //! (`NonPrimitiveTableEntry.public_values`): they are observed into the
 //! Fiat-Shamir transcript by both the native and the in-circuit verifier, and
-//! Fiat-Shamir transcript by both the native and the in-circuit verifier, and
-//! the in-circuit verifier allocates them as parent-circuit targets
 //! the in-circuit verifier allocates them as parent-circuit targets
 //! (`BatchStarkVerifierInputsBuilder::allocate`), which the parent can
-//! (`BatchStarkVerifierInputsBuilder::allocate`), which the parent can
-//! `connect`. This module implements a minimal table that uses that channel:
 //! `connect`. This module implements a minimal table that uses that channel:
 //!
-//!
-//! - the op reads the `N` statement expressions (witnesses) of the node
 //! - the op reads the `N` statement expressions (witnesses) of the node
 //!   circuit;
-//!   circuit;
-//! - the trace holds their `D = 4` base coefficients in a single row;
 //! - the trace holds their `D = 4` base coefficients in a single row;
 //! - the AIR **receives** each `(witness_index, value)` from the
-//! - the AIR **receives** each `(witness_index, value)` from the
-//!   `WitnessChecks` bus (tying the row to the circuit's actual witness
 //!   `WitnessChecks` bus (tying the row to the circuit's actual witness
 //!   values) and constrains every cell against the instance public values
-//!   values) and constrains every cell against the instance public values
-//!   (`mult · (cell − pv) = 0`, where `mult` is the receive multiplicity:
 //!   (`mult · (cell − pv) = 0`, where `mult` is the receive multiplicity:
 //!   `−1` on the single active row, `0` on padding).
-//!   `−1` on the single active row, `0` on padding).
-//!
 //!
 //! Soundness: the bus receive forces the row to equal the witnesses the
-//! Soundness: the bus receive forces the row to equal the witnesses the
-//! circuit actually used; the public-value constraints force the instance
 //! circuit actually used; the public-value constraints force the instance
 //! public values to equal the row; the transcript binds the instance public
-//! public values to equal the row; the transcript binds the instance public
 //! values. A cheating prover therefore cannot make a proof whose claimed
-//! values. A cheating prover therefore cannot make a proof whose claimed
-//! statement differs from what the circuit computed.
 //! statement differs from what the circuit computed.
 
 use std::fmt::Debug;

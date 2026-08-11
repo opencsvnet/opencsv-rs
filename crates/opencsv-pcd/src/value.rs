@@ -64,11 +64,12 @@ pub(crate) fn range_check_value(
 /// Soundness: all limbs must already be range-checked
 /// ([`range_check_value`]). Then every per-limb difference `t` lies in
 /// `(-2^26, 2^26) ⊂ (-p/2, p/2)`, so the field equality `t = 2^24 · c` with
-/// `c ∈ {0, 1}` holds in BabyBear iff it holds over the integers — no
-/// wrap-around can fake balance. (Using a uniform radix `2^24` on the 16-bit
-/// top limb is deliberate: it treats values as 72-bit for the carry
-/// arithmetic, which is still exact, and any top-limb overflow yields a
-/// non-zero final carry.)
+/// `c ∈ {-1, 0, 1}` (the set enforced by `c(c-1)(c+1) = 0` below; `-1` is a
+/// borrow, as above) holds in BabyBear iff it holds over the integers:
+/// `|t - 2^24 · c| < 2^26 + 2^24 < p`, so no wrap-around can fake balance.
+/// (Using a uniform radix `2^24` on the 16-bit top limb is deliberate: it
+/// treats values as 72-bit for the carry arithmetic, which is still exact,
+/// and any top-limb overflow yields a non-zero final carry.)
 pub(crate) fn enforce_sum_eq(
     builder: &mut CircuitBuilder<EF>,
     lhs: [&[ExprId; VALUE_LIMBS]; 2],
