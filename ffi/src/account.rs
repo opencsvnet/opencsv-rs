@@ -322,6 +322,10 @@ pub struct AccountConfig {
     /// product. This list contains public manifests only, never issuer keys.
     #[serde(default)]
     pub usd_issuers: Vec<UsdIssuerPolicy>,
+    /// Absolute miner-fee ceiling in satoshis for fee-bump replacements,
+    /// which take no per-call fee policy. When omitted, bumps are uncapped.
+    #[serde(default)]
+    pub max_fee_sats: Option<u64>,
     /// Unit tests that exercise unrelated account transitions can opt out of
     /// the live confirmed-chain dependency. This field does not exist in
     /// normal or feature builds and therefore cannot weaken a shipped wallet.
@@ -4853,6 +4857,19 @@ impl AccountWallet {
         let replacement = manifest
             .replacement(&proposal, target_sat_per_vb)
             .map_err(batch_protocol_error)?;
+        if self
+            .config
+            .max_fee_sats
+            .is_some_and(|limit| replacement.miner_fee() > limit)
+        {
+            return Err(AccountError::new(
+                "fee_limit_exceeded",
+                format!(
+                    "{} sats exceeds configured maximum",
+                    replacement.miner_fee()
+                ),
+            ));
+        }
         let replacement_transaction = sign_manifest(&replacement)?;
         let replacement_txid = replacement_transaction.compute_txid();
         let replacement_hex = hex_encode(&serialize(&replacement_transaction));
@@ -6092,6 +6109,16 @@ impl AccountWallet {
                     "replacement outputs exceed the protected funding input",
                 )
             })?;
+        if self
+            .config
+            .max_fee_sats
+            .is_some_and(|limit| replacement_fee_sats > limit)
+        {
+            return Err(AccountError::new(
+                "fee_limit_exceeded",
+                format!("{replacement_fee_sats} sats exceeds configured maximum"),
+            ));
+        }
         let mut receipt: Value = operation
             .receipt_json
             .as_deref()
@@ -12653,6 +12680,112 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "slow recursive receipts; run explicitly with --release --ignored"]
+    fn fee_bump_send_batch_enforces_configured_fee_ceiling() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config_value: Value = serde_json::from_str(&config_with_url(
+            AccountRole::Primary,
+            true,
+            "http://127.0.0.1:1",
+        ))
+        .unwrap();
+        config_value["max_fee_sats"] = json!(5_000);
+        let mut wallet = AccountWallet::open(
+            &config_value.to_string(),
+            &[96u8; 32],
+            dir.path().join("wallet.sqlite").to_str().unwrap(),
+        )
+        .unwrap();
+        allow_funding_verification(&mut wallet);
+        fund(&mut wallet, 60_000);
+        let minted = prepare_test_issuance(&mut wallet, "USD", &[60, 40]).unwrap();
+        let asset_id = minted["asset_id"].as_str().unwrap().to_owned();
+        let mint_operation = minted["operation_id"].as_str().unwrap().to_owned();
+        let mint_pending = wallet.pending_by_operation.remove(&mint_operation).unwrap();
+        wallet
+            .primary_protocol_mut()
+            .unwrap()
+            .finalize(
+                mint_pending,
+                AnchorRef {
+                    txid: [97u8; 32],
+                    location: opencsv_core::chain::AnchorLocation {
+                        height: 1,
+                        position: 0,
+                    },
+                },
+            )
+            .unwrap();
+        wallet.release_fee_reservation(&mint_operation).unwrap();
+        wallet
+            .db
+            .conn
+            .execute(
+                "UPDATE opencsv_operations SET state = 'cancelled'
+                 WHERE operation_id = ?1",
+                [&mint_operation],
+            )
+            .unwrap();
+        fund(&mut wallet, 20_000);
+        fund(&mut wallet, 19_000);
+        let stock_outpoint = OutPoint::new(Txid::from_byte_array([98u8; 32]), 0);
+        wallet
+            .db
+            .conn
+            .execute(
+                "INSERT INTO opencsv_batch_stocks(
+                     participant_count, txid, vout, value_sats, birth_height,
+                     state, reserved_by_batch, created_at
+                 ) VALUES(2, ?1, 0, ?2, 1, 'available', NULL, 1)",
+                params![
+                    stock_outpoint.txid.to_string(),
+                    i64::try_from(opencsv_bitcoin::batch_v2::MIN_OUTPUT_SATS).unwrap(),
+                ],
+            )
+            .unwrap();
+        let request = |owner: u8, amount: u64| {
+            json!({
+                "asset_id": asset_id,
+                "to_owner": hex_encode(&[owner; 32]),
+                "amount": amount,
+            })
+            .to_string()
+        };
+        let first = wallet.transfer_batch_plan(&request(99, 60)).unwrap();
+        let batch_id = first["batch"]["batch_local_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        wallet
+            .transfer_batch_add_recipient(&batch_id, &request(100, 40))
+            .unwrap();
+        wallet.freeze_send_batch(&batch_id).unwrap();
+        let job = match wallet.begin_send_batch_proof(&batch_id).unwrap() {
+            BatchProofJobStart::Run(job) => job,
+            _ => panic!("frozen two-member batch did not produce a proof job"),
+        };
+        let completed = job.run().unwrap();
+        let proved = wallet.finish_send_batch_proof(completed).unwrap();
+        wallet
+            .acknowledge_send_batch_backup(&batch_id, proved["checkpoint_hash"].as_str().unwrap())
+            .unwrap();
+        let broadcast = wallet.sign_and_broadcast_send_batch(&batch_id).unwrap();
+        assert_eq!(broadcast["state"], "broadcast_unobserved");
+
+        let below = wallet.fee_bump_send_batch(&batch_id, 3).unwrap();
+        assert_eq!(below["state"], "broadcast_unobserved");
+        let below_fee = below["receipt"]["miner_fee_sats"].as_u64().unwrap();
+        assert!(below_fee <= 5_000);
+
+        let error = wallet.fee_bump_send_batch(&batch_id, 40).unwrap_err();
+        assert_eq!(error.code, "fee_limit_exceeded");
+        assert_eq!(
+            wallet.send_batch_status(&batch_id).unwrap()["state"],
+            json!("broadcast_unobserved")
+        );
+    }
+
+    #[test]
     fn reviewed_asset_revocation_blocks_signing_and_cancels_unsigned_batch() {
         let dir = tempfile::tempdir().unwrap();
         let (cfg, asset_id) = reviewed_test_config(51);
@@ -14117,6 +14250,75 @@ mod tests {
                 .signed_tx_hex
                 .as_deref(),
             Some(second_replacement_hex.as_str())
+        );
+    }
+
+    #[test]
+    fn fee_bump_enforces_configured_fee_ceiling() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wallet.sqlite");
+        let mut config_value: Value = serde_json::from_str(&config_with_url(
+            AccountRole::Primary,
+            true,
+            "http://127.0.0.1:1",
+        ))
+        .unwrap();
+        config_value["max_fee_sats"] = json!(5_000);
+        let mut wallet = AccountWallet::open(
+            &config_value.to_string(),
+            &[11u8; 32],
+            path.to_str().unwrap(),
+        )
+        .unwrap();
+        allow_funding_verification(&mut wallet);
+        fund(&mut wallet, 100_000);
+        let prepared = prepare_test_issuance(&mut wallet, "TFC", &[10]).unwrap();
+        let operation_id = prepared["operation_id"].as_str().unwrap().to_owned();
+        wallet
+            .acknowledge_operation_backup(
+                &operation_id,
+                prepared["checkpoint_hash"].as_str().unwrap(),
+            )
+            .unwrap();
+        wallet
+            .sign_and_broadcast(
+                &operation_id,
+                &json!({ "target_sat_per_vb": 1, "max_fee_sats": 5_000 }).to_string(),
+            )
+            .unwrap();
+
+        let below = wallet.fee_bump(&operation_id, 5).unwrap();
+        assert_eq!(
+            below["state"],
+            OperationState::BroadcastUnobserved.as_str()
+        );
+        let below_fee = below["receipt"]["fee_sats"].as_u64().unwrap();
+        assert!(below_fee <= 5_000);
+        let bumped_hex = wallet
+            .operation(&operation_id)
+            .unwrap()
+            .signed_tx_hex
+            .unwrap();
+
+        let error = wallet.fee_bump(&operation_id, 50).unwrap_err();
+        assert_eq!(error.code, "fee_limit_exceeded");
+        // A rejected bump leaves the last persisted replacement untouched.
+        let operation = wallet.operation(&operation_id).unwrap();
+        assert_eq!(operation.state, OperationState::BroadcastUnobserved.as_str());
+        assert_eq!(operation.signed_tx_hex.as_deref(), Some(bumped_hex.as_str()));
+
+        let still_bumpable = wallet.fee_bump(&operation_id, 8).unwrap();
+        assert_eq!(
+            still_bumpable["state"],
+            OperationState::BroadcastUnobserved.as_str()
+        );
+        assert_ne!(
+            wallet
+                .operation(&operation_id)
+                .unwrap()
+                .signed_tx_hex
+                .as_deref(),
+            Some(bumped_hex.as_str())
         );
     }
 
