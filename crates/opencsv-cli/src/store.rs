@@ -1,7 +1,8 @@
 //! Wallet storage: a local directory with everything a client knows.
 //!
 //! Layout (all serde/bincode unless noted; **prototype-grade — secrets are
-//! stored unencrypted, protect the directory yourself**):
+//! stored unencrypted, but the wallet keeps them 0600 inside a 0700
+//! directory**):
 //!
 //! ```text
 //! <wallet-dir>/
@@ -92,8 +93,14 @@ impl Wallet {
     /// The directory itself is created on the first write.
     pub fn open(dir: impl Into<PathBuf>) -> Result<Self, Error> {
         let dir = dir.into();
-        let keys = read_optional(&dir.join(KEYS_FILE))?.unwrap_or_default();
-        let issuers = read_optional(&dir.join(ISSUERS_FILE))?.unwrap_or_default();
+        let keys_path = dir.join(KEYS_FILE);
+        let issuers_path = dir.join(ISSUERS_FILE);
+        // Secret files written by older versions may be group/world
+        // readable; tighten them before loading (best-effort).
+        tighten_secret_file(&keys_path);
+        tighten_secret_file(&issuers_path);
+        let keys = read_optional(&keys_path)?.unwrap_or_default();
+        let issuers = read_optional(&issuers_path)?.unwrap_or_default();
         let assets = read_dir_bincode(&dir.join(ASSETS_DIR))?;
         let coins = read_dir_bincode(&dir.join(COINS_DIR))?;
         Ok(Self {
@@ -138,14 +145,14 @@ impl Wallet {
     /// Add a freshly generated owner secret and persist the key file.
     pub fn add_key(&mut self, secret: OwnerSecret) -> Result<(), Error> {
         self.keys.push(secret);
-        write_bincode(&self.dir.join(KEYS_FILE), &self.keys)
+        write_secret_bincode(&self.dir.join(KEYS_FILE), &self.keys)
     }
 
     /// Add an issuer record and persist it; the genesis is also pinned.
     pub fn add_issuer(&mut self, record: IssuerRecord) -> Result<(), Error> {
         self.pin_asset(record.genesis.clone())?;
         self.issuers.push(record);
-        write_bincode(&self.dir.join(ISSUERS_FILE), &self.issuers)
+        write_secret_bincode(&self.dir.join(ISSUERS_FILE), &self.issuers)
     }
 
     /// Pin an asset genesis (trust-on-first-use), persisted by asset id.
@@ -270,13 +277,22 @@ fn decode_bincode<T: DeserializeOwned>(path: &Path, bytes: &[u8]) -> Result<T, E
 }
 
 fn write_bincode<T: Serialize>(path: &Path, value: &T) -> Result<(), Error> {
-    let bytes = bincode::serde::encode_to_vec(value, bincode::config::standard()).map_err(|e| {
+    write_bytes(path, &encode_bincode(path, value)?)
+}
+
+/// Same as `write_bincode`, but for files holding secrets: the parent
+/// directory is forced to 0700 and the file itself to 0600.
+fn write_secret_bincode<T: Serialize>(path: &Path, value: &T) -> Result<(), Error> {
+    write_secret_bytes(path, &encode_bincode(path, value)?)
+}
+
+fn encode_bincode<T: Serialize>(path: &Path, value: &T) -> Result<Vec<u8>, Error> {
+    bincode::serde::encode_to_vec(value, bincode::config::standard()).map_err(|e| {
         Error::Decode {
             path: path.to_path_buf(),
             message: format!("serialization failed: {e}"),
         }
-    })?;
-    write_bytes(path, &bytes)
+    })
 }
 
 fn write_bytes(path: &Path, bytes: &[u8]) -> Result<(), Error> {
@@ -284,4 +300,92 @@ fn write_bytes(path: &Path, bytes: &[u8]) -> Result<(), Error> {
         std::fs::create_dir_all(parent).map_err(io_err(path))?;
     }
     std::fs::write(path, bytes).map_err(io_err(path))
+}
+
+fn write_secret_bytes(path: &Path, bytes: &[u8]) -> Result<(), Error> {
+    use std::io::Write as _;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(io_err(path))?;
+        set_private_permissions(parent, 0o700)?;
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true).write(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path).map_err(io_err(path))?;
+    file.write_all(bytes).map_err(io_err(path))?;
+    // `mode` only applies when the file is created; force it in case a
+    // pre-existing file had looser permissions.
+    set_private_permissions(path, 0o600)
+}
+
+fn set_private_permissions(path: &Path, mode: u32) -> Result<(), Error> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
+            .map_err(io_err(path))?;
+    }
+    Ok(())
+}
+
+/// Best-effort hardening of an existing secret file: chmod it to 0600 if it
+/// is group/world accessible. Never fails — opening the wallet must not
+/// break over a chmod error.
+fn tighten_secret_file(path: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(metadata) = std::fs::metadata(path) {
+            if metadata.permissions().mode() & 0o077 != 0 {
+                let _ = set_private_permissions(path, 0o600);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn secret_files_are_written_0600_in_a_0700_directory() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("wallet");
+        let mut wallet = Wallet::open(&dir).unwrap();
+        wallet.add_key(OwnerSecret::from_bytes([7; 32])).unwrap();
+        write_secret_bincode(&dir.join(ISSUERS_FILE), &Vec::<IssuerRecord>::new()).unwrap();
+
+        let mode = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&dir), 0o700);
+        assert_eq!(mode(&dir.join(KEYS_FILE)), 0o600);
+        assert_eq!(mode(&dir.join(ISSUERS_FILE)), 0o600);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn loose_secret_files_are_tightened_on_open() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("wallet");
+        let mut wallet = Wallet::open(&dir).unwrap();
+        wallet.add_key(OwnerSecret::from_bytes([7; 32])).unwrap();
+        drop(wallet);
+
+        let keys_path = dir.join(KEYS_FILE);
+        std::fs::set_permissions(&keys_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let wallet = Wallet::open(&dir).unwrap();
+        assert_eq!(wallet.secrets().len(), 1);
+        assert_eq!(
+            std::fs::metadata(&keys_path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
 }
