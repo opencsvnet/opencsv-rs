@@ -812,3 +812,49 @@ an exact reviewed instrument and a mixed reviewed/unreviewed consignment; the
 warnings-denied default FFI suite passes 76 tests and the recovery-feature
 suite passes 78, with the repository's three slow recursive-proof cases still
 explicitly ignored.
+
+## 2026-08-12 — cached send raced mandatory chain verification
+
+The first fresh Test USD v2 Carol-to-Bob acceptance attempt used merged Signal
+tip `784b0122445bf9f92e0a11a5587a419500f98868` and Rust tip
+`f582c118721f679b84870e55271f4723d7e1cac6`. Signal durably announced 25 Test
+USD as operation `dbfeed5be1f83f94e662947bdb07137d` in solo batch
+`15316e14d8aa5746adc906f220947a84`, reserved the confirmed fee outpoint, and
+survived a deliberate app termination at `fee_reserved` with the same
+operation id. On relaunch the proof boundary returned `stale_chain_state` and
+the old failure policy cancelled both operation and batch. No proof, signed
+transaction, txid, broadcast, or asset spend was written. The failed intent
+remains visible as a receipt and is not acceptance footage.
+
+Code inspection found the race that makes this outcome possible. The send
+sheet correctly renders cached balances immediately and starts the phone-owned
+compact-filter scan concurrently, but background proving could begin before
+that scan registered or caught up. The Rust boundary then used the same
+terminal code for (a) unavailable peers or a missing/behind scan and (b) a
+verified contradiction such as an already-spent input. Failing closed was
+correct; destroying the resumable proposal for temporary unavailability was
+not.
+
+The replacement policy distinguishes disposition without weakening any
+verification. Peer, filter-scan, and unconfirmed-parent transport outages now
+return stable `chain_verification_unavailable` (or the existing dependency
+code) with `retryable: true`. A retryable proof failure clears only the active
+proof lease, preserves the exact operation id, fee reservation, solo/frozen
+batch, and unsigned state, and records the error in the durable receipt. A
+later call retries the same proposal. Verified spend, output mismatch,
+rollback, proof, layout, or policy failures remain terminal and cancel the
+complete unsigned batch; neither class may sign without fresh mandatory
+evidence. Signal separately waits for a successful compact-filter scan before
+starting solo or multi-recipient proof work, while keeping the already-posted
+pending chat entry visible during catch-up.
+
+Focused tests prove that a retryable outage retains one locked outpoint and
+one operation across re-entry, that a verified conflict still cancels the solo
+operation and its enclosing batch, and that a frozen multi-recipient batch is
+preserved only for retryable verification outages. The complete default FFI
+unit suite passes 79 tests with three deliberate slow recursive-proof cases
+ignored and zero failures.
+The explicitly opt-in release-mode reopen-and-resume proof test also passes;
+after its one-time optimized/LTO build, the test completes the resumed proof in
+10.32 seconds on this Mac. That is a development-host recovery receipt, not an
+iPhone product-performance claim.

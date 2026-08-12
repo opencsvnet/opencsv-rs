@@ -10,6 +10,11 @@ The interactive send path journals through `opencsv_transfer_plan` and returns
 to Signal immediately; `opencsv_operation_prove` advances that exact id in a
 resumable background pass. Only proof-ready operations may be signed, so fast
 pending presentation never weakens double-spend or lineage checks.
+Mandatory peer or local-scan unavailability returns
+`{"reason":"chain_verification_unavailable","retryable":true,...}` and keeps
+the exact planned/fee-reserved operation and Bitcoin lock durable. Verified
+conflicts and stale-state contradictions return `"retryable":false` and close
+the complete unsigned solo or frozen batch.
 
 The older in-memory compatibility model is retained temporarily:
 `opencsv_wallet_create` returns a small secrets

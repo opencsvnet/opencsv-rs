@@ -84,6 +84,11 @@ pub struct AccountError {
     pub code: &'static str,
     /// Human-readable detail, not intended for branching.
     pub message: String,
+    /// Whether retrying the same durable operation may succeed without any
+    /// proposal, input, or policy change. This is deliberately separate from
+    /// `code`: `stale_chain_state` denotes a verified contradiction, while
+    /// transient peer/scan availability uses a retryable error.
+    pub retryable: bool,
 }
 
 impl AccountError {
@@ -91,12 +96,25 @@ impl AccountError {
         Self {
             code,
             message: message.into(),
+            retryable: false,
+        }
+    }
+
+    fn retryable(code: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            code,
+            message: message.into(),
+            retryable: true,
         }
     }
 
     /// JSON object returned by the C ABI.
     pub fn json(&self) -> Value {
-        json!({ "error": self.message, "reason": self.code })
+        json!({
+            "error": self.message,
+            "reason": self.code,
+            "retryable": self.retryable,
+        })
     }
 }
 
@@ -534,8 +552,8 @@ impl FundingVerifier for CbfFundingVerifier {
             ));
         }
         let mut client_guard = self.client.lock().map_err(|_| {
-            AccountError::new(
-                "stale_chain_state",
+            AccountError::retryable(
+                "chain_verification_unavailable",
                 "authoritative fee-outpoint verifier lock was poisoned",
             )
         })?;
@@ -545,15 +563,15 @@ impl FundingVerifier for CbfFundingVerifier {
                 // fails closed; a later operation may establish a fresh,
                 // independently attested session.
                 *client_guard = None;
-                return Err(AccountError::new(
-                    "stale_chain_state",
+                return Err(AccountError::retryable(
+                    "chain_verification_unavailable",
                     format!("authoritative fee-outpoint resync: {error}"),
                 ));
             }
             if network != OpenCsvNetwork::Regtest && client.connected_peer_count() < 2 {
                 *client_guard = None;
-                return Err(AccountError::new(
-                    "stale_chain_state",
+                return Err(AccountError::retryable(
+                    "chain_verification_unavailable",
                     "authoritative fee-outpoint resync retained fewer than two independent peers",
                 ));
             }
@@ -565,14 +583,14 @@ impl FundingVerifier for CbfFundingVerifier {
                 timeout: self.timeout,
             };
             let client = CbfClient::connect(&config).map_err(|error| {
-                AccountError::new(
-                    "stale_chain_state",
+                AccountError::retryable(
+                    "chain_verification_unavailable",
                     format!("authoritative fee-outpoint sync: {error}"),
                 )
             })?;
             if network != OpenCsvNetwork::Regtest && client.connected_peer_count() < 2 {
-                return Err(AccountError::new(
-                    "stale_chain_state",
+                return Err(AccountError::retryable(
+                    "chain_verification_unavailable",
                     "authoritative fee-outpoint sync retained fewer than two independent peers",
                 ));
             }
@@ -592,8 +610,8 @@ impl FundingVerifier for CbfFundingVerifier {
                 self.max_blocks,
             )
             .map_err(|error| {
-                AccountError::new(
-                    "stale_chain_state",
+                AccountError::retryable(
+                    "chain_verification_unavailable",
                     format!("authoritative fee-outpoint check: {error}"),
                 )
             })?;
@@ -1192,7 +1210,7 @@ impl AccountProofJob {
             for dependency in &proved.unconfirmed_dependencies {
                 let txid = unconfirmed_dependency_txid(dependency)?;
                 match client.get_tx(&txid).map_err(|error| {
-                    AccountError::new(
+                    AccountError::retryable(
                         "unconfirmed_dependency_unavailable",
                         format!("could not re-observe parent {dependency}: {error}"),
                     )
@@ -1367,7 +1385,7 @@ impl AccountBatchProofJob {
                 let txid = unconfirmed_dependency_txid(dependency)?;
                 let dependency_observation_started = Instant::now();
                 let observed = client.get_tx(&txid).map_err(|error| {
-                    AccountError::new(
+                    AccountError::retryable(
                         "unconfirmed_dependency_unavailable",
                         format!("could not re-observe parent {dependency}: {error}"),
                     )
@@ -4070,6 +4088,13 @@ impl AccountWallet {
         error: AccountError,
     ) -> Result<T, AccountError> {
         self.db.delete_meta("active_batch_proof")?;
+        if !error.retryable {
+            if let Some(member) = self.send_batch_members(batch_local_id)?.first() {
+                self.reject_prebroadcast_operation(&member.operation_id, error.code)?;
+            } else {
+                self.cancel_send_batch(batch_local_id)?;
+            }
+        }
         self.db.conn.execute(
             "UPDATE opencsv_send_batches SET receipt_json = ?2, updated_at = ?3
              WHERE batch_local_id = ?1",
@@ -5384,6 +5409,10 @@ impl AccountWallet {
         error: AccountError,
     ) -> Result<T, AccountError> {
         self.db.delete_meta("active_proof_operation")?;
+        if error.retryable {
+            self.record_retryable_proof_error(operation_id, &error)?;
+            return Err(error);
+        }
         if error.code == "unconfirmed_dependency_changed" {
             if let Some(dependency) = error
                 .message
@@ -5396,6 +5425,40 @@ impl AccountWallet {
             }
         }
         self.fail_prebroadcast(operation_id, error)
+    }
+
+    /// Keep an exact pre-broadcast proposal and its fee lock durable when the
+    /// mandatory chain evidence is temporarily unavailable. No proof or
+    /// signature is installed. Re-entering `prove_operation` retries the same
+    /// operation id and reserved outpoint after the scan/peers recover.
+    fn record_retryable_proof_error(
+        &mut self,
+        operation_id: &str,
+        error: &AccountError,
+    ) -> Result<(), AccountError> {
+        let now = unix_time()?;
+        let encoded = error.json().to_string();
+        self.db.conn.execute(
+            "UPDATE opencsv_operations
+             SET receipt_json = json_set(COALESCE(receipt_json, '{}'),
+                                         '$.retryable_proof_error', json(?2)),
+                 rejection_reason = NULL, updated_at = ?3
+             WHERE operation_id = ?1
+               AND state IN ('planned', 'fee_reserved')",
+            params![operation_id, encoded, now],
+        )?;
+        self.db.conn.execute(
+            "UPDATE opencsv_send_batches
+             SET receipt_json = json_set(COALESCE(receipt_json, '{}'),
+                                         '$.retryable_proof_error', json(?2)),
+                 updated_at = ?3
+             WHERE batch_local_id IN (
+                 SELECT batch_local_id FROM opencsv_send_batch_members
+                 WHERE operation_id = ?1
+             ) AND state IN ('collecting', 'solo', 'frozen')",
+            params![operation_id, encoded, now],
+        )?;
+        Ok(())
     }
 
     /// Compatibility one-shot used by existing callers. New interactive
@@ -8091,7 +8154,7 @@ impl AccountWallet {
             }
             let txid = unconfirmed_dependency_txid(dependency)?;
             let observed = client.get_tx(&txid).map_err(|error| {
-                AccountError::new(
+                AccountError::retryable(
                     "unconfirmed_dependency_unavailable",
                     format!("could not re-observe parent {dependency}: {error}"),
                 )
@@ -10377,14 +10440,14 @@ fn confirmed_protocol_input_spends(
     for nullifier in nullifiers {
         let (scan_tip, occurrence) =
             scan::registered_nullifier_occurrence(nullifier).map_err(|error| {
-                AccountError::new(
-                    "stale_chain_state",
+                AccountError::retryable(
+                    "chain_verification_unavailable",
                     format!("confirmed OpenCSV spend scan is unavailable: {error}"),
                 )
             })?;
         if scan_tip < minimum_tip {
-            return Err(AccountError::new(
-                "stale_chain_state",
+            return Err(AccountError::retryable(
+                "chain_verification_unavailable",
                 format!(
                     "confirmed OpenCSV spend scan tip {scan_tip} is behind verified funding tip {minimum_tip}"
                 ),
@@ -10438,6 +10501,7 @@ mod tests {
     enum VerificationVerdict {
         Accept,
         Reject(&'static str, &'static str),
+        RetryableReject(&'static str, &'static str),
     }
 
     struct ScriptedVerifier {
@@ -10475,6 +10539,9 @@ mod tests {
                     source: "scripted-verified-blocks",
                 }),
                 VerificationVerdict::Reject(code, message) => Err(AccountError::new(code, message)),
+                VerificationVerdict::RetryableReject(code, message) => {
+                    Err(AccountError::retryable(code, message))
+                }
             }
         }
     }
@@ -12363,6 +12430,152 @@ mod tests {
     }
 
     #[test]
+    fn retryable_chain_verification_preserves_solo_operation_and_fee_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let (cfg, asset_id) = reviewed_test_config(101);
+        let mut wallet = AccountWallet::open(
+            &cfg,
+            &[102u8; 32],
+            dir.path().join("wallet.sqlite").to_str().unwrap(),
+        )
+        .unwrap();
+        let verifier = use_scripted_verifier(
+            &mut wallet,
+            [
+                VerificationVerdict::RetryableReject(
+                    "chain_verification_unavailable",
+                    "confirmed spend scan is still catching up",
+                ),
+                VerificationVerdict::Accept,
+            ],
+        );
+        fund(&mut wallet, 50_000);
+        let planned = wallet
+            .transfer_batch_plan(
+                &json!({
+                    "asset_id": asset_id,
+                    "to_owner": hex_encode(&[103u8; 32]),
+                    "amount": 1,
+                })
+                .to_string(),
+            )
+            .unwrap();
+        let operation_id = planned["operation_id"].as_str().unwrap().to_owned();
+        let batch_id = planned["batch"]["batch_local_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert_eq!(wallet.freeze_send_batch(&batch_id).unwrap()["state"], "solo");
+
+        let job = match wallet.begin_proof_job(&operation_id).unwrap() {
+            ProofJobStart::Run(job) => job,
+            ProofJobStart::Ready(_) => panic!("planned operation was already proved"),
+        };
+        let reserved = wallet.operation(&operation_id).unwrap();
+        let reserved_outpoint = operation_outpoint(&reserved).unwrap();
+        let error = match job.run() {
+            Ok(_) => panic!("retryable verifier unexpectedly accepted the proof job"),
+            Err(error) => error,
+        };
+        assert!(error.retryable);
+        assert_eq!(error.code, "chain_verification_unavailable");
+        assert_eq!(
+            wallet
+                .fail_proof_job::<Value>(&operation_id, error)
+                .unwrap_err()
+                .code,
+            "chain_verification_unavailable",
+        );
+
+        let after = wallet.operation(&operation_id).unwrap();
+        assert_eq!(after.state, OperationState::FeeReserved.as_str());
+        assert_eq!(operation_outpoint(&after).unwrap(), reserved_outpoint);
+        assert!(wallet.bitcoin.is_outpoint_locked(reserved_outpoint));
+        assert!(after.rejection_reason.is_none());
+        assert!(wallet.db.meta("active_proof_operation").unwrap().is_none());
+        assert_eq!(wallet.send_batch(&batch_id).unwrap().state, "solo");
+        let receipt: Value = serde_json::from_str(after.receipt_json.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            receipt["retryable_proof_error"]["reason"],
+            "chain_verification_unavailable",
+        );
+        assert_eq!(receipt["retryable_proof_error"]["retryable"], true);
+
+        // A later retry owns the same durable proposal and fee outpoint. The
+        // accepting second verifier verdict is intentionally left to the job;
+        // no new operation or reservation is created before proving resumes.
+        let retry = match wallet.begin_proof_job(&operation_id).unwrap() {
+            ProofJobStart::Run(job) => job,
+            ProofJobStart::Ready(_) => panic!("retry unexpectedly skipped proof work"),
+        };
+        assert_eq!(
+            operation_outpoint(&wallet.operation(&operation_id).unwrap()).unwrap(),
+            reserved_outpoint,
+        );
+        assert_eq!(verifier.calls.load(Ordering::SeqCst), 1);
+        drop(retry);
+    }
+
+    #[test]
+    fn verified_conflict_still_cancels_solo_operation_and_batch() {
+        let dir = tempfile::tempdir().unwrap();
+        let (cfg, asset_id) = reviewed_test_config(104);
+        let mut wallet = AccountWallet::open(
+            &cfg,
+            &[105u8; 32],
+            dir.path().join("wallet.sqlite").to_str().unwrap(),
+        )
+        .unwrap();
+        use_scripted_verifier(
+            &mut wallet,
+            [VerificationVerdict::Reject(
+                "conflicting_operation",
+                "verified block spends the reserved fee outpoint",
+            )],
+        );
+        fund(&mut wallet, 50_000);
+        let planned = wallet
+            .transfer_batch_plan(
+                &json!({
+                    "asset_id": asset_id,
+                    "to_owner": hex_encode(&[106u8; 32]),
+                    "amount": 1,
+                })
+                .to_string(),
+            )
+            .unwrap();
+        let operation_id = planned["operation_id"].as_str().unwrap().to_owned();
+        let batch_id = planned["batch"]["batch_local_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        wallet.freeze_send_batch(&batch_id).unwrap();
+        let job = match wallet.begin_proof_job(&operation_id).unwrap() {
+            ProofJobStart::Run(job) => job,
+            ProofJobStart::Ready(_) => panic!("planned operation was already proved"),
+        };
+        let error = match job.run() {
+            Ok(_) => panic!("conflicting verifier unexpectedly accepted the proof job"),
+            Err(error) => error,
+        };
+        assert!(!error.retryable);
+        assert_eq!(
+            wallet
+                .fail_proof_job::<Value>(&operation_id, error)
+                .unwrap_err()
+                .code,
+            "conflicting_operation",
+        );
+        let operation = wallet.operation(&operation_id).unwrap();
+        assert_eq!(operation.state, OperationState::Cancelled.as_str());
+        assert_eq!(
+            operation.rejection_reason.as_deref(),
+            Some("conflicting_operation"),
+        );
+        assert_eq!(wallet.send_batch(&batch_id).unwrap().state, "cancelled");
+    }
+
+    #[test]
     fn prebroadcast_member_failure_cancels_the_complete_batch() {
         let dir = tempfile::tempdir().unwrap();
         let (cfg, asset_id) = reviewed_test_config(82);
@@ -12406,6 +12619,73 @@ mod tests {
                 Some("stale_chain_state")
             );
         }
+    }
+
+    #[test]
+    fn batch_proof_failure_preserves_only_retryable_verification_outages() {
+        let dir = tempfile::tempdir().unwrap();
+        let (cfg, asset_id) = reviewed_test_config(107);
+        let mut wallet = AccountWallet::open(
+            &cfg,
+            &[108u8; 32],
+            dir.path().join("wallet.sqlite").to_str().unwrap(),
+        )
+        .unwrap();
+        let request = |recipient: u8| {
+            json!({
+                "asset_id": asset_id,
+                "to_owner": hex_encode(&[recipient; 32]),
+                "amount": 1,
+            })
+            .to_string()
+        };
+        let first = wallet.transfer_batch_plan(&request(109)).unwrap();
+        let batch_id = first["batch"]["batch_local_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        wallet
+            .transfer_batch_add_recipient(&batch_id, &request(110))
+            .unwrap();
+        wallet.freeze_send_batch(&batch_id).unwrap();
+        wallet.db.set_meta("active_batch_proof", &batch_id).unwrap();
+
+        let retryable = AccountError::retryable(
+            "chain_verification_unavailable",
+            "compact-filter peers are temporarily unavailable",
+        );
+        assert_eq!(
+            wallet
+                .fail_send_batch_proof::<Value>(&batch_id, retryable)
+                .unwrap_err()
+                .code,
+            "chain_verification_unavailable",
+        );
+        assert_eq!(wallet.send_batch(&batch_id).unwrap().state, "frozen");
+        assert!(wallet
+            .send_batch_members(&batch_id)
+            .unwrap()
+            .iter()
+            .all(|member| wallet.operation(&member.operation_id).unwrap().state == "planned"));
+
+        wallet.db.set_meta("active_batch_proof", &batch_id).unwrap();
+        let conflict = AccountError::new(
+            "conflicting_operation",
+            "verified block spends a batch fee input",
+        );
+        assert_eq!(
+            wallet
+                .fail_send_batch_proof::<Value>(&batch_id, conflict)
+                .unwrap_err()
+                .code,
+            "conflicting_operation",
+        );
+        assert_eq!(wallet.send_batch(&batch_id).unwrap().state, "cancelled");
+        assert!(wallet
+            .send_batch_members(&batch_id)
+            .unwrap()
+            .iter()
+            .all(|member| wallet.operation(&member.operation_id).unwrap().state == "cancelled"));
     }
 
     #[test]

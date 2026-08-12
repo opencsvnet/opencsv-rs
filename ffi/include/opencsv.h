@@ -140,6 +140,9 @@ char *opencsv_send_batch_fee_bump(uint64_t handle,
                                   uint64_t target_sat_per_vb);
 char *opencsv_send_batch_refresh_spv(uint64_t handle,
                                      const char *batch_local_id);
+/* A transient mandatory-chain outage returns retryable=true and preserves the
+ * exact unsigned operation/batch and fee locks. A verified conflict returns
+ * retryable=false and closes the complete unsigned batch. */
 char *opencsv_operation_prove(uint64_t handle, const char *operation_id);
 /* Compatibility one-shot for non-interactive callers. */
 char *opencsv_transfer_prepare(uint64_t handle, const char *request_json);
