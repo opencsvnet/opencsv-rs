@@ -843,6 +843,7 @@ impl SqlitePersister {
         )?;
         let mut db = Self { conn };
         db.initialize_account_schema()?;
+        db.repair_observation_receipt_schema()?;
         Ok(db)
     }
 
@@ -986,6 +987,62 @@ impl SqlitePersister {
                  updated_at INTEGER NOT NULL
              ) STRICT;",
         )?;
+        Ok(())
+    }
+
+    /// One development build persisted the complete SPV verdict object in
+    /// `detail`, while the stable account-status schema has always exposed an
+    /// optional string there. Repair those local receipts on open so an old
+    /// cached observation cannot make the whole wallet status undecodable.
+    fn repair_observation_receipt_schema(&mut self) -> Result<(), AccountError> {
+        let mut statement = self.conn.prepare(
+            "SELECT subject_txid, check_id, receipt_json
+             FROM opencsv_observation_receipts",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?;
+        let mut repairs = Vec::new();
+        for row in rows {
+            let (subject_txid, check_id, encoded) = row?;
+            let mut receipt: Value = serde_json::from_str(&encoded).map_err(|error| {
+                AccountError::new(
+                    "database_corrupt",
+                    format!("observation receipt {subject_txid}/{check_id}: {error}"),
+                )
+            })?;
+            let Some(detail) = receipt.get("detail") else {
+                continue;
+            };
+            if detail.is_null() || detail.is_string() {
+                continue;
+            }
+            let normalized = detail
+                .get("reason")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+                .or_else(|| {
+                    (detail.get("status").and_then(Value::as_str) == Some("verified")).then(|| {
+                        "verified exact transaction through the phone-owned multi-peer scan"
+                            .to_owned()
+                    })
+                })
+                .unwrap_or_else(|| "legacy observer receipt detail normalized".to_owned());
+            receipt["detail"] = json!(normalized);
+            repairs.push((subject_txid, check_id, receipt.to_string()));
+        }
+        drop(statement);
+        for (subject_txid, check_id, encoded) in repairs {
+            self.conn.execute(
+                "UPDATE opencsv_observation_receipts SET receipt_json = ?3
+                 WHERE subject_txid = ?1 AND check_id = ?2",
+                params![subject_txid, check_id, encoded],
+            )?;
+        }
         Ok(())
     }
 
@@ -15017,6 +15074,42 @@ mod tests {
             .unwrap();
         let persisted: Value = serde_json::from_str(&encoded).unwrap();
         assert!(persisted["detail"].is_string());
+    }
+
+    #[test]
+    fn account_open_repairs_legacy_object_observation_detail() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wallet.sqlite");
+        let db = SqlitePersister::open(&path).unwrap();
+        let legacy = json!({
+            "check_id": "multi_peer_spv_confirmation",
+            "detail": { "status": "verified", "reason": null },
+        });
+        db.conn
+            .execute(
+                "INSERT INTO opencsv_observation_receipts(
+                     subject_txid, check_id, receipt_json, observed_at
+                 ) VALUES('00', 'multi_peer_spv_confirmation', ?1, 1)",
+                [legacy.to_string()],
+            )
+            .unwrap();
+        drop(db);
+
+        let repaired = SqlitePersister::open(&path).unwrap();
+        let encoded: String = repaired
+            .conn
+            .query_row(
+                "SELECT receipt_json FROM opencsv_observation_receipts
+                 WHERE subject_txid = '00' AND check_id = 'multi_peer_spv_confirmation'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let receipt: Value = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(
+            receipt["detail"],
+            "verified exact transaction through the phone-owned multi-peer scan"
+        );
     }
 
     #[test]
