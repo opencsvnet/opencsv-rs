@@ -3095,6 +3095,246 @@ impl AccountWallet {
         self.batch_reserve_operation_json(&maintenance_id)
     }
 
+    /// Replace one wallet-internal reserve split at a higher fee rate. The
+    /// original inputs, stock outputs, fee cells, output order, version, and
+    /// locktime are immutable; only the final wallet-change value may fall.
+    pub fn fee_bump_batch_reserves(
+        &mut self,
+        maintenance_id: &str,
+        target_sat_per_vb: u64,
+    ) -> Result<Value, AccountError> {
+        self.require_write_enabled()?;
+        if target_sat_per_vb == 0 {
+            return Err(AccountError::new(
+                "invalid_fee_policy",
+                "target_sat_per_vb must be positive",
+            ));
+        }
+        let current = self.batch_reserve_operation_json(maintenance_id)?;
+        if !matches!(
+            current["state"].as_str(),
+            Some("broadcast_unobserved" | "mempool")
+        ) {
+            return Err(AccountError::new(
+                "invalid_operation_state",
+                format!(
+                    "cannot fee-bump reserve maintenance in {}",
+                    current["state"].as_str().unwrap_or("unknown")
+                ),
+            ));
+        }
+        let original_bytes = hex_decode(
+            current["signed_tx_hex"].as_str().ok_or_else(|| {
+                AccountError::new("database_corrupt", "maintenance has no transaction")
+            })?,
+            "reserve maintenance transaction",
+        )?;
+        let original: Transaction = deserialize(&original_bytes)
+            .map_err(|error| AccountError::new("database_corrupt", error.to_string()))?;
+        let original_txid = original.compute_txid();
+        if current["txid"].as_str() != Some(original_txid.to_string().as_str()) {
+            return Err(AccountError::new(
+                "database_corrupt",
+                "maintenance txid differs from its persisted bytes",
+            ));
+        }
+        let stock_count = usize::try_from(current["stock_count"].as_u64().ok_or_else(|| {
+            AccountError::new("database_corrupt", "maintenance has no stock count")
+        })?)
+        .map_err(|_| AccountError::new("database_corrupt", "stock count exceeds usize"))?;
+        let fee_cell_count =
+            usize::try_from(current["fee_cell_count"].as_u64().ok_or_else(|| {
+                AccountError::new("database_corrupt", "maintenance has no fee-cell count")
+            })?)
+            .map_err(|_| AccountError::new("database_corrupt", "fee-cell count exceeds usize"))?;
+        let protected_count = stock_count
+            .checked_add(fee_cell_count)
+            .ok_or_else(|| AccountError::new("database_corrupt", "output count overflow"))?;
+        if original.output.len() != protected_count.saturating_add(1) {
+            return Err(AccountError::new(
+                "protocol_layout_violation",
+                "reserve maintenance must end with exactly one wallet-change output",
+            ));
+        }
+        let change = original.output.last().ok_or_else(|| {
+            AccountError::new(
+                "protocol_layout_violation",
+                "reserve maintenance has no change",
+            )
+        })?;
+        if self
+            .bitcoin
+            .derivation_of_spk(change.script_pubkey.clone())
+            .is_none()
+        {
+            return Err(AccountError::new(
+                "protocol_layout_violation",
+                "reserve-maintenance change is not controlled by this wallet",
+            ));
+        }
+        let original_last_seen = self.bitcoin.get_tx(original_txid).and_then(|transaction| {
+            match transaction.chain_position {
+                ChainPosition::Unconfirmed { last_seen, .. } => last_seen,
+                ChainPosition::Confirmed { .. } => None,
+            }
+        });
+        let fee_rate = FeeRate::from_sat_per_vb(target_sat_per_vb).ok_or_else(|| {
+            AccountError::new("invalid_fee_policy", "fee rate exceeds Bitcoin limits")
+        })?;
+        let mut builder = self
+            .bitcoin
+            .build_fee_bump(original_txid)
+            .map_err(|error| AccountError::new("fee_bump_rejected", error.to_string()))?;
+        builder.ordering(TxOrdering::Untouched);
+        builder.nlocktime(original.lock_time);
+        builder.set_exact_sequence(Sequence::ENABLE_RBF_NO_LOCKTIME);
+        builder.drain_to(change.script_pubkey.clone());
+        builder.manually_selected_only();
+        builder.fee_rate(fee_rate);
+        let mut psbt = builder
+            .finish()
+            .map_err(|error| AccountError::new("insufficient_fees", error.to_string()))?;
+        let finalized = self
+            .bitcoin
+            .sign(&mut psbt, SignOptions::default())
+            .map_err(|error| AccountError::new("signing_failed", error.to_string()))?;
+        if !finalized {
+            return Err(AccountError::new(
+                "signing_failed",
+                "reserve-maintenance fee-bump PSBT was not finalized",
+            ));
+        }
+        let replacement_fee_sats = psbt
+            .fee_amount()
+            .ok_or_else(|| {
+                AccountError::new("signing_failed", "could not calculate replacement fee")
+            })?
+            .to_sat();
+        if self
+            .config
+            .max_fee_sats
+            .is_some_and(|limit| replacement_fee_sats > limit)
+        {
+            return Err(AccountError::new(
+                "fee_limit_exceeded",
+                format!("{replacement_fee_sats} sats exceeds configured maximum"),
+            ));
+        }
+        let replacement = psbt
+            .extract_tx()
+            .map_err(|error| AccountError::new("signing_failed", error.to_string()))?;
+        if replacement.version != original.version
+            || replacement.lock_time != original.lock_time
+            || replacement.input.len() != original.input.len()
+            || replacement
+                .input
+                .iter()
+                .zip(&original.input)
+                .any(|(new, old)| {
+                    new.previous_output != old.previous_output
+                        || new.sequence != old.sequence
+                        || new.script_sig != old.script_sig
+                })
+            || replacement.output.len() != original.output.len()
+            || replacement.output[..protected_count] != original.output[..protected_count]
+            || replacement.output[protected_count].script_pubkey != change.script_pubkey
+            || replacement.output[protected_count].value >= change.value
+        {
+            return Err(AccountError::new(
+                "protocol_layout_violation",
+                "reserve replacement changed protected inputs, outputs, or ordering",
+            ));
+        }
+        let mut receipt = current["receipt"].clone();
+        let original_fee_sats = receipt
+            .as_object()
+            .ok_or_else(|| {
+                AccountError::new("database_corrupt", "maintenance receipt is not an object")
+            })?
+            .get("fee_sats")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| AccountError::new("database_corrupt", "maintenance fee is absent"))?;
+        let fee_increment_sats = replacement_fee_sats
+            .checked_sub(original_fee_sats)
+            .ok_or_else(|| {
+                AccountError::new("fee_bump_rejected", "replacement fee did not rise")
+            })?;
+        if fee_increment_sats == 0 {
+            return Err(AccountError::new(
+                "fee_bump_rejected",
+                "replacement fee did not rise",
+            ));
+        }
+        let replacement_txid = replacement.compute_txid();
+        let replacement_hex = hex_encode(&serialize(&replacement));
+        {
+            let receipt_object = receipt.as_object_mut().expect("receipt checked above");
+            receipt_object.insert("replaces".into(), json!(original_txid.to_string()));
+            receipt_object.insert("txid".into(), json!(replacement_txid.to_string()));
+            receipt_object.insert("target_sat_per_vb".into(), json!(target_sat_per_vb));
+            receipt_object.insert("fee_rate_sat_per_vb".into(), json!(target_sat_per_vb));
+            receipt_object.insert("fee_sats".into(), json!(replacement_fee_sats));
+            receipt_object.insert("fee_increment_sats".into(), json!(fee_increment_sats));
+            receipt_object.insert(
+                "replacement_change_sats".into(),
+                json!(replacement.output[protected_count].value.to_sat()),
+            );
+        }
+        let now = unix_time()?;
+        let transaction = self
+            .db
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute(
+            "UPDATE opencsv_batch_reserve_operations
+             SET state = 'signed_persisted', signed_tx_hex = ?2, txid = ?3,
+                 receipt_json = ?4, updated_at = ?5
+             WHERE maintenance_id = ?1",
+            params![
+                maintenance_id,
+                replacement_hex,
+                replacement_txid.to_string(),
+                receipt.to_string(),
+                now,
+            ],
+        )?;
+        transaction.execute(
+            "UPDATE opencsv_batch_stocks SET txid = ?2
+             WHERE txid = ?1 AND state = 'pending'",
+            params![original_txid.to_string(), replacement_txid.to_string()],
+        )?;
+        transaction.commit()?;
+        let now = u64::try_from(now)
+            .map_err(|_| AccountError::new("clock_error", "negative timestamp"))?;
+        let seen_at = original_last_seen
+            .and_then(|last_seen| last_seen.checked_add(1))
+            .map_or(now, |next| next.max(now));
+        self.bitcoin
+            .apply_unconfirmed_txs([(Arc::new(replacement.clone()), seen_at)]);
+        self.bitcoin.persist(&mut self.db)?;
+        let (p2p_submissions, relay_peers) = self.submit_direct_p2p(&replacement)?;
+        let client = self.esplora_client();
+        let generic_relay_fallback = relay_via_esplora_if_unobserved(&client, &replacement);
+        if let Some(receipt_object) = receipt.as_object_mut() {
+            receipt_object.insert("p2p_submissions".into(), json!(p2p_submissions));
+            receipt_object.insert("p2p_peers".into(), json!(relay_peers));
+            receipt_object.insert(
+                "generic_relay_fallback".into(),
+                json!(matches!(&generic_relay_fallback, Ok(true))),
+            );
+            if let Err(error) = &generic_relay_fallback {
+                receipt_object.insert("generic_relay_error".into(), json!(error.to_string()));
+            }
+        }
+        self.db.conn.execute(
+            "UPDATE opencsv_batch_reserve_operations
+             SET state = 'broadcast_unobserved', receipt_json = ?2, updated_at = ?3
+             WHERE maintenance_id = ?1",
+            params![maintenance_id, receipt.to_string(), unix_time()?],
+        )?;
+        self.batch_reserve_operation_json(maintenance_id)
+    }
+
     /// Apply pinned raw-byte observation to an exact reserve-maintenance
     /// transaction. A socket submission alone never reaches `mempool`.
     pub fn observe_batch_reserve_unconfirmed(
@@ -3343,6 +3583,7 @@ impl AccountWallet {
             "fee_cell_count": row.3,
             "signed_tx_hex": row.4,
             "txid": row.5,
+            "fee_rate_sat_per_vb": receipt["fee_rate_sat_per_vb"],
             "receipt": receipt,
         }))
     }
@@ -13079,6 +13320,114 @@ mod tests {
             wallet.status().unwrap()["batch_reserves"]["inventory"][0]["count"],
             3
         );
+    }
+
+    #[test]
+    fn reserve_maintenance_fee_bump_only_reduces_wallet_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wallet.sqlite");
+        let key = [68u8; 32];
+        let mut wallet = AccountWallet::open(
+            &config_with_url(AccountRole::Primary, true, "http://127.0.0.1:1"),
+            &key,
+            path.to_str().unwrap(),
+        )
+        .unwrap();
+        fund(&mut wallet, 100_000);
+        let prepared = wallet
+            .prepare_batch_reserves(
+                2,
+                &json!({ "target_sat_per_vb": 1, "max_fee_sats": 5_000 }).to_string(),
+            )
+            .unwrap();
+        let maintenance_id = prepared["maintenance_id"].as_str().unwrap();
+        let original: Transaction = deserialize(
+            &hex_decode(
+                prepared["signed_tx_hex"].as_str().unwrap(),
+                "reserve maintenance transaction",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let original_txid = original.compute_txid();
+        let original_fee = prepared["receipt"]["fee_sats"].as_u64().unwrap();
+
+        let bumped = wallet.fee_bump_batch_reserves(maintenance_id, 4).unwrap();
+        assert_eq!(bumped["state"], "broadcast_unobserved");
+        assert_eq!(bumped["fee_rate_sat_per_vb"], 4);
+        assert_eq!(bumped["receipt"]["replaces"], original_txid.to_string());
+        let replacement: Transaction = deserialize(
+            &hex_decode(
+                bumped["signed_tx_hex"].as_str().unwrap(),
+                "reserve replacement transaction",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_ne!(replacement.compute_txid(), original_txid);
+        assert_eq!(replacement.version, original.version);
+        assert_eq!(replacement.lock_time, original.lock_time);
+        assert_eq!(replacement.input.len(), original.input.len());
+        assert!(replacement
+            .input
+            .iter()
+            .zip(&original.input)
+            .all(|(new, old)| {
+                new.previous_output == old.previous_output
+                    && new.sequence == old.sequence
+                    && new.script_sig == old.script_sig
+            }));
+        assert_eq!(replacement.output.len(), original.output.len());
+        assert_eq!(
+            replacement.output[..replacement.output.len() - 1],
+            original.output[..original.output.len() - 1]
+        );
+        assert_eq!(
+            replacement.output.last().unwrap().script_pubkey,
+            original.output.last().unwrap().script_pubkey
+        );
+        assert!(replacement.output.last().unwrap().value < original.output.last().unwrap().value);
+        let replacement_fee = bumped["receipt"]["fee_sats"].as_u64().unwrap();
+        assert!(replacement_fee > original_fee);
+        assert_eq!(
+            bumped["receipt"]["fee_increment_sats"],
+            replacement_fee - original_fee
+        );
+        let old_stocks: i64 = wallet
+            .db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM opencsv_batch_stocks WHERE txid = ?1",
+                [original_txid.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let replacement_stocks: i64 = wallet
+            .db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM opencsv_batch_stocks WHERE txid = ?1",
+                [replacement.compute_txid().to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(old_stocks, 0);
+        assert_eq!(replacement_stocks, 3);
+        let replacement_txid = replacement.compute_txid().to_string();
+        drop(wallet);
+
+        let reopened = AccountWallet::open(
+            &config_with_url(AccountRole::Primary, true, "http://127.0.0.1:1"),
+            &key,
+            path.to_str().unwrap(),
+        )
+        .unwrap();
+        let recovered = reopened
+            .batch_reserve_operation_json(maintenance_id)
+            .unwrap();
+        assert_eq!(recovered["state"], "broadcast_unobserved");
+        assert_eq!(recovered["txid"], replacement_txid);
+        assert_eq!(recovered["signed_tx_hex"], bumped["signed_tx_hex"]);
     }
 
     #[test]

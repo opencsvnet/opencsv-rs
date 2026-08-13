@@ -401,6 +401,28 @@ pub unsafe extern "C" fn opencsv_account_resume_batch_reserves(
     })
 }
 
+/// Replace a wallet-internal reserve split at a higher fee rate. No Bitcoin
+/// recipient or caller-selected input crosses the FFI boundary.
+///
+/// # Safety
+/// `maintenance_id` must be a valid NUL-terminated UTF-8 string.
+#[no_mangle]
+pub unsafe extern "C" fn opencsv_account_fee_bump_batch_reserves(
+    handle: u64,
+    maintenance_id: *const c_char,
+    target_sat_per_vb: u64,
+) -> *mut c_char {
+    guarded(|| {
+        let maintenance_id = match unsafe { in_str(maintenance_id, "maintenance_id") } {
+            Ok(value) => value,
+            Err(error) => return err(error),
+        };
+        with_account(handle, |account| {
+            account.fee_bump_batch_reserves(maintenance_id, target_sat_per_vb)
+        })
+    })
+}
+
 /// Promote reserve stock after CBF proves the exact confirmed outpoints.
 ///
 /// # Safety

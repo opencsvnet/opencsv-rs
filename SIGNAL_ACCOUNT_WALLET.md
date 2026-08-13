@@ -155,6 +155,14 @@ positions, change destination, and non-dust change. Appending an input would
 require a second authoritative verification and durable reservation protocol,
 so the product API does not permit it.
 
+Batch-stock reserve maintenance follows the same closed policy. A replacement
+is reconstructed only from its durable maintenance id and may reduce only the
+final wallet-change output. Its complete input set, version, locktime, three
+signed stock outputs, derived fee cells, scripts, values, and output positions
+remain byte-for-byte fixed. The replacement bytes and remapped pending stock
+outpoints are committed atomically before relay; no address, UTXO, or coin
+selection crosses the FFI boundary.
+
 ## Network trust
 
 Esplora is a configurable read accelerator and generic relay fallback. Direct
@@ -203,6 +211,7 @@ The action-oriented surface is:
 - `opencsv_account_prepare_batch_reserves` /
   `opencsv_account_observe_batch_reserves` /
   `opencsv_account_resume_batch_reserves` /
+  `opencsv_account_fee_bump_batch_reserves` /
   `opencsv_account_refresh_batch_reserves`
 - `opencsv_transfer_prepare` (one-shot compatibility wrapper)
 - `opencsv_operation_ack_backup`

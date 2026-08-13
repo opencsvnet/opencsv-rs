@@ -53,6 +53,10 @@ char *opencsv_account_observe_batch_reserves(
     const char *observations_json);
 char *opencsv_account_resume_batch_reserves(uint64_t handle,
                                             const char *maintenance_id);
+char *opencsv_account_fee_bump_batch_reserves(
+    uint64_t handle,
+    const char *maintenance_id,
+    uint64_t target_sat_per_vb);
 char *opencsv_account_refresh_batch_reserves(uint64_t handle,
                                              const char *maintenance_id);
 char *opencsv_account_set_backup_state(uint64_t handle, bool verified,

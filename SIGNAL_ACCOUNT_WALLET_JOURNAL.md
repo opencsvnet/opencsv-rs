@@ -858,3 +858,28 @@ The explicitly opt-in release-mode reopen-and-resume proof test also passes;
 after its one-time optimized/LTO build, the test completes the resumed proof in
 10.32 seconds on this Mac. That is a development-host recovery receipt, not an
 iPhone product-performance claim.
+
+## 2026-08-13 — reserve maintenance needs its own constrained RBF
+
+Carol's count-2 batching reserve transaction
+`9f13165553241f8a7af472429c97e2c41d65dfbd8cf3c93eb91158474de0f3f9`
+remained unconfirmed while Signet advanced. Its 985-sat fee over 492 vbytes is
+about 2 sat/vB, while Blockstream's public Signet mempool reported roughly
+36 MB queued and a broad 3 sat/vB band ahead of it. Rebroadcasting the same
+bytes could not change that ordering, and using a generic Bitcoin wallet bump
+would violate the rule that OpenCSV alone controls fee spending and output
+layout.
+
+Reserve maintenance now has a dedicated action keyed only by its durable
+maintenance id and a target feerate. Rust reconstructs the exact persisted
+transaction, forbids added or reordered inputs, freezes every stock and fee-cell
+output byte-for-byte, preserves version and locktime, and permits only the
+final wallet-change value to decrease. It commits the signed replacement and
+atomically remaps all pending stock rows to the replacement txid before any
+relay. A crash after that commit resumes the same bytes; the old observation
+receipts remain historical evidence and cannot certify the replacement.
+
+The new regression proves the protected layout, increased fee, txid remap,
+and reopen recovery. The complete default FFI run passes 85 unit tests plus
+two integration tests, with three deliberate slow recursive-proof cases
+ignored and zero failures.
