@@ -2732,6 +2732,12 @@ impl AccountWallet {
             let check_id = receipt["check_id"].as_str().ok_or_else(|| {
                 AccountError::new("invalid_observation_evidence", "receipt has no check id")
             })?;
+            if !receipt["detail"].is_null() && !receipt["detail"].is_string() {
+                return Err(AccountError::new(
+                    "invalid_observation_evidence",
+                    "receipt detail must be a string or null",
+                ));
+            }
             self.db.conn.execute(
                 "INSERT INTO opencsv_observation_receipts(
                      subject_txid, check_id, receipt_json, observed_at
@@ -5886,6 +5892,14 @@ impl AccountWallet {
         let now_ms = unix_time_millis()?;
         let spv_started_at_ms = now_ms.saturating_sub(i64::try_from(spv_ms).unwrap_or(i64::MAX));
         let verified = verdict["status"] == "verified";
+        let detail = if verified {
+            "verified exact transaction through the phone-owned multi-peer scan".to_owned()
+        } else {
+            verdict["reason"]
+                .as_str()
+                .unwrap_or("multi-peer scan has not settled the transaction")
+                .to_owned()
+        };
         let failures = if verified {
             Vec::new()
         } else {
@@ -5909,7 +5923,7 @@ impl AccountWallet {
                 "certificate_profile": Value::Null,
                 "certificate_chain_fingerprints_sha256": [],
                 "raw_byte_match": false,
-                "detail": verdict,
+                "detail": detail,
                 "failures": failures,
             })],
         )?;
@@ -14964,6 +14978,45 @@ mod tests {
         assert_eq!(settled_receipt["delivery_ready"], true);
         assert!(settled_receipt.get("replacement_delivery_required").is_none());
         assert!(!wallet.pending_by_operation.contains_key(&operation_id));
+    }
+
+    #[test]
+    fn observation_receipt_detail_preserves_the_public_string_schema() {
+        let dir = tempfile::tempdir().unwrap();
+        let wallet = AccountWallet::open(
+            &config(AccountRole::Primary, true),
+            &[76u8; 32],
+            dir.path().join("wallet.sqlite").to_str().unwrap(),
+        )
+        .unwrap();
+        let invalid = json!({
+            "check_id": "multi_peer_spv_confirmation",
+            "detail": { "status": "verified" },
+        });
+        let error = wallet
+            .persist_observation_receipts("00", &[invalid])
+            .unwrap_err();
+        assert_eq!(error.code, "invalid_observation_evidence");
+
+        let valid = json!({
+            "check_id": "multi_peer_spv_confirmation",
+            "detail": "verified exact transaction through the phone-owned multi-peer scan",
+        });
+        wallet
+            .persist_observation_receipts("00", &[valid])
+            .unwrap();
+        let encoded: String = wallet
+            .db
+            .conn
+            .query_row(
+                "SELECT receipt_json FROM opencsv_observation_receipts
+                 WHERE subject_txid = '00' AND check_id = 'multi_peer_spv_confirmation'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let persisted: Value = serde_json::from_str(&encoded).unwrap();
+        assert!(persisted["detail"].is_string());
     }
 
     #[test]
