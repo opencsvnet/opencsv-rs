@@ -2150,6 +2150,7 @@ impl AccountWallet {
                  'stock_count', stock_count,
                  'fee_cell_count', fee_cell_count,
                  'txid', txid,
+                 'fee_rate_sat_per_vb', json_extract(receipt_json, '$.fee_rate_sat_per_vb'),
                  'updated_at', updated_at
              ) FROM opencsv_batch_reserve_operations
              ORDER BY updated_at DESC LIMIT 10",
@@ -13270,6 +13271,11 @@ mod tests {
             )
             .unwrap();
         assert_eq!(prepared["state"], "broadcast_unobserved");
+        assert_eq!(
+            wallet.status().unwrap()["batch_reserves"]["maintenance_operations"][0]
+                ["fee_rate_sat_per_vb"],
+            1
+        );
         let raw = hex_decode(
             prepared["signed_tx_hex"].as_str().unwrap(),
             "reserve maintenance transaction",
