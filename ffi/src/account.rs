@@ -6234,6 +6234,12 @@ impl AccountWallet {
             .build_fee_bump(original_txid)
             .map_err(|error| AccountError::new("fee_bump_rejected", error.to_string()))?;
         builder.ordering(TxOrdering::Untouched);
+        // BDK otherwise derives a fresh anti-fee-sniping locktime from the
+        // wallet's current tip. The tip can advance between the original
+        // broadcast and an RBF attempt, but OpenCSV protects the original
+        // version, locktime, and input prefix as protocol context.
+        builder.nlocktime(original.lock_time);
+        builder.set_exact_sequence(Sequence::ENABLE_RBF_NO_LOCKTIME);
         builder.drain_to(original.output[2].script_pubkey.clone());
         // The product path bumps by reducing protected change. Adding a new
         // input would require another independently verified durable
@@ -14805,6 +14811,10 @@ mod tests {
             .unwrap()
             .signed_tx_hex
             .unwrap();
+        // Advance the wallet tip while the original remains unconfirmed.
+        // Without an explicit replacement locktime, BDK would silently use
+        // this newer height and violate the protected transaction context.
+        fund(&mut wallet, 10_000);
         let bump_pending = wallet.fee_bump(&operation_id, 5).unwrap();
         assert_eq!(
             bump_pending["state"],
@@ -14818,6 +14828,17 @@ mod tests {
             deserialize(&hex_decode(&original_hex, "original tx").unwrap()).unwrap();
         let replacement: Transaction =
             deserialize(&hex_decode(&replacement_hex, "replacement tx").unwrap()).unwrap();
+        assert_eq!(replacement.version, original.version);
+        assert_eq!(replacement.lock_time, original.lock_time);
+        assert!(replacement
+            .input
+            .iter()
+            .zip(&original.input)
+            .all(|(new, old)| {
+                new.previous_output == old.previous_output
+                    && new.sequence == old.sequence
+                    && new.script_sig == old.script_sig
+            }));
         validate_solo_anchor_replacement(&original, &replacement).unwrap();
         let replacement_fee_sats = 100_000
             - replacement
