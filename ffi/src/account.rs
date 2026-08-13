@@ -70,6 +70,8 @@ const CHECKPOINT_VERSION: u32 = 4;
 pub const TEST_USD_V2_DEPLOYMENT_ID: &str = "opencsv-test-usd-v2";
 const DEFAULT_STOP_GAP: usize = 20;
 const DEFAULT_PARALLEL_REQUESTS: usize = 4;
+const DEFAULT_ESPLORA_REQUEST_TIMEOUT_SECS: u64 = 5;
+const DEFAULT_ESPLORA_MAX_RETRIES: usize = 0;
 const DEFAULT_VERIFICATION_TIMEOUT_SECS: u64 = 8;
 const DEFAULT_MAX_VERIFICATION_BLOCKS: u64 = 10_000;
 const MIN_FEE_RESERVE_SATS: u64 = 2_500;
@@ -156,6 +158,14 @@ fn default_stop_gap() -> usize {
 
 fn default_parallel_requests() -> usize {
     DEFAULT_PARALLEL_REQUESTS
+}
+
+fn default_esplora_request_timeout_secs() -> u64 {
+    DEFAULT_ESPLORA_REQUEST_TIMEOUT_SECS
+}
+
+fn default_esplora_max_retries() -> usize {
+    DEFAULT_ESPLORA_MAX_RETRIES
 }
 
 fn default_verification_timeout_secs() -> u64 {
@@ -324,6 +334,14 @@ pub struct AccountConfig {
     /// Maximum parallel Esplora requests.
     #[serde(default = "default_parallel_requests")]
     pub parallel_requests: usize,
+    /// Per-request timeout for the non-authoritative Esplora accelerator.
+    /// The wallet UI must remain usable when an accelerator stalls.
+    #[serde(default = "default_esplora_request_timeout_secs")]
+    pub esplora_request_timeout_secs: u64,
+    /// Retry budget for one accelerator request. Protocol verification and
+    /// required raw observers have separate fail-closed policies.
+    #[serde(default = "default_esplora_max_retries")]
+    pub esplora_max_retries: usize,
     /// Independently configurable network observations. An omitted list gets
     /// fail-closed signet defaults for the two built-in API observers.
     #[serde(default)]
@@ -1066,6 +1084,8 @@ pub(crate) struct AccountProofJob {
     verifier: Arc<dyn FundingVerifier>,
     protocol_snapshot: MemWallet,
     esplora_url: String,
+    esplora_request_timeout_secs: u64,
+    esplora_max_retries: usize,
     require_protocol_spend_preflight: bool,
 }
 
@@ -1111,6 +1131,8 @@ pub(crate) struct AccountBatchProofJob {
     verifier: Arc<dyn FundingVerifier>,
     protocol_snapshot: MemWallet,
     esplora_url: String,
+    esplora_request_timeout_secs: u64,
+    esplora_max_retries: usize,
     require_protocol_spend_preflight: bool,
 }
 
@@ -1206,7 +1228,11 @@ impl AccountProofJob {
         let dependency_observation_started = Instant::now();
         let mut dependency_observed_at = None;
         if !proved.unconfirmed_dependencies.is_empty() {
-            let client = esplora_client::Builder::new(&self.esplora_url).build_blocking();
+            let client = build_blocking_esplora_client(
+                &self.esplora_url,
+                self.esplora_request_timeout_secs,
+                self.esplora_max_retries,
+            );
             for dependency in &proved.unconfirmed_dependencies {
                 let txid = unconfirmed_dependency_txid(dependency)?;
                 match client.get_tx(&txid).map_err(|error| {
@@ -1322,7 +1348,11 @@ impl AccountBatchProofJob {
         )
         .map_err(batch_protocol_error)?;
 
-        let client = esplora_client::Builder::new(&self.esplora_url).build_blocking();
+        let client = build_blocking_esplora_client(
+            &self.esplora_url,
+            self.esplora_request_timeout_secs,
+            self.esplora_max_retries,
+        );
         let mut completed_members = Vec::with_capacity(self.members.len());
         let mut commitments = Vec::with_capacity(self.members.len());
         let mut local_proving_ms = 0_u64;
@@ -1491,6 +1521,14 @@ impl AccountBatchProofJob {
 }
 
 impl AccountWallet {
+    fn esplora_client(&self) -> esplora_client::BlockingClient {
+        build_blocking_esplora_client(
+            &self.config.esplora_url,
+            self.config.esplora_request_timeout_secs,
+            self.config.esplora_max_retries,
+        )
+    }
+
     /// Open or initialize an account database.
     pub fn open_device_bound(
         config_json: &str,
@@ -1525,6 +1563,7 @@ impl AccountWallet {
         let network = parse_network(&config.network)?;
         validate_deployment(&config)?;
         validate_esplora_url(&config.esplora_url)?;
+        validate_esplora_client_policy(&config)?;
         if config.observation_checks.is_empty() {
             config.observation_checks = default_observation_checks(&config.network);
         }
@@ -2118,11 +2157,15 @@ impl AccountWallet {
 
     /// Synchronize the BDK wallet through the configured Esplora accelerator.
     pub fn sync(&mut self) -> Result<Value, AccountError> {
-        let client = esplora_client::Builder::new(&self.config.esplora_url).build_blocking();
+        let client = build_blocking_esplora_client(
+            &self.config.esplora_url,
+            self.config.esplora_request_timeout_secs,
+            self.config.esplora_max_retries,
+        );
         let request = self.bitcoin.start_full_scan();
         let update = client
             .full_scan(request, self.config.stop_gap, self.config.parallel_requests)
-            .map_err(|error| AccountError::new("sync_failed", error.to_string()))?;
+            .map_err(|error| AccountError::retryable("sync_failed", error.to_string()))?;
         self.bitcoin
             .apply_update(update)
             .map_err(|error| AccountError::new("stale_chain_state", error.to_string()))?;
@@ -2285,7 +2328,7 @@ impl AccountWallet {
         let superseded_consignment_ids =
             matching_payment_consignments(&self.db.conn, &consignment_id, &payment_id)?;
         let anchor_txid = Txid::from_byte_array(consignment.anchor_ref.txid);
-        let client = esplora_client::Builder::new(&self.config.esplora_url).build_blocking();
+        let client = self.esplora_client();
         let transaction = client
             .get_tx(&anchor_txid)
             .map_err(|error| AccountError::new("mempool_observation_failed", error.to_string()))?;
@@ -2972,7 +3015,7 @@ impl AccountWallet {
             .apply_unconfirmed_txs([(Arc::new(transaction.clone()), seen_at)]);
         self.bitcoin.persist(&mut self.db)?;
         let (p2p_submissions, relay_peers) = self.submit_direct_p2p(&transaction)?;
-        let client = esplora_client::Builder::new(&self.config.esplora_url).build_blocking();
+        let client = self.esplora_client();
         let fallback = relay_via_esplora_if_unobserved(&client, &transaction);
         receipt["p2p_submissions"] = json!(p2p_submissions);
         receipt["p2p_peers"] = json!(relay_peers);
@@ -3099,7 +3142,7 @@ impl AccountWallet {
             .apply_unconfirmed_txs([(Arc::new(transaction.clone()), seen_at)]);
         self.bitcoin.persist(&mut self.db)?;
         let (p2p_submissions, relay_peers) = self.submit_direct_p2p(&transaction)?;
-        let client = esplora_client::Builder::new(&self.config.esplora_url).build_blocking();
+        let client = self.esplora_client();
         let fallback = relay_via_esplora_if_unobserved(&client, &transaction);
         let mut receipt = current["receipt"].clone();
         receipt["resume_p2p_submissions"] = json!(p2p_submissions);
@@ -3129,7 +3172,7 @@ impl AccountWallet {
             .ok_or_else(|| AccountError::new("database_corrupt", "maintenance has no txid"))?
             .parse::<Txid>()
             .map_err(|error| AccountError::new("database_corrupt", error.to_string()))?;
-        let client = esplora_client::Builder::new(&self.config.esplora_url).build_blocking();
+        let client = self.esplora_client();
         let status = client
             .get_tx_status(&txid)
             .map_err(|error| AccountError::new("sync_failed", error.to_string()))?;
@@ -3858,6 +3901,8 @@ impl AccountWallet {
                 AccountError::new("primary_required", "linked devices cannot prove batches")
             })?,
             esplora_url: self.config.esplora_url.clone(),
+            esplora_request_timeout_secs: self.config.esplora_request_timeout_secs,
+            esplora_max_retries: self.config.esplora_max_retries,
             require_protocol_spend_preflight: protocol_spend_preflight_required(&self.config),
         })))
     }
@@ -4487,7 +4532,7 @@ impl AccountWallet {
         )?;
         let relay_submission_started = Instant::now();
         let (p2p_submissions, relay_peers) = self.submit_direct_p2p(&transaction)?;
-        let client = esplora_client::Builder::new(&self.config.esplora_url).build_blocking();
+        let client = self.esplora_client();
         let fallback = relay_via_esplora_if_unobserved(&client, &transaction);
         let mut receipt: Value = self
             .send_batch(batch_local_id)?
@@ -4676,7 +4721,7 @@ impl AccountWallet {
             .apply_unconfirmed_txs([(Arc::new(transaction.clone()), seen_at)]);
         self.bitcoin.persist(&mut self.db)?;
         let (p2p_submissions, relay_peers) = self.submit_direct_p2p(&transaction)?;
-        let client = esplora_client::Builder::new(&self.config.esplora_url).build_blocking();
+        let client = self.esplora_client();
         let fallback = relay_via_esplora_if_unobserved(&client, &transaction);
         let mut receipt: Value = batch
             .receipt_json
@@ -5098,7 +5143,7 @@ impl AccountWallet {
             .apply_unconfirmed_txs([(Arc::new(replacement_transaction.clone()), seen_at)]);
         self.bitcoin.persist(&mut self.db)?;
         let (p2p_submissions, relay_peers) = self.submit_direct_p2p(&replacement_transaction)?;
-        let client = esplora_client::Builder::new(&self.config.esplora_url).build_blocking();
+        let client = self.esplora_client();
         let fallback = relay_via_esplora_if_unobserved(&client, &replacement_transaction);
         batch_receipt["p2p_submissions"] = json!(p2p_submissions);
         batch_receipt["p2p_peers"] = json!(relay_peers);
@@ -5252,6 +5297,8 @@ impl AccountWallet {
             verifier: self.funding_verifier.clone(),
             protocol_snapshot,
             esplora_url: self.config.esplora_url.clone(),
+            esplora_request_timeout_secs: self.config.esplora_request_timeout_secs,
+            esplora_max_retries: self.config.esplora_max_retries,
             require_protocol_spend_preflight: protocol_spend_preflight_required(&self.config),
         })))
     }
@@ -5740,7 +5787,7 @@ impl AccountWallet {
 
         let relay_submission_started = Instant::now();
         let (p2p_submissions, relay_peers) = self.submit_direct_p2p(&tx)?;
-        let client = esplora_client::Builder::new(&self.config.esplora_url).build_blocking();
+        let client = self.esplora_client();
         // A completed P2P socket write proves submission only. Core can
         // close before processing the unsolicited transaction, so never let
         // `p2p_submissions` suppress the observable generic-relay path.
@@ -5946,8 +5993,7 @@ impl AccountWallet {
                     return Ok(value);
                 }
                 let (p2p_submissions, _) = self.submit_direct_p2p(&tx)?;
-                let client =
-                    esplora_client::Builder::new(&self.config.esplora_url).build_blocking();
+                let client = self.esplora_client();
                 let fallback = relay_via_esplora_if_unobserved(&client, &tx);
                 if let Some(object) = receipt.as_object_mut() {
                     object.insert("resume_p2p_submissions".into(), json!(p2p_submissions));
@@ -5993,7 +6039,7 @@ impl AccountWallet {
         else {
             return Ok(None);
         };
-        let client = esplora_client::Builder::new(&self.config.esplora_url).build_blocking();
+        let client = self.esplora_client();
         let status = client
             .get_tx_status(&replaced)
             .map_err(|error| AccountError::new("sync_failed", error.to_string()))?;
@@ -6282,7 +6328,7 @@ impl AccountWallet {
             .apply_unconfirmed_txs([(Arc::new(replacement.clone()), seen_at)]);
         self.bitcoin.persist(&mut self.db)?;
         let (p2p_submissions, relay_peers) = self.submit_direct_p2p(&replacement)?;
-        let client = esplora_client::Builder::new(&self.config.esplora_url).build_blocking();
+        let client = self.esplora_client();
         let generic_relay_fallback = relay_via_esplora_if_unobserved(&client, &replacement);
         if let Some(object) = receipt.as_object_mut() {
             object.insert("p2p_submissions".into(), json!(p2p_submissions));
@@ -8147,7 +8193,7 @@ impl AccountWallet {
         if dependencies.is_empty() {
             return Ok(());
         }
-        let client = esplora_client::Builder::new(&self.config.esplora_url).build_blocking();
+        let client = self.esplora_client();
         for dependency in dependencies {
             if self.dependency_reobservation_is_fresh(dependency)? {
                 continue;
@@ -8588,7 +8634,7 @@ impl AccountWallet {
             .ok_or_else(|| AccountError::new("invalid_operation_state", "operation is unsigned"))?
             .parse::<Txid>()
             .map_err(|error| AccountError::new("database_corrupt", error.to_string()))?;
-        let client = esplora_client::Builder::new(&self.config.esplora_url).build_blocking();
+        let client = self.esplora_client();
         let observed = client
             .get_tx(&txid)
             .map_err(|error| AccountError::new("sync_failed", error.to_string()))?;
@@ -10085,6 +10131,33 @@ fn validate_esplora_url(url: &str) -> Result<(), AccountError> {
     }
 }
 
+fn validate_esplora_client_policy(config: &AccountConfig) -> Result<(), AccountError> {
+    if !(1..=60).contains(&config.esplora_request_timeout_secs) {
+        return Err(AccountError::new(
+            "invalid_config",
+            "Esplora request timeout must be between 1 and 60 seconds",
+        ));
+    }
+    if config.esplora_max_retries > 3 {
+        return Err(AccountError::new(
+            "invalid_config",
+            "Esplora request retries must not exceed 3",
+        ));
+    }
+    Ok(())
+}
+
+fn build_blocking_esplora_client(
+    url: &str,
+    request_timeout_secs: u64,
+    max_retries: usize,
+) -> esplora_client::BlockingClient {
+    esplora_client::Builder::new(url)
+        .timeout(request_timeout_secs)
+        .max_retries(max_retries)
+        .build_blocking()
+}
+
 const MEMPOOL_SPACE_SIGNET_CHAIN_PINS: [&str; 2] = [
     // Sectigo Public Server Authentication CA OV R36.
     "6542d176bed50f193c0ce297ae44ecd8a0a86bec2ede682769344059b4e78530",
@@ -10575,6 +10648,73 @@ mod tests {
             "test_skip_protocol_spend_preflight": true,
         }))
         .unwrap()
+    }
+
+    #[test]
+    fn esplora_accelerator_defaults_are_bounded_and_invalid_overrides_fail_closed() {
+        let parsed: AccountConfig =
+            serde_json::from_str(&config(AccountRole::Primary, false)).unwrap();
+        assert_eq!(
+            parsed.esplora_request_timeout_secs,
+            DEFAULT_ESPLORA_REQUEST_TIMEOUT_SECS
+        );
+        assert_eq!(parsed.esplora_max_retries, DEFAULT_ESPLORA_MAX_RETRIES);
+        validate_esplora_client_policy(&parsed).unwrap();
+
+        let mut zero_timeout = parsed.clone();
+        zero_timeout.esplora_request_timeout_secs = 0;
+        assert_eq!(
+            validate_esplora_client_policy(&zero_timeout)
+                .unwrap_err()
+                .code,
+            "invalid_config"
+        );
+
+        let mut excessive_retries = parsed;
+        excessive_retries.esplora_max_retries = 4;
+        assert_eq!(
+            validate_esplora_client_policy(&excessive_retries)
+                .unwrap_err()
+                .code,
+            "invalid_config"
+        );
+    }
+
+    #[test]
+    fn stalled_esplora_sync_returns_retryable_without_waiting_for_the_server() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let _server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 2048];
+            let _ = stream.read(&mut request).unwrap();
+            thread::sleep(Duration::from_secs(5));
+        });
+        let mut config_value: Value = serde_json::from_str(&config_with_url(
+            AccountRole::Primary,
+            false,
+            &format!("http://{address}"),
+        ))
+        .unwrap();
+        config_value["esplora_request_timeout_secs"] = json!(1);
+        config_value["esplora_max_retries"] = json!(0);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bounded-sync.sqlite");
+        let mut wallet = AccountWallet::open(
+            &config_value.to_string(),
+            &[13_u8; 32],
+            path.to_str().unwrap(),
+        )
+        .unwrap();
+
+        let started = Instant::now();
+        let error = wallet.sync().unwrap_err();
+        assert_eq!(error.code, "sync_failed");
+        assert!(error.retryable);
+        assert!(
+            started.elapsed() < Duration::from_secs(4),
+            "one stalled accelerator request exceeded its configured bound"
+        );
     }
 
     #[test]
