@@ -5859,26 +5859,32 @@ impl AccountWallet {
             .as_deref()
             .and_then(|encoded| serde_json::from_str(encoded).ok())
             .unwrap_or_else(|| json!({}));
-        let consignment_base64 = receipt["consignment_base64"].as_str().ok_or_else(|| {
-            AccountError::new(
-                "operation_not_observed",
-                "SPV settlement requires an independently observed consignment",
-            )
-        })?;
-        let consignment = base64::engine::general_purpose::STANDARD
-            .decode(consignment_base64)
-            .map_err(|error| AccountError::new("database_corrupt", error.to_string()))?;
-        let spv_started = Instant::now();
-        let verdict = self.scan_verify(&hex_encode(&consignment))?;
-        let spv_ms = elapsed_millis(spv_started);
-        let now_ms = unix_time_millis()?;
-        let spv_started_at_ms = now_ms.saturating_sub(i64::try_from(spv_ms).unwrap_or(i64::MAX));
         let txid = operation.txid.as_deref().ok_or_else(|| {
             AccountError::new(
                 "invalid_operation_state",
                 "SPV operation has no transaction id",
             )
         })?;
+        let parsed_txid = txid.parse::<Txid>().map_err(|error| {
+            AccountError::new("database_corrupt", format!("operation txid: {error}"))
+        })?;
+        // Required raw observers gate zero-confirmation delivery. They must
+        // not strand a replacement after the phone-owned CBF path has proved
+        // the exact txid in a PoW-verified block. Build the replacement
+        // consignment on a clone, verify it first, and install that candidate
+        // only after the scan succeeds. A missing/unavailable observer can
+        // therefore never mutate protocol state by itself.
+        let (consignment, mut finalized_candidate) = self.spv_consignment_candidate(
+            operation_id,
+            &operation,
+            parsed_txid,
+            &receipt,
+        )?;
+        let spv_started = Instant::now();
+        let verdict = self.scan_verify(&hex_encode(&consignment))?;
+        let spv_ms = elapsed_millis(spv_started);
+        let now_ms = unix_time_millis()?;
+        let spv_started_at_ms = now_ms.saturating_sub(i64::try_from(spv_ms).unwrap_or(i64::MAX));
         let verified = verdict["status"] == "verified";
         let failures = if verified {
             Vec::new()
@@ -5908,13 +5914,26 @@ impl AccountWallet {
             })],
         )?;
         receipt["phase_timings_ms"]["spv_confirmation"] = json!(spv_ms);
-        self.db.conn.execute(
-            "UPDATE opencsv_operations SET receipt_json = ?2, updated_at = ?3
-             WHERE operation_id = ?1",
-            params![operation_id, receipt.to_string(), unix_time()?],
-        )?;
+        let installed_candidate = verified && finalized_candidate.is_some();
+        if installed_candidate {
+            let (protocol_candidate, spends) =
+                finalized_candidate.take().expect("candidate checked");
+            self.install_spv_finalized_candidate(
+                operation_id,
+                &consignment,
+                spends,
+                protocol_candidate,
+                &mut receipt,
+            )?;
+        } else {
+            self.db.conn.execute(
+                "UPDATE opencsv_operations SET receipt_json = ?2, updated_at = ?3
+                 WHERE operation_id = ?1",
+                params![operation_id, receipt.to_string(), unix_time()?],
+            )?;
+        }
 
-        if verified {
+        if verified && !installed_candidate {
             let delivered = receipt["consignment_delivered"] == true;
             let next = if delivered {
                 OperationState::ConsignmentDelivered.as_str()
@@ -5926,7 +5945,7 @@ impl AccountWallet {
                  updated_at = ?3 WHERE operation_id = ?1",
                 params![operation_id, next, unix_time()?],
             )?;
-        } else if matches!(
+        } else if !verified && matches!(
             operation.state.as_str(),
             "confirmed" | "consignment_delivered"
         ) {
@@ -5964,6 +5983,94 @@ impl AccountWallet {
             object.insert("spv".into(), verdict);
         }
         Ok(value)
+    }
+
+    fn spv_consignment_candidate(
+        &self,
+        operation_id: &str,
+        operation: &OperationRow,
+        txid: Txid,
+        receipt: &Value,
+    ) -> Result<(Vec<u8>, Option<(MemWallet, Vec<String>)>), AccountError> {
+        if let Some(consignment_base64) = receipt["consignment_base64"].as_str() {
+            let consignment = base64::engine::general_purpose::STANDARD
+                .decode(consignment_base64)
+                .map_err(|error| AccountError::new("database_corrupt", error.to_string()))?;
+            return Ok((consignment, None));
+        }
+        if !matches!(
+            operation.state.as_str(),
+            "signed_persisted" | "broadcast_unobserved"
+        ) {
+            return Err(AccountError::new(
+                "operation_not_observed",
+                "SPV settlement requires a consignment or resumable signed proof",
+            ));
+        }
+        let pending_id = *self.pending_by_operation.get(operation_id).ok_or_else(|| {
+            AccountError::new(
+                "operation_not_resumable",
+                "confirmed operation has no durable pending proof",
+            )
+        })?;
+        let mut protocol_candidate = self.protocol.clone().ok_or_else(|| {
+            AccountError::new("account_role_violation", "linked account cannot finalize")
+        })?;
+        let (consignment, spends) = protocol_candidate
+            .finalize(
+                pending_id,
+                AnchorRef {
+                    txid: txid.to_byte_array(),
+                    location: MEMPOOL_LOCATION,
+                },
+            )
+            .map_err(|error| AccountError::new("operation_not_resumable", error))?;
+        Ok((consignment, Some((protocol_candidate, spends))))
+    }
+
+    fn install_spv_finalized_candidate(
+        &mut self,
+        operation_id: &str,
+        consignment: &[u8],
+        spends: Vec<String>,
+        protocol_candidate: MemWallet,
+        receipt: &mut Value,
+    ) -> Result<(), AccountError> {
+        let consignment_id = sha256::Hash::hash(consignment).to_string();
+        let consignment_base64 = base64::engine::general_purpose::STANDARD.encode(consignment);
+        if let Some(object) = receipt.as_object_mut() {
+            object.insert("consignment_id".into(), json!(consignment_id));
+            object.insert("consignment_base64".into(), json!(consignment_base64));
+            object.insert("delivery_ready".into(), json!(true));
+            object.remove("replacement_delivery_required");
+        }
+        let now = unix_time()?;
+        let transaction = self.db.conn.transaction()?;
+        transaction.execute(
+            "INSERT OR IGNORE INTO opencsv_consignments(
+                 consignment_id, consignment_base64, spent_state_json, created_at
+             ) VALUES(?1, ?2, ?3, ?4)",
+            params![
+                consignment_id,
+                consignment_base64,
+                json!({ "spends": spends }).to_string(),
+                now,
+            ],
+        )?;
+        transaction.execute(
+            "UPDATE opencsv_operations SET state = ?2, receipt_json = ?3,
+             rejection_reason = NULL, updated_at = ?4 WHERE operation_id = ?1",
+            params![
+                operation_id,
+                OperationState::Confirmed.as_str(),
+                receipt.to_string(),
+                now,
+            ],
+        )?;
+        transaction.commit()?;
+        self.protocol = Some(protocol_candidate);
+        self.pending_by_operation.remove(operation_id);
+        Ok(())
     }
 
     /// Resume a crash-interrupted operation. Signed transactions are
@@ -14773,6 +14880,90 @@ mod tests {
             .mark_consignment_delivered(&operation_id, &replacement_delivery_nonce)
             .unwrap();
         assert_eq!(acknowledged["receipt"]["consignment_delivered"], true);
+    }
+
+    #[test]
+    fn confirmed_spv_can_finalize_replacement_without_raw_observer() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut wallet = AccountWallet::open(
+            &config(AccountRole::Primary, true),
+            &[73u8; 32],
+            dir.path().join("wallet.sqlite").to_str().unwrap(),
+        )
+        .unwrap();
+        allow_funding_verification(&mut wallet);
+        fund(&mut wallet, 100_000);
+        let prepared = prepare_test_issuance(&mut wallet, "TSP", &[10]).unwrap();
+        let operation_id = prepared["operation_id"].as_str().unwrap().to_owned();
+        wallet
+            .finalize_observed_operation(&operation_id, Txid::from_byte_array([74u8; 32]))
+            .unwrap();
+
+        let replacement_txid = Txid::from_byte_array([75u8; 32]);
+        let mut replacement_receipt: Value = serde_json::from_str(
+            wallet
+                .operation(&operation_id)
+                .unwrap()
+                .receipt_json
+                .as_deref()
+                .unwrap(),
+        )
+        .unwrap();
+        replacement_receipt["txid"] = json!(replacement_txid.to_string());
+        wallet
+            .persist_signed_replacement(
+                &operation_id,
+                "00",
+                replacement_txid,
+                &mut replacement_receipt,
+            )
+            .unwrap();
+        wallet
+            .db
+            .conn
+            .execute(
+                "UPDATE opencsv_operations SET state = 'broadcast_unobserved'
+                 WHERE operation_id = ?1",
+                [&operation_id],
+            )
+            .unwrap();
+
+        let operation = wallet.operation(&operation_id).unwrap();
+        let receipt: Value =
+            serde_json::from_str(operation.receipt_json.as_deref().unwrap()).unwrap();
+        let (consignment, candidate) = wallet
+            .spv_consignment_candidate(&operation_id, &operation, replacement_txid, &receipt)
+            .unwrap();
+        let consignment = Consignment::from_bytes(&consignment).unwrap();
+        assert_eq!(consignment.anchor_ref.txid, replacement_txid.to_byte_array());
+        assert_eq!(operation.state, OperationState::BroadcastUnobserved.as_str());
+        assert!(wallet.pending_by_operation.contains_key(&operation_id));
+        assert!(wallet
+            .operation(&operation_id)
+            .unwrap()
+            .receipt_json
+            .as_deref()
+            .unwrap()
+            .contains("replacement_delivery_required"));
+
+        let (protocol_candidate, spends) = candidate.unwrap();
+        let mut installed_receipt = receipt;
+        wallet
+            .install_spv_finalized_candidate(
+                &operation_id,
+                &consignment.to_bytes(),
+                spends,
+                protocol_candidate,
+                &mut installed_receipt,
+            )
+            .unwrap();
+        let settled = wallet.operation(&operation_id).unwrap();
+        let settled_receipt: Value =
+            serde_json::from_str(settled.receipt_json.as_deref().unwrap()).unwrap();
+        assert_eq!(settled.state, OperationState::Confirmed.as_str());
+        assert_eq!(settled_receipt["delivery_ready"], true);
+        assert!(settled_receipt.get("replacement_delivery_required").is_none());
+        assert!(!wallet.pending_by_operation.contains_key(&operation_id));
     }
 
     #[test]
