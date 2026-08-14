@@ -45,7 +45,7 @@ use crate::fullscan::{anchors_in_block, ScannedAnchor};
 use crate::hash::{from_hex, hash_to_display, to_hex};
 
 /// First line of every scan-index file (format version tag).
-const MAGIC: &str = "opencsv-cbf-scan-index-v2";
+const MAGIC: &str = "opencsv-cbf-scan-index-v3";
 
 /// How [`ScanIndex::open`] initialized its rebuildable cache.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -83,6 +83,11 @@ pub struct ScanIndex {
     from_height: u64,
     /// Highest height whose filter has been checked.
     synced_tip: u64,
+    /// Canonical header hash for every checked height, beginning at
+    /// `from_height`. Keeping the contiguous lineage lets a later sync
+    /// detect both tip regression and a same-height fork before any cached
+    /// occurrence can contribute confirmations.
+    chain_hashes: Vec<[u8; 32]>,
     occurrences: Vec<ScannedAnchor>,
     counters: ScanCounters,
     load_status: ScanLoadStatus,
@@ -100,6 +105,7 @@ impl ScanIndex {
             network,
             from_height: 0,
             synced_tip: 0,
+            chain_hashes: Vec::new(),
             occurrences: Vec::new(),
             counters: ScanCounters::default(),
             load_status: ScanLoadStatus::Fresh,
@@ -122,12 +128,15 @@ impl ScanIndex {
             self.load_status = ScanLoadStatus::RebuildRequired;
             return Ok(());
         };
-        let Some((from_height, synced_tip, occurrences)) = decode_body(body, self.network) else {
+        let Some((from_height, synced_tip, chain_hashes, occurrences)) =
+            decode_body(body, self.network)
+        else {
             self.load_status = ScanLoadStatus::RebuildRequired;
             return Ok(());
         };
         self.from_height = from_height;
         self.synced_tip = synced_tip;
+        self.chain_hashes = chain_hashes;
         self.occurrences = occurrences;
         self.load_status = ScanLoadStatus::Loaded;
         Ok(())
@@ -141,6 +150,13 @@ impl ScanIndex {
             self.from_height,
             self.synced_tip
         );
+        for (offset, hash) in self.chain_hashes.iter().enumerate() {
+            let height = self
+                .from_height
+                .checked_add(u64::try_from(offset).expect("scan lineage fits u64"))
+                .expect("scan lineage height fits u64");
+            body.push_str(&format!("block {height} {}\n", hash_to_display(hash)));
+        }
         for e in &self.occurrences {
             let mut line = format!(
                 "occurrence {} {} {} {} {}",
@@ -188,14 +204,16 @@ impl ScanIndex {
             self.synced_tip = from_height.saturating_sub(1);
         }
         let tip = client.tip_height();
+        self.reconcile_chain_view(tip, |height| client.block_hash(height))?;
         let (filters_before, blocks_before) = client.fetched_bytes();
-        for height in (self.synced_tip + 1)..=tip {
+        let next_height = self.synced_tip.saturating_add(1).max(self.from_height);
+        for height in next_height..=tip {
+            let block_hash = client
+                .block_hash(height)
+                .ok_or_else(|| Error::Consensus(format!("no header at height {height}")))?;
             let current_marker = client.filter_matches(height, &MARKER_SPK)?;
             let legacy_marker = client.filter_matches(height, &LEGACY_MARKER_SPK)?;
             if current_marker || legacy_marker {
-                let block_hash = client
-                    .block_hash(height)
-                    .ok_or_else(|| Error::Consensus(format!("no header at height {height}")))?;
                 let block = client.fetch_block(&block_hash)?;
                 if block.compute_merkle_root() != block.header.merkle_root {
                     return Err(Error::Consensus(format!(
@@ -206,12 +224,58 @@ impl ScanIndex {
                 self.counters.blocks_fetched += 1;
                 self.occurrences.extend(anchors_in_block(&block, height));
             }
+            self.chain_hashes.push(block_hash);
             self.synced_tip = height;
         }
         let (filters_after, blocks_after) = client.fetched_bytes();
         self.counters.filters_bytes += filters_after - filters_before;
         self.counters.blocks_bytes += blocks_after - blocks_before;
         self.persist()?;
+        Ok(())
+    }
+
+    /// Reconcile the rebuildable cache with the client's newly verified
+    /// header chain. A matching hash at the common tip proves the stored
+    /// prefix is still canonical because headers commit to their parent.
+    /// On mismatch, walk back to the common ancestor, then discard both
+    /// orphaned occurrences and their confirmation-producing heights.
+    fn reconcile_chain_view(
+        &mut self,
+        tip: u64,
+        mut canonical_hash: impl FnMut(u64) -> Option<[u8; 32]>,
+    ) -> Result<(), Error> {
+        if self.chain_hashes.is_empty() {
+            return Ok(());
+        }
+        let common_tip = self.synced_tip.min(tip);
+        let mut ancestor = self.from_height.saturating_sub(1);
+        if common_tip >= self.from_height {
+            for height in (self.from_height..=common_tip).rev() {
+                let offset = usize::try_from(height - self.from_height)
+                    .map_err(|_| Error::Consensus("scan lineage exceeds usize".into()))?;
+                let stored = self.chain_hashes.get(offset).ok_or_else(|| {
+                    Error::Consensus("scan lineage is shorter than its synced tip".into())
+                })?;
+                let canonical = canonical_hash(height)
+                    .ok_or_else(|| Error::Consensus(format!("no header at height {height}")))?;
+                if *stored == canonical {
+                    ancestor = height;
+                    break;
+                }
+            }
+        }
+        if ancestor < self.synced_tip {
+            self.occurrences
+                .retain(|entry| entry.location.height <= ancestor);
+            let keep = if ancestor < self.from_height {
+                0
+            } else {
+                usize::try_from(ancestor - self.from_height + 1)
+                    .map_err(|_| Error::Consensus("scan lineage exceeds usize".into()))?
+            };
+            self.chain_hashes.truncate(keep);
+            self.synced_tip = ancestor;
+        }
         Ok(())
     }
 
@@ -271,7 +335,10 @@ fn verified_body(text: &str) -> Option<&str> {
     (expected.as_slice() == Sha256::digest(body.as_bytes()).as_slice()).then_some(body)
 }
 
-fn decode_body(body: &str, network: Network) -> Option<(u64, u64, Vec<ScannedAnchor>)> {
+fn decode_body(
+    body: &str,
+    network: Network,
+) -> Option<(u64, u64, Vec<[u8; 32]>, Vec<ScannedAnchor>)> {
     let mut lines = body.lines();
     if lines.next().map(str::trim) != Some(MAGIC) {
         return None;
@@ -279,6 +346,7 @@ fn decode_body(body: &str, network: Network) -> Option<(u64, u64, Vec<ScannedAnc
     let mut saw_network = false;
     let mut from_height: Option<u64> = None;
     let mut synced_tip: Option<u64> = None;
+    let mut chain_hashes = Vec::new();
     let mut occurrences = Vec::new();
     for line in lines {
         let fields: Vec<&str> = line.split_whitespace().collect();
@@ -291,6 +359,12 @@ fn decode_body(body: &str, network: Network) -> Option<(u64, u64, Vec<ScannedAnc
             }
             ["from", h] if from_height.is_none() => from_height = h.parse().ok(),
             ["tip", h] if synced_tip.is_none() => synced_tip = h.parse().ok(),
+            ["block", h, hash] => {
+                let height = h.parse().ok()?;
+                let mut bytes: [u8; 32] = from_hex(hash).ok()?.try_into().ok()?;
+                bytes.reverse();
+                chain_hashes.push((height, bytes));
+            }
             ["occurrence", h, p, txid, ctx, record, rest @ ..] => {
                 let txid = {
                     let mut bytes: [u8; 32] = from_hex(txid).ok()?.try_into().ok()?;
@@ -339,6 +413,9 @@ fn decode_body(body: &str, network: Network) -> Option<(u64, u64, Vec<ScannedAnc
     }
     let from_height = from_height?;
     let synced_tip = synced_tip?;
+    let expected_hashes = synced_tip
+        .checked_sub(from_height.saturating_sub(1))
+        .and_then(|count| usize::try_from(count).ok())?;
     if !saw_network
         || (synced_tip > 0 && from_height == 0)
         || synced_tip < from_height.saturating_sub(1)
@@ -348,10 +425,25 @@ fn decode_body(body: &str, network: Network) -> Option<(u64, u64, Vec<ScannedAnc
         || occurrences
             .windows(2)
             .any(|pair| pair[0].location > pair[1].location)
+        || chain_hashes.len() != expected_hashes
+        || chain_hashes
+            .iter()
+            .enumerate()
+            .any(|(offset, (height, _))| {
+                u64::try_from(offset)
+                    .ok()
+                    .and_then(|offset| from_height.checked_add(offset))
+                    != Some(*height)
+            })
     {
         return None;
     }
-    Some((from_height, synced_tip, occurrences))
+    Some((
+        from_height,
+        synced_tip,
+        chain_hashes.into_iter().map(|(_, hash)| hash).collect(),
+        occurrences,
+    ))
 }
 
 fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), Error> {
@@ -467,11 +559,13 @@ mod tests {
         assert_eq!(index.load_status(), ScanLoadStatus::Fresh);
         index.from_height = 10;
         index.synced_tip = 20;
+        index.chain_hashes = (10_u8..=20).map(|byte| [byte; 32]).collect();
         index.persist().unwrap();
 
         let loaded = ScanIndex::open(dir.path(), Network::Signet).unwrap();
         assert_eq!(loaded.load_status(), ScanLoadStatus::Loaded);
         assert_eq!(loaded.synced_tip(), 20);
+        assert_eq!(loaded.chain_hashes.len(), 11);
 
         let path = dir.path().join("scan-index.log");
         let mut bytes = std::fs::read(&path).unwrap();
@@ -492,12 +586,51 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
             dir.path().join("scan-index.log"),
-            "opencsv-cbf-scan-index-v1\nnetwork signet\nfrom 10\ntip 20\n",
+            "opencsv-cbf-scan-index-v2\nnetwork signet\nfrom 10\ntip 20\n",
         )
         .unwrap();
 
         let rebuilt = ScanIndex::open(dir.path(), Network::Signet).unwrap();
         assert_eq!(rebuilt.load_status(), ScanLoadStatus::RebuildRequired);
         assert_eq!(rebuilt.synced_tip(), 0);
+    }
+
+    #[test]
+    fn reorg_and_tip_regression_prune_orphaned_occurrences() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut index = ScanIndex::open(dir.path(), Network::Signet).unwrap();
+        index.from_height = 10;
+        index.synced_tip = 12;
+        index.chain_hashes = vec![[10; 32], [11; 32], [12; 32]];
+        index.occurrences.push(ScannedAnchor {
+            location: AnchorLocation {
+                height: 12,
+                position: 0,
+            },
+            txid: [7; 32],
+            record: AnchorRecord::xfer(&[Digest([8; 32])], &[9; 32]),
+            ctx: [9; 32],
+            batch: None,
+        });
+
+        index
+            .reconcile_chain_view(12, |height| match height {
+                10 => Some([10; 32]),
+                11 => Some([21; 32]),
+                12 => Some([22; 32]),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(index.synced_tip, 10);
+        assert_eq!(index.chain_hashes, vec![[10; 32]]);
+        assert!(index.occurrences.is_empty());
+
+        index.synced_tip = 12;
+        index.chain_hashes = vec![[10; 32], [11; 32], [12; 32]];
+        index
+            .reconcile_chain_view(11, |height| Some([u8::try_from(height).unwrap(); 32]))
+            .unwrap();
+        assert_eq!(index.synced_tip, 11);
+        assert_eq!(index.chain_hashes.len(), 2);
     }
 }

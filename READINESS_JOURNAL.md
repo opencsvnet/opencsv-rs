@@ -164,3 +164,29 @@ the fee by 910 sats to 5 sat/vB, retained 7,542 sats of change, and confirmed
 at height 316079. Separate process invocations reopened the SQLite journal at
 every state boundary. Generic Bitcoin send and raw-transaction APIs were never
 introduced.
+
+## 2026-08-14 — reorg-aware scans and reserve replacement reconciliation
+
+Adversarial review found two places where rebuildable acceleration could be
+mistaken for verified chain state. The scan index recorded only a checked tip,
+so a same-height fork or tip regression could leave orphaned occurrences
+contributing confirmations. Scan index v3 now stores the contiguous verified
+block-hash lineage, compares the common tip on every sync, walks back to the
+common ancestor when necessary, and prunes orphaned occurrences before any
+new scan result is used. Older indexes rebuild rather than being guessed into
+the new format.
+
+Wallet-internal batch-reserve RBF also tracked only the newest candidate. If a
+superseded split confirmed, pending stock rows could remain attached to the
+losing txid. Each fee bump now retains the exact signed bytes, txid, and fee of
+every superseded candidate. An Esplora status is only a height hint: every
+candidate stock output must match the persisted transaction and pass the
+phone-owned funding verifier before the journal can restore it. A dishonest
+accelerator therefore leaves the newest candidate and stock mapping unchanged.
+Reserve replacement change is additionally required to remain above the exact
+script dust floor; protected outputs and ordering are still immutable.
+
+The rejected alternative was switching candidates immediately after a public
+API reported `confirmed`. That would have made an accelerator authoritative
+during an RBF race. Full CBF and FFI suites passed with deterministic reorg,
+original-wins, dishonest-accelerator, and dust-floor regressions.
