@@ -602,16 +602,27 @@ mod tests {
         index.from_height = 10;
         index.synced_tip = 12;
         index.chain_hashes = vec![[10; 32], [11; 32], [12; 32]];
-        index.occurrences.push(ScannedAnchor {
+        let raw_nf = Digest([8; 32]);
+        let orphaned_ref = AnchorRef {
             location: AnchorLocation {
                 height: 12,
                 position: 0,
             },
             txid: [7; 32],
-            record: AnchorRecord::xfer(&[Digest([8; 32])], &[9; 32]),
+        };
+        index.occurrences.push(ScannedAnchor {
+            location: orphaned_ref.location,
+            txid: orphaned_ref.txid,
+            record: AnchorRecord::xfer(&[raw_nf], &[9; 32]),
             ctx: [9; 32],
             batch: None,
         });
+        assert_eq!(index.locate(&orphaned_ref), Some(orphaned_ref.location));
+        assert_eq!(
+            index.first_nullifier_occurrence(&raw_nf),
+            Some(orphaned_ref.location)
+        );
+        assert_eq!(index.confirmations_at(orphaned_ref.location.height), 1);
 
         index
             .reconcile_chain_view(12, |height| match height {
@@ -624,13 +635,55 @@ mod tests {
         assert_eq!(index.synced_tip, 10);
         assert_eq!(index.chain_hashes, vec![[10; 32]]);
         assert!(index.occurrences.is_empty());
+        assert_eq!(index.locate(&orphaned_ref), None);
+        assert_eq!(index.first_nullifier_occurrence(&raw_nf), None);
+        assert_eq!(index.scan_check(&raw_nf, 10, 12), None);
 
+        let canonical_ref = AnchorRef {
+            location: AnchorLocation {
+                height: 11,
+                position: 3,
+            },
+            txid: [27; 32],
+        };
         index.synced_tip = 12;
-        index.chain_hashes = vec![[10; 32], [11; 32], [12; 32]];
+        index.chain_hashes = vec![[10; 32], [21; 32], [22; 32]];
+        index.occurrences.push(ScannedAnchor {
+            location: canonical_ref.location,
+            txid: canonical_ref.txid,
+            record: AnchorRecord::xfer(&[raw_nf], &[29; 32]),
+            ctx: [29; 32],
+            batch: None,
+        });
+        index.persist().unwrap();
+        let reopened = ScanIndex::open(dir.path(), Network::Signet).unwrap();
+        assert_eq!(reopened.load_status(), ScanLoadStatus::Loaded);
+        assert_eq!(reopened.locate(&orphaned_ref), None);
+        assert_eq!(
+            reopened.locate(&canonical_ref),
+            Some(canonical_ref.location)
+        );
+        assert_eq!(
+            reopened.first_nullifier_occurrence(&raw_nf),
+            Some(canonical_ref.location)
+        );
+        assert_eq!(reopened.confirmations_at(canonical_ref.location.height), 2);
+        assert_eq!(
+            reopened.scan_check(&raw_nf, 10, 12),
+            Some((canonical_ref.location, [29; 32]))
+        );
+
+        let mut index = reopened;
+        index.synced_tip = 12;
         index
-            .reconcile_chain_view(11, |height| Some([u8::try_from(height).unwrap(); 32]))
+            .reconcile_chain_view(11, |height| match height {
+                10 => Some([10; 32]),
+                11 => Some([21; 32]),
+                _ => None,
+            })
             .unwrap();
         assert_eq!(index.synced_tip, 11);
         assert_eq!(index.chain_hashes.len(), 2);
+        assert_eq!(index.confirmations_at(canonical_ref.location.height), 1);
     }
 }

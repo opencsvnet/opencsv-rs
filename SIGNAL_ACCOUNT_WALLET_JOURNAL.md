@@ -930,3 +930,30 @@ has id `4e916bdc96e21a7e8f0942d50779c0f186cb005bb2a86614056ce7faa29bd566`.
 The receipt records 575 ms for the final SPV confirmation refresh. This is a
 real confirmed-chain recovery receipt; it is not a substitute for the two
 required raw observers used to unlock zero-confirmation forwarding.
+
+## 2026-08-14 — adversarial closure keeps contradictions and replacement history explicit
+
+The release review identified three seams where the implementation was safe
+but its evidence was either ambiguous or only one epoch deep. First, a pinned
+required observer returning a different, well-formed Bitcoin transaction was
+reported as the generic `required_observation_failed` quorum result. That hid
+the difference between an outage and direct contradictory bytes. The account
+boundary now returns stable `observer_transaction_conflict` for that case,
+while malformed bytes, missing evidence, stale cache data, and ordinary quorum
+loss retain their existing reasons. The durable per-observer receipt still
+records the exact-byte mismatch and the conflicting check identifier.
+
+Second, reserve-maintenance RBF had a complete candidate list but its test
+proved only one replacement. The focused regression now performs two fee
+bumps, proves that the second increment is calculated from the current fee,
+that every earlier exact signed transaction remains in order as a recovery
+candidate, that protected stock outputs remain byte-identical, and that only
+the latest txid owns the pending stock rows after reopen.
+
+Third, compact-filter reorg coverage proved orphan pruning but stopped before
+a replacement occurrence became the settlement-of-record. The strengthened
+test now begins with an accepted anchor, rolls it off at a common ancestor,
+proves that lookup, occurrence, and scan decisions forget it, installs the
+same nullifier on the canonical fork at a new location, persists and reopens
+the index, and checks the new confirmation depth. These are focused local
+receipts; hosted CI and independent review remain separate release gates.

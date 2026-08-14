@@ -10804,6 +10804,7 @@ fn evaluate_observation_evidence(
         })
         .count();
     let mut successful_required_raw_observers = 0u32;
+    let mut conflicting_required_raw_observers = Vec::new();
     for check in policy {
         // Raw host evidence is supplied by Signal. Direct relay submission
         // and multi-peer confirmation have separate Rust-owned receipts and
@@ -10864,15 +10865,26 @@ fn evaluate_observation_evidence(
             {
                 failures.push("certificate chain does not match configured pins".to_owned());
             }
-            let raw_match = if check.kind == ObservationKind::RawTransactionApi {
+            let observed_raw = if check.kind == ObservationKind::RawTransactionApi {
                 evidence
                     .raw_transaction_hex
                     .as_deref()
                     .and_then(|encoded| hex_decode(encoded, "observed raw transaction").ok())
-                    .is_some_and(|raw| raw == exact_raw_transaction)
             } else {
-                false
+                None
             };
+            let raw_match = observed_raw
+                .as_deref()
+                .is_some_and(|raw| raw == exact_raw_transaction);
+            let reports_conflicting_transaction = check.mode == ObservationMode::Require
+                && evidence.result == ObservationResult::Observed
+                && observed_raw.as_deref().is_some_and(|raw| {
+                    raw != exact_raw_transaction && deserialize::<Transaction>(raw).is_ok()
+                });
+            if reports_conflicting_transaction {
+                failures.push("observer returned a different valid transaction".to_owned());
+                conflicting_required_raw_observers.push(check.id.clone());
+            }
             if check.kind == ObservationKind::RawTransactionApi && !raw_match {
                 failures.push("raw transaction bytes do not match".to_owned());
             }
@@ -10943,6 +10955,18 @@ fn evaluate_observation_evidence(
                     .collect::<Vec<_>>()
                     .join(", ")
             ),
+        ));
+    }
+    if !conflicting_required_raw_observers.is_empty() {
+        return Ok((
+            receipts,
+            Some(AccountError::new(
+                "observer_transaction_conflict",
+                format!(
+                    "required observers returned different valid transaction bytes: {}",
+                    conflicting_required_raw_observers.join(", ")
+                ),
+            )),
         ));
     }
     let required_failure = (required_raw_observer_count > 0
@@ -12735,6 +12759,63 @@ mod tests {
     }
 
     #[test]
+    fn required_observer_conflicting_valid_transaction_is_a_distinct_failure() {
+        let policy = default_observation_checks("signet");
+        let now = unix_time_millis().unwrap();
+        let exact = Transaction {
+            version: transaction::Version::ONE,
+            lock_time: absolute::LockTime::ZERO,
+            input: Vec::new(),
+            output: Vec::new(),
+        };
+        let conflicting = Transaction {
+            version: transaction::Version::TWO,
+            lock_time: absolute::LockTime::ZERO,
+            input: Vec::new(),
+            output: Vec::new(),
+        };
+        let exact_raw = serialize(&exact);
+        let evidence = json!({
+            "observations": [
+                {
+                    "check_id": "mempool_space_signet",
+                    "endpoint": "https://mempool.space/signet/api",
+                    "result": "observed",
+                    "started_at_ms": now - 15,
+                    "completed_at_ms": now - 5,
+                    "cached_at_ms": now - 5,
+                    "certificate_profile": "sectigo_r46",
+                    "certificate_chain_fingerprints_sha256": [MEMPOOL_SPACE_SIGNET_CHAIN_PINS[0]],
+                    "raw_transaction_hex": hex_encode(&exact_raw)
+                },
+                {
+                    "check_id": "blockstream_signet",
+                    "endpoint": "https://blockstream.info/signet/api",
+                    "result": "observed",
+                    "started_at_ms": now - 20,
+                    "completed_at_ms": now - 4,
+                    "cached_at_ms": now - 4,
+                    "certificate_profile": "lets_encrypt_yr",
+                    "certificate_chain_fingerprints_sha256": [BLOCKSTREAM_SIGNET_CHAIN_PINS[1]],
+                    "raw_transaction_hex": hex_encode(&serialize(&conflicting))
+                }
+            ]
+        });
+
+        let (receipts, failure) =
+            evaluate_observation_evidence(&policy, 2, &exact_raw, &evidence.to_string()).unwrap();
+        let failure = failure.expect("a contradictory required observer must fail closed");
+        assert_eq!(failure.code, "observer_transaction_conflict");
+        assert_eq!(receipts[0]["raw_byte_match"], true);
+        assert_eq!(receipts[1]["raw_byte_match"], false);
+        assert!(receipts[1]["failures"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|failure| failure == "observer returned a different valid transaction"));
+    }
+
+    #[test]
     fn raw_observer_quorum_must_match_required_candidates() {
         let dir = tempfile::tempdir().unwrap();
         let cfg = json!({
@@ -13950,7 +14031,76 @@ mod tests {
             .unwrap();
         assert_eq!(old_stocks, 0);
         assert_eq!(replacement_stocks, 3);
-        let replacement_txid = replacement.compute_txid().to_string();
+        let first_replacement_txid = replacement.compute_txid().to_string();
+        let first_replacement_hex = bumped["signed_tx_hex"].as_str().unwrap().to_owned();
+
+        let second_bump = wallet.fee_bump_batch_reserves(maintenance_id, 7).unwrap();
+        let second_replacement: Transaction = deserialize(
+            &hex_decode(
+                second_bump["signed_tx_hex"].as_str().unwrap(),
+                "second reserve replacement transaction",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let second_replacement_fee = second_bump["receipt"]["fee_sats"].as_u64().unwrap();
+        assert_eq!(second_bump["receipt"]["replaces"], first_replacement_txid);
+        assert!(second_replacement_fee > replacement_fee);
+        assert_eq!(
+            second_bump["receipt"]["fee_increment_sats"],
+            second_replacement_fee - replacement_fee
+        );
+        let candidates = second_bump["receipt"]["replacement_candidates"]
+            .as_array()
+            .unwrap();
+        assert_eq!(candidates.len(), 2);
+        assert_eq!(candidates[0]["txid"], original_txid.to_string());
+        assert_eq!(
+            candidates[0]["signed_tx_hex"],
+            prepared["signed_tx_hex"]
+        );
+        assert_eq!(candidates[0]["fee_sats"], original_fee);
+        assert_eq!(candidates[1]["txid"], first_replacement_txid);
+        assert_eq!(candidates[1]["signed_tx_hex"], first_replacement_hex);
+        assert_eq!(candidates[1]["fee_sats"], replacement_fee);
+        assert_eq!(
+            second_replacement.output[..second_replacement.output.len() - 1],
+            original.output[..original.output.len() - 1]
+        );
+        assert!(
+            second_replacement.output.last().unwrap().value
+                < replacement.output.last().unwrap().value
+        );
+        assert!(
+            second_replacement.output.last().unwrap().value
+                >= second_replacement
+                    .output
+                    .last()
+                    .unwrap()
+                    .script_pubkey
+                    .minimal_non_dust()
+        );
+        let first_replacement_stocks: i64 = wallet
+            .db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM opencsv_batch_stocks WHERE txid = ?1",
+                [&first_replacement_txid],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let second_replacement_txid = second_replacement.compute_txid().to_string();
+        let second_replacement_stocks: i64 = wallet
+            .db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM opencsv_batch_stocks WHERE txid = ?1",
+                [&second_replacement_txid],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(first_replacement_stocks, 0);
+        assert_eq!(second_replacement_stocks, 3);
         drop(wallet);
 
         let reopened = AccountWallet::open(
@@ -13963,8 +14113,12 @@ mod tests {
             .batch_reserve_operation_json(maintenance_id)
             .unwrap();
         assert_eq!(recovered["state"], "broadcast_unobserved");
-        assert_eq!(recovered["txid"], replacement_txid);
-        assert_eq!(recovered["signed_tx_hex"], bumped["signed_tx_hex"]);
+        assert_eq!(recovered["txid"], second_replacement_txid);
+        assert_eq!(recovered["signed_tx_hex"], second_bump["signed_tx_hex"]);
+        assert_eq!(
+            recovered["receipt"]["replacement_candidates"],
+            second_bump["receipt"]["replacement_candidates"]
+        );
     }
 
     #[test]
