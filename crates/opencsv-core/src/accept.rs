@@ -12,7 +12,7 @@ use opencsv_kernel::accept as accept_kernel;
 use crate::anchor::{binding, nullifier_commit, AnchorRecord};
 use crate::asset::AssetId;
 use crate::chain::{AnchorChain, AnchorLocation};
-use crate::coin::{Coin, OwnerSecret};
+use crate::coin::{Coin, Owner, OwnerSecret};
 use crate::consignment::{CoinOpening, Consignment};
 use crate::digest::{Digest, TruncatedDigest};
 
@@ -73,6 +73,25 @@ pub struct AcceptParams<'a> {
     pub recipient_secrets: &'a [OwnerSecret],
     /// Assets already pinned by this client. If an opening names an asset not
     /// in this list, the consignment must carry matching genesis `aux`.
+    pub known_assets: &'a [AssetId],
+}
+
+/// Parameters for validating a consignment against already-authenticated
+/// public recipient identities.
+///
+/// This is the headless sender/issuer settlement boundary: it runs the same
+/// proof, anchor, confirmation, binding, occurrence, and ownership checks as
+/// [`accept`], but it does not claim that the verifier possesses a recipient
+/// secret. A caller must obtain these public identities from its own durable
+/// operation, never from the untrusted consignment.
+pub struct PublicOwnerAcceptParams<'a> {
+    /// Verification key of the transaction predicate being claimed.
+    pub vk: &'a [u8],
+    /// Required confirmation depth `k` (paper §4.7 rule 2).
+    pub required_confirmations: u64,
+    /// Public owners authenticated by the caller's durable operation.
+    pub recipient_owners: &'a [Owner],
+    /// Assets already pinned by this client.
     pub known_assets: &'a [AssetId],
 }
 
@@ -206,6 +225,37 @@ pub fn accept<V: ProofVerifier, C: AnchorChain>(
     verifier: &V,
     params: &AcceptParams,
 ) -> Result<AcceptedCoins, RejectReason> {
+    let recipient_owners = params
+        .recipient_secrets
+        .iter()
+        .map(OwnerSecret::owner)
+        .collect::<Vec<_>>();
+    accept_for_public_owners(
+        consignment,
+        chain,
+        verifier,
+        &PublicOwnerAcceptParams {
+            vk: params.vk,
+            required_confirmations: params.required_confirmations,
+            recipient_owners: &recipient_owners,
+            known_assets: params.known_assets,
+        },
+    )
+}
+
+/// Validate and select outputs for authenticated public recipient identities.
+///
+/// This function differs from [`accept`] only in the source of the owner set:
+/// the caller supplies public identities authenticated by its own operation
+/// journal instead of deriving them from locally held secrets. It therefore
+/// proves that a sender/issuer's exact intended recipient appears in a valid,
+/// settled consignment without implying custody of that recipient's coins.
+pub fn accept_for_public_owners<V: ProofVerifier, C: AnchorChain>(
+    consignment: &Consignment,
+    chain: &C,
+    verifier: &V,
+    params: &PublicOwnerAcceptParams,
+) -> Result<AcceptedCoins, RejectReason> {
     let openings = &consignment.coin_openings;
     reject_if(accept_kernel::preflight_rejection(
         !openings.is_empty(),
@@ -325,7 +375,7 @@ pub fn accept<V: ProofVerifier, C: AnchorChain>(
     }
 
     // Step 4 — ownership check.
-    let owners: HashSet<_> = params.recipient_secrets.iter().map(|s| s.owner()).collect();
+    let owners: HashSet<_> = params.recipient_owners.iter().copied().collect();
     let coins: Vec<Coin> = openings
         .iter()
         .filter(|o| owners.contains(&o.owner))

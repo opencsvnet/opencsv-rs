@@ -63,7 +63,10 @@ pub mod instrument;
 pub mod issuer;
 mod kernel;
 
-pub use accept::{accept, AcceptParams, AcceptedCoins, MockVerifier, ProofVerifier, RejectReason};
+pub use accept::{
+    accept, accept_for_public_owners, AcceptParams, AcceptedCoins, MockVerifier, ProofVerifier,
+    PublicOwnerAcceptParams, RejectReason,
+};
 pub use anchor::{binding, mint_commit, nullifier_commit, AnchorRecord, ANCHOR_SIZE};
 pub use asset::{AssetGenesis, AssetId};
 pub use audit::{supply, SupplyError};

@@ -137,6 +137,14 @@ enum OperationCommand {
     },
     /// Resume an interrupted operation idempotently.
     Resume(OperationId),
+    /// Verify confirmed settlement through a multi-peer compact-filter scan.
+    RefreshSpv {
+        #[command(flatten)]
+        operation: OperationId,
+        /// Scan configuration with peers, cache directory, and starting height.
+        #[arg(long)]
+        scan_config: PathBuf,
+    },
     /// Admit exact unconfirmed bytes after independent pinned observation.
     Observe {
         #[command(flatten)]
@@ -298,6 +306,19 @@ fn run(cli: Cli) -> Result<Value, CliError> {
         Command::Operation(OperationCommand::Resume(operation)) => wallet
             .resume_operation(&operation.operation_id)
             .map_err(Into::into),
+        Command::Operation(OperationCommand::RefreshSpv {
+            operation,
+            scan_config,
+        }) => {
+            let scan_config = read_text(&scan_config, "scan_config_read_failed")?;
+            let scan_receipt = opencsv_ffi::scan::sync_json(&scan_config)
+                .map_err(|error| CliError::new("scan_failed", error))?;
+            let mut operation_receipt = wallet.refresh_operation_spv(&operation.operation_id)?;
+            if let Some(object) = operation_receipt.as_object_mut() {
+                object.insert("scan_sync".into(), scan_receipt);
+            }
+            Ok(operation_receipt)
+        }
         Command::Operation(OperationCommand::Observe {
             operation,
             raw_transaction,
@@ -581,6 +602,35 @@ mod tests {
     }
 
     #[test]
+    fn parses_explicit_spv_refresh_without_host_claims() {
+        let cli = Cli::try_parse_from([
+            "opencsv-issuer",
+            "--database",
+            "issuer.sqlite",
+            "--config",
+            "config.json",
+            "--account-root-file",
+            "root.secret",
+            "--device-binding-file",
+            "device.secret",
+            "operation",
+            "refresh-spv",
+            "--operation-id",
+            "operation-1",
+            "--scan-config",
+            "scan.json",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Operation(OperationCommand::RefreshSpv {
+                operation: OperationId { operation_id },
+                scan_config,
+            }) if operation_id == "operation-1" && scan_config == Path::new("scan.json")
+        ));
+    }
+
+    #[test]
     fn decodes_raw_and_hex_secrets() {
         assert_eq!(decode_secret(&[7_u8; 32], "test").unwrap(), [7_u8; 32]);
         let encoded = format!("{}\n", "ab".repeat(32));
@@ -628,7 +678,10 @@ mod tests {
 
     #[test]
     fn bare_output_names_sync_the_current_directory() {
-        assert_eq!(durability_parent(Path::new("checkpoint.json")), Path::new("."));
+        assert_eq!(
+            durability_parent(Path::new("checkpoint.json")),
+            Path::new(".")
+        );
         assert_eq!(
             durability_parent(Path::new("receipts/checkpoint.json")),
             Path::new("receipts")

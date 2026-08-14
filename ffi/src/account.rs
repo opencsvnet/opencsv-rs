@@ -3600,6 +3600,29 @@ impl AccountWallet {
         .map_err(|error| AccountError::new("scan_failed", error))
     }
 
+    fn scan_verify_outgoing_operation(
+        &self,
+        operation: &OperationRow,
+        consignment_hex: &str,
+    ) -> Result<Value, AccountError> {
+        if operation.kind != "mint" {
+            return self.scan_verify(consignment_hex);
+        }
+        let request: Value = serde_json::from_str(&operation.request_json)
+            .map_err(|error| AccountError::new("database_corrupt", error.to_string()))?;
+        let to_owner = request["to_owner"].as_str().ok_or_else(|| {
+            AccountError::new("database_corrupt", "mint operation has no recipient owner")
+        })?;
+        let owner = Digest::from_bytes(decode_hex_32(to_owner, "mint recipient owner")?);
+        scan::verify_json_for_public_owners(
+            consignment_hex,
+            &[owner],
+            &self.known_asset_ids()?,
+            &opencsv_pcd::CoinProofVerifier,
+        )
+        .map_err(|error| AccountError::new("scan_failed", error))
+    }
+
     /// Read-only N-of-M chain-view decision using this account's identities.
     pub fn cross_check(&self, request_json: &str) -> Result<Value, AccountError> {
         match crosscheck::run_cross_check(
@@ -6186,7 +6209,7 @@ impl AccountWallet {
             &receipt,
         )?;
         let spv_started = Instant::now();
-        let verdict = self.scan_verify(&hex_encode(&consignment))?;
+        let verdict = self.scan_verify_outgoing_operation(&operation, &hex_encode(&consignment))?;
         let spv_ms = elapsed_millis(spv_started);
         let now_ms = unix_time_millis()?;
         let spv_started_at_ms = now_ms.saturating_sub(i64::try_from(spv_ms).unwrap_or(i64::MAX));

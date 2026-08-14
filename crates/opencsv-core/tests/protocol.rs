@@ -405,6 +405,34 @@ fn accept_mint_consignment_happy_path_with_genesis_aux() {
 }
 
 #[test]
+fn authenticated_public_owner_can_verify_outgoing_mint_without_its_secret() {
+    let g = genesis();
+    let asset_id = g.asset_id();
+    let recipient = secret(3).owner();
+    let mut chain = MockAnchorChain::new();
+    let anchor_ref = mint_anchor(&mut chain, &asset_id, 100);
+    let openings = vec![opening_for(asset_id, 100, 3, 4)];
+    let consignment = consignment_for(&chain, anchor_ref, vec![], openings, Some(g));
+    chain.advance_blocks(5);
+
+    let accepted = accept_for_public_owners(
+        &consignment,
+        &chain,
+        &MockVerifier,
+        &PublicOwnerAcceptParams {
+            vk: VK,
+            required_confirmations: 6,
+            recipient_owners: &[recipient],
+            known_assets: &[],
+        },
+    )
+    .expect("sender can verify its authenticated public recipient");
+    assert_eq!(accepted.coins.len(), 1);
+    assert_eq!(accepted.coins[0].owner, recipient);
+    assert_eq!(accepted.anchor, anchor_ref.location);
+}
+
+#[test]
 fn accept_transfer_consignment_happy_path() {
     let g = genesis();
     let asset_id = g.asset_id();

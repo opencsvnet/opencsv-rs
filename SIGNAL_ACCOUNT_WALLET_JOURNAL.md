@@ -883,3 +883,50 @@ The new regression proves the protected layout, increased fee, txid remap,
 and reopen recovery. The complete default FFI run passes 85 unit tests plus
 two integration tests, with three deliberate slow recursive-proof cases
 ignored and zero failures.
+
+## 2026-08-13 — headless issuance needs an explicit confirmed-SPV recovery command
+
+The live `[50, 50]` Test USD issuance reached `broadcast_unobserved` with an
+exact persisted transaction, three P2P submissions, and an independently
+retrieved Blockstream copy. The configured mempool.space Signet endpoint was
+unreachable from the development host, so the required two-observer policy
+correctly refused zero-confirmation delivery. The Rust account wallet already
+had a stronger recovery path: `refresh_operation_spv` verifies the exact
+transaction through multi-peer header agreement, PoW, BIP158 discovery, full
+block retrieval, Merkle inclusion, and OpenCSV record validation. Signal could
+invoke that boundary, but the headless issuer CLI could not.
+
+`opencsv-issuer operation refresh-spv --operation-id ID --scan-config
+scan.json` now exposes that existing verifier without accepting raw
+transaction bytes, a block height, or a caller-supplied success Boolean. A
+first live attempt that omitted scan registration failed honestly with `no
+scan registered`; the final command therefore requires an explicit scan
+configuration, syncs/registers its persistent cache in the same process, and
+returns that sync receipt alongside the operation receipt. Before confirmation
+it returns the honest unsettled scan result. After confirmation it can finalize
+the exact durable proof and make the canonical consignment delivery-ready even
+when a public unconfirmed observer is unavailable. This does not downgrade the
+default two-observer zero-confirmation policy; it provides the independently
+verified confirmed-chain alternative already present at the Rust boundary.
+
+The first registered live scan then rejected the confirmed mint with
+`NoOwnedOutput`. That exposed a second incorrect reuse: receiver acceptance
+derives its owner set from locally held secrets, but an issuer minting both
+outputs to Carol correctly holds none of Carol's secrets. Core verification
+now has a public-owner entry point with identical proof, anchor,
+confirmation, binding, occurrence, and pure-kernel decisions. The issuer path
+feeds it only the recipient owner authenticated by the durable mint request;
+it neither trusts an owner supplied by the consignment nor credits the issuer
+with Carol's coins. Secret-based receiver acceptance remains a wrapper over
+the same decision path.
+
+The corrected headless path was then exercised against the live Signet mint
+operation `06232685d70a6cfd844927638339a9b5`. The compact-filter scan reached
+height 317580 and independently finalized transaction
+`79479eeda1a372dd83fed7deb1722eee1878f63ea7a508cb5e29023a62925906`,
+confirmed at height 317579. The durable operation advanced to `confirmed`,
+its delivery receipt became ready, and the exported 537,303-byte consignment
+has id `4e916bdc96e21a7e8f0942d50779c0f186cb005bb2a86614056ce7faa29bd566`.
+The receipt records 575 ms for the final SPV confirmation refresh. This is a
+real confirmed-chain recovery receipt; it is not a substitute for the two
+required raw observers used to unlock zero-confirmation forwarding.

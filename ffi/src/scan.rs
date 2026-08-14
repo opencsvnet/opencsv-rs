@@ -33,7 +33,7 @@ use opencsv_cbf::{CbfClient, Config as CbfConfig, Network, ScanIndex};
 use opencsv_core::accept::{accept, AcceptParams, ProofVerifier};
 use opencsv_core::chain::AnchorChain as _;
 use opencsv_core::consignment::Consignment;
-use opencsv_core::{AssetId, Digest, OwnerSecret};
+use opencsv_core::{AssetId, Digest, Owner, OwnerSecret, PublicOwnerAcceptParams};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
@@ -394,6 +394,52 @@ pub fn verify_json<V: ProofVerifier>(
             "anchor": { "height": accepted.anchor.height, "position": accepted.anchor.position },
             "confirmations": index.confirmations_at(accepted.anchor.height),
             "tip_height": tip,
+        })),
+        Err(reason) => Ok(json!({
+            "status": "rejected",
+            "reason": format!("{reason:?}"),
+            "tip_height": tip,
+        })),
+    }
+}
+
+/// Verify against public recipient identities authenticated by a durable
+/// sender/issuer operation. This never credits the calling wallet and does
+/// not imply possession of a recipient secret.
+pub(crate) fn verify_json_for_public_owners<V: ProofVerifier>(
+    consignment_hex: &str,
+    recipient_owners: &[Owner],
+    known_assets: &[AssetId],
+    verifier: &V,
+) -> Result<Value, String> {
+    let blob = from_hex(consignment_hex)?;
+    let consignment = Consignment::from_bytes(&blob).map_err(|e| e.to_string())?;
+    let index = registered_index()?;
+    let accepted = opencsv_core::accept_for_public_owners(
+        &consignment,
+        &index,
+        verifier,
+        &PublicOwnerAcceptParams {
+            vk: COIN_VK,
+            required_confirmations: registered_required_confirmations(),
+            recipient_owners,
+            known_assets,
+        },
+    );
+    let tip = index.synced_tip();
+    match accepted {
+        Ok(accepted) => Ok(json!({
+            "status": "verified",
+            "coins": accepted.coins.iter().map(|coin| json!({
+                "id": to_hex(coin.commitment().as_bytes()),
+                "asset_id": to_hex(coin.asset_id.as_bytes()),
+                "value": coin.value,
+                "owner": to_hex(coin.owner.as_bytes()),
+            })).collect::<Vec<_>>(),
+            "anchor": { "height": accepted.anchor.height, "position": accepted.anchor.position },
+            "confirmations": index.confirmations_at(accepted.anchor.height),
+            "tip_height": tip,
+            "ownership_source": "authenticated_public_operation",
         })),
         Err(reason) => Ok(json!({
             "status": "rejected",

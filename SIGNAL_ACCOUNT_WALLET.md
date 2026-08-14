@@ -268,7 +268,13 @@ The lifecycle is intentionally two-stage:
    gates signing on the prepared checkpoint.
 5. `operation broadcast --operation-id ID --sat-per-vb RATE` signs, persists,
    and attempts direct P2P broadcast. `operation status`, `resume`, `cancel`,
-   and `fee-bump` expose the durable recovery path.
+   `fee-bump`, and `refresh-spv --scan-config scan.json` expose the durable
+   recovery path. The last command first syncs/registers the caller-owned scan
+   cache, then asks the Rust-owned multi-peer compact-filter verifier to settle
+   an already-confirmed operation; it accepts no host-supplied confirmation
+   flag. For an outgoing mint, ownership is checked against the exact public
+   recipient stored in the durable operation; the issuer never needs and never
+   claims to hold the recipient's secret.
 
 Signal consumes only public manifests selected through its reviewed
 `usd_issuers` policy. An unrelated operator may create another instrument, but
