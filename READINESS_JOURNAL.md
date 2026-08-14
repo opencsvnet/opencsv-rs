@@ -186,6 +186,13 @@ accelerator therefore leaves the newest candidate and stock mapping unchanged.
 Reserve replacement change is additionally required to remain above the exact
 script dust floor; protected outputs and ordering are still immutable.
 
+The first remediation draft also made candidate reconciliation a prerequisite
+for crash-resume. That would have let an accelerator outage prevent direct P2P
+rebroadcast of the already-persisted current transaction. The final path skips
+definitively rejected candidate hints, records transient reconciliation
+failure, and continues the exact current-byte resume. Settlement still fails
+closed until the verified-chain check succeeds.
+
 The rejected alternative was switching candidates immediately after a public
 API reported `confirmed`. That would have made an accelerator authoritative
 during an RBF race. Full CBF and FFI suites passed with deterministic reorg,

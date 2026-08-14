@@ -3460,6 +3460,7 @@ impl AccountWallet {
                     "reserve replacement has no pending stocks",
                 ));
             }
+            let mut candidate_verified = true;
             for (vout, value_sats) in &stocks {
                 let vout = u32::try_from(*vout)
                     .map_err(|_| AccountError::new("database_corrupt", "stock vout exceeds u32"))?;
@@ -3475,11 +3476,24 @@ impl AccountWallet {
                         "reserve replacement stock differs from its persisted transaction",
                     ));
                 }
-                self.funding_verifier.verify(&FundingVerificationRequest {
+                match self.funding_verifier.verify(&FundingVerificationRequest {
                     outpoint: OutPoint::new(txid, vout),
                     txout: expected,
                     birth_height: u64::from(block_height),
-                })?;
+                }) {
+                    Ok(_) => {}
+                    Err(error)
+                        if !error.retryable
+                            && matches!(error.code, "stale_chain_state" | "conflicting_operation") =>
+                    {
+                        candidate_verified = false;
+                        break;
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+            if !candidate_verified {
+                continue;
             }
             let mut receipt = current["receipt"].clone();
             let receipt_object = receipt.as_object_mut().ok_or_else(|| {
@@ -3612,11 +3626,22 @@ impl AccountWallet {
     /// Reapply and rebroadcast an exact persisted reserve-maintenance
     /// transaction after a crash. No new outputs or coin selection occur.
     pub fn resume_batch_reserves(&mut self, maintenance_id: &str) -> Result<Value, AccountError> {
-        if let Some((restored, _)) =
-            self.reconcile_confirmed_batch_reserve_replacement(maintenance_id)?
+        let reconciliation_error = match self
+            .reconcile_confirmed_batch_reserve_replacement(maintenance_id)
         {
-            return Ok(restored);
-        }
+            Ok(Some((restored, _))) => return Ok(restored),
+            Ok(None) => None,
+            Err(error)
+                if error.retryable
+                    || matches!(
+                        error.code,
+                        "sync_failed" | "stale_chain_state" | "conflicting_operation"
+                    ) =>
+            {
+                Some(error)
+            }
+            Err(error) => return Err(error),
+        };
         let current = self.batch_reserve_operation_json(maintenance_id)?;
         if !matches!(
             current["state"].as_str(),
@@ -3648,6 +3673,14 @@ impl AccountWallet {
         let client = self.esplora_client();
         let fallback = relay_via_esplora_if_unobserved(&client, &transaction);
         let mut receipt = current["receipt"].clone();
+        if let Some(error) = reconciliation_error {
+            receipt["resume_candidate_reconciliation"] = json!({
+                "result": "unavailable",
+                "reason": error.code,
+                "detail": error.message,
+                "retryable": error.retryable,
+            });
+        }
         receipt["resume_p2p_submissions"] = json!(p2p_submissions);
         receipt["resume_p2p_peers"] = json!(relay_peers);
         receipt["resume_generic_relay_fallback"] = json!(matches!(&fallback, Ok(true)));
@@ -14032,11 +14065,9 @@ mod tests {
 
         let (esplora_url, server) = confirmed_status_server(321_001);
         wallet.config.esplora_url = esplora_url;
-        let error = wallet.resume_batch_reserves(maintenance_id).unwrap_err();
+        let unchanged = wallet.resume_batch_reserves(maintenance_id).unwrap();
         server.join().unwrap();
-        assert_eq!(error.code, "conflicting_operation");
 
-        let unchanged = wallet.batch_reserve_operation_json(maintenance_id).unwrap();
         assert_eq!(unchanged["txid"], replacement_txid);
         assert_eq!(
             unchanged["receipt"]["replacement_candidates"][0]["txid"],
@@ -14052,6 +14083,54 @@ mod tests {
             )
             .unwrap();
         assert_eq!(replacement_stocks, 3);
+    }
+
+    #[test]
+    fn reserve_resume_records_unavailable_reconciliation_and_rebroadcasts_current_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wallet.sqlite");
+        let key = [71u8; 32];
+        let mut wallet = AccountWallet::open(
+            &config_with_url(AccountRole::Primary, true, "http://127.0.0.1:1"),
+            &key,
+            path.to_str().unwrap(),
+        )
+        .unwrap();
+        fund(&mut wallet, 100_000);
+        let prepared = wallet
+            .prepare_batch_reserves(
+                2,
+                &json!({ "target_sat_per_vb": 1, "max_fee_sats": 5_000 }).to_string(),
+            )
+            .unwrap();
+        let maintenance_id = prepared["maintenance_id"].as_str().unwrap();
+        let bumped = wallet.fee_bump_batch_reserves(maintenance_id, 4).unwrap();
+        let replacement_txid = bumped["txid"].as_str().unwrap().to_owned();
+        let replacement_hex = bumped["signed_tx_hex"].as_str().unwrap().to_owned();
+        use_scripted_verifier(
+            &mut wallet,
+            [VerificationVerdict::RetryableReject(
+                "chain_verification_unavailable",
+                "compact-filter peers are temporarily unavailable",
+            )],
+        );
+
+        let (esplora_url, server) = confirmed_status_server(321_002);
+        wallet.config.esplora_url = esplora_url;
+        let resumed = wallet.resume_batch_reserves(maintenance_id).unwrap();
+        server.join().unwrap();
+
+        assert_eq!(resumed["state"], "broadcast_unobserved");
+        assert_eq!(resumed["txid"], replacement_txid);
+        assert_eq!(resumed["signed_tx_hex"], replacement_hex);
+        assert_eq!(
+            resumed["receipt"]["resume_candidate_reconciliation"]["reason"],
+            "chain_verification_unavailable"
+        );
+        assert_eq!(
+            resumed["receipt"]["resume_candidate_reconciliation"]["retryable"],
+            true
+        );
     }
 
     #[test]
