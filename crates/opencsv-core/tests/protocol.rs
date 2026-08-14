@@ -430,6 +430,21 @@ fn authenticated_public_owner_can_verify_outgoing_mint_without_its_secret() {
     assert_eq!(accepted.coins.len(), 1);
     assert_eq!(accepted.coins[0].owner, recipient);
     assert_eq!(accepted.anchor, anchor_ref.location);
+
+    let wrong_owner = secret(9).owner();
+    let rejected = accept_for_public_owners(
+        &consignment,
+        &chain,
+        &MockVerifier,
+        &PublicOwnerAcceptParams {
+            vk: VK,
+            required_confirmations: 6,
+            recipient_owners: &[wrong_owner],
+            known_assets: &[],
+        },
+    )
+    .expect_err("an unrelated public owner must not verify the outgoing mint");
+    assert_eq!(rejected, RejectReason::NoOwnedOutput);
 }
 
 #[test]
