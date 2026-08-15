@@ -34,6 +34,10 @@ Limited and general releases remain bounded by the committed ceilings at
 intent creation and again before proof/signing, so application configuration
 cannot raise them. Cancelled or protocol-rejected intents stop consuming the
 rolling-day allowance; live and completed intents continue to count.
+When exact transaction bytes are signed and persisted, their receipt snapshots
+the authorizing registry version, commitment, rollout, and miner-fee ceiling.
+A later registry change therefore cannot raise that operation's RBF exposure
+or strand its protocol-safe recovery by lowering the current ceiling.
 Until a valid nonempty release is present, status returns
 `write_block_reason: "production_usd_not_configured"`, and every new consumer
 transfer, batch, proof, signing, and wallet-internal reserve-split path fails

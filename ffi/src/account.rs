@@ -3305,6 +3305,7 @@ impl AccountWallet {
             "fee_sats": fee.to_sat(),
             "fee_rate_sat_per_vb": policy.target_sat_per_vb,
         });
+        self.stamp_production_rollout_authorization(&mut receipt);
         let now = unix_time()?;
         self.db.conn.execute_batch("BEGIN IMMEDIATE")?;
         let persisted = (|| -> Result<(), AccountError> {
@@ -3489,8 +3490,7 @@ impl AccountWallet {
             })?
             .to_sat();
         if self
-            .config
-            .max_fee_sats
+            .signed_fee_limit(&current["receipt"])?
             .is_some_and(|limit| replacement_fee_sats > limit)
         {
             return Err(AccountError::new(
@@ -5335,6 +5335,7 @@ impl AccountWallet {
             batch_receipt["signed_at"] = json!(now);
             batch_receipt["stock_verification"] = json!(stock_verification);
             batch_receipt["phase_timings_ms"] = phase_timings_ms.clone();
+            self.stamp_production_rollout_authorization(&mut batch_receipt);
             self.db.conn.execute(
                 "UPDATE opencsv_send_batches
                  SET state = 'signed_persisted', signed_tx_hex = ?2,
@@ -5369,6 +5370,7 @@ impl AccountWallet {
                         "missing member verification"
                     ))?);
                 receipt["phase_timings_ms"] = phase_timings_ms.clone();
+                self.stamp_production_rollout_authorization(&mut receipt);
                 self.db.conn.execute(
                     "UPDATE opencsv_operations
                      SET state = 'signed_persisted', signed_tx_hex = ?2,
@@ -5891,9 +5893,13 @@ impl AccountWallet {
         let replacement = manifest
             .replacement(&proposal, target_sat_per_vb)
             .map_err(batch_protocol_error)?;
+        let mut batch_receipt: Value = batch
+            .receipt_json
+            .as_deref()
+            .and_then(|encoded| serde_json::from_str(encoded).ok())
+            .unwrap_or_else(|| json!({}));
         if self
-            .config
-            .max_fee_sats
+            .signed_fee_limit(&batch_receipt)?
             .is_some_and(|limit| replacement.miner_fee() > limit)
         {
             return Err(AccountError::new(
@@ -5971,11 +5977,6 @@ impl AccountWallet {
             ));
         }
         let now = unix_time()?;
-        let mut batch_receipt: Value = batch
-            .receipt_json
-            .as_deref()
-            .and_then(|encoded| serde_json::from_str(encoded).ok())
-            .unwrap_or_else(|| json!({}));
         batch_receipt["replaces"] = json!(original_txid.to_string());
         batch_receipt["txid"] = json!(replacement_txid.to_string());
         batch_receipt["replacement_epoch"] = json!(replacement.replacement_epoch());
@@ -6679,6 +6680,7 @@ impl AccountWallet {
             "delivery_nonce": operation.delivery_nonce,
             "phase_timings_ms": phase_timings_ms,
         });
+        self.stamp_production_rollout_authorization(&mut receipt);
         self.db.conn.execute(
             "UPDATE opencsv_operations
              SET state = ?2, signed_tx_hex = ?3, txid = ?4,
@@ -7425,9 +7427,13 @@ impl AccountWallet {
                     "replacement outputs exceed the protected funding input",
                 )
             })?;
+        let mut receipt: Value = operation
+            .receipt_json
+            .as_deref()
+            .and_then(|encoded| serde_json::from_str(encoded).ok())
+            .unwrap_or_else(|| json!({}));
         if self
-            .config
-            .max_fee_sats
+            .signed_fee_limit(&receipt)?
             .is_some_and(|limit| replacement_fee_sats > limit)
         {
             return Err(AccountError::new(
@@ -7435,11 +7441,6 @@ impl AccountWallet {
                 format!("{replacement_fee_sats} sats exceeds configured maximum"),
             ));
         }
-        let mut receipt: Value = operation
-            .receipt_json
-            .as_deref()
-            .and_then(|encoded| serde_json::from_str(encoded).ok())
-            .unwrap_or_else(|| json!({}));
         let receipt_object = receipt.as_object_mut().ok_or_else(|| {
             AccountError::new("database_corrupt", "operation receipt is not an object")
         })?;
@@ -8843,6 +8844,57 @@ impl AccountWallet {
             (None, Some(account)) => Some(account),
             (None, None) => None,
         }
+    }
+
+    fn production_rollout_authorization(&self) -> Option<Value> {
+        (self.config.network == "mainnet")
+            .then(|| {
+                self.config.production_usd_registry.as_ref().map(|release| {
+                    json!({
+                        "release": release,
+                    })
+                })
+            })
+            .flatten()
+    }
+
+    fn stamp_production_rollout_authorization(&self, receipt: &mut Value) {
+        if let Some(authorization) = self.production_rollout_authorization() {
+            receipt["production_rollout_authorization"] = authorization;
+        }
+    }
+
+    fn signed_fee_limit(&self, receipt: &Value) -> Result<Option<u64>, AccountError> {
+        let Some(authorization) = receipt.get("production_rollout_authorization") else {
+            return Ok(self.config.max_fee_sats);
+        };
+        let release = serde_json::from_value::<ProductionUsdRegistryRelease>(
+            authorization["release"].clone(),
+        )
+        .map_err(|error| {
+            AccountError::new(
+                "database_corrupt",
+                format!("signed production rollout authorization: {error}"),
+            )
+        })?;
+        if self.config.network != "mainnet"
+            || release.format_version != PRODUCTION_USD_REGISTRY_FORMAT_VERSION
+            || release.registry_version == 0
+            || release.deployment_id != self.config.deployment_id
+        {
+            return Err(AccountError::new(
+                "database_corrupt",
+                "signed production rollout authorization has the wrong deployment identity",
+            ));
+        }
+        validate_production_rollout_policy(&release.rollout)?;
+        if production_usd_registry_commitment(&release)? != release.commitment_sha256 {
+            return Err(AccountError::new(
+                "database_corrupt",
+                "signed production rollout authorization commitment does not match its release",
+            ));
+        }
+        Ok(Some(release.rollout.max_miner_fee_sats))
     }
 
     fn require_production_transfer_amount(
@@ -13099,6 +13151,99 @@ mod tests {
         wallet.transfer_plan(&request(1, 3)).unwrap();
         let error = wallet.transfer_plan(&request(10, 4)).unwrap_err();
         assert_eq!(error.code, "production_operation_limit_exceeded");
+    }
+
+    #[test]
+    fn production_rollout_rechecks_unsigned_operations_before_signing() {
+        let config = mainnet_config(vec![mainnet_usd_issuer_policy(88)]);
+        let config_value: Value = serde_json::from_str(&config).unwrap();
+        let release = serde_json::from_value::<ProductionUsdRegistryRelease>(
+            config_value["production_usd_registry"].clone(),
+        )
+        .unwrap();
+        let asset_id = hex_encode(release.issuers[0].manifest.genesis.asset_id().as_bytes());
+        let dir = tempfile::tempdir().unwrap();
+        let mut wallet = AccountWallet::open(
+            &config,
+            &[88_u8; 32],
+            dir.path().join("wallet.sqlite").to_str().unwrap(),
+        )
+        .unwrap();
+        let planned = wallet
+            .transfer_plan(
+                &json!({
+                    "asset_id": asset_id,
+                    "to_owner": hex_encode(&[89_u8; 32]),
+                    "amount": 10,
+                })
+                .to_string(),
+            )
+            .unwrap();
+        let operation_id = planned["operation_id"].as_str().unwrap();
+        wallet
+            .db
+            .conn
+            .execute(
+                "UPDATE opencsv_operations SET state = 'proof_ready', backup_acked = 1
+                 WHERE operation_id = ?1",
+                [operation_id],
+            )
+            .unwrap();
+        wallet
+            .config
+            .production_usd_registry
+            .as_mut()
+            .unwrap()
+            .rollout
+            .max_transfer_base_units = 5;
+
+        let error = wallet
+            .sign_and_broadcast(operation_id, r#"{"target_sat_per_vb":1}"#)
+            .unwrap_err();
+        assert_eq!(error.code, "production_value_limit_exceeded");
+        assert_eq!(
+            wallet.operation(operation_id).unwrap().state,
+            OperationState::Cancelled.as_str()
+        );
+    }
+
+    #[test]
+    fn signed_production_fee_authorization_survives_registry_changes() {
+        let config = rewrite_mainnet_release(
+            &mainnet_config(vec![mainnet_usd_issuer_policy(89)]),
+            |release| release.rollout.max_miner_fee_sats = 5_000,
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let mut wallet = AccountWallet::open(
+            &config,
+            &[89_u8; 32],
+            dir.path().join("wallet.sqlite").to_str().unwrap(),
+        )
+        .unwrap();
+        let mut receipt = json!({});
+        wallet.stamp_production_rollout_authorization(&mut receipt);
+        assert_eq!(
+            receipt["production_rollout_authorization"]["release"]["rollout"]
+                ["max_miner_fee_sats"],
+            5_000
+        );
+        wallet.config.max_fee_sats = Some(1_000);
+        wallet
+            .config
+            .production_usd_registry
+            .as_mut()
+            .unwrap()
+            .rollout
+            .max_miner_fee_sats = 1_000;
+        assert_eq!(wallet.signed_fee_limit(&receipt).unwrap(), Some(5_000));
+        wallet.config.max_fee_sats = Some(50_000);
+        assert_eq!(wallet.signed_fee_limit(&receipt).unwrap(), Some(5_000));
+        receipt["production_rollout_authorization"]["release"]["rollout"]
+            ["max_miner_fee_sats"] = json!(50_000);
+        assert_eq!(
+            wallet.signed_fee_limit(&receipt).unwrap_err().code,
+            "database_corrupt"
+        );
     }
 
     #[test]
