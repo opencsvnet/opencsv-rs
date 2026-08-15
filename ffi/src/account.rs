@@ -20,7 +20,9 @@ use bdk_wallet::bitcoin::consensus::encode::{deserialize, serialize};
 use bdk_wallet::bitcoin::constants::genesis_block;
 use bdk_wallet::bitcoin::hashes::{sha256, Hash as _};
 use bdk_wallet::bitcoin::script::PushBytesBuf;
-use bdk_wallet::bitcoin::secp256k1::{PublicKey, Secp256k1, SecretKey};
+use bdk_wallet::bitcoin::secp256k1::{
+    ecdsa::Signature as EcdsaSignature, Message, PublicKey, Secp256k1, SecretKey,
+};
 use bdk_wallet::bitcoin::{
     Amount, FeeRate, Network, OutPoint, ScriptBuf, Sequence, Transaction, Txid,
 };
@@ -3305,7 +3307,7 @@ impl AccountWallet {
             "fee_sats": fee.to_sat(),
             "fee_rate_sat_per_vb": policy.target_sat_per_vb,
         });
-        self.stamp_production_rollout_authorization(&mut receipt);
+        self.stamp_production_rollout_authorization(&mut receipt, &maintenance_id)?;
         let now = unix_time()?;
         self.db.conn.execute_batch("BEGIN IMMEDIATE")?;
         let persisted = (|| -> Result<(), AccountError> {
@@ -3490,7 +3492,7 @@ impl AccountWallet {
             })?
             .to_sat();
         if self
-            .signed_fee_limit(&current["receipt"])?
+            .signed_fee_limit(&current["receipt"], maintenance_id)?
             .is_some_and(|limit| replacement_fee_sats > limit)
         {
             return Err(AccountError::new(
@@ -5335,7 +5337,7 @@ impl AccountWallet {
             batch_receipt["signed_at"] = json!(now);
             batch_receipt["stock_verification"] = json!(stock_verification);
             batch_receipt["phase_timings_ms"] = phase_timings_ms.clone();
-            self.stamp_production_rollout_authorization(&mut batch_receipt);
+            self.stamp_production_rollout_authorization(&mut batch_receipt, batch_local_id)?;
             self.db.conn.execute(
                 "UPDATE opencsv_send_batches
                  SET state = 'signed_persisted', signed_tx_hex = ?2,
@@ -5370,7 +5372,10 @@ impl AccountWallet {
                         "missing member verification"
                     ))?);
                 receipt["phase_timings_ms"] = phase_timings_ms.clone();
-                self.stamp_production_rollout_authorization(&mut receipt);
+                self.stamp_production_rollout_authorization(
+                    &mut receipt,
+                    &member.operation_id,
+                )?;
                 self.db.conn.execute(
                     "UPDATE opencsv_operations
                      SET state = 'signed_persisted', signed_tx_hex = ?2,
@@ -5899,7 +5904,7 @@ impl AccountWallet {
             .and_then(|encoded| serde_json::from_str(encoded).ok())
             .unwrap_or_else(|| json!({}));
         if self
-            .signed_fee_limit(&batch_receipt)?
+            .signed_fee_limit(&batch_receipt, batch_local_id)?
             .is_some_and(|limit| replacement.miner_fee() > limit)
         {
             return Err(AccountError::new(
@@ -6680,7 +6685,7 @@ impl AccountWallet {
             "delivery_nonce": operation.delivery_nonce,
             "phase_timings_ms": phase_timings_ms,
         });
-        self.stamp_production_rollout_authorization(&mut receipt);
+        self.stamp_production_rollout_authorization(&mut receipt, operation_id)?;
         self.db.conn.execute(
             "UPDATE opencsv_operations
              SET state = ?2, signed_tx_hex = ?3, txid = ?4,
@@ -7433,7 +7438,7 @@ impl AccountWallet {
             .and_then(|encoded| serde_json::from_str(encoded).ok())
             .unwrap_or_else(|| json!({}));
         if self
-            .signed_fee_limit(&receipt)?
+            .signed_fee_limit(&receipt, operation_id)?
             .is_some_and(|limit| replacement_fee_sats > limit)
         {
             return Err(AccountError::new(
@@ -8846,25 +8851,59 @@ impl AccountWallet {
         }
     }
 
-    fn production_rollout_authorization(&self) -> Option<Value> {
-        (self.config.network == "mainnet")
-            .then(|| {
-                self.config.production_usd_registry.as_ref().map(|release| {
-                    json!({
-                        "release": release,
-                    })
-                })
-            })
+    fn production_authorization_secret(&self) -> Result<SecretKey, AccountError> {
+        let fee_seed = self.bitcoin_fee_seed.as_ref().ok_or_else(|| {
+            AccountError::new(
+                "database_corrupt",
+                "production authorization needs the primary Bitcoin fee seed",
+            )
+        })?;
+        let derived = Zeroizing::new(derive::<32>(
+            fee_seed.as_ref(),
+            b"production-rollout-authorization-v1",
+            self.config.deployment_id.as_bytes(),
+        )?);
+        SecretKey::from_slice(derived.as_ref()).map_err(|_| {
+            AccountError::new(
+                "key_derivation_failed",
+                "derived production authorization key is not a valid secp256k1 scalar",
+            )
+        })
+    }
+
+    fn stamp_production_rollout_authorization(
+        &self,
+        receipt: &mut Value,
+        operation_identity: &str,
+    ) -> Result<(), AccountError> {
+        let Some(release) = (self.config.network == "mainnet")
+            .then(|| self.config.production_usd_registry.as_ref())
             .flatten()
+        else {
+            return Ok(());
+        };
+        let digest = production_rollout_authorization_digest(
+            &self.config.deployment_id,
+            operation_identity,
+            &release.commitment_sha256,
+        )?;
+        let signature = Secp256k1::new().sign_ecdsa(
+            &Message::from_digest(digest),
+            &self.production_authorization_secret()?,
+        );
+        receipt["production_rollout_authorization"] = json!({
+            "release": release,
+            "operation_identity": operation_identity,
+            "signature_compact": hex_encode(&signature.serialize_compact()),
+        });
+        Ok(())
     }
 
-    fn stamp_production_rollout_authorization(&self, receipt: &mut Value) {
-        if let Some(authorization) = self.production_rollout_authorization() {
-            receipt["production_rollout_authorization"] = authorization;
-        }
-    }
-
-    fn signed_fee_limit(&self, receipt: &Value) -> Result<Option<u64>, AccountError> {
+    fn signed_fee_limit(
+        &self,
+        receipt: &Value,
+        expected_operation_identity: &str,
+    ) -> Result<Option<u64>, AccountError> {
         let Some(authorization) = receipt.get("production_rollout_authorization") else {
             if self.config.network == "mainnet" {
                 return Err(AccountError::new(
@@ -8900,6 +8939,44 @@ impl AccountWallet {
                 "signed production rollout authorization commitment does not match its release",
             ));
         }
+        if authorization["operation_identity"].as_str() != Some(expected_operation_identity) {
+            return Err(AccountError::new(
+                "database_corrupt",
+                "signed production rollout authorization belongs to another operation",
+            ));
+        }
+        let signature_bytes = hex_decode(
+            authorization["signature_compact"]
+                .as_str()
+                .ok_or_else(|| {
+                    AccountError::new(
+                        "database_corrupt",
+                        "signed production rollout authorization has no signature",
+                    )
+                })?,
+            "production rollout authorization signature",
+        )?;
+        let signature = EcdsaSignature::from_compact(&signature_bytes).map_err(|_| {
+            AccountError::new(
+                "database_corrupt",
+                "signed production rollout authorization signature is malformed",
+            )
+        })?;
+        let digest = production_rollout_authorization_digest(
+            &self.config.deployment_id,
+            expected_operation_identity,
+            &release.commitment_sha256,
+        )?;
+        let secp = Secp256k1::new();
+        let public_key =
+            PublicKey::from_secret_key(&secp, &self.production_authorization_secret()?);
+        secp.verify_ecdsa(&Message::from_digest(digest), &signature, &public_key)
+            .map_err(|_| {
+                AccountError::new(
+                    "database_corrupt",
+                    "signed production rollout authorization signature does not verify",
+                )
+            })?;
         Ok(Some(release.rollout.max_miner_fee_sats))
     }
 
@@ -12014,6 +12091,34 @@ struct ProductionUsdRegistryCommitmentPayload<'a> {
     approval_receipts: &'a [String],
 }
 
+#[derive(Serialize)]
+struct ProductionRolloutAuthorizationPayload<'a> {
+    domain: &'static str,
+    deployment_id: &'a str,
+    operation_identity: &'a str,
+    release_commitment_sha256: &'a str,
+}
+
+fn production_rollout_authorization_digest(
+    deployment_id: &str,
+    operation_identity: &str,
+    release_commitment_sha256: &str,
+) -> Result<[u8; 32], AccountError> {
+    let canonical = serde_json::to_vec(&ProductionRolloutAuthorizationPayload {
+        domain: "OpenCSV-production-rollout-authorization-v1",
+        deployment_id,
+        operation_identity,
+        release_commitment_sha256,
+    })
+    .map_err(|error| {
+        AccountError::new(
+            "database_corrupt",
+            format!("encode production rollout authorization: {error}"),
+        )
+    })?;
+    Ok(sha256::Hash::hash(&canonical).to_byte_array())
+}
+
 fn production_usd_registry_commitment(
     release: &ProductionUsdRegistryRelease,
 ) -> Result<String, AccountError> {
@@ -13222,7 +13327,12 @@ mod tests {
             signet_dir.path().join("wallet.sqlite").to_str().unwrap(),
         )
         .unwrap();
-        assert_eq!(signet.signed_fee_limit(&json!({})).unwrap(), None);
+        assert_eq!(
+            signet
+                .signed_fee_limit(&json!({}), "legacy-signet-operation")
+                .unwrap(),
+            None
+        );
 
         let config = rewrite_mainnet_release(
             &mainnet_config(vec![mainnet_usd_issuer_policy(89)]),
@@ -13236,15 +13346,34 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            wallet.signed_fee_limit(&json!({})).unwrap_err().code,
+            wallet
+                .signed_fee_limit(&json!({}), "operation-89")
+                .unwrap_err()
+                .code,
             "database_corrupt"
         );
         let mut receipt = json!({});
-        wallet.stamp_production_rollout_authorization(&mut receipt);
+        wallet
+            .stamp_production_rollout_authorization(&mut receipt, "operation-89")
+            .unwrap();
         assert_eq!(
             receipt["production_rollout_authorization"]["release"]["rollout"]
                 ["max_miner_fee_sats"],
             5_000
+        );
+        assert_eq!(
+            receipt["production_rollout_authorization"]["signature_compact"]
+                .as_str()
+                .unwrap()
+                .len(),
+            128
+        );
+        assert_eq!(
+            wallet
+                .signed_fee_limit(&receipt, "another-operation")
+                .unwrap_err()
+                .code,
+            "database_corrupt"
         );
         wallet.config.max_fee_sats = Some(1_000);
         wallet
@@ -13254,13 +13383,39 @@ mod tests {
             .unwrap()
             .rollout
             .max_miner_fee_sats = 1_000;
-        assert_eq!(wallet.signed_fee_limit(&receipt).unwrap(), Some(5_000));
+        assert_eq!(
+            wallet.signed_fee_limit(&receipt, "operation-89").unwrap(),
+            Some(5_000)
+        );
         wallet.config.max_fee_sats = Some(50_000);
-        assert_eq!(wallet.signed_fee_limit(&receipt).unwrap(), Some(5_000));
+        assert_eq!(
+            wallet.signed_fee_limit(&receipt, "operation-89").unwrap(),
+            Some(5_000)
+        );
+        let mut self_consistent_forgery = receipt.clone();
+        let mut forged_release = serde_json::from_value::<ProductionUsdRegistryRelease>(
+            self_consistent_forgery["production_rollout_authorization"]["release"].clone(),
+        )
+        .unwrap();
+        forged_release.rollout.max_miner_fee_sats = 50_000;
+        forged_release.commitment_sha256 =
+            production_usd_registry_commitment(&forged_release).unwrap();
+        self_consistent_forgery["production_rollout_authorization"]["release"] =
+            serde_json::to_value(forged_release).unwrap();
+        assert_eq!(
+            wallet
+                .signed_fee_limit(&self_consistent_forgery, "operation-89")
+                .unwrap_err()
+                .code,
+            "database_corrupt"
+        );
         receipt["production_rollout_authorization"]["release"]["rollout"]
             ["max_miner_fee_sats"] = json!(50_000);
         assert_eq!(
-            wallet.signed_fee_limit(&receipt).unwrap_err().code,
+            wallet
+                .signed_fee_limit(&receipt, "operation-89")
+                .unwrap_err()
+                .code,
             "database_corrupt"
         );
     }

@@ -15,6 +15,17 @@ limit without production metadata. Falling back to the live mainnet release
 was rejected because later policy may neither raise the exposure of old signed
 bytes nor retroactively stand in for their missing authorization.
 
+A second adversarial pass then replaced the complete release and recomputed its
+self-hash. Commitment consistency alone cannot authenticate which release
+authorized one operation. Each mainnet snapshot is now signed by a
+deployment-separated key derived inside the Rust wallet, over the release
+commitment and stable solo, batch, or reserve operation identity. A
+self-consistent substituted release, a snapshot copied between operations, a
+missing signature, and malformed signature bytes all fail as database
+corruption. Reusing the release commitment as its own authenticator was
+rejected because an attacker able to rewrite the receipt can recompute an
+unkeyed hash.
+
 ## 2026-08-15 — production issuer policy is an exact release input
 
 The initial mainnet gate considered any nonempty, internally valid

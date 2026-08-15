@@ -238,6 +238,12 @@ containing application release authenticates this immutable input through its
 normal distribution signature; the public receipts do not by themselves
 prove issuer backing, solvency, legal authority, or brand control.
 
+Every signed production operation also carries the complete release snapshot
+plus a Rust-wallet signature over its commitment and stable operation identity.
+This makes a self-consistent substituted release, a snapshot copied between
+operations, or missing authentication fail as database corruption during RBF;
+the live host policy is never substituted for the original authorization.
+
 Rust persists the highest accepted production registry version plus commitment
 as an atomic database floor and includes it in Secure Backup checkpoints. A
 client downgrade therefore opens read-only with
