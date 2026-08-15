@@ -239,10 +239,13 @@ pub(crate) fn validate_production_issuance_policy(
                 "production issuance authority key is not a secp256k1 public key",
             )
         })?;
-        if key.serialize().as_slice() != bytes.as_slice() {
+        let canonical = key.serialize();
+        if canonical.as_slice() != bytes.as_slice()
+            || encoded != &to_hex(&canonical)
+        {
             return Err(ValidationError::new(
                 "invalid_production_issuance_policy",
-                "production issuance authority keys must use compressed canonical encoding",
+                "production issuance authority keys must use lowercase compressed canonical encoding",
             ));
         }
         if previous_key.is_some_and(|previous| previous >= encoded.as_str()) {
@@ -252,7 +255,7 @@ pub(crate) fn validate_production_issuance_policy(
             ));
         }
         previous_key = Some(encoded);
-        keys.insert(encoded);
+        keys.insert(canonical);
     }
     if usize::from(policy.signature_threshold) < 2
         || usize::from(policy.signature_threshold) > keys.len()
@@ -924,6 +927,27 @@ mod tests {
         .unwrap_err()
         .message
         .contains("unauthorized key"));
+    }
+
+    #[test]
+    fn authority_key_text_cannot_duplicate_one_signer() {
+        let mut policy = policy();
+        let same_key = policy.authority_public_keys[0].clone();
+        policy.authority_public_keys = vec![same_key.to_uppercase(), same_key];
+        policy.authority_public_keys.sort();
+        policy.signature_threshold = 2;
+        policy.commitment_sha256 = production_issuance_policy_commitment(&policy).unwrap();
+
+        let error = validate_production_issuance_policy(
+            &policy,
+            &policy.deployment_id,
+            policy.registry_version,
+            &policy.asset_id,
+            &policy.commitment_sha256,
+        )
+        .unwrap_err();
+        assert_eq!(error.code, "invalid_production_issuance_policy");
+        assert!(error.message.contains("lowercase compressed canonical"));
     }
 
     #[test]

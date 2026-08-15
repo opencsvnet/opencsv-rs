@@ -1,5 +1,20 @@
 # Signet/mainnet readiness decision journal
 
+## 2026-08-15 — threshold keys have one canonical text identity
+
+An adversarial exact-tip pass found that the threshold policy parsed compressed
+secp256k1 keys but deduplicated their submitted hex strings. Because hex parsing
+accepts both cases, one public key could appear once in uppercase and once in
+lowercase, count as two policy members, and reuse one signature under both text
+aliases. That would reduce a declared two-key threshold to one signer.
+
+Policy validation now requires the submitted key to equal the lowercase hex of
+its canonical compressed serialization and deduplicates the serialized key
+bytes. A focused regression presents the same key through uppercase and
+lowercase aliases and requires rejection before authorization verification.
+Case-insensitive comparison alone was rejected because it would leave a second
+canonicalization rule beside the exact commitment encoding.
+
 ## 2026-08-15 — production supply floors are atomic, backup-carried, and replay-safe
 
 The threshold envelope is now admitted at the issuer wallet boundary. Mainnet
@@ -33,7 +48,9 @@ and durable ledger rather than requiring the live policy to remain installed;
 unsigned work does fail closed after removal. Tests cover replay, skipped
 sequence, stale supply, backup round-trip, tampered backup, and signed recovery
 after policy rotation. The full FFI library result is 123 passed, zero failed,
-and three explicitly ignored slow release tests.
+and three explicitly ignored slow release tests. The subsequent canonical-key
+regression raises that exact-head result to 124 passed, zero failed, and three
+ignored; all three pass explicitly in release mode.
 
 ## 2026-08-15 — production issuance uses a distinct threshold authority
 
