@@ -290,6 +290,44 @@ pub struct UsdIssuerPolicy {
     pub priority: u32,
 }
 
+/// Release-authorized production stage. Candidate releases are reviewable but
+/// cannot create Bitcoin writes; limited/general releases may write only
+/// within the exact committed rollout caps.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ProductionActivationPhase {
+    /// Reviewable policy bytes; all fresh consumer Bitcoin writes are blocked.
+    Candidate,
+    /// Explicit limited rollout under the committed caps.
+    Limited,
+    /// Explicit general rollout, still constrained by the committed caps.
+    General,
+}
+
+/// Exact loss/volume envelope committed by a production registry release.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ProductionRolloutPolicy {
+    /// Release-authorized activation stage.
+    pub phase: ProductionActivationPhase,
+    /// Maximum base units in one recipient transfer.
+    pub max_transfer_base_units: u64,
+    /// Maximum combined base units in one frozen multi-recipient batch.
+    pub max_batch_total_base_units: u64,
+    /// Maximum active/completed outgoing base units created in any rolling day.
+    pub max_rolling_24h_outgoing_base_units: u64,
+    /// Maximum active/completed transfer operations created in any rolling day.
+    pub max_rolling_24h_operations: u32,
+    /// Maximum recipients committed into one batch, including one to disable
+    /// explicit multi-recipient batching while retaining solo timeout.
+    pub max_batch_recipients: u8,
+    /// Maximum sats allocated to protected batch stocks and fee cells by one
+    /// wallet-internal reserve-maintenance transaction.
+    pub max_reserve_allocation_sats: u64,
+    /// Absolute miner-fee ceiling for initial transactions and replacements.
+    pub max_miner_fee_sats: u64,
+}
+
 /// Exact production USD registry carried by one reviewed application release.
 ///
 /// The registry is not fetched at spend time. Its commitment binds the
@@ -308,6 +346,8 @@ pub struct ProductionUsdRegistryRelease {
     pub deployment_id: String,
     /// Ordered, exact issuer-specific manifests and selection priorities.
     pub issuers: Vec<UsdIssuerPolicy>,
+    /// Candidate/limited/general stage and exact loss/volume caps.
+    pub rollout: ProductionRolloutPolicy,
     /// Immutable source revision that generated the containing client build.
     pub source_revision: String,
     /// Public review/approval receipts for this exact registry release.
@@ -919,6 +959,10 @@ fn write_block_error(reason: &'static str) -> AccountError {
         "production_registry_conflict" => AccountError::new(
             "production_registry_conflict",
             "the production USD registry reuses a version with different committed bytes",
+        ),
+        "production_activation_not_authorized" => AccountError::new(
+            "production_activation_not_authorized",
+            "this production registry is a candidate and does not authorize consumer Bitcoin writes",
         ),
         "production_observation_policy_required" => AccountError::new(
             "production_observation_policy_required",
@@ -2375,7 +2419,9 @@ impl AccountWallet {
                 "approval_receipts": registry.approval_receipts,
                 "commitment_sha256": registry.commitment_sha256,
                 "issuer_count": registry.issuers.len(),
+                "rollout": registry.rollout,
             })),
+            "production_activation_write_ready": self.production_activation_write_ready(),
             "production_observation_policy_ready": self.production_observation_policy_ready(),
             "issuance_enabled": false,
             "device_binding": {
@@ -3118,6 +3164,38 @@ impl AccountWallet {
         let fee_cell_count = usize::from(participant_count)
             .checked_mul(3)
             .ok_or_else(|| AccountError::new("arithmetic_overflow", "fee cell count overflow"))?;
+        let reserve_allocation_sats = u64::try_from(stock_count)
+            .ok()
+            .and_then(|count| count.checked_mul(opencsv_bitcoin::batch_v2::MIN_OUTPUT_SATS))
+            .and_then(|stocks| {
+                u64::try_from(fee_cell_count)
+                    .ok()
+                    .and_then(|count| count.checked_mul(MIN_FEE_RESERVE_SATS))
+                    .and_then(|fee_cells| stocks.checked_add(fee_cells))
+            })
+            .ok_or_else(|| {
+                AccountError::new("arithmetic_overflow", "reserve allocation overflow")
+            })?;
+        if let Some(rollout) = self.production_rollout_policy() {
+            if participant_count > rollout.max_batch_recipients {
+                return Err(AccountError::new(
+                    "production_batch_limit_exceeded",
+                    format!(
+                        "{participant_count} recipients exceeds the production batch limit of {}",
+                        rollout.max_batch_recipients
+                    ),
+                ));
+            }
+            if reserve_allocation_sats > rollout.max_reserve_allocation_sats {
+                return Err(AccountError::new(
+                    "production_reserve_limit_exceeded",
+                    format!(
+                        "{reserve_allocation_sats} sats exceeds the production reserve-allocation limit of {}",
+                        rollout.max_reserve_allocation_sats
+                    ),
+                ));
+            }
+        }
         let stock_secret = self.batch_stock_secret()?;
         let stock_pubkey = PublicKey::from_secret_key(&Secp256k1::new(), &stock_secret);
         let stock_script =
@@ -3180,8 +3258,8 @@ impl AccountWallet {
         let fee = psbt.fee_amount().ok_or_else(|| {
             AccountError::new("signing_failed", "could not calculate maintenance fee")
         })?;
-        if policy
-            .max_fee_sats
+        if self
+            .effective_fee_limit(policy.max_fee_sats)
             .is_some_and(|maximum| fee.to_sat() > maximum)
         {
             return Err(AccountError::new(
@@ -4270,6 +4348,7 @@ impl AccountWallet {
         self.require_product_write_enabled()?;
         let (request, normalized_request) = normalize_transfer_request(request_json)?;
         self.require_reviewed_usd_asset(&request.asset_id)?;
+        self.require_production_new_transfer_policy(&request)?;
         let operation_id = random_id(16);
         let delivery_nonce = random_id(16);
         self.insert_planned_operation(
@@ -4309,6 +4388,7 @@ impl AccountWallet {
         self.require_product_write_enabled()?;
         let (request, normalized_request) = normalize_transfer_request(request_json)?;
         self.require_reviewed_usd_asset(&request.asset_id)?;
+        self.require_production_new_transfer_policy(&request)?;
         let now_ms = unix_time_millis()?;
         let operation_created_at = unix_time()?;
         let existing = match requested_batch {
@@ -4346,6 +4426,9 @@ impl AccountWallet {
                     "the local batch reached the reviewed C1 participant limit",
                 ));
             }
+            let mut requests = self.transfer_requests_for_batch_members(&members)?;
+            requests.push(request.clone());
+            self.require_production_batch_policy(&requests)?;
             let operation_id = random_id(16);
             let delivery_nonce = random_id(16);
             let ordinal = u8::try_from(members.len()).map_err(|_| {
@@ -4378,6 +4461,7 @@ impl AccountWallet {
                 "the requested Add Recipient batch does not exist",
             ));
         }
+        self.require_production_batch_policy(std::slice::from_ref(&request))?;
         let batch_local_id = random_id(16);
         let operation_id = random_id(16);
         let delivery_nonce = random_id(16);
@@ -4432,6 +4516,11 @@ impl AccountWallet {
                 "send batch contains no operations",
             ));
         }
+        let requests = self.transfer_requests_for_batch_members(&members)?;
+        for request in &requests {
+            self.require_reviewed_transfer(request)?;
+        }
+        self.require_production_batch_policy(&requests)?;
         if batch.state == "collecting" {
             let next_state = if members.len() == 1 { "solo" } else { "frozen" };
             let count = u8::try_from(members.len()).map_err(|_| {
@@ -4583,13 +4672,18 @@ impl AccountWallet {
         // Review every exact instrument before reserving Bitcoin or protocol
         // inputs. A registry change on reopen invalidates the complete
         // unsigned batch; it can never leave a subset looking sendable.
+        let requests = self.transfer_requests_for_batch_members(&members)?;
+        if let Err(error) = self.require_production_batch_policy(&requests) {
+            self.cancel_send_batch(batch_local_id)?;
+            return Err(error);
+        }
         for member in &members {
             let operation = self.operation(&member.operation_id)?;
             let request: TransferRequest =
                 serde_json::from_str(&operation.request_json).map_err(|error| {
                     AccountError::new("database_corrupt", format!("transfer request: {error}"))
                 })?;
-            if let Err(error) = self.require_reviewed_usd_asset(&request.asset_id) {
+            if let Err(error) = self.require_reviewed_transfer(&request) {
                 self.cancel_send_batch(batch_local_id)?;
                 return Err(error);
             }
@@ -4747,12 +4841,21 @@ impl AccountWallet {
         let mut protocol_candidate = self.protocol.as_ref().cloned().ok_or_else(|| {
             AccountError::new("primary_required", "linked devices cannot prove batches")
         })?;
+        let completed_requests = completed
+            .members
+            .iter()
+            .map(|member| member.request.clone())
+            .collect::<Vec<_>>();
+        if let Err(error) = self.require_production_batch_policy(&completed_requests) {
+            self.cancel_send_batch(&completed.batch_local_id)?;
+            return Err(error);
+        }
         protocol_candidate
             .mark_spent(&completed.reconciled_spent_coin_ids)
             .map_err(|error| AccountError::new("database_error", error))?;
         let mut pending_ids = Vec::with_capacity(completed.members.len());
         for member in &completed.members {
-            if let Err(error) = self.require_reviewed_usd_asset(&member.request.asset_id) {
+            if let Err(error) = self.require_reviewed_transfer(&member.request) {
                 self.cancel_send_batch(&completed.batch_local_id)?;
                 return Err(error);
             }
@@ -5036,13 +5139,18 @@ impl AccountWallet {
         })?;
         let proposal = BatchProposal::from_wire(proposal_wire).map_err(batch_protocol_error)?;
         let members = self.send_batch_members(batch_local_id)?;
+        let requests = self.transfer_requests_for_batch_members(&members)?;
+        if let Err(error) = self.require_production_batch_policy(&requests) {
+            self.cancel_send_batch(batch_local_id)?;
+            return Err(error);
+        }
         for member in &members {
             let operation = self.operation(&member.operation_id)?;
             let request: TransferRequest =
                 serde_json::from_str(&operation.request_json).map_err(|error| {
                     AccountError::new("database_corrupt", format!("transfer request: {error}"))
                 })?;
-            if let Err(error) = self.require_reviewed_usd_asset(&request.asset_id) {
+            if let Err(error) = self.require_reviewed_transfer(&request) {
                 self.cancel_send_batch(batch_local_id)?;
                 return Err(error);
             }
@@ -5176,6 +5284,16 @@ impl AccountWallet {
             .map_err(batch_protocol_error)?;
         let manifest = BatchManifest::from_wire(&proposal, commitments, manifest_wire)
             .map_err(batch_protocol_error)?;
+        if self
+            .config
+            .max_fee_sats
+            .is_some_and(|limit| manifest.miner_fee() > limit)
+        {
+            return Err(AccountError::new(
+                "fee_limit_exceeded",
+                format!("{} sats exceeds configured maximum", manifest.miner_fee()),
+            ));
+        }
         phase_timings_ms["pre_sign_verification"] =
             json!(elapsed_millis(pre_sign_verification_started));
         let local_signing_persistence_started = Instant::now();
@@ -6064,7 +6182,7 @@ impl AccountWallet {
                 );
             }
         };
-        if let Err(error) = self.require_reviewed_usd_asset(&request.asset_id) {
+        if let Err(error) = self.require_reviewed_transfer(&request) {
             return self.fail_prebroadcast(operation_id, error);
         }
         let funding = match operation.state.as_str() {
@@ -6137,7 +6255,7 @@ impl AccountWallet {
             .map_err(|error| {
                 AccountError::new("database_corrupt", format!("transfer request: {error}"))
             })?;
-        if let Err(error) = self.require_reviewed_usd_asset(&current_request.asset_id) {
+        if let Err(error) = self.require_reviewed_transfer(&current_request) {
             return self.fail_proof_job(&completed.operation_id, error);
         }
         if current_request.asset_id != completed.request.asset_id
@@ -6418,7 +6536,7 @@ impl AccountWallet {
                 serde_json::from_str(&operation.request_json).map_err(|error| {
                     AccountError::new("database_corrupt", format!("transfer request: {error}"))
                 })?;
-            if let Err(error) = self.require_reviewed_usd_asset(&request.asset_id) {
+            if let Err(error) = self.require_reviewed_transfer(&request) {
                 return self.fail_prebroadcast(operation_id, error);
             }
         }
@@ -6533,8 +6651,8 @@ impl AccountWallet {
         let fee = psbt.fee_amount().ok_or_else(|| {
             AccountError::new("signing_failed", "could not calculate transaction fee")
         })?;
-        if policy
-            .max_fee_sats
+        if self
+            .effective_fee_limit(policy.max_fee_sats)
             .is_some_and(|limit| fee.to_sat() > limit)
         {
             return Err(AccountError::new(
@@ -8580,6 +8698,9 @@ impl AccountWallet {
         if !self.production_usd_configured() {
             return Err(write_block_error("production_usd_not_configured"));
         }
+        if !self.production_activation_write_ready() {
+            return Err(write_block_error("production_activation_not_authorized"));
+        }
         if !self.production_observation_policy_ready() {
             return Err(write_block_error("production_observation_policy_required"));
         }
@@ -8604,6 +8725,20 @@ impl AccountWallet {
             || (self.production_usd_registry_state == ProductionUsdRegistryState::Current
                 && self.config.production_usd_registry.is_some()
                 && !self.config.usd_issuers.is_empty())
+    }
+
+    fn production_activation_write_ready(&self) -> bool {
+        self.config.network != "mainnet"
+            || self
+                .config
+                .production_usd_registry
+                .as_ref()
+                .is_some_and(|registry| {
+                    matches!(
+                        registry.rollout.phase,
+                        ProductionActivationPhase::Limited | ProductionActivationPhase::General
+                    )
+                })
     }
 
     /// Production may use the immutable built-ins or independently hosted
@@ -8658,6 +8793,9 @@ impl AccountWallet {
         if !self.production_usd_configured() {
             return Ok(Some("production_usd_not_configured"));
         }
+        if !self.production_activation_write_ready() {
+            return Ok(Some("production_activation_not_authorized"));
+        }
         if !self.production_observation_policy_ready() {
             return Ok(Some("production_observation_policy_required"));
         }
@@ -8685,6 +8823,180 @@ impl AccountWallet {
             "asset_not_reviewed",
             "the exact asset is not in Signal's reviewed USD issuer registry",
         ))
+    }
+
+    fn production_rollout_policy(&self) -> Option<&ProductionRolloutPolicy> {
+        (self.config.network == "mainnet")
+            .then(|| {
+                self.config
+                    .production_usd_registry
+                    .as_ref()
+                    .map(|registry| &registry.rollout)
+            })
+            .flatten()
+    }
+
+    fn effective_fee_limit(&self, per_call: Option<u64>) -> Option<u64> {
+        match (per_call, self.config.max_fee_sats) {
+            (Some(per_call), Some(account)) => Some(per_call.min(account)),
+            (Some(per_call), None) => Some(per_call),
+            (None, Some(account)) => Some(account),
+            (None, None) => None,
+        }
+    }
+
+    fn require_production_transfer_amount(
+        &self,
+        request: &TransferRequest,
+    ) -> Result<(), AccountError> {
+        let Some(policy) = self.production_rollout_policy() else {
+            return Ok(());
+        };
+        if request.amount > policy.max_transfer_base_units {
+            return Err(AccountError::new(
+                "production_value_limit_exceeded",
+                format!(
+                    "{} base units exceeds the per-transfer production limit of {}",
+                    request.amount, policy.max_transfer_base_units
+                ),
+            ));
+        }
+        Ok(())
+    }
+
+    fn production_rolling_transfer_usage(&self) -> Result<(u64, u64), AccountError> {
+        let cutoff = unix_time()?.saturating_sub(24 * 60 * 60);
+        let mut statement = self.db.conn.prepare(
+            "SELECT request_json FROM opencsv_operations
+             WHERE kind = 'transfer' AND created_at >= ?1
+               AND state NOT IN ('cancelled', 'protocol_rejected')",
+        )?;
+        let rows = statement.query_map([cutoff], |row| row.get::<_, String>(0))?;
+        let mut count = 0_u64;
+        let mut amount = 0_u64;
+        for row in rows {
+            let request = serde_json::from_str::<TransferRequest>(&row?).map_err(|error| {
+                AccountError::new(
+                    "database_corrupt",
+                    format!("rolling transfer request: {error}"),
+                )
+            })?;
+            count = count.checked_add(1).ok_or_else(|| {
+                AccountError::new("database_corrupt", "rolling operation count overflow")
+            })?;
+            amount = amount.checked_add(request.amount).ok_or_else(|| {
+                AccountError::new("database_corrupt", "rolling transfer amount overflow")
+            })?;
+        }
+        Ok((count, amount))
+    }
+
+    fn require_production_existing_transfer_policy(
+        &self,
+        request: &TransferRequest,
+    ) -> Result<(), AccountError> {
+        self.require_production_transfer_amount(request)?;
+        let Some(policy) = self.production_rollout_policy() else {
+            return Ok(());
+        };
+        let (count, amount) = self.production_rolling_transfer_usage()?;
+        if count > u64::from(policy.max_rolling_24h_operations) {
+            return Err(AccountError::new(
+                "production_operation_limit_exceeded",
+                "active/completed rolling-day operation count exceeds current production policy",
+            ));
+        }
+        if amount > policy.max_rolling_24h_outgoing_base_units {
+            return Err(AccountError::new(
+                "production_value_limit_exceeded",
+                "active/completed rolling-day outgoing amount exceeds current production policy",
+            ));
+        }
+        Ok(())
+    }
+
+    fn require_production_new_transfer_policy(
+        &self,
+        request: &TransferRequest,
+    ) -> Result<(), AccountError> {
+        self.require_production_transfer_amount(request)?;
+        let Some(policy) = self.production_rollout_policy() else {
+            return Ok(());
+        };
+        let (count, amount) = self.production_rolling_transfer_usage()?;
+        if count
+            .checked_add(1)
+            .is_none_or(|next| next > u64::from(policy.max_rolling_24h_operations))
+        {
+            return Err(AccountError::new(
+                "production_operation_limit_exceeded",
+                "new transfer would exceed the rolling-day production operation limit",
+            ));
+        }
+        if amount
+            .checked_add(request.amount)
+            .is_none_or(|next| next > policy.max_rolling_24h_outgoing_base_units)
+        {
+            return Err(AccountError::new(
+                "production_value_limit_exceeded",
+                "new transfer would exceed the rolling-day production value limit",
+            ));
+        }
+        Ok(())
+    }
+
+    fn require_production_batch_policy(
+        &self,
+        requests: &[TransferRequest],
+    ) -> Result<(), AccountError> {
+        let Some(policy) = self.production_rollout_policy() else {
+            return Ok(());
+        };
+        if requests.len() > usize::from(policy.max_batch_recipients) {
+            return Err(AccountError::new(
+                "production_batch_limit_exceeded",
+                format!(
+                    "{} recipients exceeds the production batch limit of {}",
+                    requests.len(),
+                    policy.max_batch_recipients
+                ),
+            ));
+        }
+        let total = requests.iter().try_fold(0_u64, |sum, request| {
+            sum.checked_add(request.amount).ok_or_else(|| {
+                AccountError::new("production_value_limit_exceeded", "batch amount overflow")
+            })
+        })?;
+        if total > policy.max_batch_total_base_units {
+            return Err(AccountError::new(
+                "production_value_limit_exceeded",
+                format!(
+                    "{total} base units exceeds the production batch limit of {}",
+                    policy.max_batch_total_base_units
+                ),
+            ));
+        }
+        Ok(())
+    }
+
+    fn transfer_requests_for_batch_members(
+        &self,
+        members: &[SendBatchMember],
+    ) -> Result<Vec<TransferRequest>, AccountError> {
+        members
+            .iter()
+            .map(|member| {
+                let operation = self.operation(&member.operation_id)?;
+                serde_json::from_str::<TransferRequest>(&operation.request_json).map_err(|error| {
+                    AccountError::new("database_corrupt", format!("transfer request: {error}"))
+                })
+            })
+            .collect()
+    }
+
+    fn require_reviewed_transfer(&self, request: &TransferRequest) -> Result<(), AccountError> {
+        self.require_reviewed_usd_asset(&request.asset_id)?;
+        self.require_production_existing_transfer_policy(request)
     }
 
     fn primary_protocol_mut(&mut self) -> Result<&mut MemWallet, AccountError> {
@@ -11639,6 +11951,7 @@ struct ProductionUsdRegistryCommitmentPayload<'a> {
     registry_version: u64,
     deployment_id: &'a str,
     issuers: &'a [UsdIssuerPolicy],
+    rollout: &'a ProductionRolloutPolicy,
     source_revision: &'a str,
     approval_receipts: &'a [String],
 }
@@ -11652,6 +11965,7 @@ fn production_usd_registry_commitment(
         registry_version: release.registry_version,
         deployment_id: &release.deployment_id,
         issuers: &release.issuers,
+        rollout: &release.rollout,
         source_revision: &release.source_revision,
         approval_receipts: &release.approval_receipts,
     })
@@ -11743,6 +12057,7 @@ fn prepare_production_usd_registry(config: &mut AccountConfig) -> Result<(), Acc
             ));
         }
     }
+    validate_production_rollout_policy(&release.rollout)?;
     validate_hex_32_config(
         &release.commitment_sha256,
         "production USD registry commitment",
@@ -11756,6 +12071,70 @@ fn prepare_production_usd_registry(config: &mut AccountConfig) -> Result<(), Acc
     }
 
     config.usd_issuers.clone_from(&release.issuers);
+    config.max_fee_sats = Some(
+        config
+            .max_fee_sats
+            .map_or(release.rollout.max_miner_fee_sats, |host_limit| {
+                host_limit.min(release.rollout.max_miner_fee_sats)
+            }),
+    );
+    Ok(())
+}
+
+fn validate_production_rollout_policy(
+    policy: &ProductionRolloutPolicy,
+) -> Result<(), AccountError> {
+    if policy.max_transfer_base_units == 0
+        || policy.max_batch_total_base_units == 0
+        || policy.max_rolling_24h_outgoing_base_units == 0
+        || policy.max_rolling_24h_operations == 0
+        || policy.max_reserve_allocation_sats == 0
+        || policy.max_miner_fee_sats == 0
+    {
+        return Err(AccountError::new(
+            "invalid_config",
+            "production rollout limits must all be positive",
+        ));
+    }
+    if policy.max_transfer_base_units > policy.max_batch_total_base_units
+        || policy.max_batch_total_base_units > policy.max_rolling_24h_outgoing_base_units
+    {
+        return Err(AccountError::new(
+            "invalid_config",
+            "production transfer limit must not exceed batch or rolling-day limits",
+        ));
+    }
+    let protocol_max = u8::try_from(MAX_LOCAL_BATCH_RECIPIENTS).unwrap_or(u8::MAX);
+    if policy.max_batch_recipients == 0 || policy.max_batch_recipients > protocol_max {
+        return Err(AccountError::new(
+            "invalid_config",
+            format!("production batch recipient limit must be 1..={protocol_max}"),
+        ));
+    }
+    if policy.max_batch_recipients >= 2 {
+        let fee_cells = u64::from(policy.max_batch_recipients)
+            .checked_mul(3)
+            .and_then(|count| count.checked_mul(MIN_FEE_RESERVE_SATS))
+            .ok_or_else(|| {
+                AccountError::new("invalid_config", "production reserve allocation overflows")
+            })?;
+        let stocks = 3_u64
+            .checked_mul(opencsv_bitcoin::batch_v2::MIN_OUTPUT_SATS)
+            .ok_or_else(|| {
+                AccountError::new("invalid_config", "production reserve allocation overflows")
+            })?;
+        let minimum = stocks.checked_add(fee_cells).ok_or_else(|| {
+            AccountError::new("invalid_config", "production reserve allocation overflows")
+        })?;
+        if policy.max_reserve_allocation_sats < minimum {
+            return Err(AccountError::new(
+                "invalid_config",
+                format!(
+                    "production reserve allocation must cover at least {minimum} sats for the configured batch limit"
+                ),
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -12426,6 +12805,17 @@ mod tests {
                 registry_version: 1,
                 deployment_id: "opencsv-mainnet-v1-test".into(),
                 issuers,
+                rollout: ProductionRolloutPolicy {
+                    phase: ProductionActivationPhase::Limited,
+                    max_transfer_base_units: 1_000_000,
+                    max_batch_total_base_units: 10_000_000,
+                    max_rolling_24h_outgoing_base_units: 100_000_000,
+                    max_rolling_24h_operations: 1_000,
+                    max_batch_recipients: u8::try_from(MAX_LOCAL_BATCH_RECIPIENTS)
+                        .unwrap_or(u8::MAX),
+                    max_reserve_allocation_sats: 1_000_000,
+                    max_miner_fee_sats: 100_000,
+                },
                 source_revision: "ab".repeat(20),
                 approval_receipts: vec![
                     "https://github.com/opencsvnet/opencsv/issues/1#unit-test-approval".into(),
@@ -12454,13 +12844,22 @@ mod tests {
         registry_version: u64,
         source_revision_byte: u8,
     ) -> String {
+        rewrite_mainnet_release(config, |release| {
+            release.registry_version = registry_version;
+            release.source_revision = format!("{source_revision_byte:02x}").repeat(20);
+        })
+    }
+
+    fn rewrite_mainnet_release(
+        config: &str,
+        mutate: impl FnOnce(&mut ProductionUsdRegistryRelease),
+    ) -> String {
         let mut value: Value = serde_json::from_str(config).unwrap();
         let mut release = serde_json::from_value::<ProductionUsdRegistryRelease>(
             value["production_usd_registry"].clone(),
         )
         .unwrap();
-        release.registry_version = registry_version;
-        release.source_revision = format!("{source_revision_byte:02x}").repeat(20);
+        mutate(&mut release);
         release.commitment_sha256 = production_usd_registry_commitment(&release).unwrap();
         value["production_usd_registry"] = serde_json::to_value(release).unwrap();
         value.to_string()
@@ -12558,6 +12957,163 @@ mod tests {
             production_usd_registry_commitment(&changed).unwrap(),
             configured_commitment
         );
+    }
+
+    #[test]
+    fn candidate_registry_is_reviewable_but_cannot_create_bitcoin_writes() {
+        let config = rewrite_mainnet_release(
+            &mainnet_config(vec![mainnet_usd_issuer_policy(84)]),
+            |release| release.rollout.phase = ProductionActivationPhase::Candidate,
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let mut wallet = AccountWallet::open(
+            &config,
+            &[84_u8; 32],
+            dir.path().join("wallet.sqlite").to_str().unwrap(),
+        )
+        .unwrap();
+        let status = wallet.status().unwrap();
+        assert_eq!(status["production_usd_configured"], true);
+        assert_eq!(status["production_activation_write_ready"], false);
+        assert_eq!(
+            status["production_usd_registry"]["rollout"]["phase"],
+            "candidate"
+        );
+        assert_eq!(
+            status["write_block_reason"],
+            "production_activation_not_authorized"
+        );
+        let error = wallet
+            .prepare_batch_reserves(
+                2,
+                &json!({ "target_sat_per_vb": 1, "max_fee_sats": 5_000 }).to_string(),
+            )
+            .unwrap_err();
+        assert_eq!(error.code, "production_activation_not_authorized");
+    }
+
+    #[test]
+    fn production_rollout_limits_gate_new_solo_and_batch_intents() {
+        let config = rewrite_mainnet_release(
+            &mainnet_config(vec![mainnet_usd_issuer_policy(85)]),
+            |release| {
+                release.rollout.max_transfer_base_units = 10;
+                release.rollout.max_batch_total_base_units = 12;
+                release.rollout.max_rolling_24h_outgoing_base_units = 100;
+                release.rollout.max_rolling_24h_operations = 10;
+                release.rollout.max_batch_recipients = 2;
+                release.rollout.max_reserve_allocation_sats = 100_000;
+                release.rollout.max_miner_fee_sats = 5_000;
+            },
+        );
+        let mut config_value: Value = serde_json::from_str(&config).unwrap();
+        config_value["max_fee_sats"] = json!(50_000);
+        let config = config_value.to_string();
+        let asset_id = hex_encode(
+            serde_json::from_value::<ProductionUsdRegistryRelease>(
+                config_value["production_usd_registry"].clone(),
+            )
+            .unwrap()
+            .issuers[0]
+                .manifest
+                .genesis
+                .asset_id()
+                .as_bytes(),
+        );
+        let request = |amount: u64, owner: u8| {
+            json!({
+                "asset_id": asset_id,
+                "to_owner": hex_encode(&[owner; 32]),
+                "amount": amount,
+            })
+            .to_string()
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let mut wallet = AccountWallet::open(
+            &config,
+            &[85_u8; 32],
+            dir.path().join("wallet.sqlite").to_str().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(wallet.config.max_fee_sats, Some(5_000));
+
+        let error = wallet.transfer_plan(&request(11, 1)).unwrap_err();
+        assert_eq!(error.code, "production_value_limit_exceeded");
+
+        let first = wallet.transfer_batch_plan(&request(7, 2)).unwrap();
+        let batch_id = first["batch"]["batch_local_id"].as_str().unwrap();
+        let error = wallet
+            .transfer_batch_add_recipient(batch_id, &request(6, 3))
+            .unwrap_err();
+        assert_eq!(error.code, "production_value_limit_exceeded");
+        wallet
+            .transfer_batch_add_recipient(batch_id, &request(5, 3))
+            .unwrap();
+        let error = wallet
+            .transfer_batch_add_recipient(batch_id, &request(1, 4))
+            .unwrap_err();
+        assert_eq!(error.code, "production_batch_limit_exceeded");
+    }
+
+    #[test]
+    fn production_rolling_limits_count_only_live_or_released_intents() {
+        let config = rewrite_mainnet_release(
+            &mainnet_config(vec![mainnet_usd_issuer_policy(86)]),
+            |release| {
+                release.rollout.max_transfer_base_units = 10;
+                release.rollout.max_batch_total_base_units = 10;
+                release.rollout.max_rolling_24h_outgoing_base_units = 20;
+                release.rollout.max_rolling_24h_operations = 2;
+            },
+        );
+        let config_value: Value = serde_json::from_str(&config).unwrap();
+        let release = serde_json::from_value::<ProductionUsdRegistryRelease>(
+            config_value["production_usd_registry"].clone(),
+        )
+        .unwrap();
+        let asset_id = hex_encode(release.issuers[0].manifest.genesis.asset_id().as_bytes());
+        let request = |amount: u64, owner: u8| {
+            json!({
+                "asset_id": asset_id,
+                "to_owner": hex_encode(&[owner; 32]),
+                "amount": amount,
+            })
+            .to_string()
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let mut wallet = AccountWallet::open(
+            &config,
+            &[86_u8; 32],
+            dir.path().join("wallet.sqlite").to_str().unwrap(),
+        )
+        .unwrap();
+
+        let first = wallet.transfer_plan(&request(10, 1)).unwrap();
+        wallet.transfer_plan(&request(10, 2)).unwrap();
+        let error = wallet.transfer_plan(&request(1, 3)).unwrap_err();
+        assert_eq!(error.code, "production_operation_limit_exceeded");
+
+        wallet
+            .cancel_operation(first["operation_id"].as_str().unwrap())
+            .unwrap();
+        wallet.transfer_plan(&request(1, 3)).unwrap();
+        let error = wallet.transfer_plan(&request(10, 4)).unwrap_err();
+        assert_eq!(error.code, "production_operation_limit_exceeded");
+    }
+
+    #[test]
+    fn malformed_production_rollout_policy_is_not_an_activation_release() {
+        let config = rewrite_mainnet_release(
+            &mainnet_config(vec![mainnet_usd_issuer_policy(87)]),
+            |release| {
+                release.rollout.max_transfer_base_units = 11;
+                release.rollout.max_batch_total_base_units = 10;
+            },
+        );
+        let value: Value = serde_json::from_str(&config).unwrap();
+        let error = open_mainnet_config_error(&value, "rollout.sqlite");
+        assert_eq!(error.code, "invalid_config");
+        assert!(error.message.contains("transfer limit"));
     }
 
     #[test]

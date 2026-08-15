@@ -24,7 +24,16 @@ deployment-bound production registry release with at least one fully
 validated, non-test `USD` issuer manifest. Loose top-level `usd_issuers` are
 rejected on mainnet. The registry commitment covers its encoding and policy
 version, deployment, exact ordered manifest set, source revision, and public
-approval receipts; status exposes that identity for independent receipts.
+approval receipts. It also commits a `candidate`, `limited`, or `general`
+activation phase plus the exact per-transfer, per-batch, rolling-day,
+recipient-count, reserve-allocation, and miner-fee ceilings; status exposes
+that identity and rollout envelope for independent receipts. A candidate
+release is intentionally reviewable but returns
+`production_activation_not_authorized` for every fresh Bitcoin write.
+Limited and general releases remain bounded by the committed ceilings at
+intent creation and again before proof/signing, so application configuration
+cannot raise them. Cancelled or protocol-rejected intents stop consuming the
+rolling-day allowance; live and completed intents continue to count.
 Until a valid nonempty release is present, status returns
 `write_block_reason: "production_usd_not_configured"`, and every new consumer
 transfer, batch, proof, signing, and wallet-internal reserve-split path fails
