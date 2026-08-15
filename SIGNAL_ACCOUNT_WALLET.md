@@ -257,7 +257,8 @@ operations, or missing authentication fail as database corruption during RBF;
 the live host policy is never substituted for the original authorization.
 The same check runs before crash rebroadcast of a solo transfer, shared batch,
 or reserve-maintenance transaction, before transaction parsing, chain lookup,
-or network I/O.
+or network I/O. Their fee-bump paths also validate it before chain verification
+or replacement signing.
 
 Production release construction is also kept out of Signal. The separately
 featured, secret-free `opencsv-registry` binary builds and verifies the exact

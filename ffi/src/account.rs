@@ -3408,6 +3408,7 @@ impl AccountWallet {
                 ),
             ));
         }
+        let signed_fee_limit = self.signed_fee_limit(&current["receipt"], maintenance_id)?;
         let original_bytes = hex_decode(
             current["signed_tx_hex"].as_str().ok_or_else(|| {
                 AccountError::new("database_corrupt", "maintenance has no transaction")
@@ -3495,10 +3496,7 @@ impl AccountWallet {
                 AccountError::new("signing_failed", "could not calculate replacement fee")
             })?
             .to_sat();
-        if self
-            .signed_fee_limit(&current["receipt"], maintenance_id)?
-            .is_some_and(|limit| replacement_fee_sats > limit)
-        {
+        if signed_fee_limit.is_some_and(|limit| replacement_fee_sats > limit) {
             return Err(AccountError::new(
                 "fee_limit_exceeded",
                 format!("{replacement_fee_sats} sats exceeds configured maximum"),
@@ -5700,6 +5698,12 @@ impl AccountWallet {
                 format!("cannot fee-bump batch in {}", batch.state),
             ));
         }
+        let mut batch_receipt: Value = batch
+            .receipt_json
+            .as_deref()
+            .and_then(|encoded| serde_json::from_str(encoded).ok())
+            .unwrap_or_else(|| json!({}));
+        let signed_fee_limit = self.signed_fee_limit(&batch_receipt, batch_local_id)?;
         let proposal =
             BatchProposal::from_wire(batch.proposal_wire.as_deref().ok_or_else(|| {
                 AccountError::new("database_corrupt", "signed batch has no proposal")
@@ -5904,15 +5908,7 @@ impl AccountWallet {
         let replacement = manifest
             .replacement(&proposal, target_sat_per_vb)
             .map_err(batch_protocol_error)?;
-        let mut batch_receipt: Value = batch
-            .receipt_json
-            .as_deref()
-            .and_then(|encoded| serde_json::from_str(encoded).ok())
-            .unwrap_or_else(|| json!({}));
-        if self
-            .signed_fee_limit(&batch_receipt, batch_local_id)?
-            .is_some_and(|limit| replacement.miner_fee() > limit)
-        {
+        if signed_fee_limit.is_some_and(|limit| replacement.miner_fee() > limit) {
             return Err(AccountError::new(
                 "fee_limit_exceeded",
                 format!(
@@ -7333,6 +7329,12 @@ impl AccountWallet {
                 format!("cannot fee-bump {}", operation.state),
             ));
         }
+        let mut receipt: Value = operation
+            .receipt_json
+            .as_deref()
+            .and_then(|encoded| serde_json::from_str(encoded).ok())
+            .unwrap_or_else(|| json!({}));
+        let signed_fee_limit = self.signed_fee_limit(&receipt, operation_id)?;
         let original_hex = operation.signed_tx_hex.as_deref().ok_or_else(|| {
             AccountError::new("database_corrupt", "operation has no signed transaction")
         })?;
@@ -7448,15 +7450,7 @@ impl AccountWallet {
                     "replacement outputs exceed the protected funding input",
                 )
             })?;
-        let mut receipt: Value = operation
-            .receipt_json
-            .as_deref()
-            .and_then(|encoded| serde_json::from_str(encoded).ok())
-            .unwrap_or_else(|| json!({}));
-        if self
-            .signed_fee_limit(&receipt, operation_id)?
-            .is_some_and(|limit| replacement_fee_sats > limit)
-        {
+        if signed_fee_limit.is_some_and(|limit| replacement_fee_sats > limit) {
             return Err(AccountError::new(
                 "fee_limit_exceeded",
                 format!("{replacement_fee_sats} sats exceeds configured maximum"),
@@ -13991,6 +13985,32 @@ mod tests {
                 .code,
             "database_corrupt"
         );
+
+        wallet
+            .db
+            .conn
+            .execute_batch(
+                "UPDATE opencsv_operations SET state = 'broadcast_unobserved'
+                 WHERE operation_id = 'pre-gate-solo';
+                 UPDATE opencsv_send_batches SET state = 'broadcast_unobserved'
+                 WHERE batch_local_id = 'pre-gate-batch';
+                 UPDATE opencsv_batch_reserve_operations
+                 SET state = 'broadcast_unobserved'
+                 WHERE maintenance_id = 'pre-gate-reserve';",
+            )
+            .unwrap();
+        for error in [
+            wallet.fee_bump("pre-gate-solo", 2).unwrap_err(),
+            wallet
+                .fee_bump_send_batch("pre-gate-batch", 2)
+                .unwrap_err(),
+            wallet
+                .fee_bump_batch_reserves("pre-gate-reserve", 2)
+                .unwrap_err(),
+        ] {
+            assert_eq!(error.code, "database_corrupt");
+            assert!(error.message.contains("authorization"), "{error:?}");
+        }
     }
 
     #[test]

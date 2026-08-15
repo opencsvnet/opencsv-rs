@@ -15,6 +15,14 @@ malformed, substituted, or cross-operation authorization fails as
 RBF was rejected because ordinary idempotent rebroadcast is itself a network
 write and must carry the same authorization evidence.
 
+The reachability check then found the inverse ordering problem in RBF: all three
+fee-bump paths did validate the snapshot, but only after reconstructing and
+signing a replacement, and the shared/solo paths could also perform live chain
+checks first. Authorization now precedes transaction parsing, chain evidence,
+and replacement signing in both resume and fee bump. Validating only before
+persistence was rejected because an unauthorized or corrupt row should not
+exercise production keys or external dependencies at all.
+
 ## 2026-08-15 — consumer activation cannot authorize production issuance
 
 The production registry gate covered transfers, batches, reserve maintenance,
