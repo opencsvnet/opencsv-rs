@@ -3909,6 +3909,14 @@ impl AccountWallet {
     /// Reapply and rebroadcast an exact persisted reserve-maintenance
     /// transaction after a crash. No new outputs or coin selection occur.
     pub fn resume_batch_reserves(&mut self, maintenance_id: &str) -> Result<Value, AccountError> {
+        let current = self.batch_reserve_operation_json(maintenance_id)?;
+        if !matches!(
+            current["state"].as_str(),
+            Some("signed_persisted" | "broadcast_unobserved")
+        ) {
+            return Ok(current);
+        }
+        self.signed_fee_limit(&current["receipt"], maintenance_id)?;
         let reconciliation_error = match self
             .reconcile_confirmed_batch_reserve_replacement(maintenance_id)
         {
@@ -3925,13 +3933,6 @@ impl AccountWallet {
             }
             Err(error) => return Err(error),
         };
-        let current = self.batch_reserve_operation_json(maintenance_id)?;
-        if !matches!(
-            current["state"].as_str(),
-            Some("signed_persisted" | "broadcast_unobserved")
-        ) {
-            return Ok(current);
-        }
         let raw = hex_decode(
             current["signed_tx_hex"].as_str().ok_or_else(|| {
                 AccountError::new("database_corrupt", "maintenance has no transaction")
@@ -5618,6 +5619,12 @@ impl AccountWallet {
         ) {
             return self.send_batch_json(batch_local_id);
         }
+        let mut receipt: Value = batch
+            .receipt_json
+            .as_deref()
+            .and_then(|encoded| serde_json::from_str(encoded).ok())
+            .unwrap_or_else(|| json!({}));
+        self.signed_fee_limit(&receipt, batch_local_id)?;
         let signed = batch.signed_tx_hex.as_deref().ok_or_else(|| {
             AccountError::new("database_corrupt", "signed batch has no transaction")
         })?;
@@ -5639,11 +5646,6 @@ impl AccountWallet {
         let (p2p_submissions, relay_peers) = self.submit_direct_p2p(&transaction)?;
         let client = self.esplora_client();
         let fallback = relay_via_esplora_if_unobserved(&client, &transaction);
-        let mut receipt: Value = batch
-            .receipt_json
-            .as_deref()
-            .and_then(|encoded| serde_json::from_str(encoded).ok())
-            .unwrap_or_else(|| json!({}));
         receipt["resume_p2p_submissions"] = json!(p2p_submissions);
         receipt["resume_p2p_peers"] = json!(relay_peers);
         receipt["resume_generic_relay_fallback"] = json!(matches!(&fallback, Ok(true)));
@@ -7026,6 +7028,12 @@ impl AccountWallet {
         }
         match operation.state.as_str() {
             "signed_persisted" | "broadcast_unobserved" => {
+                let mut receipt: Value = operation
+                    .receipt_json
+                    .as_deref()
+                    .and_then(|encoded| serde_json::from_str(encoded).ok())
+                    .unwrap_or_else(|| json!({}));
+                self.signed_fee_limit(&receipt, operation_id)?;
                 let signed = operation.signed_tx_hex.as_deref().ok_or_else(|| {
                     AccountError::new("database_corrupt", "signed state has no transaction")
                 })?;
@@ -7033,11 +7041,6 @@ impl AccountWallet {
                     .map_err(|error| {
                         AccountError::new("database_corrupt", format!("signed tx: {error}"))
                     })?;
-                let mut receipt: Value = operation
-                    .receipt_json
-                    .as_deref()
-                    .and_then(|encoded| serde_json::from_str(encoded).ok())
-                    .unwrap_or_else(|| json!({}));
                 if let Some(value) = self.reconcile_confirmed_replacement(
                     operation_id,
                     tx.compute_txid(),
@@ -13906,6 +13909,88 @@ mod tests {
             .fee_bump("pre-gate-mainnet-mint", 2)
             .unwrap_err();
         assert_eq!(fee_bump_error.code, "production_issuance_not_authorized");
+    }
+
+    #[test]
+    fn mainnet_resume_rejects_missing_signed_authorization_before_network_io() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut wallet = AccountWallet::open(
+            &mainnet_config(vec![mainnet_usd_issuer_policy(73)]),
+            &[73_u8; 32],
+            dir.path().join("wallet.sqlite").to_str().unwrap(),
+        )
+        .unwrap();
+
+        wallet
+            .insert_planned_operation(
+                "pre-gate-solo",
+                "transfer",
+                &json!({
+                    "asset_id": hex_encode(&[4_u8; 32]),
+                    "to_owner": hex_encode(&[5_u8; 32]),
+                    "amount": 1,
+                })
+                .to_string(),
+                "pre-gate-solo-delivery",
+            )
+            .unwrap();
+        wallet
+            .db
+            .conn
+            .execute(
+                "UPDATE opencsv_operations
+                 SET state = 'signed_persisted', signed_tx_hex = '00',
+                     receipt_json = '{}'
+                 WHERE operation_id = 'pre-gate-solo'",
+                [],
+            )
+            .unwrap();
+        assert_eq!(
+            wallet.resume_operation("pre-gate-solo").unwrap_err().code,
+            "database_corrupt"
+        );
+
+        wallet
+            .db
+            .conn
+            .execute(
+                "INSERT INTO opencsv_send_batches(
+                     batch_local_id, state, deadline_ms, participant_count,
+                     signed_tx_hex, txid, receipt_json, created_at, updated_at
+                 ) VALUES(
+                     'pre-gate-batch', 'signed_persisted', 0, 2,
+                     '00', '00', '{}', 0, 0
+                 )",
+                [],
+            )
+            .unwrap();
+        assert_eq!(
+            wallet.resume_send_batch("pre-gate-batch").unwrap_err().code,
+            "database_corrupt"
+        );
+
+        wallet
+            .db
+            .conn
+            .execute(
+                "INSERT INTO opencsv_batch_reserve_operations(
+                     maintenance_id, state, participant_count, stock_count,
+                     fee_cell_count, signed_tx_hex, txid, receipt_json,
+                     created_at, updated_at
+                 ) VALUES(
+                     'pre-gate-reserve', 'signed_persisted', 2, 3,
+                     6, '00', '00', '{}', 0, 0
+                 )",
+                [],
+            )
+            .unwrap();
+        assert_eq!(
+            wallet
+                .resume_batch_reserves("pre-gate-reserve")
+                .unwrap_err()
+                .code,
+            "database_corrupt"
+        );
     }
 
     #[test]

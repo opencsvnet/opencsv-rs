@@ -1,5 +1,20 @@
 # Signet/mainnet readiness decision journal
 
+## 2026-08-15 — crash rebroadcast revalidates production authorization
+
+The signed-authorization snapshot was mandatory for production fee replacement,
+but the three idempotent crash-resume paths still parsed and rebroadcast their
+persisted solo, shared-batch, or reserve transaction without revalidating that
+snapshot. A stale signed row from a pre-gate binary could therefore reach the
+network even though a missing snapshot was documented as corrupt state.
+
+Each resume path now verifies the deployment-bound, operation-bound wallet
+signature before transaction parsing, chain reconciliation, or relay. Missing,
+malformed, substituted, or cross-operation authorization fails as
+`database_corrupt`; signet compatibility is unchanged. Deferring the check to
+RBF was rejected because ordinary idempotent rebroadcast is itself a network
+write and must carry the same authorization evidence.
+
 ## 2026-08-15 — consumer activation cannot authorize production issuance
 
 The production registry gate covered transfers, batches, reserve maintenance,

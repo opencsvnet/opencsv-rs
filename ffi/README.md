@@ -41,6 +41,10 @@ solo, batch, or reserve operation identity. A missing snapshot, self-consistent
 substitution, or cross-operation copy is database corruption. A later registry
 change therefore cannot raise that operation's RBF exposure or strand its
 protocol-safe recovery by lowering the current ceiling.
+Solo, shared-batch, and reserve-maintenance crash resume revalidate that exact
+authorization before parsing transaction bytes, consulting chain state, or
+attempting relay. A stale signed row from a pre-gate binary cannot turn
+idempotent rebroadcast into an authorization bypass.
 Until a valid nonempty release is present, status returns
 `write_block_reason: "production_usd_not_configured"`, and every new consumer
 transfer, batch, proof, signing, and wallet-internal reserve-split path fails
