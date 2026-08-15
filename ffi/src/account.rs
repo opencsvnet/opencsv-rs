@@ -13368,9 +13368,43 @@ mod tests {
                 .len(),
             128
         );
+        let reopened = AccountWallet::open(
+            &config,
+            &[89_u8; 32],
+            dir.path().join("reopened.sqlite").to_str().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            reopened
+                .signed_fee_limit(&receipt, "operation-89")
+                .unwrap(),
+            Some(5_000)
+        );
         assert_eq!(
             wallet
                 .signed_fee_limit(&receipt, "another-operation")
+                .unwrap_err()
+                .code,
+            "database_corrupt"
+        );
+        let mut missing_signature = receipt.clone();
+        missing_signature["production_rollout_authorization"]
+            .as_object_mut()
+            .unwrap()
+            .remove("signature_compact");
+        assert_eq!(
+            wallet
+                .signed_fee_limit(&missing_signature, "operation-89")
+                .unwrap_err()
+                .code,
+            "database_corrupt"
+        );
+        let mut malformed_signature = receipt.clone();
+        malformed_signature["production_rollout_authorization"]["signature_compact"] =
+            json!("00");
+        assert_eq!(
+            wallet
+                .signed_fee_limit(&malformed_signature, "operation-89")
                 .unwrap_err()
                 .code,
             "database_corrupt"
