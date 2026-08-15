@@ -40,8 +40,9 @@ Test USD: exact transaction bytes from both immutable, pinned mempool.space
 and Blockstream endpoints, direct P2P relay evidence, and confirmed-chain SPV.
 Production may replace the built-ins with independently hosted pinned
 observers, but two distinct required raw endpoints, non-disabled direct relay,
-and non-disabled SPV are a second activation gate. A downgraded policy keeps
-the account readable and returns
+non-disabled SPV, and two distinct configured compact-filter peers are a
+second activation gate. A downgraded policy keeps the account readable and
+returns
 `production_observation_policy_required` before any new Bitcoin write.
 
 The older in-memory compatibility model is retained temporarily:

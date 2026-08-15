@@ -232,8 +232,9 @@ Omitting `observation_checks` on signet or mainnet installs two required raw
 transaction observers plus observable direct relay and confirmed-chain SPV.
 The built-in endpoints and chain-pin profiles are immutable for each network.
 Mainnet product writes additionally require two distinct pinned raw endpoints,
-direct relay, and SPV to remain enabled; an explicitly weakened configuration
-is read-only with `production_observation_policy_required`. Swift performs
+direct relay and SPV to remain enabled, and at least two distinct configured
+compact-filter peers; an explicitly weakened configuration is read-only with
+`production_observation_policy_required`. Swift performs
 normal TLS/hostname validation and pin matching, while Rust treats its raw
 bytes and TLS receipt as untrusted evidence and recomputes the transaction id.
 

@@ -11,8 +11,9 @@ unacceptable production default.
 Mainnet now installs immutable pinned mempool.space and Blockstream observers,
 requires both exact byte receipts, and retains visible direct relay and
 confirmed-chain SPV. Independently hosted replacements remain supported, but
-new mainnet writes require two distinct pinned raw endpoints plus non-disabled
-relay and SPV. A weaker configuration remains readable and reports the stable
+new mainnet writes require two distinct pinned raw endpoints, non-disabled
+relay and SPV, and two distinct configured compact-filter peers. A weaker
+configuration remains readable and reports the stable
 `production_observation_policy_required` reason. Treating configurable
 Off/Observe/Require controls as permission for a silent production downgrade
 was rejected; those controls remain useful for testnets and diagnostics.

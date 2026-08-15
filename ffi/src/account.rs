@@ -844,7 +844,7 @@ fn write_block_error(reason: &'static str) -> AccountError {
         ),
         "production_observation_policy_required" => AccountError::new(
             "production_observation_policy_required",
-            "mainnet Bitcoin-writing operations require two independent pinned raw-transaction observers, direct relay, and confirmed-chain verification",
+            "mainnet Bitcoin-writing operations require two independent pinned raw-transaction observers, direct relay, and two confirmed-chain peers",
         ),
         _ => AccountError::new("write_disabled", "wallet writes are disabled"),
     }
@@ -8522,7 +8522,16 @@ impl AccountWallet {
         let confirmed_spv_enabled = self.config.observation_checks.iter().any(|check| {
             check.kind == ObservationKind::ConfirmedSpv && check.mode != ObservationMode::Off
         });
-        required_raw_hosts.len() >= 2 && direct_relay_enabled && confirmed_spv_enabled
+        let verification_peers = if self.config.verification_peers.is_empty() {
+            &self.config.peers
+        } else {
+            &self.config.verification_peers
+        };
+        let independent_verification_peers = verification_peers.iter().collect::<HashSet<_>>();
+        required_raw_hosts.len() >= 2
+            && direct_relay_enabled
+            && confirmed_spv_enabled
+            && independent_verification_peers.len() >= 2
     }
 
     fn write_block_reason(&self) -> Result<Option<&'static str>, AccountError> {
@@ -12031,6 +12040,7 @@ mod tests {
             "deployment_id": "opencsv-mainnet-v1-test",
             "network": "mainnet",
             "esplora_url": "https://mempool.space/api",
+            "peers": ["127.0.0.1:8333", "127.0.0.2:8333"],
             "role": AccountRole::Primary,
             "backup_verified": true,
             "usd_issuers": issuers,
@@ -12216,6 +12226,27 @@ mod tests {
 
         let status = wallet.status().unwrap();
         assert_eq!(status["required_raw_observer_quorum"], 2);
+        assert_eq!(status["production_observation_policy_ready"], false);
+        assert_eq!(
+            status["write_block_reason"],
+            "production_observation_policy_required"
+        );
+    }
+
+    #[test]
+    fn mainnet_product_requires_two_distinct_confirmed_chain_peers() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config: Value =
+            serde_json::from_str(&mainnet_config(vec![mainnet_usd_issuer_policy(79)])).unwrap();
+        config["peers"] = json!(["127.0.0.1:8333", "127.0.0.1:8333"]);
+        let mut wallet = AccountWallet::open(
+            &config.to_string(),
+            &[80_u8; 32],
+            dir.path().join("wallet.sqlite").to_str().unwrap(),
+        )
+        .unwrap();
+
+        let status = wallet.status().unwrap();
         assert_eq!(status["production_observation_policy_ready"], false);
         assert_eq!(
             status["write_block_reason"],
