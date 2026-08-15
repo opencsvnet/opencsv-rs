@@ -3608,12 +3608,10 @@ impl AccountWallet {
         if operation.kind != "mint" {
             return self.scan_verify(consignment_hex);
         }
-        let request: Value = serde_json::from_str(&operation.request_json)
-            .map_err(|error| AccountError::new("database_corrupt", error.to_string()))?;
-        let to_owner = request["to_owner"].as_str().ok_or_else(|| {
-            AccountError::new("database_corrupt", "mint operation has no recipient owner")
-        })?;
-        let owner = Digest::from_bytes(decode_hex_32(to_owner, "mint recipient owner")?);
+        if self.mint_recipient_is_self_owned(operation)? {
+            return self.scan_verify(consignment_hex);
+        }
+        let owner = self.mint_recipient_owner(operation)?;
         scan::verify_json_for_public_owners(
             consignment_hex,
             &[owner],
@@ -3621,6 +3619,26 @@ impl AccountWallet {
             &opencsv_pcd::CoinProofVerifier,
         )
         .map_err(|error| AccountError::new("scan_failed", error))
+    }
+
+    fn mint_recipient_owner(&self, operation: &OperationRow) -> Result<Digest, AccountError> {
+        let request: Value = serde_json::from_str(&operation.request_json)
+            .map_err(|error| AccountError::new("database_corrupt", error.to_string()))?;
+        let to_owner = request["to_owner"].as_str().ok_or_else(|| {
+            AccountError::new("database_corrupt", "mint operation has no recipient owner")
+        })?;
+        Ok(Digest::from_bytes(decode_hex_32(
+            to_owner,
+            "mint recipient owner",
+        )?))
+    }
+
+    fn mint_recipient_is_self_owned(&self, operation: &OperationRow) -> Result<bool, AccountError> {
+        let owner = self.mint_recipient_owner(operation)?;
+        Ok(self
+            .owner_secrets()?
+            .iter()
+            .any(|secret| secret.owner() == owner))
     }
 
     /// Read-only N-of-M chain-view decision using this account's identities.
@@ -5337,9 +5355,18 @@ impl AccountWallet {
                 .as_deref()
                 .and_then(|encoded| serde_json::from_str(encoded).ok())
                 .unwrap_or_else(|| json!({}));
+            let prior_delivery = self.replacement_delivery_snapshot(operation, &receipt)?;
+            let replacement_delivery_nonce = random_id(16);
             let receipt_object = receipt.as_object_mut().ok_or_else(|| {
                 AccountError::new("database_corrupt", "operation receipt is not an object")
             })?;
+            if let Some(prior_delivery) = prior_delivery {
+                receipt_object.insert("pre_replacement_delivery".into(), prior_delivery);
+            }
+            receipt_object.insert(
+                "delivery_nonce".into(),
+                json!(replacement_delivery_nonce.clone()),
+            );
             let stale_consignment_id = receipt_object
                 .remove("consignment_id")
                 .and_then(|value| value.as_str().map(str::to_owned));
@@ -5381,6 +5408,7 @@ impl AccountWallet {
                 operation.operation_id.clone(),
                 receipt.to_string(),
                 stale_consignment_id,
+                replacement_delivery_nonce,
             ));
         }
         let now = unix_time()?;
@@ -5396,7 +5424,8 @@ impl AccountWallet {
         batch_receipt["miner_fee_sats"] = json!(replacement.miner_fee());
         self.db.conn.execute_batch("BEGIN IMMEDIATE")?;
         let persisted = (|| -> Result<(), AccountError> {
-            for (operation_id, receipt, stale_consignment_id) in &operation_updates {
+            for (operation_id, receipt, stale_consignment_id, delivery_nonce) in &operation_updates
+            {
                 if let Some(stale_id) = stale_consignment_id {
                     self.db.conn.execute(
                         "DELETE FROM opencsv_consignment_snapshots WHERE consignment_id = ?1",
@@ -5410,13 +5439,15 @@ impl AccountWallet {
                 self.db.conn.execute(
                     "UPDATE opencsv_operations
                      SET state = 'signed_persisted', signed_tx_hex = ?2,
-                         txid = ?3, receipt_json = ?4, updated_at = ?5
+                         txid = ?3, receipt_json = ?4, delivery_nonce = ?5,
+                         updated_at = ?6
                      WHERE operation_id = ?1",
                     params![
                         operation_id,
                         replacement_hex,
                         replacement_txid.to_string(),
                         receipt,
+                        delivery_nonce,
                         now,
                     ],
                 )?;
@@ -6508,7 +6539,94 @@ impl AccountWallet {
             ));
         }
         let original_hex = hex_encode(&serialize(&original));
+        let mut restored_consignment: Option<(String, String, String)> = None;
+        let mut restored_delivery_nonce = None;
         if let Some(object) = receipt.as_object_mut() {
+            if let Some(prior_delivery) = object.remove("pre_replacement_delivery") {
+                let prior = prior_delivery.as_object().ok_or_else(|| {
+                    AccountError::new(
+                        "database_corrupt",
+                        "pre-replacement delivery receipt is not an object",
+                    )
+                })?;
+                let consignment_id = prior
+                    .get("consignment_id")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| {
+                        AccountError::new(
+                            "database_corrupt",
+                            "pre-replacement delivery has no consignment id",
+                        )
+                    })?
+                    .to_owned();
+                let consignment_base64 = prior
+                    .get("consignment_base64")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| {
+                        AccountError::new(
+                            "database_corrupt",
+                            "pre-replacement delivery has no consignment bytes",
+                        )
+                    })?
+                    .to_owned();
+                let spent_state_json = prior
+                    .get("spent_state_json")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| {
+                        AccountError::new(
+                            "database_corrupt",
+                            "pre-replacement delivery has no spent-state receipt",
+                        )
+                    })?
+                    .to_owned();
+                let delivery_nonce = prior
+                    .get("delivery_nonce")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| {
+                        AccountError::new(
+                            "database_corrupt",
+                            "pre-replacement delivery has no delivery nonce",
+                        )
+                    })?
+                    .to_owned();
+                validate_consignment_identity(&consignment_id, &consignment_base64)?;
+                serde_json::from_str::<Value>(&spent_state_json).map_err(|error| {
+                    AccountError::new(
+                        "database_corrupt",
+                        format!("pre-replacement spent state: {error}"),
+                    )
+                })?;
+                object.insert("consignment_id".into(), json!(consignment_id));
+                object.insert("consignment_base64".into(), json!(consignment_base64));
+                object.insert("delivery_ready".into(), json!(true));
+                if prior.get("consignment_delivered") == Some(&Value::Bool(true)) {
+                    object.insert("consignment_delivered".into(), json!(true));
+                    if let Some(delivered_at) = prior.get("consignment_delivered_at") {
+                        object.insert("consignment_delivered_at".into(), delivered_at.clone());
+                    }
+                } else {
+                    object.remove("consignment_delivered");
+                    object.remove("consignment_delivered_at");
+                }
+                object.insert("delivery_nonce".into(), json!(delivery_nonce));
+                if let Some(superseded) = object
+                    .get_mut("superseded_consignment_ids")
+                    .and_then(Value::as_array_mut)
+                {
+                    superseded.retain(|value| value.as_str() != Some(consignment_id.as_str()));
+                }
+                restored_consignment = Some((consignment_id, consignment_base64, spent_state_json));
+                restored_delivery_nonce = Some(delivery_nonce);
+            } else {
+                // Legacy replacement receipts did not preserve the original
+                // attachment. Return to a resumable state and let the SPV
+                // path rebuild it from the durable pending proof.
+                object.remove("consignment_id");
+                object.remove("consignment_base64");
+                object.remove("delivery_ready");
+                object.remove("consignment_delivered");
+                object.remove("consignment_delivered_at");
+            }
             object.insert(
                 "fee_bump_outcome".into(),
                 json!("original_confirmed_before_replacement_observed"),
@@ -6518,23 +6636,42 @@ impl AccountWallet {
                 json!(replacement_txid.to_string()),
             );
             object.insert("txid".into(), json!(replaced.to_string()));
+            object.insert("explorer_confirmed".into(), json!(true));
+            object.insert("requires_spv_confirmation".into(), json!(true));
+            object.remove("replacement_delivery_required");
+            object.remove("replaces");
         }
-        self.db.conn.execute(
+        let now = unix_time()?;
+        let transaction = self.db.conn.transaction()?;
+        if let Some((consignment_id, consignment_base64, spent_state_json)) = restored_consignment {
+            transaction.execute(
+                "INSERT OR REPLACE INTO opencsv_consignments(
+                     consignment_id, consignment_base64, spent_state_json, created_at
+                 ) VALUES(?1, ?2, ?3, ?4)",
+                params![consignment_id, consignment_base64, spent_state_json, now],
+            )?;
+        }
+        transaction.execute(
             "UPDATE opencsv_operations SET state = ?2, signed_tx_hex = ?3,
              txid = ?4, receipt_json = ?5, rejection_reason = NULL,
-             updated_at = ?6 WHERE operation_id = ?1",
+             delivery_nonce = COALESCE(?6, delivery_nonce), updated_at = ?7
+             WHERE operation_id = ?1",
             params![
                 operation_id,
-                OperationState::Confirmed.as_str(),
+                OperationState::BroadcastUnobserved.as_str(),
                 original_hex,
                 replaced.to_string(),
                 receipt.to_string(),
-                unix_time()?,
+                restored_delivery_nonce,
+                now,
             ],
         )?;
+        transaction.commit()?;
         let mut value = operation_json(&self.operation(operation_id)?)?;
         if let Some(object) = value.as_object_mut() {
-            object.insert("confirmed".into(), json!(true));
+            object.insert("confirmed".into(), json!(false));
+            object.insert("explorer_confirmed".into(), json!(true));
+            object.insert("requires_spv_confirmation".into(), json!(true));
             object.insert("block_height".into(), json!(status.block_height));
             object.insert("observed_via".into(), json!(self.config.esplora_url));
         }
@@ -9262,9 +9399,14 @@ impl AccountWallet {
                 .insert(operation_id.to_owned(), pending_id);
         }
 
+        let operation = self.operation(operation_id)?;
+        let prior_delivery = self.replacement_delivery_snapshot(&operation, receipt)?;
         let receipt_object = receipt.as_object_mut().ok_or_else(|| {
             AccountError::new("database_corrupt", "operation receipt is not an object")
         })?;
+        if let Some(prior_delivery) = prior_delivery {
+            receipt_object.insert("pre_replacement_delivery".into(), prior_delivery);
+        }
         // A replacement is a new proof-bearing attachment. Rotate the
         // transport acknowledgement nonce atomically with its exact bytes so
         // a delayed acknowledgement for the superseded consignment cannot
@@ -9329,6 +9471,62 @@ impl AccountWallet {
         )?;
         transaction.commit()?;
         Ok(())
+    }
+
+    fn replacement_delivery_snapshot(
+        &self,
+        operation: &OperationRow,
+        receipt: &Value,
+    ) -> Result<Option<Value>, AccountError> {
+        let Some(consignment_id) = receipt.get("consignment_id").and_then(Value::as_str) else {
+            return Ok(None);
+        };
+        let consignment_base64 = receipt
+            .get("consignment_base64")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                AccountError::new(
+                    "database_corrupt",
+                    "delivery-ready receipt has no consignment bytes",
+                )
+            })?;
+        validate_consignment_identity(consignment_id, consignment_base64)?;
+        let (stored_base64, spent_state_json): (String, String) = self
+            .db
+            .conn
+            .query_row(
+                "SELECT consignment_base64, spent_state_json
+                 FROM opencsv_consignments WHERE consignment_id = ?1",
+                [consignment_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?
+            .ok_or_else(|| {
+                AccountError::new(
+                    "database_corrupt",
+                    "delivery-ready receipt has no persisted consignment",
+                )
+            })?;
+        if stored_base64 != consignment_base64 {
+            return Err(AccountError::new(
+                "database_corrupt",
+                "receipt and persisted consignment bytes disagree",
+            ));
+        }
+        serde_json::from_str::<Value>(&spent_state_json).map_err(|error| {
+            AccountError::new(
+                "database_corrupt",
+                format!("persisted consignment spent state: {error}"),
+            )
+        })?;
+        Ok(Some(json!({
+            "consignment_id": consignment_id,
+            "consignment_base64": consignment_base64,
+            "spent_state_json": spent_state_json,
+            "delivery_nonce": operation.delivery_nonce,
+            "consignment_delivered": receipt["consignment_delivered"] == true,
+            "consignment_delivered_at": receipt.get("consignment_delivered_at"),
+        })))
     }
 
     fn backup_verified(&self) -> Result<bool, AccountError> {
@@ -10059,6 +10257,28 @@ fn canonical_consignment_identity(blob: &[u8]) -> Result<(Vec<u8>, String), Acco
     let canonical = consignment.to_bytes();
     let identity = sha256::Hash::hash(&canonical).to_string();
     Ok((canonical, identity))
+}
+
+fn validate_consignment_identity(
+    expected_id: &str,
+    consignment_base64: &str,
+) -> Result<(), AccountError> {
+    let blob = base64::engine::general_purpose::STANDARD
+        .decode(consignment_base64)
+        .map_err(|error| AccountError::new("database_corrupt", error.to_string()))?;
+    let (canonical, identity) = canonical_consignment_identity(&blob).map_err(|error| {
+        AccountError::new(
+            "database_corrupt",
+            format!("persisted consignment is invalid: {}", error.message),
+        )
+    })?;
+    if canonical != blob || identity != expected_id {
+        return Err(AccountError::new(
+            "database_corrupt",
+            "persisted consignment identity does not match its canonical bytes",
+        ));
+    }
+    Ok(())
 }
 
 /// Stable logical-payment identity. An RBF replacement changes only the
@@ -11373,6 +11593,43 @@ mod tests {
     ) -> Result<Value, AccountError> {
         let asset_id = create_test_instrument(wallet, unit_code);
         wallet.mint_prepare(&json!({ "asset_id": asset_id, "amounts": amounts }).to_string())
+    }
+
+    #[test]
+    fn self_mint_settlement_routes_through_the_wallet_ownership_scan() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut wallet = AccountWallet::open(
+            &config(AccountRole::Primary, true),
+            &[94u8; 32],
+            dir.path().join("wallet.sqlite").to_str().unwrap(),
+        )
+        .unwrap();
+        allow_funding_verification(&mut wallet);
+        fund(&mut wallet, 20_000);
+        let minted = prepare_test_issuance(&mut wallet, "SLF", &[100]).unwrap();
+        let operation_id = minted["operation_id"].as_str().unwrap().to_owned();
+        let operation = wallet.operation(&operation_id).unwrap();
+        assert!(wallet.mint_recipient_is_self_owned(&operation).unwrap());
+
+        let external_owner = hex_encode(&[95u8; 32]);
+        wallet
+            .db
+            .conn
+            .execute(
+                "UPDATE opencsv_operations SET request_json = ?2 WHERE operation_id = ?1",
+                params![
+                    operation_id,
+                    json!({
+                        "asset_id": minted["asset_id"],
+                        "to_owner": external_owner,
+                        "amounts": [100],
+                    })
+                    .to_string(),
+                ],
+            )
+            .unwrap();
+        let external = wallet.operation(&operation_id).unwrap();
+        assert!(!wallet.mint_recipient_is_self_owned(&external).unwrap());
     }
 
     fn confirmed_status_server(block_height: u32) -> (String, thread::JoinHandle<()>) {
@@ -13968,10 +14225,31 @@ mod tests {
         let broadcast = wallet.sign_and_broadcast_send_batch(&batch_id).unwrap();
         assert_eq!(broadcast["state"], "broadcast_unobserved");
 
+        let original_nonces = wallet
+            .send_batch_members(&batch_id)
+            .unwrap()
+            .into_iter()
+            .map(|member| {
+                let operation = wallet.operation(&member.operation_id).unwrap();
+                (member.operation_id, operation.delivery_nonce)
+            })
+            .collect::<Vec<_>>();
+
         let below = wallet.fee_bump_send_batch(&batch_id, 3).unwrap();
         assert_eq!(below["state"], "broadcast_unobserved");
         let below_fee = below["receipt"]["miner_fee_sats"].as_u64().unwrap();
         assert!(below_fee <= 5_000);
+        for (operation_id, original_nonce) in original_nonces {
+            let replacement = wallet.operation(&operation_id).unwrap();
+            assert_ne!(replacement.delivery_nonce, original_nonce);
+            let receipt: Value =
+                serde_json::from_str(replacement.receipt_json.as_deref().unwrap()).unwrap();
+            assert_eq!(receipt["delivery_nonce"], replacement.delivery_nonce);
+            let stale = wallet
+                .mark_consignment_delivered(&operation_id, &original_nonce)
+                .unwrap_err();
+            assert_eq!(stale.code, "delivery_nonce_mismatch");
+        }
 
         let error = wallet.fee_bump_send_batch(&batch_id, 40).unwrap_err();
         assert_eq!(error.code, "fee_limit_exceeded");
@@ -15690,13 +15968,42 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("wallet.sqlite");
         let (url, server) = confirmed_status_server(123);
-        let mut wallet = AccountWallet::open(
-            &config_with_url(AccountRole::Primary, true, &url),
-            &[13_u8; 32],
-            path.to_str().unwrap(),
-        )
-        .unwrap();
+        let cfg = config_with_url(AccountRole::Primary, true, &url);
+        let key = [13_u8; 32];
+        let mut wallet = AccountWallet::open(&cfg, &key, path.to_str().unwrap()).unwrap();
+        allow_funding_verification(&mut wallet);
         let original_txid = fund(&mut wallet, 50_000).txid;
+        let own_owner = wallet.status().unwrap()["owners"][0]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let asset_id = hex_encode(&[14u8; 32]);
+        let operation_id = "replacement-race";
+        install_replay_operation(
+            &mut wallet,
+            operation_id,
+            &[(100, own_owner)],
+            Vec::new(),
+            &asset_id,
+            15,
+        );
+        finalize_test_operation(&mut wallet, operation_id, original_txid);
+        let original = wallet.operation(operation_id).unwrap();
+        let original_delivery_nonce = original.delivery_nonce.clone();
+        let original_receipt: Value =
+            serde_json::from_str(original.receipt_json.as_deref().unwrap()).unwrap();
+        let original_consignment_id = original_receipt["consignment_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let original_consignment_base64 = original_receipt["consignment_base64"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        wallet
+            .mark_consignment_delivered(operation_id, &original_delivery_nonce)
+            .unwrap();
+
         let replacement = Transaction {
             version: transaction::Version::TWO,
             lock_time: absolute::LockTime::ZERO,
@@ -15704,35 +16011,51 @@ mod tests {
             output: Vec::new(),
         };
         let replacement_txid = replacement.compute_txid();
-        let operation_id = "replacement-race";
+        let mut replacement_receipt: Value = serde_json::from_str(
+            wallet
+                .operation(operation_id)
+                .unwrap()
+                .receipt_json
+                .as_deref()
+                .unwrap(),
+        )
+        .unwrap();
+        replacement_receipt["replaces"] = json!(original_txid.to_string());
+        replacement_receipt["txid"] = json!(replacement_txid.to_string());
         wallet
-            .insert_planned_operation(operation_id, "mint", "{}", "delivery")
-            .unwrap();
-        wallet
-            .db
-            .conn
-            .execute(
-                "UPDATE opencsv_operations SET state = ?2, signed_tx_hex = ?3,
-                 txid = ?4, receipt_json = ?5 WHERE operation_id = ?1",
-                params![
-                    operation_id,
-                    OperationState::SignedPersisted.as_str(),
-                    hex_encode(&serialize(&replacement)),
-                    replacement_txid.to_string(),
-                    json!({
-                        "replaces": original_txid.to_string(),
-                        "txid": replacement_txid.to_string(),
-                    })
-                    .to_string(),
-                ],
+            .persist_signed_replacement(
+                operation_id,
+                &hex_encode(&serialize(&replacement)),
+                replacement_txid,
+                &mut replacement_receipt,
             )
             .unwrap();
+        let replacement_delivery_nonce = wallet.operation(operation_id).unwrap().delivery_nonce;
+        assert_ne!(replacement_delivery_nonce, original_delivery_nonce);
 
         let receipt = wallet.resume_operation(operation_id).unwrap();
-        assert_eq!(receipt["state"], OperationState::Confirmed.as_str());
-        assert_eq!(receipt["confirmed"], true);
+        assert_eq!(
+            receipt["state"],
+            OperationState::BroadcastUnobserved.as_str()
+        );
+        assert_eq!(receipt["confirmed"], false);
+        assert_eq!(receipt["explorer_confirmed"], true);
+        assert_eq!(receipt["requires_spv_confirmation"], true);
         assert_eq!(receipt["block_height"], 123);
         assert_eq!(receipt["txid"], original_txid.to_string());
+        assert_eq!(receipt["delivery_nonce"], original_delivery_nonce);
+        assert_eq!(receipt["receipt"]["delivery_ready"], true);
+        assert_eq!(receipt["receipt"]["consignment_delivered"], true);
+        assert_eq!(
+            receipt["receipt"]["consignment_id"],
+            original_consignment_id
+        );
+        assert_eq!(
+            receipt["receipt"]["consignment_base64"],
+            original_consignment_base64
+        );
+        assert!(receipt["receipt"].get("pre_replacement_delivery").is_none());
+        assert!(receipt["receipt"].get("replaces").is_none());
         assert_eq!(
             receipt["receipt"]["failed_replacement_txid"],
             replacement_txid.to_string()
@@ -15751,7 +16074,30 @@ mod tests {
         )
         .unwrap();
         assert_eq!(restored_tx.compute_txid(), original_txid);
+        let restored_count: i64 = wallet
+            .db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM opencsv_consignments WHERE consignment_id = ?1",
+                [&original_consignment_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(restored_count, 1);
+        assert_eq!(
+            wallet
+                .mark_consignment_delivered(operation_id, &replacement_delivery_nonce)
+                .unwrap_err()
+                .code,
+            "delivery_nonce_mismatch"
+        );
         server.join().unwrap();
+        drop(wallet);
+        let reopened = AccountWallet::open(&cfg, &key, path.to_str().unwrap()).unwrap();
+        assert_eq!(
+            reopened.operation(operation_id).unwrap().state,
+            OperationState::BroadcastUnobserved.as_str()
+        );
     }
 
     #[test]
