@@ -197,3 +197,25 @@ The rejected alternative was switching candidates immediately after a public
 API reported `confirmed`. That would have made an accelerator authoritative
 during an RBF race. Full CBF and FFI suites passed with deterministic reorg,
 original-wins, dishonest-accelerator, and dust-floor regressions.
+
+## 2026-08-15 — bounded DNS and network-accurate recovery failures
+
+The anchor-HTTP compatibility client already enforced one absolute request
+deadline, but each lookup created a new system-resolver thread. A stalled
+platform resolver could therefore strand one thread per retry even though
+every caller returned on time. Resolution now goes through one process-wide
+worker with one queued request. Further requests fail closed at the bounded
+capacity; expired queued work is skipped. The rejected alternative was a
+larger thread pool because it would only raise, rather than remove, the leak
+bound under an indefinitely stalled resolver.
+
+Secure Backup rejection also reused `testnet_reset_required` for legacy or
+foreign checkpoints on every network. Signet and regtest retain that stable
+reset instruction, while mainnet now returns `deployment_mismatch`; no
+mainnet recovery failure tells an operator to perform a testnet reset.
+
+Finally, FFI documentation now makes the idempotency boundary explicit:
+verification `credits` describe the accepted payment and are not an accounting
+delta. Persistent hosts must deduplicate retries by the stable `payment_id`.
+The legacy in-memory verifier remains compatibility-only and is not a new-host
+integration surface.

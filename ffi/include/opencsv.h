@@ -73,6 +73,11 @@ char *opencsv_account_rebind_test_device(
     const uint8_t *device_binding_key,
     size_t device_binding_key_len);
 #endif
+/* Successful account verification responses include a stable payment_id.
+ * The credits array describes the accepted payment, not a newly-added delta:
+ * a replay may return the same totals while the Rust store remains idempotent.
+ * Hosts must key durable UI/accounting by payment_id and must never sum credits
+ * from repeated verification responses. */
 char *opencsv_account_verify_consignment(uint64_t handle,
                                          const uint8_t *blob,
                                          size_t blob_len,
@@ -203,7 +208,10 @@ char *opencsv_pending_import(uint64_t handle, const char *pending_json);
 char *opencsv_consignment_finalize(uint64_t handle, uint64_t pending_id,
                                    const char *anchor_ref_json);
 
-/* Verify a received consignment blob against an anchor snapshot. */
+/* Verify a received consignment blob against an anchor snapshot. This legacy
+ * compatibility result's credits are also descriptive totals, not a delta;
+ * new hosts should use opencsv_account_verify_consignment and deduplicate by
+ * its stable payment_id. */
 char *opencsv_verify_consignment(uint64_t handle, const uint8_t *blob,
                                  size_t blob_len,
                                  const char *anchor_snapshot_json,
