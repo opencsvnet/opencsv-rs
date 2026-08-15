@@ -3240,6 +3240,10 @@ impl AccountWallet {
             || replacement.output[..protected_count] != original.output[..protected_count]
             || replacement.output[protected_count].script_pubkey != change.script_pubkey
             || replacement.output[protected_count].value >= change.value
+            || replacement.output[protected_count].value
+                < replacement.output[protected_count]
+                    .script_pubkey
+                    .minimal_non_dust()
         {
             return Err(AccountError::new(
                 "protocol_layout_violation",
@@ -3270,6 +3274,26 @@ impl AccountWallet {
         let replacement_hex = hex_encode(&serialize(&replacement));
         {
             let receipt_object = receipt.as_object_mut().expect("receipt checked above");
+            let candidates = receipt_object
+                .entry("replacement_candidates")
+                .or_insert_with(|| json!([]))
+                .as_array_mut()
+                .ok_or_else(|| {
+                    AccountError::new(
+                        "database_corrupt",
+                        "reserve replacement candidates are not an array",
+                    )
+                })?;
+            if !candidates.iter().any(|candidate| {
+                candidate.get("txid").and_then(Value::as_str)
+                    == Some(original_txid.to_string().as_str())
+            }) {
+                candidates.push(json!({
+                    "txid": original_txid.to_string(),
+                    "signed_tx_hex": current["signed_tx_hex"],
+                    "fee_sats": original_fee_sats,
+                }));
+            }
             receipt_object.insert("replaces".into(), json!(original_txid.to_string()));
             receipt_object.insert("txid".into(), json!(replacement_txid.to_string()));
             receipt_object.insert("target_sat_per_vb".into(), json!(target_sat_per_vb));
@@ -3334,6 +3358,190 @@ impl AccountWallet {
             params![maintenance_id, receipt.to_string(), unix_time()?],
         )?;
         self.batch_reserve_operation_json(maintenance_id)
+    }
+
+    /// If any superseded reserve-split candidate appears confirmed before the
+    /// latest replacement, independently verify every exact stock outpoint
+    /// before restoring that transaction. Esplora supplies only the height
+    /// hint; it can never select a winning replacement by itself.
+    fn reconcile_confirmed_batch_reserve_replacement(
+        &mut self,
+        maintenance_id: &str,
+    ) -> Result<Option<(Value, u32)>, AccountError> {
+        let current = self.batch_reserve_operation_json(maintenance_id)?;
+        let candidates = current["receipt"]
+            .get("replacement_candidates")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        if candidates.is_empty() {
+            return Ok(None);
+        }
+        let client = self.esplora_client();
+        for candidate in candidates {
+            let txid_text = candidate
+                .get("txid")
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    AccountError::new(
+                        "database_corrupt",
+                        "reserve replacement candidate has no txid",
+                    )
+                })?;
+            let txid = txid_text
+                .parse::<Txid>()
+                .map_err(|error| AccountError::new("database_corrupt", error.to_string()))?;
+            let status = client
+                .get_tx_status(&txid)
+                .map_err(|error| AccountError::new("sync_failed", error.to_string()))?;
+            if !status.confirmed {
+                continue;
+            }
+            let block_height = status.block_height.ok_or_else(|| {
+                AccountError::new(
+                    "sync_failed",
+                    "confirmed reserve candidate has no block height",
+                )
+            })?;
+            let signed_tx_hex = candidate
+                .get("signed_tx_hex")
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    AccountError::new(
+                        "database_corrupt",
+                        "reserve replacement candidate has no signed bytes",
+                    )
+                })?;
+            let bytes = hex_decode(signed_tx_hex, "confirmed reserve candidate")?;
+            let transaction: Transaction = deserialize(&bytes)
+                .map_err(|error| AccountError::new("database_corrupt", error.to_string()))?;
+            if transaction.compute_txid() != txid {
+                return Err(AccountError::new(
+                    "database_corrupt",
+                    "confirmed reserve candidate txid differs from its persisted bytes",
+                ));
+            }
+            let fee_sats = candidate
+                .get("fee_sats")
+                .and_then(Value::as_u64)
+                .ok_or_else(|| {
+                    AccountError::new(
+                        "database_corrupt",
+                        "reserve replacement candidate has no fee",
+                    )
+                })?;
+            let current_txid = current["txid"].as_str().ok_or_else(|| {
+                AccountError::new("database_corrupt", "maintenance has no current txid")
+            })?;
+            let participant_count =
+                u8::try_from(current["participant_count"].as_u64().ok_or_else(|| {
+                    AccountError::new("database_corrupt", "maintenance has no participant count")
+                })?)
+                .map_err(|_| {
+                    AccountError::new("database_corrupt", "participant count exceeds u8")
+                })?;
+            let stock_pubkey =
+                PublicKey::from_secret_key(&Secp256k1::new(), &self.batch_stock_secret()?);
+            let stock_script =
+                stock_witness_script(stock_pubkey, usize::from(participant_count)).to_p2wsh();
+            let stocks = {
+                let mut statement = self.db.conn.prepare(
+                    "SELECT vout, value_sats FROM opencsv_batch_stocks
+                     WHERE txid = ?1 AND state = 'pending' ORDER BY vout",
+                )?;
+                let rows = statement.query_map([current_txid], |row| {
+                    Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+                })?;
+                rows.collect::<Result<Vec<_>, _>>()?
+            };
+            if stocks.is_empty() {
+                return Err(AccountError::new(
+                    "database_corrupt",
+                    "reserve replacement has no pending stocks",
+                ));
+            }
+            let mut candidate_verified = true;
+            for (vout, value_sats) in &stocks {
+                let vout = u32::try_from(*vout)
+                    .map_err(|_| AccountError::new("database_corrupt", "stock vout exceeds u32"))?;
+                let expected = bdk_wallet::bitcoin::TxOut {
+                    value: Amount::from_sat(u64::try_from(*value_sats).map_err(|_| {
+                        AccountError::new("database_corrupt", "stock value is negative")
+                    })?),
+                    script_pubkey: stock_script.clone(),
+                };
+                if transaction.output.get(vout as usize) != Some(&expected) {
+                    return Err(AccountError::new(
+                        "database_corrupt",
+                        "reserve replacement stock differs from its persisted transaction",
+                    ));
+                }
+                match self.funding_verifier.verify(&FundingVerificationRequest {
+                    outpoint: OutPoint::new(txid, vout),
+                    txout: expected,
+                    birth_height: u64::from(block_height),
+                }) {
+                    Ok(_) => {}
+                    Err(error)
+                        if !error.retryable
+                            && matches!(error.code, "stale_chain_state" | "conflicting_operation") =>
+                    {
+                        candidate_verified = false;
+                        break;
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+            if !candidate_verified {
+                continue;
+            }
+            let mut receipt = current["receipt"].clone();
+            let receipt_object = receipt.as_object_mut().ok_or_else(|| {
+                AccountError::new("database_corrupt", "maintenance receipt is not an object")
+            })?;
+            receipt_object.insert("txid".into(), json!(txid.to_string()));
+            receipt_object.insert("fee_sats".into(), json!(fee_sats));
+            receipt_object.insert(
+                "fee_bump_outcome".into(),
+                json!("superseded_reserve_candidate_confirmed"),
+            );
+            receipt_object.insert("failed_replacement_txid".into(), json!(current_txid));
+            receipt_object.insert("explorer_confirmed".into(), json!(true));
+            receipt_object.insert("confirmed_stock_verified".into(), json!(true));
+            receipt_object.insert("requires_confirmed_stock_verification".into(), json!(false));
+            receipt_object.remove("replaces");
+            receipt_object.remove("replacement_candidates");
+
+            let now = unix_time()?;
+            let db_transaction = self
+                .db
+                .conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)?;
+            db_transaction.execute(
+                "UPDATE opencsv_batch_reserve_operations
+                 SET state = 'broadcast_unobserved', signed_tx_hex = ?2,
+                     txid = ?3, receipt_json = ?4, updated_at = ?5
+                 WHERE maintenance_id = ?1",
+                params![
+                    maintenance_id,
+                    signed_tx_hex,
+                    txid.to_string(),
+                    receipt.to_string(),
+                    now,
+                ],
+            )?;
+            db_transaction.execute(
+                "UPDATE opencsv_batch_stocks SET txid = ?2
+                 WHERE txid = ?1 AND state = 'pending'",
+                params![current_txid, txid.to_string()],
+            )?;
+            db_transaction.commit()?;
+            return Ok(Some((
+                self.batch_reserve_operation_json(maintenance_id)?,
+                block_height,
+            )));
+        }
+        Ok(None)
     }
 
     /// Apply pinned raw-byte observation to an exact reserve-maintenance
@@ -3418,6 +3626,22 @@ impl AccountWallet {
     /// Reapply and rebroadcast an exact persisted reserve-maintenance
     /// transaction after a crash. No new outputs or coin selection occur.
     pub fn resume_batch_reserves(&mut self, maintenance_id: &str) -> Result<Value, AccountError> {
+        let reconciliation_error = match self
+            .reconcile_confirmed_batch_reserve_replacement(maintenance_id)
+        {
+            Ok(Some((restored, _))) => return Ok(restored),
+            Ok(None) => None,
+            Err(error)
+                if error.retryable
+                    || matches!(
+                        error.code,
+                        "sync_failed" | "stale_chain_state" | "conflicting_operation"
+                    ) =>
+            {
+                Some(error)
+            }
+            Err(error) => return Err(error),
+        };
         let current = self.batch_reserve_operation_json(maintenance_id)?;
         if !matches!(
             current["state"].as_str(),
@@ -3449,6 +3673,14 @@ impl AccountWallet {
         let client = self.esplora_client();
         let fallback = relay_via_esplora_if_unobserved(&client, &transaction);
         let mut receipt = current["receipt"].clone();
+        if let Some(error) = reconciliation_error {
+            receipt["resume_candidate_reconciliation"] = json!({
+                "result": "unavailable",
+                "reason": error.code,
+                "detail": error.message,
+                "retryable": error.retryable,
+            });
+        }
         receipt["resume_p2p_submissions"] = json!(p2p_submissions);
         receipt["resume_p2p_peers"] = json!(relay_peers);
         receipt["resume_generic_relay_fallback"] = json!(matches!(&fallback, Ok(true)));
@@ -3467,7 +3699,11 @@ impl AccountWallet {
     /// Promote pending stock only after the accelerator discovers a block and
     /// the CBF verifier independently proves each exact outpoint unspent.
     pub fn refresh_batch_reserves(&mut self, maintenance_id: &str) -> Result<Value, AccountError> {
-        let value = self.batch_reserve_operation_json(maintenance_id)?;
+        let reconciled = self.reconcile_confirmed_batch_reserve_replacement(maintenance_id)?;
+        let (value, reconciled_height) = match reconciled {
+            Some((value, height)) => (value, Some(height)),
+            None => (self.batch_reserve_operation_json(maintenance_id)?, None),
+        };
         if value["state"] == "confirmed" {
             return Ok(value);
         }
@@ -3476,12 +3712,18 @@ impl AccountWallet {
             .ok_or_else(|| AccountError::new("database_corrupt", "maintenance has no txid"))?
             .parse::<Txid>()
             .map_err(|error| AccountError::new("database_corrupt", error.to_string()))?;
-        let client = self.esplora_client();
-        let status = client
-            .get_tx_status(&txid)
-            .map_err(|error| AccountError::new("sync_failed", error.to_string()))?;
-        let Some(block_height) = status.block_height else {
-            return Ok(value);
+        let block_height = match reconciled_height {
+            Some(height) => height,
+            None => {
+                let client = self.esplora_client();
+                let status = client
+                    .get_tx_status(&txid)
+                    .map_err(|error| AccountError::new("sync_failed", error.to_string()))?;
+                let Some(block_height) = status.block_height else {
+                    return Ok(value);
+                };
+                block_height
+            }
         };
         let participant_count =
             u8::try_from(value["participant_count"].as_u64().ok_or_else(|| {
@@ -10562,6 +10804,7 @@ fn evaluate_observation_evidence(
         })
         .count();
     let mut successful_required_raw_observers = 0u32;
+    let mut conflicting_required_raw_observers = Vec::new();
     for check in policy {
         // Raw host evidence is supplied by Signal. Direct relay submission
         // and multi-peer confirmation have separate Rust-owned receipts and
@@ -10622,15 +10865,26 @@ fn evaluate_observation_evidence(
             {
                 failures.push("certificate chain does not match configured pins".to_owned());
             }
-            let raw_match = if check.kind == ObservationKind::RawTransactionApi {
+            let observed_raw = if check.kind == ObservationKind::RawTransactionApi {
                 evidence
                     .raw_transaction_hex
                     .as_deref()
                     .and_then(|encoded| hex_decode(encoded, "observed raw transaction").ok())
-                    .is_some_and(|raw| raw == exact_raw_transaction)
             } else {
-                false
+                None
             };
+            let raw_match = observed_raw
+                .as_deref()
+                .is_some_and(|raw| raw == exact_raw_transaction);
+            let reports_conflicting_transaction = check.mode == ObservationMode::Require
+                && evidence.result == ObservationResult::Observed
+                && observed_raw.as_deref().is_some_and(|raw| {
+                    raw != exact_raw_transaction && deserialize::<Transaction>(raw).is_ok()
+                });
+            if reports_conflicting_transaction {
+                failures.push("observer returned a different valid transaction".to_owned());
+                conflicting_required_raw_observers.push(check.id.clone());
+            }
             if check.kind == ObservationKind::RawTransactionApi && !raw_match {
                 failures.push("raw transaction bytes do not match".to_owned());
             }
@@ -10701,6 +10955,18 @@ fn evaluate_observation_evidence(
                     .collect::<Vec<_>>()
                     .join(", ")
             ),
+        ));
+    }
+    if !conflicting_required_raw_observers.is_empty() {
+        return Ok((
+            receipts,
+            Some(AccountError::new(
+                "observer_transaction_conflict",
+                format!(
+                    "required observers returned different valid transaction bytes: {}",
+                    conflicting_required_raw_observers.join(", ")
+                ),
+            )),
         ));
     }
     let required_failure = (required_raw_observer_count > 0
@@ -12493,6 +12759,63 @@ mod tests {
     }
 
     #[test]
+    fn required_observer_conflicting_valid_transaction_is_a_distinct_failure() {
+        let policy = default_observation_checks("signet");
+        let now = unix_time_millis().unwrap();
+        let exact = Transaction {
+            version: transaction::Version::ONE,
+            lock_time: absolute::LockTime::ZERO,
+            input: Vec::new(),
+            output: Vec::new(),
+        };
+        let conflicting = Transaction {
+            version: transaction::Version::TWO,
+            lock_time: absolute::LockTime::ZERO,
+            input: Vec::new(),
+            output: Vec::new(),
+        };
+        let exact_raw = serialize(&exact);
+        let evidence = json!({
+            "observations": [
+                {
+                    "check_id": "mempool_space_signet",
+                    "endpoint": "https://mempool.space/signet/api",
+                    "result": "observed",
+                    "started_at_ms": now - 15,
+                    "completed_at_ms": now - 5,
+                    "cached_at_ms": now - 5,
+                    "certificate_profile": "sectigo_r46",
+                    "certificate_chain_fingerprints_sha256": [MEMPOOL_SPACE_SIGNET_CHAIN_PINS[0]],
+                    "raw_transaction_hex": hex_encode(&exact_raw)
+                },
+                {
+                    "check_id": "blockstream_signet",
+                    "endpoint": "https://blockstream.info/signet/api",
+                    "result": "observed",
+                    "started_at_ms": now - 20,
+                    "completed_at_ms": now - 4,
+                    "cached_at_ms": now - 4,
+                    "certificate_profile": "lets_encrypt_yr",
+                    "certificate_chain_fingerprints_sha256": [BLOCKSTREAM_SIGNET_CHAIN_PINS[1]],
+                    "raw_transaction_hex": hex_encode(&serialize(&conflicting))
+                }
+            ]
+        });
+
+        let (receipts, failure) =
+            evaluate_observation_evidence(&policy, 2, &exact_raw, &evidence.to_string()).unwrap();
+        let failure = failure.expect("a contradictory required observer must fail closed");
+        assert_eq!(failure.code, "observer_transaction_conflict");
+        assert_eq!(receipts[0]["raw_byte_match"], true);
+        assert_eq!(receipts[1]["raw_byte_match"], false);
+        assert!(receipts[1]["failures"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|failure| failure == "observer returned a different valid transaction"));
+    }
+
+    #[test]
     fn raw_observer_quorum_must_match_required_candidates() {
         let dir = tempfile::tempdir().unwrap();
         let cfg = json!({
@@ -13673,6 +13996,15 @@ mod tests {
             original.output.last().unwrap().script_pubkey
         );
         assert!(replacement.output.last().unwrap().value < original.output.last().unwrap().value);
+        assert!(
+            replacement.output.last().unwrap().value
+                >= replacement
+                    .output
+                    .last()
+                    .unwrap()
+                    .script_pubkey
+                    .minimal_non_dust()
+        );
         let replacement_fee = bumped["receipt"]["fee_sats"].as_u64().unwrap();
         assert!(replacement_fee > original_fee);
         assert_eq!(
@@ -13699,7 +14031,76 @@ mod tests {
             .unwrap();
         assert_eq!(old_stocks, 0);
         assert_eq!(replacement_stocks, 3);
-        let replacement_txid = replacement.compute_txid().to_string();
+        let first_replacement_txid = replacement.compute_txid().to_string();
+        let first_replacement_hex = bumped["signed_tx_hex"].as_str().unwrap().to_owned();
+
+        let second_bump = wallet.fee_bump_batch_reserves(maintenance_id, 7).unwrap();
+        let second_replacement: Transaction = deserialize(
+            &hex_decode(
+                second_bump["signed_tx_hex"].as_str().unwrap(),
+                "second reserve replacement transaction",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let second_replacement_fee = second_bump["receipt"]["fee_sats"].as_u64().unwrap();
+        assert_eq!(second_bump["receipt"]["replaces"], first_replacement_txid);
+        assert!(second_replacement_fee > replacement_fee);
+        assert_eq!(
+            second_bump["receipt"]["fee_increment_sats"],
+            second_replacement_fee - replacement_fee
+        );
+        let candidates = second_bump["receipt"]["replacement_candidates"]
+            .as_array()
+            .unwrap();
+        assert_eq!(candidates.len(), 2);
+        assert_eq!(candidates[0]["txid"], original_txid.to_string());
+        assert_eq!(
+            candidates[0]["signed_tx_hex"],
+            prepared["signed_tx_hex"]
+        );
+        assert_eq!(candidates[0]["fee_sats"], original_fee);
+        assert_eq!(candidates[1]["txid"], first_replacement_txid);
+        assert_eq!(candidates[1]["signed_tx_hex"], first_replacement_hex);
+        assert_eq!(candidates[1]["fee_sats"], replacement_fee);
+        assert_eq!(
+            second_replacement.output[..second_replacement.output.len() - 1],
+            original.output[..original.output.len() - 1]
+        );
+        assert!(
+            second_replacement.output.last().unwrap().value
+                < replacement.output.last().unwrap().value
+        );
+        assert!(
+            second_replacement.output.last().unwrap().value
+                >= second_replacement
+                    .output
+                    .last()
+                    .unwrap()
+                    .script_pubkey
+                    .minimal_non_dust()
+        );
+        let first_replacement_stocks: i64 = wallet
+            .db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM opencsv_batch_stocks WHERE txid = ?1",
+                [&first_replacement_txid],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let second_replacement_txid = second_replacement.compute_txid().to_string();
+        let second_replacement_stocks: i64 = wallet
+            .db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM opencsv_batch_stocks WHERE txid = ?1",
+                [&second_replacement_txid],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(first_replacement_stocks, 0);
+        assert_eq!(second_replacement_stocks, 3);
         drop(wallet);
 
         let reopened = AccountWallet::open(
@@ -13712,8 +14113,178 @@ mod tests {
             .batch_reserve_operation_json(maintenance_id)
             .unwrap();
         assert_eq!(recovered["state"], "broadcast_unobserved");
-        assert_eq!(recovered["txid"], replacement_txid);
-        assert_eq!(recovered["signed_tx_hex"], bumped["signed_tx_hex"]);
+        assert_eq!(recovered["txid"], second_replacement_txid);
+        assert_eq!(recovered["signed_tx_hex"], second_bump["signed_tx_hex"]);
+        assert_eq!(
+            recovered["receipt"]["replacement_candidates"],
+            second_bump["receipt"]["replacement_candidates"]
+        );
+    }
+
+    #[test]
+    fn reserve_maintenance_restores_an_original_that_confirms_after_fee_bump() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wallet.sqlite");
+        let key = [69u8; 32];
+        let mut wallet = AccountWallet::open(
+            &config_with_url(AccountRole::Primary, true, "http://127.0.0.1:1"),
+            &key,
+            path.to_str().unwrap(),
+        )
+        .unwrap();
+        allow_funding_verification(&mut wallet);
+        fund(&mut wallet, 100_000);
+        let prepared = wallet
+            .prepare_batch_reserves(
+                2,
+                &json!({ "target_sat_per_vb": 1, "max_fee_sats": 5_000 }).to_string(),
+            )
+            .unwrap();
+        let maintenance_id = prepared["maintenance_id"].as_str().unwrap();
+        let original_txid = prepared["txid"].as_str().unwrap().to_owned();
+        let original_hex = prepared["signed_tx_hex"].as_str().unwrap().to_owned();
+        let bumped = wallet.fee_bump_batch_reserves(maintenance_id, 4).unwrap();
+        let replacement_txid = bumped["txid"].as_str().unwrap().to_owned();
+        assert_ne!(replacement_txid, original_txid);
+
+        let (esplora_url, server) = confirmed_status_server(321_000);
+        wallet.config.esplora_url = esplora_url;
+        let restored = wallet.resume_batch_reserves(maintenance_id).unwrap();
+        server.join().unwrap();
+
+        assert_eq!(restored["state"], "broadcast_unobserved");
+        assert_eq!(restored["txid"], original_txid);
+        assert_eq!(restored["signed_tx_hex"], original_hex);
+        assert_eq!(
+            restored["receipt"]["fee_bump_outcome"],
+            "superseded_reserve_candidate_confirmed"
+        );
+        assert_eq!(
+            restored["receipt"]["failed_replacement_txid"],
+            replacement_txid
+        );
+        assert!(restored["receipt"].get("replaces").is_none());
+        assert!(restored["receipt"].get("replacement_candidates").is_none());
+        let original_stocks: i64 = wallet
+            .db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM opencsv_batch_stocks WHERE txid = ?1 AND state = 'pending'",
+                [original_txid],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let replacement_stocks: i64 = wallet
+            .db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM opencsv_batch_stocks WHERE txid = ?1 AND state = 'pending'",
+                [replacement_txid],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(original_stocks, 3);
+        assert_eq!(replacement_stocks, 0);
+    }
+
+    #[test]
+    fn reserve_replacement_accelerator_cannot_override_verified_chain_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wallet.sqlite");
+        let key = [70u8; 32];
+        let mut wallet = AccountWallet::open(
+            &config_with_url(AccountRole::Primary, true, "http://127.0.0.1:1"),
+            &key,
+            path.to_str().unwrap(),
+        )
+        .unwrap();
+        fund(&mut wallet, 100_000);
+        let prepared = wallet
+            .prepare_batch_reserves(
+                2,
+                &json!({ "target_sat_per_vb": 1, "max_fee_sats": 5_000 }).to_string(),
+            )
+            .unwrap();
+        let maintenance_id = prepared["maintenance_id"].as_str().unwrap();
+        let original_txid = prepared["txid"].as_str().unwrap().to_owned();
+        let bumped = wallet.fee_bump_batch_reserves(maintenance_id, 4).unwrap();
+        let replacement_txid = bumped["txid"].as_str().unwrap().to_owned();
+        use_scripted_verifier(
+            &mut wallet,
+            [VerificationVerdict::Reject(
+                "conflicting_operation",
+                "accelerator candidate is absent from the verified chain",
+            )],
+        );
+
+        let (esplora_url, server) = confirmed_status_server(321_001);
+        wallet.config.esplora_url = esplora_url;
+        let unchanged = wallet.resume_batch_reserves(maintenance_id).unwrap();
+        server.join().unwrap();
+
+        assert_eq!(unchanged["txid"], replacement_txid);
+        assert_eq!(
+            unchanged["receipt"]["replacement_candidates"][0]["txid"],
+            original_txid
+        );
+        let replacement_stocks: i64 = wallet
+            .db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM opencsv_batch_stocks WHERE txid = ?1 AND state = 'pending'",
+                [replacement_txid],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(replacement_stocks, 3);
+    }
+
+    #[test]
+    fn reserve_resume_records_unavailable_reconciliation_and_rebroadcasts_current_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wallet.sqlite");
+        let key = [71u8; 32];
+        let mut wallet = AccountWallet::open(
+            &config_with_url(AccountRole::Primary, true, "http://127.0.0.1:1"),
+            &key,
+            path.to_str().unwrap(),
+        )
+        .unwrap();
+        fund(&mut wallet, 100_000);
+        let prepared = wallet
+            .prepare_batch_reserves(
+                2,
+                &json!({ "target_sat_per_vb": 1, "max_fee_sats": 5_000 }).to_string(),
+            )
+            .unwrap();
+        let maintenance_id = prepared["maintenance_id"].as_str().unwrap();
+        let bumped = wallet.fee_bump_batch_reserves(maintenance_id, 4).unwrap();
+        let replacement_txid = bumped["txid"].as_str().unwrap().to_owned();
+        let replacement_hex = bumped["signed_tx_hex"].as_str().unwrap().to_owned();
+        use_scripted_verifier(
+            &mut wallet,
+            [VerificationVerdict::RetryableReject(
+                "chain_verification_unavailable",
+                "compact-filter peers are temporarily unavailable",
+            )],
+        );
+
+        let (esplora_url, server) = confirmed_status_server(321_002);
+        wallet.config.esplora_url = esplora_url;
+        let resumed = wallet.resume_batch_reserves(maintenance_id).unwrap();
+        server.join().unwrap();
+
+        assert_eq!(resumed["state"], "broadcast_unobserved");
+        assert_eq!(resumed["txid"], replacement_txid);
+        assert_eq!(resumed["signed_tx_hex"], replacement_hex);
+        assert_eq!(
+            resumed["receipt"]["resume_candidate_reconciliation"]["reason"],
+            "chain_verification_unavailable"
+        );
+        assert_eq!(
+            resumed["receipt"]["resume_candidate_reconciliation"]["retryable"],
+            true
+        );
     }
 
     #[test]
