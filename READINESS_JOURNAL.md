@@ -8,7 +8,7 @@ valid. Neither proves that responsible operators approved expansion of real
 production supply. Reusing either as the supply authority was rejected.
 
 The new secret-free verifier defines a separately committed policy for one
-deployment, exact consumer-registry release, and asset. It requires a sorted set
+deployment, exact consumer-registry version, and asset. It requires a sorted set
 of distinct administrative secp256k1 keys with a threshold of at least two,
 per-authorization and cumulative supply ceilings, a bounded authorization
 lifetime, a policy validity window, immutable source revision, and public review
@@ -17,9 +17,10 @@ amounts, monotonic sequence, supply-before and supply-after values, validity
 window, policy commitment, and approval receipts. Signatures are unique, sorted,
 authorized, low-S, and over a domain-separated canonical digest.
 
-The verifier takes the expected deployment, registry commitment, asset id, and
-policy commitment as external inputs from the containing release. Trusting
-those fields from the policy being checked was rejected as circular
+The verifier takes the expected deployment, registry version, asset id, and
+policy commitment as external inputs from the containing release; a mint
+authorization additionally binds the final registry commitment. Trusting those
+fields from the policy being checked was rejected as circular
 self-authorization. One-key policies were also rejected:
 the AIR issuer key already supplies single-key protocol authority, so the
 administrative boundary must add independent quorum rather than rename the same
@@ -43,6 +44,13 @@ policy reference, inventing an unknown asset, duplicating a reference, or adding
 one to v1 fails closed. Creating a v2 fixture with placeholder authority keys
 was rejected because reviewable format support is not evidence of an actual key
 ceremony or production release.
+
+The first policy draft also committed the registry hash while registry v2
+committed the policy hash. That creates a cryptographic fixed point with no
+ordinary construction procedure. The policy now binds the registry version;
+the registry binds the policy commitment; and each threshold-signed mint binds
+both final commitments. Keeping the two-way hash reference was rejected even
+though each artifact looked independently well formed.
 
 ## 2026-08-15 — crash rebroadcast revalidates production authorization
 

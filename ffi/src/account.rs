@@ -58,6 +58,10 @@ use sha2::Sha256;
 use url::Url;
 use zeroize::Zeroizing;
 
+#[cfg(any(test, feature = "issuer-tools"))]
+use crate::production_issuance::{
+    validate_production_issuance_policy, ProductionIssuancePolicy, ProductionMintAuthorization,
+};
 use crate::wallet::MemWallet;
 use crate::{
     crosscheck, scan,
@@ -497,6 +501,11 @@ pub struct AccountConfig {
     /// exact release input. Signet and regtest refuse this field.
     #[serde(default)]
     pub production_usd_registry: Option<ProductionUsdRegistryRelease>,
+    /// Public threshold-supply policies used only by the opt-in headless
+    /// issuer build. Default Signal builds reject this field as unknown.
+    #[cfg(any(test, feature = "issuer-tools"))]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub production_issuance_policies: Vec<ProductionIssuancePolicy>,
     /// Absolute miner-fee ceiling in satoshis for fee-bump replacements,
     /// which take no per-call fee policy. When omitted, bumps are uncapped.
     #[serde(default)]
@@ -858,13 +867,15 @@ impl OperationState {
 }
 
 #[cfg(any(test, feature = "issuer-tools"))]
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct IssuanceRequest {
     asset_id: String,
     #[serde(default)]
     to_owner: Option<String>,
     amounts: Vec<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    production_authorization: Option<ProductionMintAuthorization>,
 }
 
 #[cfg(any(test, feature = "issuer-tools"))]
@@ -1830,6 +1841,8 @@ impl AccountWallet {
         validate_observation_checks(&config)?;
         prepare_production_usd_registry(&mut config)?;
         validate_usd_issuer_policy(&config)?;
+        #[cfg(any(test, feature = "issuer-tools"))]
+        validate_configured_production_issuance_policies(&config)?;
 
         #[cfg(feature = "test-wallet-recovery")]
         let account_root_for_test_rebind = match config.role {
@@ -12364,6 +12377,62 @@ fn validate_production_issuance_policy_refs(
                 "production issuance policy references an asset absent from the exact consumer registry",
             ));
         }
+    }
+    Ok(())
+}
+
+#[cfg(any(test, feature = "issuer-tools"))]
+fn validate_configured_production_issuance_policies(
+    config: &AccountConfig,
+) -> Result<(), AccountError> {
+    if config.production_issuance_policies.is_empty() {
+        return Ok(());
+    }
+    if config.network != "mainnet" {
+        return Err(AccountError::new(
+            "invalid_config",
+            "production issuance policies are mainnet-only",
+        ));
+    }
+    let release = config.production_usd_registry.as_ref().ok_or_else(|| {
+        AccountError::new(
+            "invalid_config",
+            "production issuance policies require an exact consumer registry release",
+        )
+    })?;
+    if release.format_version != PRODUCTION_USD_REGISTRY_FORMAT_VERSION_V2 {
+        return Err(AccountError::new(
+            "invalid_config",
+            "production issuance policies require registry format version two",
+        ));
+    }
+    let mut previous_asset: Option<&str> = None;
+    for policy in &config.production_issuance_policies {
+        if previous_asset.is_some_and(|previous| previous >= policy.asset_id.as_str()) {
+            return Err(AccountError::new(
+                "invalid_config",
+                "configured production issuance policies must be unique and sorted by asset id",
+            ));
+        }
+        previous_asset = Some(&policy.asset_id);
+        let reference = release
+            .issuance_policy_commitments
+            .iter()
+            .find(|reference| reference.asset_id == policy.asset_id)
+            .ok_or_else(|| {
+                AccountError::new(
+                    "invalid_config",
+                    "configured production issuance policy is absent from the exact registry release",
+                )
+            })?;
+        validate_production_issuance_policy(
+            policy,
+            &config.deployment_id,
+            release.registry_version,
+            &reference.asset_id,
+            &reference.policy_commitment_sha256,
+        )
+        .map_err(|error| AccountError::new(error.code, error.message))?;
     }
     Ok(())
 }

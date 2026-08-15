@@ -64,7 +64,7 @@ regtest issuer flows are unchanged.
 
 The secret-free `opencsv-registry` tool now defines the reviewable form of that
 separate authority without enabling it. A version-one issuance policy commits
-one exact deployment, production-registry commitment, asset id, sorted set of
+one exact deployment, production-registry version, asset id, sorted set of
 distinct administrative secp256k1 public keys, a threshold of at least two,
 per-authorization and cumulative supply ceilings, authorization lifetime,
 policy validity window, source revision, and public approval receipts. These
@@ -74,9 +74,10 @@ amounts, monotonic sequence, supply-before/supply-after transition, validity
 window, policy commitment, and public approval receipts; every threshold
 signature covers the canonical authorization digest and must be low-S.
 
-Policy and authorization verification always requires the expected deployment,
-registry commitment, asset id, and policy commitment as external inputs from
-the containing release. A self-consistent JSON file cannot nominate its own
+Policy verification requires the expected deployment, registry version, asset
+id, and policy commitment as external inputs from the containing release. Mint
+authorization verification additionally requires that release's exact registry
+commitment. A self-consistent JSON file cannot nominate its own
 trust root. The current wallet does not yet admit these envelopes or advance a
 replay-safe supply floor, so the mainnet issuance
 write gate remains closed. Operators may review canonical bytes with:
@@ -85,10 +86,11 @@ write gate remains closed. Operators may review canonical bytes with:
 opencsv-registry issuance-policy build --input draft.json --output policy.json
 opencsv-registry issuance-policy verify --input policy.json \
   --expected-deployment <deployment> \
-  --expected-registry-commitment <sha256> --expected-asset-id <asset-id> \
+  --expected-registry-version <version> --expected-asset-id <asset-id> \
   --expected-policy-commitment <sha256>
 opencsv-registry mint-authorization verify --policy policy.json \
   --authorization mint.json --expected-deployment <deployment> \
+  --expected-registry-version <version> \
   --expected-registry-commitment <sha256> --expected-asset-id <asset-id> \
   --expected-policy-commitment <sha256> \
   --expected-to-owner <owner> --expected-amount <units> \
@@ -104,6 +106,11 @@ version-one release carrying references fail closed. This gives the external
 `--expected-policy-commitment` input one reproducible source without treating
 the policy file as its own authority. No version-two production release or real
 policy exists yet.
+
+The policy deliberately does not commit the registry hash: registry v2 already
+commits the policy hash, so including the reverse edge would create an
+unconstructible hash fixed point. The threshold-signed mint envelope binds both
+final commitments instead.
 
 The database stores the highest registry version and its exact commitment as
 one atomic floor, and production Secure Backup checkpoints carry the same

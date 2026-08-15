@@ -57,16 +57,17 @@ mainnet boundary fails closed instead. Signet/regtest issuance is unaffected.
 
 The next reviewable boundary is implemented as a pure, secret-free verifier,
 not as a Signal API or enabled mint path. A production issuance policy commits
-the exact deployment, consumer-registry commitment, asset id, at least two
+the exact deployment, consumer-registry version, asset id, at least two
 distinct administrative secp256k1 keys, threshold, per-mint and cumulative
 supply ceilings, authorization lifetime, policy validity, source revision, and
 approval receipts. The administrative threshold is independent of the AIR
 issuer key. Each mint envelope additionally binds its exact recipient, amounts,
 sequence, supply-before/supply-after transition, validity window, and policy
-commitment. Verification receives the expected deployment, registry commitment,
-asset id, and policy commitment from the containing reviewed release so a
-policy cannot authorize itself. No authority secret enters Signal or the
-secret-free verifier.
+commitment. Verification receives the expected deployment, registry version,
+asset id, and policy commitment from the containing reviewed release; the mint
+envelope separately binds the release's final registry commitment. This avoids
+a policy-hash/registry-hash cycle while preventing self-authorization. No
+authority secret enters Signal or the secret-free verifier.
 
 This format alone does not activate issuance. The wallet still returns
 `production_issuance_not_authorized` until the reviewed policy is bound into a

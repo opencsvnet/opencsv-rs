@@ -78,9 +78,9 @@ enum IssuancePolicyCommand {
         /// Exact production deployment expected by the application.
         #[arg(long)]
         expected_deployment: String,
-        /// Exact production registry release commitment.
+        /// Exact production registry release version.
         #[arg(long)]
-        expected_registry_commitment: String,
+        expected_registry_version: u64,
         /// Exact issuer asset id admitted by that registry.
         #[arg(long)]
         expected_asset_id: String,
@@ -106,6 +106,9 @@ enum MintAuthorizationCommand {
         /// Exact production registry release commitment.
         #[arg(long)]
         expected_registry_commitment: String,
+        /// Exact production registry release version.
+        #[arg(long)]
+        expected_registry_version: u64,
         /// Exact issuer asset id admitted by that registry.
         #[arg(long)]
         expected_asset_id: String,
@@ -204,7 +207,7 @@ fn run(cli: Cli) -> Result<Value, CliError> {
         Command::IssuancePolicy(IssuancePolicyCommand::Verify {
             input,
             expected_deployment,
-            expected_registry_commitment,
+            expected_registry_version,
             expected_asset_id,
             expected_policy_commitment,
         }) => {
@@ -212,7 +215,7 @@ fn run(cli: Cli) -> Result<Value, CliError> {
             verify_production_issuance_policy_json(
                 &policy,
                 &expected_deployment,
-                &expected_registry_commitment,
+                expected_registry_version,
                 &expected_asset_id,
                 &expected_policy_commitment,
             )
@@ -223,6 +226,7 @@ fn run(cli: Cli) -> Result<Value, CliError> {
             authorization,
             expected_deployment,
             expected_registry_commitment,
+            expected_registry_version,
             expected_asset_id,
             expected_policy_commitment,
             expected_to_owner,
@@ -235,6 +239,7 @@ fn run(cli: Cli) -> Result<Value, CliError> {
                 &policy,
                 &authorization,
                 &expected_deployment,
+                expected_registry_version,
                 &expected_registry_commitment,
                 &expected_asset_id,
                 &expected_policy_commitment,
@@ -353,8 +358,8 @@ mod tests {
             "policy.json",
             "--expected-deployment",
             "opencsv-mainnet-v1",
-            "--expected-registry-commitment",
-            &"11".repeat(32),
+            "--expected-registry-version",
+            "1",
             "--expected-asset-id",
             &"22".repeat(32),
             "--expected-policy-commitment",
@@ -378,6 +383,8 @@ mod tests {
             "opencsv-mainnet-v1",
             "--expected-registry-commitment",
             &"11".repeat(32),
+            "--expected-registry-version",
+            "1",
             "--expected-asset-id",
             &"22".repeat(32),
             "--expected-policy-commitment",

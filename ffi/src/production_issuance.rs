@@ -35,13 +35,16 @@ impl ValidationError {
     }
 }
 
+/// Canonical public policy for one production issuer's administrative supply
+/// authority. It contains public keys and ceilings only; authority secrets are
+/// never accepted by this crate boundary.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct ProductionIssuancePolicy {
+pub struct ProductionIssuancePolicy {
     pub(crate) format_version: u32,
     pub(crate) policy_version: u64,
     pub(crate) deployment_id: String,
-    pub(crate) registry_commitment_sha256: String,
+    pub(crate) registry_version: u64,
     pub(crate) asset_id: String,
     pub(crate) authority_public_keys: Vec<String>,
     pub(crate) signature_threshold: u8,
@@ -88,7 +91,7 @@ struct PolicyCommitmentPayload<'a> {
     format_version: u32,
     policy_version: u64,
     deployment_id: &'a str,
-    registry_commitment_sha256: &'a str,
+    registry_version: u64,
     asset_id: &'a str,
     authority_public_keys: &'a [String],
     signature_threshold: u8,
@@ -127,7 +130,7 @@ pub(crate) fn production_issuance_policy_commitment(
         format_version: policy.format_version,
         policy_version: policy.policy_version,
         deployment_id: &policy.deployment_id,
-        registry_commitment_sha256: &policy.registry_commitment_sha256,
+        registry_version: policy.registry_version,
         asset_id: &policy.asset_id,
         authority_public_keys: &policy.authority_public_keys,
         signature_threshold: policy.signature_threshold,
@@ -179,7 +182,7 @@ pub(crate) fn production_mint_authorization_digest(
 pub(crate) fn validate_production_issuance_policy(
     policy: &ProductionIssuancePolicy,
     expected_deployment_id: &str,
-    expected_registry_commitment: &str,
+    expected_registry_version: u64,
     expected_asset_id: &str,
     expected_policy_commitment: &str,
 ) -> Result<(), ValidationError> {
@@ -202,14 +205,10 @@ pub(crate) fn validate_production_issuance_policy(
             "production issuance policy belongs to another deployment",
         ));
     }
-    validate_hex_32(
-        &policy.registry_commitment_sha256,
-        "production registry commitment",
-    )?;
-    if policy.registry_commitment_sha256 != expected_registry_commitment {
+    if policy.registry_version == 0 || policy.registry_version != expected_registry_version {
         return Err(ValidationError::new(
             "invalid_production_issuance_policy",
-            "production issuance policy belongs to another registry release",
+            "production issuance policy belongs to another registry version",
         ));
     }
     validate_hex_32(&policy.asset_id, "production issuance asset id")?;
@@ -316,6 +315,7 @@ pub(crate) fn validate_production_issuance_policy(
 pub(crate) fn verify_production_mint_authorization(
     policy: &ProductionIssuancePolicy,
     authorization: &ProductionMintAuthorization,
+    expected_registry_version: u64,
     expected_policy_commitment: &str,
     expected_to_owner: &str,
     expected_amounts: &[u64],
@@ -324,7 +324,7 @@ pub(crate) fn verify_production_mint_authorization(
     validate_production_issuance_policy(
         policy,
         &authorization.deployment_id,
-        &authorization.registry_commitment_sha256,
+        expected_registry_version,
         &authorization.asset_id,
         expected_policy_commitment,
     )?;
@@ -547,7 +547,7 @@ pub fn build_production_issuance_policy_json(
     validate_production_issuance_policy(
         &policy,
         &policy.deployment_id,
-        &policy.registry_commitment_sha256,
+        policy.registry_version,
         &policy.asset_id,
         &policy.commitment_sha256,
     )?;
@@ -564,7 +564,7 @@ pub fn build_production_issuance_policy_json(
 pub fn verify_production_issuance_policy_json(
     policy_json: &str,
     expected_deployment_id: &str,
-    expected_registry_commitment: &str,
+    expected_registry_version: u64,
     expected_asset_id: &str,
     expected_policy_commitment: &str,
 ) -> Result<serde_json::Value, ValidationError> {
@@ -578,7 +578,7 @@ pub fn verify_production_issuance_policy_json(
     validate_production_issuance_policy(
         &policy,
         expected_deployment_id,
-        expected_registry_commitment,
+        expected_registry_version,
         expected_asset_id,
         expected_policy_commitment,
     )?;
@@ -588,6 +588,7 @@ pub fn verify_production_issuance_policy_json(
         "authorization_note": "policy verification does not create a signed mint authorization or activate mainnet issuance",
         "format_version": policy.format_version,
         "policy_version": policy.policy_version,
+        "registry_version": policy.registry_version,
         "deployment_id": policy.deployment_id,
         "asset_id": policy.asset_id,
         "signature_threshold": policy.signature_threshold,
@@ -604,6 +605,7 @@ pub fn verify_production_mint_authorization_json(
     policy_json: &str,
     authorization_json: &str,
     expected_deployment_id: &str,
+    expected_registry_version: u64,
     expected_registry_commitment: &str,
     expected_asset_id: &str,
     expected_policy_commitment: &str,
@@ -628,13 +630,20 @@ pub fn verify_production_mint_authorization_json(
     validate_production_issuance_policy(
         &policy,
         expected_deployment_id,
-        expected_registry_commitment,
+        expected_registry_version,
         expected_asset_id,
         expected_policy_commitment,
     )?;
+    if authorization.registry_commitment_sha256 != expected_registry_commitment {
+        return Err(ValidationError::new(
+            "production_issuance_not_authorized",
+            "production mint authorization belongs to another registry release",
+        ));
+    }
     let digest = verify_production_mint_authorization(
         &policy,
         &authorization,
+        expected_registry_version,
         expected_policy_commitment,
         expected_to_owner,
         expected_amounts,
@@ -752,7 +761,7 @@ mod tests {
             format_version: PRODUCTION_ISSUANCE_POLICY_FORMAT_VERSION,
             policy_version: 1,
             deployment_id: "opencsv-mainnet-v1".into(),
-            registry_commitment_sha256: "11".repeat(32),
+            registry_version: 1,
             asset_id: "22".repeat(32),
             authority_public_keys,
             signature_threshold: 2,
@@ -774,7 +783,7 @@ mod tests {
             format_version: PRODUCTION_MINT_AUTHORIZATION_FORMAT_VERSION,
             authorization_id_sha256: "00".repeat(32),
             deployment_id: policy.deployment_id.clone(),
-            registry_commitment_sha256: policy.registry_commitment_sha256.clone(),
+            registry_commitment_sha256: "11".repeat(32),
             issuance_policy_commitment_sha256: policy.commitment_sha256.clone(),
             asset_id: policy.asset_id.clone(),
             to_owner: "33".repeat(32),
@@ -810,7 +819,7 @@ mod tests {
         validate_production_issuance_policy(
             &policy,
             &policy.deployment_id,
-            &policy.registry_commitment_sha256,
+            policy.registry_version,
             &policy.asset_id,
             &policy.commitment_sha256,
         )
@@ -819,6 +828,7 @@ mod tests {
         verify_production_mint_authorization(
             &policy,
             &authorization,
+            policy.registry_version,
             &policy.commitment_sha256,
             &authorization.to_owner,
             &authorization.amounts,
@@ -832,6 +842,7 @@ mod tests {
             verify_production_mint_authorization(
                 &policy,
                 &changed_amount,
+                policy.registry_version,
                 &policy.commitment_sha256,
                 &changed_amount.to_owner,
                 &changed_amount.amounts,
@@ -848,6 +859,7 @@ mod tests {
             verify_production_mint_authorization(
                 &policy,
                 &changed_supply,
+                policy.registry_version,
                 &policy.commitment_sha256,
                 &changed_supply.to_owner,
                 &changed_supply.amounts,
@@ -869,6 +881,7 @@ mod tests {
         assert!(verify_production_mint_authorization(
             &policy,
             &one_signature,
+            policy.registry_version,
             &policy.commitment_sha256,
             &one_signature.to_owner,
             &one_signature.amounts,
@@ -883,6 +896,7 @@ mod tests {
         assert!(verify_production_mint_authorization(
             &policy,
             &duplicate_signature,
+            policy.registry_version,
             &policy.commitment_sha256,
             &duplicate_signature.to_owner,
             &duplicate_signature.amounts,
@@ -901,6 +915,7 @@ mod tests {
         assert!(verify_production_mint_authorization(
             &policy,
             &wrong_key,
+            policy.registry_version,
             &policy.commitment_sha256,
             &wrong_key.to_owner,
             &wrong_key.amounts,
@@ -919,6 +934,7 @@ mod tests {
             verify_production_mint_authorization(
                 &policy,
                 &valid_authorization,
+                policy.registry_version,
                 &policy.commitment_sha256,
                 &valid_authorization.to_owner,
                 &valid_authorization.amounts,
@@ -941,6 +957,7 @@ mod tests {
             verify_production_mint_authorization(
                 &small_cap,
                 &over_cap,
+                small_cap.registry_version,
                 &small_cap.commitment_sha256,
                 &over_cap.to_owner,
                 &over_cap.amounts,
@@ -961,7 +978,7 @@ mod tests {
         assert!(validate_production_issuance_policy(
             &one_of_one,
             &one_of_one.deployment_id,
-            &one_of_one.registry_commitment_sha256,
+            one_of_one.registry_version,
             &one_of_one.asset_id,
             &one_of_one.commitment_sha256,
         )
@@ -975,7 +992,7 @@ mod tests {
         assert!(validate_production_issuance_policy(
             &duplicate,
             &duplicate.deployment_id,
-            &duplicate.registry_commitment_sha256,
+            duplicate.registry_version,
             &duplicate.asset_id,
             &duplicate.commitment_sha256,
         )
@@ -992,7 +1009,8 @@ mod tests {
             &serde_json::to_string(&policy).unwrap(),
             &serde_json::to_string(&authorization).unwrap(),
             &policy.deployment_id,
-            &policy.registry_commitment_sha256,
+            policy.registry_version,
+            &authorization.registry_commitment_sha256,
             &policy.asset_id,
             &policy.commitment_sha256,
             &authorization.to_owner,
@@ -1007,6 +1025,7 @@ mod tests {
             &serde_json::to_string(&policy).unwrap(),
             &serde_json::to_string(&authorization).unwrap(),
             &policy.deployment_id,
+            policy.registry_version,
             &"44".repeat(32),
             &policy.asset_id,
             &policy.commitment_sha256,
@@ -1021,7 +1040,8 @@ mod tests {
             &serde_json::to_string(&policy).unwrap(),
             &serde_json::to_string(&authorization).unwrap(),
             &policy.deployment_id,
-            &policy.registry_commitment_sha256,
+            policy.registry_version,
+            &authorization.registry_commitment_sha256,
             &policy.asset_id,
             &"55".repeat(32),
             &authorization.to_owner,
