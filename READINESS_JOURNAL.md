@@ -1,5 +1,22 @@
 # Signet/mainnet readiness decision journal
 
+## 2026-08-15 — production observation policy cannot silently downgrade
+
+The first production gate made an empty mainnet issuer registry read-only, but
+fresh mainnet configuration still inherited no required raw-transaction
+observers. A host could therefore activate a reviewed USD product while using
+only a best-effort read accelerator. That was weaker than Test USD and an
+unacceptable production default.
+
+Mainnet now installs immutable pinned mempool.space and Blockstream observers,
+requires both exact byte receipts, and retains visible direct relay and
+confirmed-chain SPV. Independently hosted replacements remain supported, but
+new mainnet writes require two distinct pinned raw endpoints plus non-disabled
+relay and SPV. A weaker configuration remains readable and reports the stable
+`production_observation_policy_required` reason. Treating configurable
+Off/Observe/Require controls as permission for a silent production downgrade
+was rejected; those controls remain useful for testnets and diagnostics.
+
 ## 2026-08-15 — production USD activation and key namespace fail closed
 
 A readable mainnet account with a non-test deployment identifier could still

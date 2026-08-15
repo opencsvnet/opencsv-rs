@@ -53,6 +53,7 @@ use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::Sha256;
+use url::Url;
 use zeroize::Zeroizing;
 
 use crate::wallet::MemWallet;
@@ -345,7 +346,7 @@ pub struct AccountConfig {
     #[serde(default = "default_esplora_max_retries")]
     pub esplora_max_retries: usize,
     /// Independently configurable network observations. An omitted list gets
-    /// fail-closed signet defaults for the two built-in API observers.
+    /// fail-closed signet/mainnet defaults for two built-in API observers.
     #[serde(default)]
     pub observation_checks: Vec<ObservationCheck>,
     /// Number of `require` raw-transaction observers that must return the
@@ -840,6 +841,10 @@ fn write_block_error(reason: &'static str) -> AccountError {
         "production_usd_not_configured" => AccountError::new(
             "production_usd_not_configured",
             "mainnet Bitcoin-writing operations require at least one reviewed non-test USD issuer manifest",
+        ),
+        "production_observation_policy_required" => AccountError::new(
+            "production_observation_policy_required",
+            "mainnet Bitcoin-writing operations require two independent pinned raw-transaction observers, direct relay, and confirmed-chain verification",
         ),
         _ => AccountError::new("write_disabled", "wallet writes are disabled"),
     }
@@ -2277,6 +2282,7 @@ impl AccountWallet {
             "write_enabled": self.write_enabled()?,
             "write_block_reason": self.write_block_reason()?,
             "production_usd_configured": self.production_usd_configured(),
+            "production_observation_policy_ready": self.production_observation_policy_ready(),
             "issuance_enabled": false,
             "device_binding": {
                 "status": match self.config.role {
@@ -8463,6 +8469,9 @@ impl AccountWallet {
         if !self.production_usd_configured() {
             return Err(write_block_error("production_usd_not_configured"));
         }
+        if !self.production_observation_policy_ready() {
+            return Err(write_block_error("production_observation_policy_required"));
+        }
         Ok(())
     }
 
@@ -8483,12 +8492,48 @@ impl AccountWallet {
         self.config.network != "mainnet" || !self.config.usd_issuers.is_empty()
     }
 
+    /// Production may use the immutable built-ins or independently hosted
+    /// replacements, but it must not turn a configurable observation policy
+    /// into a silent safety downgrade. Two distinct pinned raw endpoints must
+    /// fail closed, direct Bitcoin relay must remain visible, and confirmed
+    /// chain verification must remain enabled before a fresh mainnet write.
+    fn production_observation_policy_ready(&self) -> bool {
+        if self.config.network != "mainnet" {
+            return true;
+        }
+        let required_raw_hosts = self
+            .config
+            .observation_checks
+            .iter()
+            .filter(|check| {
+                check.kind == ObservationKind::RawTransactionApi
+                    && check.mode == ObservationMode::Require
+                    && !check.chain_fingerprints_sha256.is_empty()
+            })
+            .filter_map(|check| {
+                let endpoint = Url::parse(check.endpoint.as_deref()?).ok()?;
+                endpoint.host_str().map(str::to_ascii_lowercase)
+            })
+            .collect::<HashSet<_>>();
+        let direct_relay_enabled = self.config.observation_checks.iter().any(|check| {
+            check.kind == ObservationKind::DirectP2pRelay
+                && check.mode != ObservationMode::Off
+        });
+        let confirmed_spv_enabled = self.config.observation_checks.iter().any(|check| {
+            check.kind == ObservationKind::ConfirmedSpv && check.mode != ObservationMode::Off
+        });
+        required_raw_hosts.len() >= 2 && direct_relay_enabled && confirmed_spv_enabled
+    }
+
     fn write_block_reason(&self) -> Result<Option<&'static str>, AccountError> {
         if let Some(reason) = self.base_write_block_reason()? {
             return Ok(Some(reason));
         }
         if !self.production_usd_configured() {
             return Ok(Some("production_usd_not_configured"));
+        }
+        if !self.production_observation_policy_ready() {
+            return Ok(Some("production_observation_policy_required"));
         }
         Ok(None)
     }
@@ -11235,14 +11280,14 @@ fn build_blocking_esplora_client(
         .build_blocking()
 }
 
-const MEMPOOL_SPACE_SIGNET_CHAIN_PINS: [&str; 2] = [
+const MEMPOOL_SPACE_CHAIN_PINS: [&str; 2] = [
     // Sectigo Public Server Authentication CA OV R36.
     "6542d176bed50f193c0ce297ae44ecd8a0a86bec2ede682769344059b4e78530",
     // Sectigo Public Server Authentication Root R46, USERTrust cross-certificate.
     "92f351bf3d54164dfa8dd8f9e1139d3150349786485d2b9eecd00e2971c1e6c5",
 ];
 
-const BLOCKSTREAM_SIGNET_CHAIN_PINS: [&str; 4] = [
+const BLOCKSTREAM_CHAIN_PINS: [&str; 4] = [
     // Let's Encrypt YR1 and YR2 intermediates.
     "13949634d99cd6fd6aa80bc034fefacceb1969feef986586713ecdbb05758d3f",
     "238b85a0099c65b970477d5724f1a1d475ce5058cffe4efa8733899bdb863c47",
@@ -11257,23 +11302,39 @@ fn owned_chain_pins<const N: usize>(pins: [&str; N]) -> Vec<String> {
 
 fn default_observation_checks(network: &str) -> Vec<ObservationCheck> {
     let mut checks = Vec::new();
-    if network == "signet" {
+    if matches!(network, "signet" | "mainnet") {
+        let (mempool_id, mempool_endpoint, blockstream_id, blockstream_endpoint) =
+            if network == "mainnet" {
+                (
+                    "mempool_space_mainnet",
+                    "https://mempool.space/api",
+                    "blockstream_mainnet",
+                    "https://blockstream.info/api",
+                )
+            } else {
+                (
+                    "mempool_space_signet",
+                    "https://mempool.space/signet/api",
+                    "blockstream_signet",
+                    "https://blockstream.info/signet/api",
+                )
+            };
         checks.push(ObservationCheck {
-            id: "mempool_space_signet".into(),
+            id: mempool_id.into(),
             kind: ObservationKind::RawTransactionApi,
-            endpoint: Some("https://mempool.space/signet/api".into()),
+            endpoint: Some(mempool_endpoint.into()),
             mode: ObservationMode::Require,
             pin_profile: Some("sectigo_r46".into()),
-            chain_fingerprints_sha256: owned_chain_pins(MEMPOOL_SPACE_SIGNET_CHAIN_PINS),
+            chain_fingerprints_sha256: owned_chain_pins(MEMPOOL_SPACE_CHAIN_PINS),
             max_age_seconds: default_observation_max_age_seconds(),
         });
         checks.push(ObservationCheck {
-            id: "blockstream_signet".into(),
+            id: blockstream_id.into(),
             kind: ObservationKind::RawTransactionApi,
-            endpoint: Some("https://blockstream.info/signet/api".into()),
+            endpoint: Some(blockstream_endpoint.into()),
             mode: ObservationMode::Require,
             pin_profile: Some("lets_encrypt_yr".into()),
-            chain_fingerprints_sha256: owned_chain_pins(BLOCKSTREAM_SIGNET_CHAIN_PINS),
+            chain_fingerprints_sha256: owned_chain_pins(BLOCKSTREAM_CHAIN_PINS),
             max_age_seconds: default_observation_max_age_seconds(),
         });
     }
@@ -11351,7 +11412,7 @@ fn validate_observation_checks(config: &AccountConfig) -> Result<(), AccountErro
                     || check.endpoint.as_deref() != Some("https://mempool.space/signet/api")
                     || check.pin_profile.as_deref() != Some("sectigo_r46")
                     || check.chain_fingerprints_sha256
-                        != owned_chain_pins(MEMPOOL_SPACE_SIGNET_CHAIN_PINS)
+                        != owned_chain_pins(MEMPOOL_SPACE_CHAIN_PINS)
                 {
                     return Err(AccountError::new(
                         "invalid_config",
@@ -11365,11 +11426,39 @@ fn validate_observation_checks(config: &AccountConfig) -> Result<(), AccountErro
                     || check.endpoint.as_deref() != Some("https://blockstream.info/signet/api")
                     || check.pin_profile.as_deref() != Some("lets_encrypt_yr")
                     || check.chain_fingerprints_sha256
-                        != owned_chain_pins(BLOCKSTREAM_SIGNET_CHAIN_PINS)
+                        != owned_chain_pins(BLOCKSTREAM_CHAIN_PINS)
                 {
                     return Err(AccountError::new(
                         "invalid_config",
                         "the built-in Blockstream signet endpoint and pin profile are immutable",
+                    ));
+                }
+            }
+            "mempool_space_mainnet" => {
+                if config.network != "mainnet"
+                    || check.kind != ObservationKind::RawTransactionApi
+                    || check.endpoint.as_deref() != Some("https://mempool.space/api")
+                    || check.pin_profile.as_deref() != Some("sectigo_r46")
+                    || check.chain_fingerprints_sha256
+                        != owned_chain_pins(MEMPOOL_SPACE_CHAIN_PINS)
+                {
+                    return Err(AccountError::new(
+                        "invalid_config",
+                        "the built-in mempool.space mainnet endpoint and pin profile are immutable",
+                    ));
+                }
+            }
+            "blockstream_mainnet" => {
+                if config.network != "mainnet"
+                    || check.kind != ObservationKind::RawTransactionApi
+                    || check.endpoint.as_deref() != Some("https://blockstream.info/api")
+                    || check.pin_profile.as_deref() != Some("lets_encrypt_yr")
+                    || check.chain_fingerprints_sha256
+                        != owned_chain_pins(BLOCKSTREAM_CHAIN_PINS)
+                {
+                    return Err(AccountError::new(
+                        "invalid_config",
+                        "the built-in Blockstream mainnet endpoint and pin profile are immutable",
                     ));
                 }
             }
@@ -11944,12 +12033,6 @@ mod tests {
             "esplora_url": "https://mempool.space/api",
             "role": AccountRole::Primary,
             "backup_verified": true,
-            "observation_checks": [{
-                "id": "mainnet_test_accelerator",
-                "kind": "raw_transaction_api",
-                "endpoint": "https://mempool.space/api",
-                "mode": "observe",
-            }],
             "usd_issuers": issuers,
             "test_skip_protocol_spend_preflight": true,
         }))
@@ -11970,6 +12053,7 @@ mod tests {
         assert_eq!(status["network"], "mainnet");
         assert_eq!(status["key_derivation_id"], MAINNET_KEY_DERIVATION_ID);
         assert_eq!(status["production_usd_configured"], false);
+        assert_eq!(status["production_observation_policy_ready"], true);
         assert_eq!(status["write_enabled"], false);
         assert_eq!(
             status["write_block_reason"],
@@ -12017,6 +12101,129 @@ mod tests {
     }
 
     #[test]
+    fn fresh_mainnet_defaults_require_two_pinned_observers_and_chain_evidence() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut wallet = AccountWallet::open(
+            &mainnet_config(Vec::new()),
+            &[74_u8; 32],
+            dir.path().join("wallet.sqlite").to_str().unwrap(),
+        )
+        .unwrap();
+
+        let status = wallet.status().unwrap();
+        let policy = status["observation_policy"].as_array().unwrap();
+        assert_eq!(policy.len(), 5);
+        assert_eq!(policy[0]["id"], "mempool_space_mainnet");
+        assert_eq!(policy[0]["endpoint"], "https://mempool.space/api");
+        assert_eq!(policy[0]["mode"], "require");
+        assert_eq!(policy[0]["pin_profile"], "sectigo_r46");
+        assert_eq!(
+            policy[0]["chain_fingerprints_sha256"],
+            json!(MEMPOOL_SPACE_CHAIN_PINS)
+        );
+        assert_eq!(policy[1]["id"], "blockstream_mainnet");
+        assert_eq!(policy[1]["endpoint"], "https://blockstream.info/api");
+        assert_eq!(policy[1]["mode"], "require");
+        assert_eq!(policy[1]["pin_profile"], "lets_encrypt_yr");
+        assert_eq!(
+            policy[1]["chain_fingerprints_sha256"],
+            json!(BLOCKSTREAM_CHAIN_PINS)
+        );
+        assert_eq!(policy[2]["kind"], "direct_p2p_relay");
+        assert_eq!(policy[2]["mode"], "observe");
+        assert_eq!(policy[4]["kind"], "confirmed_spv");
+        assert_eq!(policy[4]["mode"], "observe");
+        assert_eq!(status["required_raw_observer_quorum"], 2);
+        assert_eq!(status["production_observation_policy_ready"], true);
+    }
+
+    #[test]
+    fn mainnet_product_writes_fail_closed_under_a_downgraded_observer_policy() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config: Value =
+            serde_json::from_str(&mainnet_config(vec![mainnet_usd_issuer_policy(75)])).unwrap();
+        config["observation_checks"] = json!([{
+            "id": "mainnet_read_accelerator",
+            "kind": "raw_transaction_api",
+            "endpoint": "https://mempool.space/api",
+            "mode": "observe"
+        }]);
+        let mut wallet = AccountWallet::open(
+            &config.to_string(),
+            &[76_u8; 32],
+            dir.path().join("wallet.sqlite").to_str().unwrap(),
+        )
+        .unwrap();
+
+        let status = wallet.status().unwrap();
+        assert_eq!(status["production_usd_configured"], true);
+        assert_eq!(status["production_observation_policy_ready"], false);
+        assert_eq!(status["write_enabled"], false);
+        assert_eq!(
+            status["write_block_reason"],
+            "production_observation_policy_required"
+        );
+        let error = wallet
+            .transfer_plan(
+                &json!({
+                    "asset_id": hex_encode(&[0_u8; 32]),
+                    "to_owner": hex_encode(&[1_u8; 32]),
+                    "amount": 1,
+                })
+                .to_string(),
+            )
+            .unwrap_err();
+        assert_eq!(error.code, "production_observation_policy_required");
+    }
+
+    #[test]
+    fn mainnet_observer_independence_is_keyed_by_host_not_url_spelling() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config: Value =
+            serde_json::from_str(&mainnet_config(vec![mainnet_usd_issuer_policy(77)])).unwrap();
+        config["observation_checks"] = json!([
+            {
+                "id": "same_host_one",
+                "kind": "raw_transaction_api",
+                "endpoint": "https://observer.example/api",
+                "mode": "require",
+                "chain_fingerprints_sha256": ["11".repeat(32)]
+            },
+            {
+                "id": "same_host_two",
+                "kind": "raw_transaction_api",
+                "endpoint": "https://observer.example/api/",
+                "mode": "require",
+                "chain_fingerprints_sha256": ["22".repeat(32)]
+            },
+            {
+                "id": "direct_p2p_relay",
+                "kind": "direct_p2p_relay",
+                "mode": "observe"
+            },
+            {
+                "id": "multi_peer_spv_confirmation",
+                "kind": "confirmed_spv",
+                "mode": "observe"
+            }
+        ]);
+        let mut wallet = AccountWallet::open(
+            &config.to_string(),
+            &[78_u8; 32],
+            dir.path().join("wallet.sqlite").to_str().unwrap(),
+        )
+        .unwrap();
+
+        let status = wallet.status().unwrap();
+        assert_eq!(status["required_raw_observer_quorum"], 2);
+        assert_eq!(status["production_observation_policy_ready"], false);
+        assert_eq!(
+            status["write_block_reason"],
+            "production_observation_policy_required"
+        );
+    }
+
+    #[test]
     fn mainnet_product_uses_a_distinct_deployment_scoped_key_namespace() {
         let dir = tempfile::tempdir().unwrap();
         let account_root = [72_u8; 32];
@@ -12036,6 +12243,7 @@ mod tests {
         let mainnet_status = mainnet.status().unwrap();
         let signet_status = signet.status().unwrap();
         assert_eq!(mainnet_status["production_usd_configured"], true);
+        assert_eq!(mainnet_status["production_observation_policy_ready"], true);
         assert_eq!(mainnet_status["write_enabled"], true);
         assert_eq!(mainnet_status["write_block_reason"], Value::Null);
         let error = mainnet
@@ -13115,14 +13323,14 @@ mod tests {
         assert_eq!(policy[0]["pin_profile"], "sectigo_r46");
         assert_eq!(
             policy[0]["chain_fingerprints_sha256"],
-            json!(MEMPOOL_SPACE_SIGNET_CHAIN_PINS)
+            json!(MEMPOOL_SPACE_CHAIN_PINS)
         );
         assert_eq!(policy[1]["id"], "blockstream_signet");
         assert_eq!(policy[1]["mode"], "require");
         assert_eq!(policy[1]["pin_profile"], "lets_encrypt_yr");
         assert_eq!(
             policy[1]["chain_fingerprints_sha256"],
-            json!(BLOCKSTREAM_SIGNET_CHAIN_PINS)
+            json!(BLOCKSTREAM_CHAIN_PINS)
         );
         assert_eq!(policy[2]["mode"], "observe");
         assert_eq!(policy[3]["mode"], "off");
@@ -13151,7 +13359,7 @@ mod tests {
                     "completed_at_ms": now - 5,
                     "cached_at_ms": now - 5,
                     "certificate_profile": "sectigo_r46",
-                    "certificate_chain_fingerprints_sha256": [MEMPOOL_SPACE_SIGNET_CHAIN_PINS[0]],
+                    "certificate_chain_fingerprints_sha256": [MEMPOOL_SPACE_CHAIN_PINS[0]],
                     "raw_transaction_hex": "0102"
                 },
                 {
@@ -13162,7 +13370,7 @@ mod tests {
                     "completed_at_ms": now - 4,
                     "cached_at_ms": now - 4,
                     "certificate_profile": "lets_encrypt_yr",
-                    "certificate_chain_fingerprints_sha256": [BLOCKSTREAM_SIGNET_CHAIN_PINS[1]],
+                    "certificate_chain_fingerprints_sha256": [BLOCKSTREAM_CHAIN_PINS[1]],
                     "raw_transaction_hex": "0102"
                 }
             ]
@@ -13234,7 +13442,7 @@ mod tests {
                     "completed_at_ms": now - 5,
                     "cached_at_ms": now - 5,
                     "certificate_profile": "sectigo_r46",
-                    "certificate_chain_fingerprints_sha256": [MEMPOOL_SPACE_SIGNET_CHAIN_PINS[0]],
+                    "certificate_chain_fingerprints_sha256": [MEMPOOL_SPACE_CHAIN_PINS[0]],
                     "raw_transaction_hex": hex_encode(&exact_raw)
                 },
                 {
@@ -13245,7 +13453,7 @@ mod tests {
                     "completed_at_ms": now - 4,
                     "cached_at_ms": now - 4,
                     "certificate_profile": "lets_encrypt_yr",
-                    "certificate_chain_fingerprints_sha256": [BLOCKSTREAM_SIGNET_CHAIN_PINS[1]],
+                    "certificate_chain_fingerprints_sha256": [BLOCKSTREAM_CHAIN_PINS[1]],
                     "raw_transaction_hex": hex_encode(&serialize(&conflicting))
                 }
             ]

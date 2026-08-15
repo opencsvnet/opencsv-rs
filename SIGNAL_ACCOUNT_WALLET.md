@@ -228,6 +228,15 @@ asset id. Status groups those issuer-specific identities under the
 the issuer name and asset id for review and receipts. Unknown or legacy assets
 remain visible but are not promoted by their ticker.
 
+Omitting `observation_checks` on signet or mainnet installs two required raw
+transaction observers plus observable direct relay and confirmed-chain SPV.
+The built-in endpoints and chain-pin profiles are immutable for each network.
+Mainnet product writes additionally require two distinct pinned raw endpoints,
+direct relay, and SPV to remain enabled; an explicitly weakened configuration
+is read-only with `production_observation_policy_required`. Swift performs
+normal TLS/hostname validation and pin matching, while Rust treats its raw
+bytes and TLS receipt as untrusted evidence and recomputes the transaction id.
+
 `opencsv_account_open` takes the public config, account-root bytes,
 device-binding bytes, and database path. The config may include
 `expected_device_binding_commitment` from a recovery checkpoint. Linked

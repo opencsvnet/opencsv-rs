@@ -35,6 +35,15 @@ but an exact transaction already signed and persisted can still resume and
 use its protocol-safe fee-bump path. Opt-in headless issuer tooling keeps its
 separate backup/device gate and remains absent from Signal's default binary.
 
+Fresh mainnet accounts also inherit the same fail-closed observation shape as
+Test USD: exact transaction bytes from both immutable, pinned mempool.space
+and Blockstream endpoints, direct P2P relay evidence, and confirmed-chain SPV.
+Production may replace the built-ins with independently hosted pinned
+observers, but two distinct required raw endpoints, non-disabled direct relay,
+and non-disabled SPV are a second activation gate. A downgraded policy keeps
+the account readable and returns
+`production_observation_policy_required` before any new Bitcoin write.
+
 The older in-memory compatibility model is retained temporarily:
 `opencsv_wallet_create` returns a small secrets
 JSON the host keeps in its keystore (iOS Keychain) and passes back to
