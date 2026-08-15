@@ -11983,6 +11983,17 @@ mod tests {
             )
             .unwrap_err();
         assert_eq!(error.code, "production_usd_not_configured");
+        let error = wallet
+            .transfer_plan(
+                &json!({
+                    "asset_id": hex_encode(&[0_u8; 32]),
+                    "to_owner": hex_encode(&[1_u8; 32]),
+                    "amount": 1,
+                })
+                .to_string(),
+            )
+            .unwrap_err();
+        assert_eq!(error.code, "production_usd_not_configured");
 
         let created = wallet
             .instrument_create(
@@ -12027,6 +12038,17 @@ mod tests {
         assert_eq!(mainnet_status["production_usd_configured"], true);
         assert_eq!(mainnet_status["write_enabled"], true);
         assert_eq!(mainnet_status["write_block_reason"], Value::Null);
+        let error = mainnet
+            .transfer_plan(
+                &json!({
+                    "asset_id": hex_encode(&[0_u8; 32]),
+                    "to_owner": hex_encode(&[1_u8; 32]),
+                    "amount": 1,
+                })
+                .to_string(),
+            )
+            .unwrap_err();
+        assert_eq!(error.code, "asset_not_reviewed");
         assert_eq!(signet_status["key_derivation_id"], TEST_KEY_DERIVATION_ID);
         assert_ne!(
             mainnet_status["root_fingerprint"],
