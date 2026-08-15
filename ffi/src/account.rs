@@ -68,6 +68,8 @@ const PRE_RESET_CHECKPOINT_VERSION: u32 = 3;
 const CHECKPOINT_VERSION: u32 = 4;
 /// Immutable deployment namespace for the fresh signet/regtest Test USD v2 wallet.
 pub const TEST_USD_V2_DEPLOYMENT_ID: &str = "opencsv-test-usd-v2";
+const TEST_KEY_DERIVATION_ID: &str = "opencsv-account-v2";
+const MAINNET_KEY_DERIVATION_ID: &str = "opencsv-mainnet-account-v1";
 const DEFAULT_STOP_GAP: usize = 20;
 const DEFAULT_PARALLEL_REQUESTS: usize = 4;
 const DEFAULT_ESPLORA_REQUEST_TIMEOUT_SECS: u64 = 5;
@@ -391,6 +393,8 @@ struct BackupCheckpointPayload {
     version: u32,
     #[serde(default)]
     deployment_id: Option<String>,
+    #[serde(default)]
+    key_derivation_id: Option<String>,
     network: String,
     root_fingerprint: String,
     device_binding_commitment: Option<String>,
@@ -810,6 +814,35 @@ const fn schema_version() -> u32 {
 
 fn default_deployment_id() -> String {
     TEST_USD_V2_DEPLOYMENT_ID.to_owned()
+}
+
+fn account_key_derivation_id(network: &str) -> &'static str {
+    if network == "mainnet" {
+        MAINNET_KEY_DERIVATION_ID
+    } else {
+        TEST_KEY_DERIVATION_ID
+    }
+}
+
+fn write_block_error(reason: &'static str) -> AccountError {
+    match reason {
+        "primary_required" => {
+            AccountError::new("primary_required", "linked devices are watch-only")
+        }
+        "device_binding_mismatch" => AccountError::new(
+            "device_binding_mismatch",
+            "this restored device is read/export-only until explicit wallet recovery",
+        ),
+        "backup_required" => AccountError::new(
+            "backup_required",
+            "verified Signal Secure Backup is required for Bitcoin-writing operations",
+        ),
+        "production_usd_not_configured" => AccountError::new(
+            "production_usd_not_configured",
+            "mainnet Bitcoin-writing operations require at least one reviewed non-test USD issuer manifest",
+        ),
+        _ => AccountError::new("write_disabled", "wallet writes are disabled"),
+    }
 }
 
 /// SQLite-backed append-only BDK changeset store.
@@ -1674,14 +1707,47 @@ impl AccountWallet {
                             "account key must be exactly 32 bytes",
                         )
                     })?);
-                let bitcoin_seed =
-                    Zeroizing::new(derive::<64>(root.as_ref(), b"bitcoin-fee-wallet-v2", &[])?);
-                let owner_seed =
-                    Zeroizing::new(derive::<32>(root.as_ref(), b"opencsv-owner-v2", &[])?);
-                let issuer_root =
-                    Zeroizing::new(derive::<32>(root.as_ref(), b"opencsv-issuer-root-v2", &[])?);
-                let batch_stock_secret =
-                    Zeroizing::new(derive::<32>(root.as_ref(), b"opencsv-batch-stock-v2", &[])?);
+                let mainnet_context = if network == Network::Bitcoin {
+                    config.deployment_id.as_bytes()
+                } else {
+                    &[]
+                };
+                let (bitcoin_label, owner_label, issuer_label, batch_label):
+                    (&[u8], &[u8], &[u8], &[u8]) = if network == Network::Bitcoin {
+                        (
+                            b"bitcoin-fee-wallet-mainnet-v1",
+                            b"opencsv-owner-mainnet-v1",
+                            b"opencsv-issuer-root-mainnet-v1",
+                            b"opencsv-batch-stock-mainnet-v1",
+                        )
+                    } else {
+                        (
+                            b"bitcoin-fee-wallet-v2",
+                            b"opencsv-owner-v2",
+                            b"opencsv-issuer-root-v2",
+                            b"opencsv-batch-stock-v2",
+                        )
+                    };
+                let bitcoin_seed = Zeroizing::new(derive::<64>(
+                    root.as_ref(),
+                    bitcoin_label,
+                    mainnet_context,
+                )?);
+                let owner_seed = Zeroizing::new(derive::<32>(
+                    root.as_ref(),
+                    owner_label,
+                    mainnet_context,
+                )?);
+                let issuer_root = Zeroizing::new(derive::<32>(
+                    root.as_ref(),
+                    issuer_label,
+                    mainnet_context,
+                )?);
+                let batch_stock_secret = Zeroizing::new(derive::<32>(
+                    root.as_ref(),
+                    batch_label,
+                    mainnet_context,
+                )?);
                 SecretKey::from_slice(batch_stock_secret.as_ref()).map_err(|_| {
                     AccountError::new(
                         "key_derivation_failed",
@@ -1694,10 +1760,23 @@ impl AccountWallet {
                 let coin_type = if network == Network::Bitcoin { 0 } else { 1 };
                 let external = format!("wpkh({xpriv}/84h/{coin_type}h/0h/0/*)");
                 let internal = format!("wpkh({xpriv}/84h/{coin_type}h/0h/1/*)");
-                let fingerprint = sha256::Hash::hash(
-                    &[b"OpenCSV account fingerprint v2".as_slice(), root.as_ref()].concat(),
-                )
-                .to_string();
+                let fingerprint = if network == Network::Bitcoin {
+                    sha256::Hash::hash(
+                        &[
+                            b"OpenCSV mainnet account fingerprint v1".as_slice(),
+                            root.as_ref(),
+                            b"\0",
+                            mainnet_context,
+                        ]
+                        .concat(),
+                    )
+                    .to_string()
+                } else {
+                    sha256::Hash::hash(
+                        &[b"OpenCSV account fingerprint v2".as_slice(), root.as_ref()].concat(),
+                    )
+                    .to_string()
+                };
                 let binding_commitment = if device_binding_key.is_empty() {
                     None
                 } else {
@@ -1708,17 +1787,24 @@ impl AccountWallet {
                                 "primary device binding must be empty or exactly 32 bytes",
                             )
                         })?);
-                    Some(
-                        sha256::Hash::hash(
-                            &[
-                                b"OpenCSV device binding v2".as_slice(),
-                                root.as_ref(),
-                                device_binding.as_ref(),
-                            ]
-                            .concat(),
-                        )
-                        .to_string(),
-                    )
+                    let binding_material = if network == Network::Bitcoin {
+                        [
+                            b"OpenCSV mainnet device binding v1".as_slice(),
+                            root.as_ref(),
+                            device_binding.as_ref(),
+                            b"\0",
+                            mainnet_context,
+                        ]
+                        .concat()
+                    } else {
+                        [
+                            b"OpenCSV device binding v2".as_slice(),
+                            root.as_ref(),
+                            device_binding.as_ref(),
+                        ]
+                        .concat()
+                    };
+                    Some(sha256::Hash::hash(&binding_material).to_string())
                 };
                 (
                     external,
@@ -1789,6 +1875,22 @@ impl AccountWallet {
                 ));
             }
             None => db.set_meta("deployment_id", &config.deployment_id)?,
+            Some(_) => {}
+        }
+        let expected_key_derivation_id = account_key_derivation_id(&config.network);
+        match db.meta("key_derivation_id")? {
+            Some(existing) if existing != expected_key_derivation_id => {
+                return Err(reset_error(format!(
+                    "database key derivation {existing} cannot open as {expected_key_derivation_id}; create a fresh deployment wallet"
+                )));
+            }
+            None if database_preexisted && config.network == "mainnet" => {
+                return Err(AccountError::new(
+                    "deployment_mismatch",
+                    "pre-v1 mainnet key derivation is archived; create a fresh production wallet",
+                ));
+            }
+            None => db.set_meta("key_derivation_id", expected_key_derivation_id)?,
             Some(_) => {}
         }
         match db.meta("root_fingerprint")? {
@@ -2152,6 +2254,7 @@ impl AccountWallet {
         Ok(json!({
             "version": SCHEMA_VERSION,
             "deployment_id": self.config.deployment_id,
+            "key_derivation_id": account_key_derivation_id(&self.config.network),
             "role": self.config.role,
             "network": self.config.network,
             "owners": owners,
@@ -2172,6 +2275,8 @@ impl AccountWallet {
             },
             "backup_verified": self.backup_verified()?,
             "write_enabled": self.write_enabled()?,
+            "write_block_reason": self.write_block_reason()?,
+            "production_usd_configured": self.production_usd_configured(),
             "issuance_enabled": false,
             "device_binding": {
                 "status": match self.config.role {
@@ -2877,7 +2982,7 @@ impl AccountWallet {
         participant_count: u8,
         fee_policy_json: &str,
     ) -> Result<Value, AccountError> {
-        self.require_write_enabled()?;
+        self.require_product_write_enabled()?;
         if !(2..=u8::try_from(MAX_LOCAL_BATCH_RECIPIENTS).unwrap_or(u8::MAX))
             .contains(&participant_count)
         {
@@ -4062,7 +4167,7 @@ impl AccountWallet {
     /// in a background task. There is deliberately no Bitcoin recipient or
     /// arbitrary-send field at this boundary.
     pub fn transfer_plan(&mut self, request_json: &str) -> Result<Value, AccountError> {
-        self.require_write_enabled()?;
+        self.require_product_write_enabled()?;
         let (request, normalized_request) = normalize_transfer_request(request_json)?;
         self.require_reviewed_usd_asset(&request.asset_id)?;
         let operation_id = random_id(16);
@@ -4101,7 +4206,7 @@ impl AccountWallet {
         request_json: &str,
         requested_batch: Option<&str>,
     ) -> Result<Value, AccountError> {
-        self.require_write_enabled()?;
+        self.require_product_write_enabled()?;
         let (request, normalized_request) = normalize_transfer_request(request_json)?;
         self.require_reviewed_usd_asset(&request.asset_id)?;
         let now_ms = unix_time_millis()?;
@@ -4218,7 +4323,7 @@ impl AccountWallet {
     /// established solo path; two or more members become an immutable C1
     /// proposal candidate. Re-entry returns the same frozen membership.
     pub fn freeze_send_batch(&mut self, batch_local_id: &str) -> Result<Value, AccountError> {
-        self.require_write_enabled()?;
+        self.require_product_write_enabled()?;
         let batch = self.send_batch(batch_local_id)?;
         let members = self.send_batch_members(batch_local_id)?;
         if members.is_empty() {
@@ -4330,7 +4435,7 @@ impl AccountWallet {
         &mut self,
         batch_local_id: &str,
     ) -> Result<BatchProofJobStart, AccountError> {
-        self.require_write_enabled()?;
+        self.require_product_write_enabled()?;
         let batch = self.send_batch(batch_local_id)?;
         let members = self.send_batch_members(batch_local_id)?;
         if batch.state == "solo" {
@@ -4809,7 +4914,7 @@ impl AccountWallet {
         &mut self,
         batch_local_id: &str,
     ) -> Result<Value, AccountError> {
-        self.require_write_enabled()?;
+        self.require_product_write_enabled()?;
         let batch = self.send_batch(batch_local_id)?;
         if batch.state != "proof_ready" {
             return Err(AccountError::new(
@@ -5829,7 +5934,7 @@ impl AccountWallet {
         &mut self,
         operation_id: &str,
     ) -> Result<ProofJobStart, AccountError> {
-        self.require_write_enabled()?;
+        self.require_product_write_enabled()?;
         let operation = self.operation(operation_id)?;
         if operation.kind != "transfer" {
             return Err(AccountError::new(
@@ -6193,6 +6298,9 @@ impl AccountWallet {
             ));
         }
         let operation = self.operation(operation_id)?;
+        if operation.kind == "transfer" {
+            self.require_product_write_enabled()?;
+        }
         if operation.state != OperationState::ProofReady.as_str() {
             return Err(AccountError::new(
                 "invalid_operation_state",
@@ -7517,6 +7625,7 @@ impl AccountWallet {
         let payload = json!({
             "version": CHECKPOINT_VERSION,
             "deployment_id": self.config.deployment_id,
+            "key_derivation_id": account_key_derivation_id(&self.config.network),
             "network": self.config.network,
             "root_fingerprint": self.root_fingerprint,
             "device_binding_commitment": self.device_binding_commitment,
@@ -7619,6 +7728,22 @@ impl AccountWallet {
                 "backup_network_mismatch",
                 "Secure Backup checkpoint belongs to another Bitcoin network",
             ));
+        }
+        let expected_key_derivation_id = account_key_derivation_id(&self.config.network);
+        match envelope.checkpoint.key_derivation_id.as_deref() {
+            Some(actual) if actual != expected_key_derivation_id => {
+                return Err(deployment_reset_error(
+                    &self.config.network,
+                    "Secure Backup checkpoint belongs to another account-key derivation namespace",
+                ));
+            }
+            None if self.config.network == "mainnet" => {
+                return Err(deployment_reset_error(
+                    &self.config.network,
+                    "pre-v1 mainnet key derivation is archived; create a fresh production wallet",
+                ));
+            }
+            Some(_) | None => {}
         }
         if envelope.checkpoint.root_fingerprint != self.root_fingerprint {
             return Err(AccountError::new(
@@ -8322,25 +8447,50 @@ impl AccountWallet {
     }
 
     fn require_write_enabled(&self) -> Result<(), AccountError> {
-        if self.config.role != AccountRole::Primary {
-            return Err(AccountError::new(
-                "primary_required",
-                "linked devices are watch-only",
-            ));
-        }
-        if !self.device_binding_valid {
-            return Err(AccountError::new(
-                "device_binding_mismatch",
-                "this restored device is read/export-only until explicit wallet recovery",
-            ));
-        }
-        if !self.backup_verified()? {
-            return Err(AccountError::new(
-                "backup_required",
-                "verified Signal Secure Backup is required for Bitcoin-writing operations",
-            ));
+        if let Some(reason) = self.base_write_block_reason()? {
+            return Err(write_block_error(reason));
         }
         Ok(())
+    }
+
+    /// Gate creation and signing of new consumer operations. Exact persisted
+    /// transactions may still be resumed, and protocol-safe fee bumps may
+    /// still recover an already signed operation after an issuer is removed.
+    /// A fresh mainnet Bitcoin write, however, is meaningless until the host
+    /// supplies at least one fully validated production USD manifest.
+    fn require_product_write_enabled(&self) -> Result<(), AccountError> {
+        self.require_write_enabled()?;
+        if !self.production_usd_configured() {
+            return Err(write_block_error("production_usd_not_configured"));
+        }
+        Ok(())
+    }
+
+    fn base_write_block_reason(&self) -> Result<Option<&'static str>, AccountError> {
+        if self.config.role != AccountRole::Primary {
+            return Ok(Some("primary_required"));
+        }
+        if !self.device_binding_valid {
+            return Ok(Some("device_binding_mismatch"));
+        }
+        if !self.backup_verified()? {
+            return Ok(Some("backup_required"));
+        }
+        Ok(None)
+    }
+
+    fn production_usd_configured(&self) -> bool {
+        self.config.network != "mainnet" || !self.config.usd_issuers.is_empty()
+    }
+
+    fn write_block_reason(&self) -> Result<Option<&'static str>, AccountError> {
+        if let Some(reason) = self.base_write_block_reason()? {
+            return Ok(Some(reason));
+        }
+        if !self.production_usd_configured() {
+            return Ok(Some("production_usd_not_configured"));
+        }
+        Ok(None)
     }
 
     /// Require the exact asset identity to be present in the reviewed USD
@@ -9770,9 +9920,7 @@ impl AccountWallet {
     }
 
     fn write_enabled(&self) -> Result<bool, AccountError> {
-        Ok(self.config.role == AccountRole::Primary
-            && self.device_binding_valid
-            && self.backup_verified()?)
+        Ok(self.write_block_reason()?.is_none())
     }
 
     fn owner_secrets(&self) -> Result<Vec<OwnerSecret>, AccountError> {
@@ -11762,6 +11910,206 @@ mod tests {
         let mut value: Value = serde_json::from_str(&config(AccountRole::Primary, true)).unwrap();
         value["usd_issuers"] = Value::Array(issuers);
         value.to_string()
+    }
+
+    fn mainnet_usd_issuer_policy(seed_byte: u8) -> Value {
+        let terms = InstrumentTermsV1 {
+            version: 1,
+            network: "mainnet".into(),
+            display_name: "Unit-test production USD".into(),
+            unit_code: "USD".into(),
+            decimals: 6,
+            issuer_name: "Unit-test production issuer".into(),
+            terms_uri: "https://opencsv.net/unit-test-production-terms".into(),
+            redemption_summary: "Synthetic manifest used only by the Rust test suite.".into(),
+            test_only: false,
+        };
+        let genesis = AssetGenesis {
+            issuer_pk: PoseidonIssuerAuthorization::public_key(&[seed_byte; 32]),
+            currency_code: *b"USD",
+            terms_hash: terms.terms_hash().unwrap(),
+            nonce: u64::from(seed_byte) + 10_000,
+        };
+        json!({
+            "manifest": InstrumentManifestV1 { terms, genesis },
+            "priority": 0,
+        })
+    }
+
+    fn mainnet_config(issuers: Vec<Value>) -> String {
+        serde_json::to_string(&json!({
+            "version": SCHEMA_VERSION,
+            "deployment_id": "opencsv-mainnet-v1-test",
+            "network": "mainnet",
+            "esplora_url": "https://mempool.space/api",
+            "role": AccountRole::Primary,
+            "backup_verified": true,
+            "observation_checks": [{
+                "id": "mainnet_test_accelerator",
+                "kind": "raw_transaction_api",
+                "endpoint": "https://mempool.space/api",
+                "mode": "observe",
+            }],
+            "usd_issuers": issuers,
+            "test_skip_protocol_spend_preflight": true,
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn mainnet_without_reviewed_product_is_read_only_and_cannot_create_reserves() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut wallet = AccountWallet::open(
+            &mainnet_config(Vec::new()),
+            &[71_u8; 32],
+            dir.path().join("wallet.sqlite").to_str().unwrap(),
+        )
+        .unwrap();
+
+        let status = wallet.status().unwrap();
+        assert_eq!(status["network"], "mainnet");
+        assert_eq!(status["key_derivation_id"], MAINNET_KEY_DERIVATION_ID);
+        assert_eq!(status["production_usd_configured"], false);
+        assert_eq!(status["write_enabled"], false);
+        assert_eq!(
+            status["write_block_reason"],
+            "production_usd_not_configured"
+        );
+
+        let error = wallet
+            .prepare_batch_reserves(
+                2,
+                &json!({ "target_sat_per_vb": 1, "max_fee_sats": 5_000 }).to_string(),
+            )
+            .unwrap_err();
+        assert_eq!(error.code, "production_usd_not_configured");
+
+        let created = wallet
+            .instrument_create(
+                &json!({
+                    "terms": {
+                        "version": 1,
+                        "network": "mainnet",
+                        "display_name": "Unit-test production USD",
+                        "unit_code": "USD",
+                        "decimals": 6,
+                        "issuer_name": "Unit-test production issuer",
+                        "terms_uri": "https://opencsv.net/unit-test-production-terms",
+                        "redemption_summary": "Synthetic manifest used only by the Rust test suite.",
+                        "test_only": false
+                    }
+                })
+                .to_string(),
+            )
+            .unwrap();
+        assert_eq!(created["backup_required"], true);
+    }
+
+    #[test]
+    fn mainnet_product_uses_a_distinct_deployment_scoped_key_namespace() {
+        let dir = tempfile::tempdir().unwrap();
+        let account_root = [72_u8; 32];
+        let mut mainnet = AccountWallet::open(
+            &mainnet_config(vec![mainnet_usd_issuer_policy(73)]),
+            &account_root,
+            dir.path().join("mainnet.sqlite").to_str().unwrap(),
+        )
+        .unwrap();
+        let mut signet = AccountWallet::open(
+            &config(AccountRole::Primary, true),
+            &account_root,
+            dir.path().join("signet.sqlite").to_str().unwrap(),
+        )
+        .unwrap();
+
+        let mainnet_status = mainnet.status().unwrap();
+        let signet_status = signet.status().unwrap();
+        assert_eq!(mainnet_status["production_usd_configured"], true);
+        assert_eq!(mainnet_status["write_enabled"], true);
+        assert_eq!(mainnet_status["write_block_reason"], Value::Null);
+        assert_eq!(signet_status["key_derivation_id"], TEST_KEY_DERIVATION_ID);
+        assert_ne!(
+            mainnet_status["root_fingerprint"],
+            signet_status["root_fingerprint"]
+        );
+        assert_ne!(
+            mainnet_status["watch_descriptors"],
+            signet_status["watch_descriptors"]
+        );
+    }
+
+    #[test]
+    fn pre_v1_mainnet_database_and_checkpoint_fail_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = mainnet_config(vec![mainnet_usd_issuer_policy(74)]);
+        let database_path = dir.path().join("archived-mainnet.sqlite");
+        let archived = AccountWallet::open(
+            &config,
+            &[75_u8; 32],
+            database_path.to_str().unwrap(),
+        )
+        .unwrap();
+        archived.db.delete_meta("key_derivation_id").unwrap();
+        drop(archived);
+
+        let error = AccountWallet::open(
+            &config,
+            &[75_u8; 32],
+            database_path.to_str().unwrap(),
+        )
+        .err()
+        .unwrap();
+        assert_eq!(error.code, "deployment_mismatch");
+
+        let source = AccountWallet::open(
+            &config,
+            &[76_u8; 32],
+            dir.path().join("checkpoint-source.sqlite").to_str().unwrap(),
+        )
+        .unwrap();
+        let mut envelope = source.checkpoint().unwrap();
+        envelope["checkpoint"]
+            .as_object_mut()
+            .unwrap()
+            .remove("key_derivation_id");
+        let canonical = serde_json::to_vec(&envelope["checkpoint"]).unwrap();
+        envelope["checkpoint_hash"] = json!(sha256::Hash::hash(&canonical).to_string());
+        let mut target = AccountWallet::open(
+            &config,
+            &[76_u8; 32],
+            dir.path().join("checkpoint-target.sqlite").to_str().unwrap(),
+        )
+        .unwrap();
+        let error = target.restore_checkpoint(&envelope.to_string()).unwrap_err();
+        assert_eq!(error.code, "deployment_mismatch");
+    }
+
+    #[test]
+    fn signet_v4_checkpoint_without_derivation_id_remains_restore_compatible() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = config(AccountRole::Primary, true);
+        let source = AccountWallet::open(
+            &config,
+            &[77_u8; 32],
+            dir.path().join("signet-source.sqlite").to_str().unwrap(),
+        )
+        .unwrap();
+        let mut envelope = source.checkpoint().unwrap();
+        envelope["checkpoint"]
+            .as_object_mut()
+            .unwrap()
+            .remove("key_derivation_id");
+        let canonical = serde_json::to_vec(&envelope["checkpoint"]).unwrap();
+        envelope["checkpoint_hash"] = json!(sha256::Hash::hash(&canonical).to_string());
+        let mut target = AccountWallet::open(
+            &config,
+            &[77_u8; 32],
+            dir.path().join("signet-target.sqlite").to_str().unwrap(),
+        )
+        .unwrap();
+
+        let restored = target.restore_checkpoint(&envelope.to_string()).unwrap();
+        assert_eq!(restored["network"], "signet");
     }
 
     #[test]

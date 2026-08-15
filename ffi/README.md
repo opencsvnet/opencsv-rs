@@ -16,6 +16,25 @@ the exact planned/fee-reserved operation and Bitcoin lock durable. Verified
 conflicts and stale-state contradictions return `"retryable":false` and close
 the complete unsigned solo or frozen batch.
 
+## Production activation boundary
+
+Opening and synchronizing a mainnet account does not activate a product. A
+mainnet account is read-only until its configuration contains at least one
+fully validated, non-test `USD` issuer manifest under a non-test deployment
+identifier. Until then status returns
+`write_block_reason: "production_usd_not_configured"`, and every new consumer
+transfer, batch, proof, signing, and wallet-internal reserve-split path fails
+with that stable reason before selecting Bitcoin inputs.
+
+Production accounts use the deployment-scoped
+`opencsv-mainnet-account-v1` key-derivation namespace. Signet/regtest retain
+the exact `opencsv-account-v2` derivation for Test USD compatibility; a
+pre-v1 mainnet database or checkpoint is archived rather than guessed into
+the production namespace. Removing an issuer stops unsigned consumer work,
+but an exact transaction already signed and persisted can still resume and
+use its protocol-safe fee-bump path. Opt-in headless issuer tooling keeps its
+separate backup/device gate and remains absent from Signal's default binary.
+
 The older in-memory compatibility model is retained temporarily:
 `opencsv_wallet_create` returns a small secrets
 JSON the host keeps in its keystore (iOS Keychain) and passes back to

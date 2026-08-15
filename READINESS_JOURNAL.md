@@ -1,5 +1,32 @@
 # Signet/mainnet readiness decision journal
 
+## 2026-08-15 — production USD activation and key namespace fail closed
+
+A readable mainnet account with a non-test deployment identifier could still
+enter wallet-internal Bitcoin reserve maintenance while its reviewed USD
+issuer registry was empty. Transfer selection rejected unknown assets later,
+but that was not a sufficient product-activation boundary: it allowed a host
+configuration mistake to create a mainnet Bitcoin write before any production
+USD instrument had been reviewed.
+
+New consumer operations now require both the existing primary/device/backup
+gate and a non-empty, fully validated mainnet USD manifest registry. Status
+exposes the stable `production_usd_not_configured` block reason. The gate is
+intentionally not applied wholesale to every mutation. Exact signed operations
+remain recoverable after a registry change, protocol-safe fee bumps may rescue
+those persisted bytes, and the separately featured headless issuer tooling
+retains its own custody gate. Treating registry removal as permission to strand
+an already-signed transaction was rejected.
+
+Mainnet also receives a new deployment-scoped key namespace instead of
+reusing the Test USD owner, issuer, batch-stock, and account-fingerprint
+derivations. Signet/regtest derivation remains byte-for-byte compatible.
+Databases and Secure Backup checkpoints record the derivation identifier;
+pre-v1 mainnet state is archived and requires a fresh production wallet,
+while an older version-4 signet checkpoint without the new label remains
+restorable. Relying on the Signal host alone to keep test and production roots
+separate was rejected because the Rust custody boundary can enforce it itself.
+
 ## 2026-08-03 — independent peer attestation
 
 The previous multi-peer header loop mutated one shared chain. That made the
