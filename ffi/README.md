@@ -77,8 +77,8 @@ signature covers the canonical authorization digest and must be low-S.
 Policy and authorization verification always requires the expected deployment,
 registry commitment, asset id, and policy commitment as external inputs from
 the containing release. A self-consistent JSON file cannot nominate its own
-trust root. The current wallet does not yet admit
-these envelopes or advance a replay-safe supply floor, so the mainnet issuance
+trust root. The current wallet does not yet admit these envelopes or advance a
+replay-safe supply floor, so the mainnet issuance
 write gate remains closed. Operators may review canonical bytes with:
 
 ```sh
@@ -94,6 +94,16 @@ opencsv-registry mint-authorization verify --policy policy.json \
   --expected-to-owner <owner> --expected-amount <units> \
   --at-unix-seconds <explicit-time>
 ```
+
+Production registry format version one remains byte-for-byte stable and cannot
+authorize issuance. Version two extends the release commitment with a sorted,
+unique list of exact `(asset_id, issuance_policy_commitment)` references, each
+of which must name an asset already admitted by the same consumer registry.
+Unknown assets, duplicate/unsorted references, mutated commitments, and a
+version-one release carrying references fail closed. This gives the external
+`--expected-policy-commitment` input one reproducible source without treating
+the policy file as its own authority. No version-two production release or real
+policy exists yet.
 
 The database stores the highest registry version and its exact commitment as
 one atomic floor, and production Secure Backup checkpoints carry the same

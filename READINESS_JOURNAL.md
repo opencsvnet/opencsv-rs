@@ -32,6 +32,18 @@ all mainnet mint preparation, signing, rebroadcast, and RBF. Activation remains
 closed until this policy is committed by a reviewed production release and a
 crash-safe, backup-carried sequence/supply floor prevents replay across recovery.
 
+A follow-up caught one remaining circularity: passing the expected registry and
+asset to the policy verifier did not prove that the containing release approved
+that policy's key set. Production registry format version two now commits a
+sorted, unique `(asset_id, policy_commitment)` list, and the verifier requires
+that exact policy commitment as an external input. Every reference must name an
+issuer already admitted by the same release. Version-one bytes and their golden
+commitment remain unchanged and cannot carry issuance authority. Mutating a
+policy reference, inventing an unknown asset, duplicating a reference, or adding
+one to v1 fails closed. Creating a v2 fixture with placeholder authority keys
+was rejected because reviewable format support is not evidence of an actual key
+ceremony or production release.
+
 ## 2026-08-15 — crash rebroadcast revalidates production authorization
 
 The signed-authorization snapshot was mandatory for production fee replacement,

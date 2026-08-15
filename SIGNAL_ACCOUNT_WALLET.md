@@ -75,6 +75,13 @@ sequence and cumulative-supply floor. A structural policy commitment, even with
 valid test signatures, is not evidence that a real issuer or key ceremony
 exists.
 
+The containing consumer registry gains this binding only in format version two:
+its canonical commitment includes sorted, unique asset-to-issuance-policy
+commitments, and every referenced asset must already be an exact reviewed
+issuer in that release. Version one remains byte-for-byte compatible and
+cannot carry a supply-policy reference. Signal still receives no mint action,
+authority key, or authorization parser through its default C boundary.
+
 Temporary root and derivation buffers are zeroized. The primary wallet keeps
 the derived signing state required while the account is open. A linked device
 passes no account root and opens with public descriptors and owner identity;
