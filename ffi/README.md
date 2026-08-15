@@ -72,7 +72,9 @@ than silently replaced. Output uses create-new semantics and is never
 overwritten. The checked-in draft has no issuers, a placeholder source
 revision, and candidate phase, so it cannot activate a production product.
 Verification requires the deployment expected by the containing application;
-a structurally valid release for another deployment fails closed.
+a structurally valid release for another deployment fails closed. Limited and
+general releases additionally require at least one exact issuer and reject the
+all-zero placeholder source revision.
 
 Production accounts use the deployment-scoped
 `opencsv-mainnet-account-v1` key-derivation namespace. Signet/regtest retain

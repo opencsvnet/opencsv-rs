@@ -12209,6 +12209,20 @@ fn validate_production_usd_registry_release(
         }
     }
     validate_production_rollout_policy(&release.rollout)?;
+    if release.rollout.phase != ProductionActivationPhase::Candidate {
+        if release.issuers.is_empty() {
+            return Err(AccountError::new(
+                "invalid_config",
+                "an activated production USD registry must contain at least one exact issuer",
+            ));
+        }
+        if release.source_revision.bytes().all(|byte| byte == b'0') {
+            return Err(AccountError::new(
+                "invalid_config",
+                "an activated production USD registry cannot use the placeholder source revision",
+            ));
+        }
+    }
     validate_usd_issuer_policies(&release.issuers, "mainnet")?;
     validate_hex_32_config(
         &release.commitment_sha256,
@@ -13213,6 +13227,27 @@ mod tests {
         .unwrap_err();
         assert_eq!(error.code, "invalid_config");
         assert!(error.message.contains("another deployment"));
+    }
+
+    #[test]
+    fn activated_registry_rejects_empty_issuers_and_placeholder_revision() {
+        let mut candidate: Value = serde_json::from_str(include_str!(
+            "../examples/production_registry_candidate_draft.json"
+        ))
+        .unwrap();
+        candidate["rollout"]["phase"] = json!("limited");
+        let error = build_production_usd_registry_release(&candidate.to_string()).unwrap_err();
+        assert_eq!(error.code, "invalid_config");
+        assert!(error.message.contains("at least one exact issuer"));
+
+        let config: Value =
+            serde_json::from_str(&mainnet_config(vec![mainnet_usd_issuer_policy(70)])).unwrap();
+        let mut draft = config["production_usd_registry"].clone();
+        draft.as_object_mut().unwrap().remove("commitment_sha256");
+        draft["source_revision"] = json!("0".repeat(40));
+        let error = build_production_usd_registry_release(&draft.to_string()).unwrap_err();
+        assert_eq!(error.code, "invalid_config");
+        assert!(error.message.contains("placeholder source revision"));
     }
 
     #[test]

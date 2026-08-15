@@ -49,6 +49,13 @@ a negative grep was also rejected: an incompatible or failed inspector can look
 the same as an absent symbol. CI now writes the symbol inventory first, making
 inspection failure fatal before testing absence.
 
+The public candidate intentionally has no issuer and an all-zero placeholder
+revision. Those fields are useful for byte-level review but must never survive
+an activation-phase edit. Limited and general registry validation now requires
+at least one exact issuer and a non-placeholder revision. Relying on the later
+write gate was rejected because the operator verifier should reject malformed
+activation bytes before they reach a wallet.
+
 ## 2026-08-15 — production issuer policy is an exact release input
 
 The initial mainnet gate considered any nonempty, internally valid
