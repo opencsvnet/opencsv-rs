@@ -12036,6 +12036,30 @@ mod tests {
             mainnet_status["watch_descriptors"],
             signet_status["watch_descriptors"]
         );
+        assert_eq!(
+            mainnet_status["deposit_address"],
+            "bc1q3k8nh9ercxsfn4d8ws9yqw97xhe7v9qag0r4wu"
+        );
+        assert_eq!(
+            mainnet_status["owners"],
+            json!(["4a7a9963d33fff574983f411bc67394f76c4a15df73fc6407251972b615f4048"])
+        );
+        assert_eq!(
+            mainnet_status["root_fingerprint"],
+            "58c5148de26407b859a24a5c89ed75186fb176028d999e198f781e75c2eba257"
+        );
+        assert_eq!(
+            mainnet_status["device_binding"]["commitment"],
+            "4858228fcc016f7e0150c70f9721d2357734475a47c8ea151239ef42a953d87b"
+        );
+        assert_eq!(
+            mainnet_status["watch_descriptors"]["external"],
+            "wpkh([45205f1f/84'/0'/0']xpub6D6NYN7PdZPEvXaGFnodfdCatyj6y6JbmeGzKAyXRDPARpKma6qNBpGW6Waky1s9WxgYYiZQnEcbVbsbf8qfcnFUnbahSL9BMxuVtWWHxqr/0/*)#ugdujupu"
+        );
+        assert_eq!(
+            mainnet_status["watch_descriptors"]["internal"],
+            "wpkh([45205f1f/84'/0'/0']xpub6D6NYN7PdZPEvXaGFnodfdCatyj6y6JbmeGzKAyXRDPARpKma6qNBpGW6Waky1s9WxgYYiZQnEcbVbsbf8qfcnFUnbahSL9BMxuVtWWHxqr/1/*)#duga0f3y"
+        );
     }
 
     #[test]
@@ -12110,6 +12134,43 @@ mod tests {
 
         let restored = target.restore_checkpoint(&envelope.to_string()).unwrap();
         assert_eq!(restored["network"], "signet");
+    }
+
+    #[test]
+    fn signet_v2_key_derivation_matches_golden() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut wallet = AccountWallet::open(
+            &config(AccountRole::Primary, true),
+            &[78_u8; 32],
+            dir.path().join("signet-golden.sqlite").to_str().unwrap(),
+        )
+        .unwrap();
+        let status = wallet.status().unwrap();
+        assert_eq!(status["key_derivation_id"], TEST_KEY_DERIVATION_ID);
+        assert_eq!(
+            status["deposit_address"],
+            "tb1qrtcjuqxddr3wvv70qn9azhskkl3rwkxctmpl03"
+        );
+        assert_eq!(
+            status["owners"],
+            json!(["f7cfee0897fcd470798c0a02c5a6e6732d80726b4b38ae3ed1dcf05299884463"])
+        );
+        assert_eq!(
+            status["root_fingerprint"],
+            "4c269d8eb2fb9b6eeeb1aaae15613ff30ca94ade92e5235ec522c321066c98ed"
+        );
+        assert_eq!(
+            status["device_binding"]["commitment"],
+            "59447ed49fcd993031a70e35f8c7d3b92ae725cdbb2bb271c0eac75a2b49f6df"
+        );
+        assert_eq!(
+            status["watch_descriptors"]["external"],
+            "wpkh([002621f1/84'/1'/0']tpubDD5Yb8gahcpKpgo4tLEZySBhEuLvc5ucEKfQcheSeNgwjsHEFGe1kynLdHBhAks7szaijc8757Tn8Wbi5SzcXKHGcbBdoGgDNXGnxpxRZUp/0/*)#6uhuhwww"
+        );
+        assert_eq!(
+            status["watch_descriptors"]["internal"],
+            "wpkh([002621f1/84'/1'/0']tpubDD5Yb8gahcpKpgo4tLEZySBhEuLvc5ucEKfQcheSeNgwjsHEFGe1kynLdHBhAks7szaijc8757Tn8Wbi5SzcXKHGcbBdoGgDNXGnxpxRZUp/1/*)#tgja2m7k"
+        );
     }
 
     #[test]
