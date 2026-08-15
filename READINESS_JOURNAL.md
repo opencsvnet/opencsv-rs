@@ -1,5 +1,37 @@
 # Signet/mainnet readiness decision journal
 
+## 2026-08-15 — production issuance uses a distinct threshold authority
+
+The consumer registry and AIR issuer key answer different questions: which
+instrument a wallet may spend, and whether one protocol mint is cryptographically
+valid. Neither proves that responsible operators approved expansion of real
+production supply. Reusing either as the supply authority was rejected.
+
+The new secret-free verifier defines a separately committed policy for one
+deployment, exact consumer-registry release, and asset. It requires a sorted set
+of distinct administrative secp256k1 keys with a threshold of at least two,
+per-authorization and cumulative supply ceilings, a bounded authorization
+lifetime, a policy validity window, immutable source revision, and public review
+receipts. Each signed mint envelope binds the exact recipient, one or two
+amounts, monotonic sequence, supply-before and supply-after values, validity
+window, policy commitment, and approval receipts. Signatures are unique, sorted,
+authorized, low-S, and over a domain-separated canonical digest.
+
+The verifier takes the expected deployment, registry commitment, asset id, and
+policy commitment as external inputs from the containing release. Trusting
+those fields from the policy being checked was rejected as circular
+self-authorization. One-key policies were also rejected:
+the AIR issuer key already supplies single-key protocol authority, so the
+administrative boundary must add independent quorum rather than rename the same
+failure mode.
+
+Five focused tests cover exact-envelope binding, threshold/duplicate/wrong-key
+failures, time and supply ceilings, ambiguous policies, external release
+identity, and create-versus-verify commitment behavior. The wallet still blocks
+all mainnet mint preparation, signing, rebroadcast, and RBF. Activation remains
+closed until this policy is committed by a reviewed production release and a
+crash-safe, backup-carried sequence/supply floor prevents replay across recovery.
+
 ## 2026-08-15 — crash rebroadcast revalidates production authorization
 
 The signed-authorization snapshot was mandatory for production fee replacement,

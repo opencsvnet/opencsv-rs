@@ -14,6 +14,10 @@ use clap::{Parser, Subcommand};
 use opencsv_ffi::account::{
     build_production_usd_registry_release, verify_production_usd_registry_release, AccountError,
 };
+use opencsv_ffi::production_issuance::{
+    build_production_issuance_policy_json, verify_production_issuance_policy_json,
+    verify_production_mint_authorization_json, ValidationError as IssuanceValidationError,
+};
 use serde_json::{json, Value};
 
 #[derive(Parser)]
@@ -47,6 +51,77 @@ enum Command {
         #[arg(long)]
         expected_deployment: String,
     },
+    /// Build and verify a distinct threshold-signed supply policy.
+    #[command(subcommand)]
+    IssuancePolicy(IssuancePolicyCommand),
+    /// Verify one exact threshold-signed mint envelope.
+    #[command(subcommand)]
+    MintAuthorization(MintAuthorizationCommand),
+}
+
+#[derive(Subcommand)]
+enum IssuancePolicyCommand {
+    /// Compute and write a canonical commitment for a draft issuance policy.
+    Build {
+        /// Draft JSON with commitment_sha256 omitted.
+        #[arg(long)]
+        input: PathBuf,
+        /// New policy file. Existing files are never overwritten.
+        #[arg(long)]
+        output: PathBuf,
+    },
+    /// Verify a policy against exact application release inputs.
+    Verify {
+        /// Complete policy JSON containing commitment_sha256.
+        #[arg(long)]
+        input: PathBuf,
+        /// Exact production deployment expected by the application.
+        #[arg(long)]
+        expected_deployment: String,
+        /// Exact production registry release commitment.
+        #[arg(long)]
+        expected_registry_commitment: String,
+        /// Exact issuer asset id admitted by that registry.
+        #[arg(long)]
+        expected_asset_id: String,
+        /// Exact issuance-policy commitment authorized by the containing release.
+        #[arg(long)]
+        expected_policy_commitment: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum MintAuthorizationCommand {
+    /// Verify threshold signatures and the exact supply transition.
+    Verify {
+        /// Complete issuance policy JSON.
+        #[arg(long)]
+        policy: PathBuf,
+        /// Complete signed mint-authorization JSON.
+        #[arg(long)]
+        authorization: PathBuf,
+        /// Exact production deployment expected by the application.
+        #[arg(long)]
+        expected_deployment: String,
+        /// Exact production registry release commitment.
+        #[arg(long)]
+        expected_registry_commitment: String,
+        /// Exact issuer asset id admitted by that registry.
+        #[arg(long)]
+        expected_asset_id: String,
+        /// Exact issuance-policy commitment authorized by the containing release.
+        #[arg(long)]
+        expected_policy_commitment: String,
+        /// Exact recipient owner identity.
+        #[arg(long)]
+        expected_to_owner: String,
+        /// One or two exact output amounts.
+        #[arg(long = "expected-amount", required = true, num_args = 1..=2)]
+        expected_amounts: Vec<u64>,
+        /// Explicit evaluation time; the verifier never hides host-clock input.
+        #[arg(long)]
+        at_unix_seconds: u64,
+    },
 }
 
 #[derive(Debug)]
@@ -76,6 +151,12 @@ impl fmt::Display for CliError {
 
 impl From<AccountError> for CliError {
     fn from(error: AccountError) -> Self {
+        Self::new(error.code, error.message)
+    }
+}
+
+impl From<IssuanceValidationError> for CliError {
+    fn from(error: IssuanceValidationError) -> Self {
         Self::new(error.code, error.message)
     }
 }
@@ -114,6 +195,54 @@ fn run(cli: Cli) -> Result<Value, CliError> {
             let release = read_text(&input)?;
             verify_production_usd_registry_release(&release, &expected_deployment)
                 .map_err(Into::into)
+        }
+        Command::IssuancePolicy(IssuancePolicyCommand::Build { input, output }) => {
+            let draft = read_text(&input)?;
+            let policy = build_production_issuance_policy_json(&draft)?;
+            write_release(&output, &policy)
+        }
+        Command::IssuancePolicy(IssuancePolicyCommand::Verify {
+            input,
+            expected_deployment,
+            expected_registry_commitment,
+            expected_asset_id,
+            expected_policy_commitment,
+        }) => {
+            let policy = read_text(&input)?;
+            verify_production_issuance_policy_json(
+                &policy,
+                &expected_deployment,
+                &expected_registry_commitment,
+                &expected_asset_id,
+                &expected_policy_commitment,
+            )
+            .map_err(Into::into)
+        }
+        Command::MintAuthorization(MintAuthorizationCommand::Verify {
+            policy,
+            authorization,
+            expected_deployment,
+            expected_registry_commitment,
+            expected_asset_id,
+            expected_policy_commitment,
+            expected_to_owner,
+            expected_amounts,
+            at_unix_seconds,
+        }) => {
+            let policy = read_text(&policy)?;
+            let authorization = read_text(&authorization)?;
+            verify_production_mint_authorization_json(
+                &policy,
+                &authorization,
+                &expected_deployment,
+                &expected_registry_commitment,
+                &expected_asset_id,
+                &expected_policy_commitment,
+                &expected_to_owner,
+                &expected_amounts,
+                at_unix_seconds,
+            )
+            .map_err(Into::into)
         }
     }
 }
@@ -215,6 +344,56 @@ mod tests {
         ])
         .unwrap();
         assert!(matches!(verify.command, Command::Verify { .. }));
+
+        let policy = Cli::try_parse_from([
+            "opencsv-registry",
+            "issuance-policy",
+            "verify",
+            "--input",
+            "policy.json",
+            "--expected-deployment",
+            "opencsv-mainnet-v1",
+            "--expected-registry-commitment",
+            &"11".repeat(32),
+            "--expected-asset-id",
+            &"22".repeat(32),
+            "--expected-policy-commitment",
+            &"33".repeat(32),
+        ])
+        .unwrap();
+        assert!(matches!(
+            policy.command,
+            Command::IssuancePolicy(IssuancePolicyCommand::Verify { .. })
+        ));
+
+        let authorization = Cli::try_parse_from([
+            "opencsv-registry",
+            "mint-authorization",
+            "verify",
+            "--policy",
+            "policy.json",
+            "--authorization",
+            "authorization.json",
+            "--expected-deployment",
+            "opencsv-mainnet-v1",
+            "--expected-registry-commitment",
+            &"11".repeat(32),
+            "--expected-asset-id",
+            &"22".repeat(32),
+            "--expected-policy-commitment",
+            &"44".repeat(32),
+            "--expected-to-owner",
+            &"33".repeat(32),
+            "--expected-amount",
+            "10",
+            "--at-unix-seconds",
+            "2000",
+        ])
+        .unwrap();
+        assert!(matches!(
+            authorization.command,
+            Command::MintAuthorization(MintAuthorizationCommand::Verify { .. })
+        ));
     }
 
     #[test]

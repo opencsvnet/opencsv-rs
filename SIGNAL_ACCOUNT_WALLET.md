@@ -55,6 +55,26 @@ issuer authorization and supply policy exist. Putting numeric limits into an
 operator-supplied registry file would not authenticate them, so the current
 mainnet boundary fails closed instead. Signet/regtest issuance is unaffected.
 
+The next reviewable boundary is implemented as a pure, secret-free verifier,
+not as a Signal API or enabled mint path. A production issuance policy commits
+the exact deployment, consumer-registry commitment, asset id, at least two
+distinct administrative secp256k1 keys, threshold, per-mint and cumulative
+supply ceilings, authorization lifetime, policy validity, source revision, and
+approval receipts. The administrative threshold is independent of the AIR
+issuer key. Each mint envelope additionally binds its exact recipient, amounts,
+sequence, supply-before/supply-after transition, validity window, and policy
+commitment. Verification receives the expected deployment, registry commitment,
+asset id, and policy commitment from the containing reviewed release so a
+policy cannot authorize itself. No authority secret enters Signal or the
+secret-free verifier.
+
+This format alone does not activate issuance. The wallet still returns
+`production_issuance_not_authorized` until the reviewed policy is bound into a
+production release and the issuer journal has a crash-safe, backup-carried
+sequence and cumulative-supply floor. A structural policy commitment, even with
+valid test signatures, is not evidence that a real issuer or key ceremony
+exists.
+
 Temporary root and derivation buffers are zeroized. The primary wallet keeps
 the derived signing state required while the account is open. A linked device
 passes no account root and opens with public descriptors and owner identity;
