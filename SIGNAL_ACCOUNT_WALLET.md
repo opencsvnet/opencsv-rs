@@ -238,6 +238,15 @@ containing application release authenticates this immutable input through its
 normal distribution signature; the public receipts do not by themselves
 prove issuer backing, solvency, legal authority, or brand control.
 
+Rust persists the highest accepted production registry version plus commitment
+as an atomic database floor and includes it in Secure Backup checkpoints. A
+client downgrade therefore opens read-only with
+`production_registry_rollback` instead of losing wallet visibility or silently
+reactivating old policy. The same version with different bytes opens read-only
+with `production_registry_conflict`. A newer authenticated release advances
+the floor; an older checkpoint can restore state but cannot lower it, while a
+newer checkpoint raises the floor and keeps an older client read-only.
+
 Omitting `observation_checks` on signet or mainnet installs two required raw
 transaction observers plus observable direct relay and confirmed-chain SPV.
 The built-in endpoints and chain-pin profiles are immutable for each network.

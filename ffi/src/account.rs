@@ -316,6 +316,42 @@ pub struct ProductionUsdRegistryRelease {
     pub commitment_sha256: String,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct ProductionUsdRegistryFloor {
+    registry_version: u64,
+    commitment_sha256: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProductionUsdRegistryState {
+    NotApplicable,
+    Unconfigured,
+    Current,
+    Rollback,
+    Conflict,
+}
+
+impl ProductionUsdRegistryState {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::NotApplicable => "not_applicable",
+            Self::Unconfigured => "unconfigured",
+            Self::Current => "current",
+            Self::Rollback => "rollback",
+            Self::Conflict => "conflict",
+        }
+    }
+
+    fn write_block_reason(self) -> Option<&'static str> {
+        match self {
+            Self::Rollback => Some("production_registry_rollback"),
+            Self::Conflict => Some("production_registry_conflict"),
+            Self::NotApplicable | Self::Unconfigured | Self::Current => None,
+        }
+    }
+}
+
 /// Account configuration supplied by Signal. It contains no secret key.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -428,6 +464,8 @@ struct BackupCheckpointPayload {
     deployment_id: Option<String>,
     #[serde(default)]
     key_derivation_id: Option<String>,
+    #[serde(default)]
+    production_usd_registry_floor: Option<ProductionUsdRegistryFloor>,
     network: String,
     root_fingerprint: String,
     device_binding_commitment: Option<String>,
@@ -874,6 +912,14 @@ fn write_block_error(reason: &'static str) -> AccountError {
             "production_usd_not_configured",
             "mainnet Bitcoin-writing operations require at least one reviewed non-test USD issuer manifest",
         ),
+        "production_registry_rollback" => AccountError::new(
+            "production_registry_rollback",
+            "this wallet has seen a newer production USD registry release and remains read-only",
+        ),
+        "production_registry_conflict" => AccountError::new(
+            "production_registry_conflict",
+            "the production USD registry reuses a version with different committed bytes",
+        ),
         "production_observation_policy_required" => AccountError::new(
             "production_observation_policy_required",
             "mainnet Bitcoin-writing operations require two independent pinned raw-transaction observers, direct relay, and two confirmed-chain peers",
@@ -1178,6 +1224,7 @@ impl WalletPersister for SqlitePersister {
 /// An open Signal account wallet.
 pub struct AccountWallet {
     config: AccountConfig,
+    production_usd_registry_state: ProductionUsdRegistryState,
     funding_verifier: Arc<dyn FundingVerifier>,
     bitcoin: PersistedWallet<SqlitePersister>,
     db: SqlitePersister,
@@ -1951,6 +1998,8 @@ impl AccountWallet {
             None => db.set_meta("network", &config.network)?,
             Some(_) => {}
         }
+        let production_usd_registry_state =
+            reconcile_production_usd_registry_floor(&mut db, &mut config)?;
         if db.meta("backup_verified")?.is_none() {
             db.set_meta(
                 "backup_verified",
@@ -2033,6 +2082,7 @@ impl AccountWallet {
         });
         let mut account = Self {
             config,
+            production_usd_registry_state,
             funding_verifier,
             bitcoin,
             db,
@@ -2315,6 +2365,8 @@ impl AccountWallet {
             "write_enabled": self.write_enabled()?,
             "write_block_reason": self.write_block_reason()?,
             "production_usd_configured": self.production_usd_configured(),
+            "production_usd_registry_state": self.production_usd_registry_state.as_str(),
+            "production_usd_registry_floor": read_production_usd_registry_floor(&self.db)?,
             "production_usd_registry": self.config.production_usd_registry.as_ref().map(|registry| json!({
                 "format_version": registry.format_version,
                 "registry_version": registry.registry_version,
@@ -7674,6 +7726,7 @@ impl AccountWallet {
             "version": CHECKPOINT_VERSION,
             "deployment_id": self.config.deployment_id,
             "key_derivation_id": account_key_derivation_id(&self.config.network),
+            "production_usd_registry_floor": read_production_usd_registry_floor(&self.db)?,
             "network": self.config.network,
             "root_fingerprint": self.root_fingerprint,
             "device_binding_commitment": self.device_binding_commitment,
@@ -7793,6 +7846,14 @@ impl AccountWallet {
             }
             Some(_) | None => {}
         }
+        let checkpoint_registry_floor_update = production_usd_registry_floor_from_checkpoint(
+            &self.config.network,
+            &self.db,
+            envelope
+                .checkpoint
+                .production_usd_registry_floor
+                .as_ref(),
+        )?;
         if envelope.checkpoint.root_fingerprint != self.root_fingerprint {
             return Err(AccountError::new(
                 "account_key_mismatch",
@@ -8465,6 +8526,9 @@ impl AccountWallet {
                 .set_meta("backup_checkpoint_version", &CHECKPOINT_VERSION.to_string())?;
             self.db
                 .set_meta("restored_checkpoint_source_hash", &actual_hash)?;
+            if let Some(floor) = checkpoint_registry_floor_update.as_ref() {
+                write_production_usd_registry_floor(&mut self.db, floor)?;
+            }
             #[cfg(any(test, feature = "issuer-tools"))]
             self.restore_issuers()?;
             self.restore_consignment_state()?;
@@ -8477,6 +8541,8 @@ impl AccountWallet {
                 return Err(error);
             }
         }
+        self.production_usd_registry_state =
+            reconcile_production_usd_registry_floor(&mut self.db, &mut self.config)?;
         // The compact checkpoint intentionally omits rebuildable BDK chain
         // history, but its durable protocol proofs and fee reservations are
         // live state. Reinstall them immediately so the first post-restore
@@ -8508,6 +8574,9 @@ impl AccountWallet {
     /// supplies at least one fully validated production USD manifest.
     fn require_product_write_enabled(&self) -> Result<(), AccountError> {
         self.require_write_enabled()?;
+        if let Some(reason) = self.production_usd_registry_state.write_block_reason() {
+            return Err(write_block_error(reason));
+        }
         if !self.production_usd_configured() {
             return Err(write_block_error("production_usd_not_configured"));
         }
@@ -8532,7 +8601,8 @@ impl AccountWallet {
 
     fn production_usd_configured(&self) -> bool {
         self.config.network != "mainnet"
-            || (self.config.production_usd_registry.is_some()
+            || (self.production_usd_registry_state == ProductionUsdRegistryState::Current
+                && self.config.production_usd_registry.is_some()
                 && !self.config.usd_issuers.is_empty())
     }
 
@@ -8580,6 +8650,9 @@ impl AccountWallet {
 
     fn write_block_reason(&self) -> Result<Option<&'static str>, AccountError> {
         if let Some(reason) = self.base_write_block_reason()? {
+            return Ok(Some(reason));
+        }
+        if let Some(reason) = self.production_usd_registry_state.write_block_reason() {
             return Ok(Some(reason));
         }
         if !self.production_usd_configured() {
@@ -11686,6 +11759,141 @@ fn prepare_production_usd_registry(config: &mut AccountConfig) -> Result<(), Acc
     Ok(())
 }
 
+fn read_production_usd_registry_floor(
+    db: &SqlitePersister,
+) -> Result<Option<ProductionUsdRegistryFloor>, AccountError> {
+    db.meta("production_usd_registry_floor")?
+        .map(|encoded| {
+            let floor = serde_json::from_str::<ProductionUsdRegistryFloor>(&encoded).map_err(
+                |error| {
+                    AccountError::new(
+                        "database_corrupt",
+                        format!("production USD registry floor: {error}"),
+                    )
+                },
+            )?;
+            if floor.registry_version == 0
+                || validate_hex_32_config(
+                    &floor.commitment_sha256,
+                    "production USD registry floor commitment",
+                )
+                .is_err()
+            {
+                return Err(AccountError::new(
+                    "database_corrupt",
+                    "production USD registry floor is malformed",
+                ));
+            }
+            Ok(floor)
+        })
+        .transpose()
+}
+
+fn write_production_usd_registry_floor(
+    db: &mut SqlitePersister,
+    floor: &ProductionUsdRegistryFloor,
+) -> Result<(), AccountError> {
+    let encoded = serde_json::to_string(floor).map_err(|error| {
+        AccountError::new(
+            "database_error",
+            format!("encode production USD registry floor: {error}"),
+        )
+    })?;
+    db.set_meta("production_usd_registry_floor", &encoded)
+}
+
+fn reconcile_production_usd_registry_floor(
+    db: &mut SqlitePersister,
+    config: &mut AccountConfig,
+) -> Result<ProductionUsdRegistryState, AccountError> {
+    if config.network != "mainnet" {
+        return Ok(ProductionUsdRegistryState::NotApplicable);
+    }
+    let stored = read_production_usd_registry_floor(db)?;
+    let Some(release) = config.production_usd_registry.as_ref() else {
+        config.usd_issuers.clear();
+        return Ok(ProductionUsdRegistryState::Unconfigured);
+    };
+    let supplied = ProductionUsdRegistryFloor {
+        registry_version: release.registry_version,
+        commitment_sha256: release.commitment_sha256.clone(),
+    };
+    let Some(stored) = stored else {
+        write_production_usd_registry_floor(db, &supplied)?;
+        return Ok(ProductionUsdRegistryState::Current);
+    };
+    if supplied.registry_version < stored.registry_version {
+        config.usd_issuers.clear();
+        return Ok(ProductionUsdRegistryState::Rollback);
+    }
+    if supplied.registry_version == stored.registry_version
+        && supplied.commitment_sha256 != stored.commitment_sha256
+    {
+        config.usd_issuers.clear();
+        return Ok(ProductionUsdRegistryState::Conflict);
+    }
+    if supplied.registry_version > stored.registry_version {
+        write_production_usd_registry_floor(db, &supplied)?;
+    }
+    Ok(ProductionUsdRegistryState::Current)
+}
+
+fn production_usd_registry_floor_from_checkpoint(
+    network: &str,
+    db: &SqlitePersister,
+    checkpoint_floor: Option<&ProductionUsdRegistryFloor>,
+) -> Result<Option<ProductionUsdRegistryFloor>, AccountError> {
+    if network != "mainnet" {
+        if checkpoint_floor.is_some() {
+            return Err(AccountError::new(
+                "invalid_backup_checkpoint",
+                "a testnet checkpoint cannot contain a production USD registry floor",
+            ));
+        }
+        return Ok(None);
+    }
+    let checkpoint_floor = checkpoint_floor.ok_or_else(|| {
+        AccountError::new(
+            "deployment_mismatch",
+            "production Secure Backup checkpoint has no registry-version floor",
+        )
+    })?;
+    if checkpoint_floor.registry_version == 0 {
+        return Err(AccountError::new(
+            "invalid_backup_checkpoint",
+            "production registry checkpoint version must be nonzero",
+        ));
+    }
+    if validate_hex_32_config(
+        &checkpoint_floor.commitment_sha256,
+        "production registry checkpoint commitment",
+    )
+    .is_err()
+    {
+        return Err(AccountError::new(
+            "invalid_backup_checkpoint",
+            "production registry checkpoint commitment is malformed",
+        ));
+    }
+    let stored = read_production_usd_registry_floor(db)?;
+    if stored.as_ref().is_some_and(|stored| {
+        stored.registry_version == checkpoint_floor.registry_version
+            && stored.commitment_sha256 != checkpoint_floor.commitment_sha256
+    }) {
+        return Err(AccountError::new(
+            "production_registry_conflict",
+            "Secure Backup reuses a production registry version with different committed bytes",
+        ));
+    }
+    if stored
+        .as_ref()
+        .is_none_or(|stored| checkpoint_floor.registry_version > stored.registry_version)
+    {
+        return Ok(Some(checkpoint_floor.clone()));
+    }
+    Ok(None)
+}
+
 fn validate_usd_issuer_policy(config: &AccountConfig) -> Result<(), AccountError> {
     let mut asset_ids = HashSet::new();
     for issuer in &config.usd_issuers {
@@ -12241,6 +12449,23 @@ mod tests {
         .unwrap()
     }
 
+    fn rewrite_mainnet_registry(
+        config: &str,
+        registry_version: u64,
+        source_revision_byte: u8,
+    ) -> String {
+        let mut value: Value = serde_json::from_str(config).unwrap();
+        let mut release = serde_json::from_value::<ProductionUsdRegistryRelease>(
+            value["production_usd_registry"].clone(),
+        )
+        .unwrap();
+        release.registry_version = registry_version;
+        release.source_revision = format!("{source_revision_byte:02x}").repeat(20);
+        release.commitment_sha256 = production_usd_registry_commitment(&release).unwrap();
+        value["production_usd_registry"] = serde_json::to_value(release).unwrap();
+        value.to_string()
+    }
+
     fn open_mainnet_config_error(config: &Value, database_name: &str) -> AccountError {
         let dir = tempfile::tempdir().unwrap();
         match AccountWallet::open(
@@ -12332,6 +12557,101 @@ mod tests {
         assert_ne!(
             production_usd_registry_commitment(&changed).unwrap(),
             configured_commitment
+        );
+    }
+
+    #[test]
+    fn production_registry_version_floor_blocks_rollback_without_hiding_status() {
+        let dir = tempfile::tempdir().unwrap();
+        let database = dir.path().join("wallet.sqlite");
+        let v1 = mainnet_config(vec![mainnet_usd_issuer_policy(81)]);
+        let v2 = rewrite_mainnet_registry(&v1, 2, 0xcd);
+
+        let mut current = AccountWallet::open(&v2, &[81_u8; 32], database.to_str().unwrap())
+            .unwrap();
+        let current_status = current.status().unwrap();
+        assert_eq!(current_status["production_usd_registry_state"], "current");
+        assert_eq!(
+            current_status["production_usd_registry_floor"]["registry_version"],
+            2
+        );
+        drop(current);
+
+        let mut rollback = AccountWallet::open(&v1, &[81_u8; 32], database.to_str().unwrap())
+            .unwrap();
+        let rollback_status = rollback.status().unwrap();
+        assert_eq!(
+            rollback_status["production_usd_registry_state"],
+            "rollback"
+        );
+        assert_eq!(rollback_status["production_usd_configured"], false);
+        assert_eq!(rollback_status["write_enabled"], false);
+        assert_eq!(
+            rollback_status["write_block_reason"],
+            "production_registry_rollback"
+        );
+        assert_eq!(
+            rollback_status["production_usd_registry_floor"]["registry_version"],
+            2
+        );
+        let error = rollback
+            .prepare_batch_reserves(
+                2,
+                &json!({ "target_sat_per_vb": 1, "max_fee_sats": 5_000 }).to_string(),
+            )
+            .unwrap_err();
+        assert_eq!(error.code, "production_registry_rollback");
+    }
+
+    #[test]
+    fn production_registry_rejects_same_version_with_different_commitment() {
+        let dir = tempfile::tempdir().unwrap();
+        let database = dir.path().join("wallet.sqlite");
+        let original = mainnet_config(vec![mainnet_usd_issuer_policy(82)]);
+        let conflicting = rewrite_mainnet_registry(&original, 1, 0xef);
+
+        drop(
+            AccountWallet::open(&original, &[82_u8; 32], database.to_str().unwrap()).unwrap(),
+        );
+        let mut wallet =
+            AccountWallet::open(&conflicting, &[82_u8; 32], database.to_str().unwrap()).unwrap();
+        let status = wallet.status().unwrap();
+        assert_eq!(status["production_usd_registry_state"], "conflict");
+        assert_eq!(status["write_block_reason"], "production_registry_conflict");
+        assert_eq!(status["production_usd_configured"], false);
+    }
+
+    #[test]
+    fn secure_backup_carries_the_registry_floor_across_a_clean_restore() {
+        let dir = tempfile::tempdir().unwrap();
+        let v1 = mainnet_config(vec![mainnet_usd_issuer_policy(83)]);
+        let v2 = rewrite_mainnet_registry(&v1, 2, 0x12);
+        let source = AccountWallet::open(
+            &v2,
+            &[83_u8; 32],
+            dir.path().join("source.sqlite").to_str().unwrap(),
+        )
+        .unwrap();
+        let checkpoint = source.checkpoint().unwrap();
+        assert_eq!(
+            checkpoint["checkpoint"]["production_usd_registry_floor"]["registry_version"],
+            2
+        );
+
+        let mut restored = AccountWallet::open(
+            &v1,
+            &[83_u8; 32],
+            dir.path().join("restored.sqlite").to_str().unwrap(),
+        )
+        .unwrap();
+        let status = restored
+            .restore_checkpoint(&checkpoint.to_string())
+            .unwrap();
+        assert_eq!(status["production_usd_registry_state"], "rollback");
+        assert_eq!(status["write_block_reason"], "production_registry_rollback");
+        assert_eq!(
+            status["production_usd_registry_floor"]["registry_version"],
+            2
         );
     }
 

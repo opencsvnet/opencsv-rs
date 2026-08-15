@@ -30,6 +30,15 @@ Until a valid nonempty release is present, status returns
 transfer, batch, proof, signing, and wallet-internal reserve-split path fails
 with that stable reason before selecting Bitcoin inputs.
 
+The database stores the highest registry version and its exact commitment as
+one atomic floor, and production Secure Backup checkpoints carry the same
+floor. Reopening or restoring with an older valid release remains readable but
+returns `production_registry_rollback`; reusing one version with different
+committed bytes returns `production_registry_conflict`. Neither case hides
+balance/history/evidence, and neither can create a new unsigned Bitcoin write.
+An authenticated higher version advances the floor, including an empty
+emergency-freeze release.
+
 Production accounts use the deployment-scoped
 `opencsv-mainnet-account-v1` key-derivation namespace. Signet/regtest retain
 the exact `opencsv-account-v2` derivation for Test USD compatibility; a

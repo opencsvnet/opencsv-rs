@@ -24,6 +24,17 @@ external evidence gates, and no real production registry exists yet. Treating
 a nonempty caller-supplied vector as equivalent to a reviewed release was
 rejected.
 
+The first release-envelope pass still treated `registry_version` as metadata.
+That allowed a valid older application configuration to reopen a wallet after a
+newer disable/freeze policy had been observed. The database now persists the
+highest version and exact commitment as one atomic floor, and production
+Secure Backup checkpoints carry it across clean restore. Older policy and
+same-version/different-bytes policy remain readable but return stable
+`production_registry_rollback` or `production_registry_conflict` write blocks.
+Higher versions advance the floor; an older checkpoint never lowers it.
+Failing account open entirely was rejected because policy rollback must not
+hide balances, history, or recovery evidence.
+
 ## 2026-08-15 — production observation policy cannot silently downgrade
 
 The first production gate made an empty mainnet issuer registry read-only, but
