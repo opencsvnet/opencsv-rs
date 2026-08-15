@@ -26,6 +26,23 @@ corruption. Reusing the release commitment as its own authenticator was
 rejected because an attacker able to rewrite the receipt can recompute an
 unkeyed hash.
 
+## 2026-08-15 — production registry bytes use one Rust implementation
+
+The wallet could verify a production registry release, but operators had no
+headless command to create the exact canonical commitment. Reimplementing the
+struct serialization in a shell or documentation script would create a second
+consensus surface and make a release depend on JSON key-order assumptions.
+
+The opt-in, separately featured `opencsv-registry` binary now calls the same
+pure builder and verifier as account open. Build input must omit the commitment,
+output is create-new and durably synced, and verification rechecks deployment, manifests,
+rollout, receipts, and the exact commitment against the operator-supplied
+application deployment. The public example is deliberately
+issuer-empty, candidate-only, and pinned to a placeholder revision; it cannot
+arm writes. Copying the commitment algorithm into an operational script was
+rejected because one byte-level implementation is easier to reproduce and
+audit.
+
 ## 2026-08-15 — production issuer policy is an exact release input
 
 The initial mainnet gate considered any nonempty, internally valid

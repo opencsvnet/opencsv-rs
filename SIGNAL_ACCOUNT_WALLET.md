@@ -244,6 +244,12 @@ This makes a self-consistent substituted release, a snapshot copied between
 operations, or missing authentication fail as database corruption during RBF;
 the live host policy is never substituted for the original authorization.
 
+Production release construction is also kept out of Signal. The separately
+featured, secret-free `opencsv-registry` binary builds and verifies the exact
+canonical envelope with the same Rust rules as account open. Its checked-in
+example is an issuer-empty candidate only; it is evidence tooling, not an
+activation artifact.
+
 Rust persists the highest accepted production registry version plus commitment
 as an atomic database floor and includes it in Secure Backup checkpoints. A
 client downgrade therefore opens read-only with

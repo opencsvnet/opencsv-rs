@@ -16,11 +16,19 @@ test-wallet-recovery = []
 # Privileged issuer/reference tooling. Signal's CocoaPods build does not enable
 # this feature, and the C ABI intentionally exposes no corresponding symbols.
 issuer-tools = ["dep:clap"]
+# Secret-free production-registry construction and verification. Kept separate
+# so an operator does not enable issuer key handling merely to review policy.
+registry-tools = ["dep:clap"]
 
 [[bin]]
 name = "opencsv-issuer"
 path = "src/bin/opencsv-issuer.rs"
 required-features = ["issuer-tools"]
+
+[[bin]]
+name = "opencsv-registry"
+path = "src/bin/opencsv-registry.rs"
+required-features = ["registry-tools"]
 
 [[example]]
 name = "signet_account_acceptance"

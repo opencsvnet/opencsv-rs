@@ -55,6 +55,25 @@ balance/history/evidence, and neither can create a new unsigned Bitcoin write.
 An authenticated higher version advances the floor, including an empty
 emergency-freeze release.
 
+The opt-in, secret-free registry operator uses the same canonical serializer,
+manifest checks, rollout validation, and commitment verifier as account open:
+
+```sh
+cargo run -p opencsv-ffi --features registry-tools --bin opencsv-registry -- \
+  build --input ffi/examples/production_registry_candidate_draft.json \
+  --output candidate-release.json
+cargo run -p opencsv-ffi --features registry-tools --bin opencsv-registry -- \
+  verify --input candidate-release.json \
+  --expected-deployment opencsv-mainnet-candidate-v1
+```
+
+Build input must omit `commitment_sha256`; a supplied value is rejected rather
+than silently replaced. Output uses create-new semantics and is never
+overwritten. The checked-in draft has no issuers, a placeholder source
+revision, and candidate phase, so it cannot activate a production product.
+Verification requires the deployment expected by the containing application;
+a structurally valid release for another deployment fails closed.
+
 Production accounts use the deployment-scoped
 `opencsv-mainnet-account-v1` key-derivation namespace. Signet/regtest retain
 the exact `opencsv-account-v2` derivation for Test USD compatibility; a

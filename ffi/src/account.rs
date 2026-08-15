@@ -11770,10 +11770,13 @@ fn parse_network(name: &str) -> Result<Network, AccountError> {
 }
 
 fn validate_deployment(config: &AccountConfig) -> Result<(), AccountError> {
-    if config.deployment_id.is_empty()
-        || config.deployment_id.len() > 64
-        || !config
-            .deployment_id
+    validate_deployment_identity(&config.network, &config.deployment_id)
+}
+
+fn validate_deployment_identity(network: &str, deployment_id: &str) -> Result<(), AccountError> {
+    if deployment_id.is_empty()
+        || deployment_id.len() > 64
+        || !deployment_id
             .bytes()
             .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
     {
@@ -11782,14 +11785,14 @@ fn validate_deployment(config: &AccountConfig) -> Result<(), AccountError> {
             "deployment_id must be 1..=64 lowercase ASCII letters, digits, or hyphens",
         ));
     }
-    match config.network.as_str() {
-        "signet" | "regtest" if config.deployment_id != TEST_USD_V2_DEPLOYMENT_ID => {
+    match network {
+        "signet" | "regtest" if deployment_id != TEST_USD_V2_DEPLOYMENT_ID => {
             return Err(AccountError::new(
                 "invalid_config",
                 format!("signet/regtest deployment_id must be {TEST_USD_V2_DEPLOYMENT_ID}"),
             ));
         }
-        "mainnet" if config.deployment_id == TEST_USD_V2_DEPLOYMENT_ID => {
+        "mainnet" if deployment_id == TEST_USD_V2_DEPLOYMENT_ID => {
             return Err(AccountError::new(
                 "invalid_config",
                 "the Test USD v2 deployment cannot run on mainnet",
@@ -12141,26 +12144,11 @@ fn production_usd_registry_commitment(
     Ok(sha256::Hash::hash(&canonical).to_string())
 }
 
-fn prepare_production_usd_registry(config: &mut AccountConfig) -> Result<(), AccountError> {
-    if config.network != "mainnet" {
-        if config.production_usd_registry.is_some() {
-            return Err(AccountError::new(
-                "invalid_config",
-                "production USD registry releases are mainnet-only",
-            ));
-        }
-        return Ok(());
-    }
-
-    if !config.usd_issuers.is_empty() {
-        return Err(AccountError::new(
-            "invalid_config",
-            "mainnet USD issuers must come from a versioned production registry release",
-        ));
-    }
-    let Some(release) = config.production_usd_registry.as_ref() else {
-        return Ok(());
-    };
+fn validate_production_usd_registry_release(
+    release: &ProductionUsdRegistryRelease,
+    expected_deployment_id: &str,
+) -> Result<(), AccountError> {
+    validate_deployment_identity("mainnet", &release.deployment_id)?;
     if release.format_version != PRODUCTION_USD_REGISTRY_FORMAT_VERSION {
         return Err(AccountError::new(
             "invalid_config",
@@ -12176,7 +12164,7 @@ fn prepare_production_usd_registry(config: &mut AccountConfig) -> Result<(), Acc
             "production USD registry version must be nonzero",
         ));
     }
-    if release.deployment_id != config.deployment_id {
+    if release.deployment_id != expected_deployment_id {
         return Err(AccountError::new(
             "invalid_config",
             "production USD registry belongs to another deployment",
@@ -12221,6 +12209,7 @@ fn prepare_production_usd_registry(config: &mut AccountConfig) -> Result<(), Acc
         }
     }
     validate_production_rollout_policy(&release.rollout)?;
+    validate_usd_issuer_policies(&release.issuers, "mainnet")?;
     validate_hex_32_config(
         &release.commitment_sha256,
         "production USD registry commitment",
@@ -12232,6 +12221,100 @@ fn prepare_production_usd_registry(config: &mut AccountConfig) -> Result<(), Acc
             "production USD registry commitment does not match its exact release payload",
         ));
     }
+    Ok(())
+}
+
+/// Build the exact canonical production-registry release used by account
+/// configuration. This pure, secret-free helper is exposed only to tests and
+/// the opt-in headless operator tools; Signal never enables that feature.
+#[cfg(any(test, feature = "registry-tools"))]
+pub fn build_production_usd_registry_release(
+    draft_json: &str,
+) -> Result<Value, AccountError> {
+    let mut value: Value = serde_json::from_str(draft_json).map_err(|error| {
+        AccountError::new(
+            "invalid_config",
+            format!("production registry draft JSON: {error}"),
+        )
+    })?;
+    let object = value.as_object_mut().ok_or_else(|| {
+        AccountError::new("invalid_config", "production registry draft must be an object")
+    })?;
+    if object.contains_key("commitment_sha256") {
+        return Err(AccountError::new(
+            "invalid_config",
+            "production registry build input must omit commitment_sha256",
+        ));
+    }
+    object.insert("commitment_sha256".into(), json!("00".repeat(32)));
+    let mut release = serde_json::from_value::<ProductionUsdRegistryRelease>(value).map_err(
+        |error| {
+            AccountError::new(
+                "invalid_config",
+                format!("production registry draft: {error}"),
+            )
+        },
+    )?;
+    release.commitment_sha256 = production_usd_registry_commitment(&release)?;
+    validate_production_usd_registry_release(&release, &release.deployment_id)?;
+    serde_json::to_value(release).map_err(|error| {
+        AccountError::new(
+            "json_encode_failed",
+            format!("production registry release: {error}"),
+        )
+    })
+}
+
+/// Verify a complete release with the exact same rules used by account open.
+#[cfg(any(test, feature = "registry-tools"))]
+pub fn verify_production_usd_registry_release(
+    release_json: &str,
+    expected_deployment_id: &str,
+) -> Result<Value, AccountError> {
+    let release = serde_json::from_str::<ProductionUsdRegistryRelease>(release_json).map_err(
+        |error| {
+            AccountError::new(
+                "invalid_config",
+                format!("production registry release JSON: {error}"),
+            )
+        },
+    )?;
+    validate_deployment_identity("mainnet", expected_deployment_id)?;
+    validate_production_usd_registry_release(&release, expected_deployment_id)?;
+    Ok(json!({
+        "structurally_valid": true,
+        "activation_authorized": false,
+        "authorization_note": "structural verification does not replace application distribution signing, independent review, or owner approval",
+        "format_version": release.format_version,
+        "registry_version": release.registry_version,
+        "deployment_id": release.deployment_id,
+        "phase": release.rollout.phase,
+        "issuer_count": release.issuers.len(),
+        "commitment_sha256": release.commitment_sha256,
+    }))
+}
+
+fn prepare_production_usd_registry(config: &mut AccountConfig) -> Result<(), AccountError> {
+    if config.network != "mainnet" {
+        if config.production_usd_registry.is_some() {
+            return Err(AccountError::new(
+                "invalid_config",
+                "production USD registry releases are mainnet-only",
+            ));
+        }
+        return Ok(());
+    }
+
+    if !config.usd_issuers.is_empty() {
+        return Err(AccountError::new(
+            "invalid_config",
+            "mainnet USD issuers must come from a versioned production registry release",
+        ));
+    }
+    let Some(release) = config.production_usd_registry.as_ref() else {
+        return Ok(());
+    };
+    validate_production_usd_registry_release(release, &config.deployment_id)?;
 
     config.usd_issuers.clone_from(&release.issuers);
     config.max_fee_sats = Some(
@@ -12437,12 +12520,19 @@ fn production_usd_registry_floor_from_checkpoint(
 }
 
 fn validate_usd_issuer_policy(config: &AccountConfig) -> Result<(), AccountError> {
+    validate_usd_issuer_policies(&config.usd_issuers, &config.network)
+}
+
+fn validate_usd_issuer_policies(
+    issuers: &[UsdIssuerPolicy],
+    network: &str,
+) -> Result<(), AccountError> {
     let mut asset_ids = HashSet::new();
-    for issuer in &config.usd_issuers {
+    for issuer in issuers {
         issuer.manifest.validate().map_err(|error| {
             AccountError::new("invalid_config", format!("USD issuer manifest: {error}"))
         })?;
-        if issuer.manifest.terms.network != config.network {
+        if issuer.manifest.terms.network != network {
             return Err(AccountError::new(
                 "invalid_config",
                 "USD issuer manifest belongs to another network",
@@ -13076,6 +13166,53 @@ mod tests {
         let error = open_mainnet_config_error(&signet, "signet.sqlite");
         assert_eq!(error.code, "invalid_config");
         assert!(error.message.contains("mainnet-only"));
+    }
+
+    #[test]
+    fn headless_registry_builder_matches_account_open_and_detects_mutation() {
+        let config: Value =
+            serde_json::from_str(&mainnet_config(vec![mainnet_usd_issuer_policy(70)])).unwrap();
+        let expected = config["production_usd_registry"].clone();
+        let mut draft = expected.clone();
+        draft.as_object_mut().unwrap().remove("commitment_sha256");
+
+        let built = build_production_usd_registry_release(&draft.to_string()).unwrap();
+        assert_eq!(built, expected);
+        let verified = verify_production_usd_registry_release(
+            &built.to_string(),
+            expected["deployment_id"].as_str().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(verified["structurally_valid"], true);
+        assert_eq!(verified["activation_authorized"], false);
+        assert_eq!(verified["issuer_count"], 1);
+        assert_eq!(verified["phase"], "limited");
+        assert_eq!(
+            verified["commitment_sha256"],
+            expected["commitment_sha256"]
+        );
+
+        let error = build_production_usd_registry_release(&expected.to_string()).unwrap_err();
+        assert_eq!(error.code, "invalid_config");
+        assert!(error.message.contains("must omit commitment"));
+
+        let mut mutated = built;
+        mutated["issuers"][0]["priority"] = json!(99);
+        let error = verify_production_usd_registry_release(
+            &mutated.to_string(),
+            expected["deployment_id"].as_str().unwrap(),
+        )
+        .unwrap_err();
+        assert_eq!(error.code, "invalid_config");
+        assert!(error.message.contains("commitment does not match"));
+
+        let error = verify_production_usd_registry_release(
+            &expected.to_string(),
+            "opencsv-mainnet-another-deployment",
+        )
+        .unwrap_err();
+        assert_eq!(error.code, "invalid_config");
+        assert!(error.message.contains("another deployment"));
     }
 
     #[test]
