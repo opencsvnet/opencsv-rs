@@ -48,15 +48,15 @@ of this executable alone conveys no authority: mint proofs require the issuer
 seed derived by the account that created the exact asset id.
 
 That cryptographic issuer key is necessary but not sufficient to activate
-production issuance. Mainnet manifest construction remains available for
-review, while mint preparation, signing, rebroadcast, and mint fee bumps all
-return `production_issuance_not_authorized` until a separately authenticated
-issuer authorization and supply policy exist. Putting numeric limits into an
-operator-supplied registry file would not authenticate them, so the current
-mainnet boundary fails closed instead. Signet/regtest issuance is unaffected.
+production issuance. Mainnet mint preparation requires registry v2 to commit a
+separately authenticated threshold policy and requires one exact signed mint
+authorization. Without both, preparation, signing, rebroadcast, and mint fee
+bumps return `production_issuance_not_authorized`. Putting numeric limits into
+an operator-supplied registry file does not authenticate them. Signet/regtest
+issuance is unaffected.
 
-The next reviewable boundary is implemented as a pure, secret-free verifier,
-not as a Signal API or enabled mint path. A production issuance policy commits
+The authorization boundary uses a pure, secret-free verifier and is enabled
+only in the headless issuer path, never as a Signal API. A production issuance policy commits
 the exact deployment, consumer-registry version, asset id, at least two
 distinct administrative secp256k1 keys, threshold, per-mint and cumulative
 supply ceilings, authorization lifetime, policy validity, source revision, and
@@ -69,12 +69,15 @@ envelope separately binds the release's final registry commitment. This avoids
 a policy-hash/registry-hash cycle while preventing self-authorization. No
 authority secret enters Signal or the secret-free verifier.
 
-This format alone does not activate issuance. The wallet still returns
-`production_issuance_not_authorized` until the reviewed policy is bound into a
-production release and the issuer journal has a crash-safe, backup-carried
-sequence and cumulative-supply floor. A structural policy commitment, even with
-valid test signatures, is not evidence that a real issuer or key ceremony
-exists.
+The headless issuer wallet admits the envelope only after the reviewed policy
+is bound into registry v2. It atomically creates the mint operation and a
+per-asset authorization-ledger row, requiring sequence one/supply zero for the
+first mint and an exact contiguous sequence and supply floor thereafter. A
+failed proof or unavailable fee input does not free the authorization for
+reuse. The ledger is included in Secure Backup; restore rejects gaps, replays,
+operation mismatches, stale floors, and authorization mutation before writing.
+A structurally valid test policy remains evidence of format behavior, not of a
+real issuer or key ceremony.
 
 The containing consumer registry gains this binding only in format version two:
 its canonical commitment includes sorted, unique asset-to-issuance-policy
@@ -82,6 +85,13 @@ commitments, and every referenced asset must already be an exact reviewed
 issuer in that release. Version one remains byte-for-byte compatible and
 cannot carry a supply-policy reference. Signal still receives no mint action,
 authority key, or authorization parser through its default C boundary.
+
+Before signing, the issuer revalidates the live v2 release, policy, threshold
+authorization, and durable ledger row. The signed receipt then snapshots the
+exact policy and authorization beside the wallet-authenticated release.
+Crash-resume and RBF verify that historical snapshot and ledger, so later
+policy removal blocks unsigned work but cannot strand an already signed
+transaction or silently substitute new policy bytes.
 
 Temporary root and derivation buffers are zeroized. The primary wallet keeps
 the derived signing state required while the account is open. A linked device

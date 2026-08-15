@@ -54,13 +54,12 @@ transfer, batch, proof, signing, and wallet-internal reserve-split path fails
 with that stable reason before selecting Bitcoin inputs.
 
 The consumer registry does not authorize expansion of issuer supply. The
-headless issuer may construct a mainnet manifest for offline review, but every
-mainnet mint preparation, pre-broadcast signature, rebroadcast, and mint RBF
-currently fails closed with `production_issuance_not_authorized`. Enabling
-production issuance requires a separately authenticated issuer authorization
-and committed supply policy after the issuer/key ceremony; an operator-edited
-registry JSON file is deliberately not treated as that authority. Signet and
-regtest issuer flows are unchanged.
+headless issuer admits a mainnet mint only when registry format v2 commits the
+exact public issuance policy and a threshold-signed authorization binds the
+recipient, amounts, registry, policy, sequence, and supply transition. Missing
+or v1 policy material fails closed with `production_issuance_not_authorized`;
+an operator-edited registry JSON file is deliberately not treated as supply
+authority. Signet and regtest issuer flows are unchanged.
 
 The secret-free `opencsv-registry` tool now defines the reviewable form of that
 separate authority without enabling it. A version-one issuance policy commits
@@ -78,9 +77,12 @@ Policy verification requires the expected deployment, registry version, asset
 id, and policy commitment as external inputs from the containing release. Mint
 authorization verification additionally requires that release's exact registry
 commitment. A self-consistent JSON file cannot nominate its own
-trust root. The current wallet does not yet admit these envelopes or advance a
-replay-safe supply floor, so the mainnet issuance
-write gate remains closed. Operators may review canonical bytes with:
+trust root. The issuer wallet verifies these envelopes before fee
+selection, creates the mint operation and authorization-ledger row in one
+`BEGIN IMMEDIATE` transaction, and requires a contiguous per-asset sequence
+and exact cumulative-supply floor. An admitted authorization is consumed even
+if proving or funding later fails, so retry requires a fresh authorization.
+Operators may review canonical bytes with:
 
 ```sh
 opencsv-registry issuance-policy build --input draft.json --output policy.json
@@ -111,6 +113,15 @@ The policy deliberately does not commit the registry hash: registry v2 already
 commits the policy hash, so including the reverse edge would create an
 unconstructible hash fixed point. The threshold-signed mint envelope binds both
 final commitments instead.
+
+The production authorization ledger stores canonical padded-u64 sequence and
+supply values so ordering remains exact beyond SQLite's signed integer range.
+Secure Backup carries every ledger row together with its mint operation and
+rejects gaps, replays, stale floors, mismatched authorizations, or missing
+operations before importing anything. Signed mints snapshot the exact policy
+and authorization beside the wallet-signed registry release. Resume and RBF
+revalidate that historical evidence and the ledger without substituting a
+later live policy; unsigned work fails closed after policy rotation.
 
 The database stores the highest registry version and its exact commitment as
 one atomic floor, and production Secure Backup checkpoints carry the same

@@ -60,7 +60,8 @@ use zeroize::Zeroizing;
 
 #[cfg(any(test, feature = "issuer-tools"))]
 use crate::production_issuance::{
-    validate_production_issuance_policy, ProductionIssuancePolicy, ProductionMintAuthorization,
+    validate_production_issuance_policy, verify_production_mint_authorization,
+    ProductionIssuancePolicy, ProductionMintAuthorization,
 };
 use crate::wallet::MemWallet;
 use crate::{
@@ -552,6 +553,9 @@ struct BackupCheckpointPayload {
     batch_stocks: Vec<BackupBatchStock>,
     #[serde(default)]
     batch_reserve_operations: Vec<BackupBatchReserveOperation>,
+    #[cfg(any(test, feature = "issuer-tools"))]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    production_issuance_authorizations: Vec<BackupProductionIssuanceAuthorization>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -656,6 +660,21 @@ struct BackupBatchReserveOperation {
     receipt_json: String,
     created_at: i64,
     updated_at: i64,
+}
+
+#[cfg(any(test, feature = "issuer-tools"))]
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct BackupProductionIssuanceAuthorization {
+    asset_id: String,
+    sequence: u64,
+    authorization_id_sha256: String,
+    policy_commitment_sha256: String,
+    supply_before_base_units: u64,
+    supply_after_base_units: u64,
+    authorization: ProductionMintAuthorization,
+    operation_id: String,
+    created_at: i64,
 }
 
 #[derive(Clone, Debug)]
@@ -879,6 +898,14 @@ struct IssuanceRequest {
 }
 
 #[cfg(any(test, feature = "issuer-tools"))]
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ProductionIssuanceAuthorizationSnapshot {
+    policy: ProductionIssuancePolicy,
+    authorization: ProductionMintAuthorization,
+}
+
+#[cfg(any(test, feature = "issuer-tools"))]
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct InstrumentCreateRequest {
@@ -1084,6 +1111,19 @@ impl SqlitePersister {
                  backup_acked INTEGER NOT NULL DEFAULT 0,
                  created_at INTEGER NOT NULL,
                  updated_at INTEGER NOT NULL
+             ) STRICT;
+             CREATE TABLE IF NOT EXISTS opencsv_production_issuance_authorizations (
+                 asset_id TEXT NOT NULL,
+                 sequence_decimal TEXT NOT NULL,
+                 authorization_id_sha256 TEXT PRIMARY KEY,
+                 policy_commitment_sha256 TEXT NOT NULL,
+                 supply_before_decimal TEXT NOT NULL,
+                 supply_after_decimal TEXT NOT NULL,
+                 authorization_json TEXT NOT NULL,
+                 operation_id TEXT NOT NULL UNIQUE,
+                 created_at INTEGER NOT NULL,
+                 UNIQUE(asset_id, sequence_decimal),
+                 FOREIGN KEY(operation_id) REFERENCES opencsv_operations(operation_id)
              ) STRICT;
              CREATE TABLE IF NOT EXISTS opencsv_consignments (
                  consignment_id TEXT PRIMARY KEY,
@@ -4261,7 +4301,7 @@ impl AccountWallet {
     pub fn mint_prepare(&mut self, request_json: &str) -> Result<Value, AccountError> {
         let total_started = Instant::now();
         self.require_issuance_write_enabled()?;
-        let request: IssuanceRequest = serde_json::from_str(request_json).map_err(|error| {
+        let mut request: IssuanceRequest = serde_json::from_str(request_json).map_err(|error| {
             AccountError::new("invalid_request", format!("issuance request: {error}"))
         })?;
         if request.amounts.is_empty() || request.amounts.len() > 2 {
@@ -4276,7 +4316,7 @@ impl AccountWallet {
                 "mint outputs must be positive",
             ));
         }
-        let asset_id = request.asset_id;
+        let asset_id = request.asset_id.clone();
         if !self.is_manifested_instrument(&asset_id)? {
             return Err(AccountError::new(
                 "instrument_definition_required",
@@ -4284,9 +4324,41 @@ impl AccountWallet {
             ));
         }
 
-        let operation_id = random_id(16);
+        let to_owner = request.to_owner.clone().unwrap_or_else(|| {
+            self.protocol
+                .as_ref()
+                .and_then(|protocol| protocol.owners().into_iter().next())
+                .unwrap_or_default()
+        });
+        request.to_owner = Some(to_owner.clone());
+        let production_authorization = if self.config.network == "mainnet" {
+            Some(self.validate_current_production_mint(&request, &to_owner)?)
+        } else {
+            None
+        };
+        let operation_id = production_authorization
+            .as_ref()
+            .map(|(_, authorization)| authorization.authorization_id_sha256.clone())
+            .unwrap_or_else(|| random_id(16));
         let delivery_nonce = random_id(16);
-        self.insert_planned_operation(&operation_id, "mint", request_json, &delivery_nonce)?;
+        let normalized_request = serde_json::to_string(&request)
+            .map_err(|error| AccountError::new("invalid_request", error.to_string()))?;
+        if let Some((policy, authorization)) = production_authorization.as_ref() {
+            self.insert_production_mint_operation(
+                &operation_id,
+                &normalized_request,
+                &delivery_nonce,
+                policy,
+                authorization,
+            )?;
+        } else {
+            self.insert_planned_operation(
+                &operation_id,
+                "mint",
+                &normalized_request,
+                &delivery_nonce,
+            )?;
+        }
         let funding = match self.reserve_fee_utxo(&operation_id) {
             Ok(funding) => funding,
             Err(error) => {
@@ -4306,14 +4378,11 @@ impl AccountWallet {
         let ctx = funding_context(funding.outpoint);
 
         let local_proving_started = Instant::now();
-        let (to_owner, proved) = {
+        let proved = {
             let protocol = match self.primary_protocol_mut() {
                 Ok(protocol) => protocol,
                 Err(error) => return self.fail_prebroadcast(&operation_id, error),
             };
-            let to_owner = request
-                .to_owner
-                .unwrap_or_else(|| protocol.owners().into_iter().next().unwrap_or_default());
             let proved = match protocol.prove_mint(&asset_id, &to_owner, &request.amounts) {
                 Ok(proved) => proved,
                 Err(error) => {
@@ -4323,7 +4392,7 @@ impl AccountWallet {
                     );
                 }
             };
-            (to_owner, proved)
+            proved
         };
         self.pending_by_operation
             .insert(operation_id.clone(), proved.pending_id);
@@ -4344,11 +4413,8 @@ impl AccountWallet {
             Err(error) => return self.fail_prebroadcast(&operation_id, error),
         };
         let local_proving_ms = elapsed_millis(local_proving_started);
-        let normalized_request = json!({
-            "asset_id": asset_id,
-            "to_owner": to_owner,
-            "amounts": request.amounts,
-        });
+        let normalized_request: Value = serde_json::from_str(&normalized_request)
+            .map_err(|error| AccountError::new("database_corrupt", error.to_string()))?;
         if let Err(error) = self.mark_proof_ready(
             &operation_id,
             &normalized_request,
@@ -6555,6 +6621,19 @@ impl AccountWallet {
             ));
         }
         let operation = self.operation(operation_id)?;
+        #[cfg(any(test, feature = "issuer-tools"))]
+        let production_issuance_snapshot = if operation.kind == "mint"
+            && self.config.network == "mainnet"
+        {
+            self.require_issuance_write_enabled()?;
+            Some(self.validate_current_production_mint_operation(&operation)?)
+        } else {
+            if operation.kind == "mint" {
+                self.require_issuance_write_enabled()?;
+            }
+            None
+        };
+        #[cfg(not(any(test, feature = "issuer-tools")))]
         if operation.kind == "mint" {
             self.require_issuance_write_enabled()?;
         }
@@ -6721,6 +6800,16 @@ impl AccountWallet {
             "delivery_nonce": operation.delivery_nonce,
             "phase_timings_ms": phase_timings_ms,
         });
+        #[cfg(any(test, feature = "issuer-tools"))]
+        if let Some(snapshot) = production_issuance_snapshot {
+            receipt["production_issuance_authorization"] =
+                serde_json::to_value(snapshot).map_err(|error| {
+                    AccountError::new(
+                        "database_corrupt",
+                        format!("production issuance snapshot: {error}"),
+                    )
+                })?;
+        }
         self.stamp_production_rollout_authorization(&mut receipt, operation_id)?;
         self.db.conn.execute(
             "UPDATE opencsv_operations
@@ -7050,7 +7139,11 @@ impl AccountWallet {
     /// to continue with backup acknowledgement or signing.
     pub fn resume_operation(&mut self, operation_id: &str) -> Result<Value, AccountError> {
         let operation = self.operation(operation_id)?;
-        if operation.kind == "mint" {
+        let signed_recovery = matches!(
+            operation.state.as_str(),
+            "signed_persisted" | "broadcast_unobserved"
+        );
+        if operation.kind == "mint" && !signed_recovery {
             self.require_issuance_write_enabled()?;
         }
         match operation.state.as_str() {
@@ -7060,7 +7153,19 @@ impl AccountWallet {
                     .as_deref()
                     .and_then(|encoded| serde_json::from_str(encoded).ok())
                     .unwrap_or_else(|| json!({}));
+                if operation.kind == "mint"
+                    && self.config.network == "mainnet"
+                    && receipt.get("production_issuance_authorization").is_none()
+                {
+                    return Err(write_block_error("production_issuance_not_authorized"));
+                }
                 self.signed_fee_limit(&receipt, operation_id)?;
+                #[cfg(any(test, feature = "issuer-tools"))]
+                self.verify_signed_production_mint(&operation, &receipt)?;
+                #[cfg(not(any(test, feature = "issuer-tools")))]
+                if operation.kind == "mint" && self.config.network == "mainnet" {
+                    return Err(write_block_error("production_issuance_not_authorized"));
+                }
                 let signed = operation.signed_tx_hex.as_deref().ok_or_else(|| {
                     AccountError::new("database_corrupt", "signed state has no transaction")
                 })?;
@@ -7348,7 +7453,7 @@ impl AccountWallet {
             ));
         }
         let operation = self.operation(operation_id)?;
-        if operation.kind == "mint" {
+        if operation.kind == "mint" && self.config.network != "mainnet" {
             self.require_issuance_write_enabled()?;
         }
         if !matches!(
@@ -7365,7 +7470,19 @@ impl AccountWallet {
             .as_deref()
             .and_then(|encoded| serde_json::from_str(encoded).ok())
             .unwrap_or_else(|| json!({}));
+        if operation.kind == "mint"
+            && self.config.network == "mainnet"
+            && receipt.get("production_issuance_authorization").is_none()
+        {
+            return Err(write_block_error("production_issuance_not_authorized"));
+        }
         let signed_fee_limit = self.signed_fee_limit(&receipt, operation_id)?;
+        #[cfg(any(test, feature = "issuer-tools"))]
+        self.verify_signed_production_mint(&operation, &receipt)?;
+        #[cfg(not(any(test, feature = "issuer-tools")))]
+        if operation.kind == "mint" && self.config.network == "mainnet" {
+            return Err(write_block_error("production_issuance_not_authorized"));
+        }
         let original_hex = operation.signed_tx_hex.as_deref().ok_or_else(|| {
             AccountError::new("database_corrupt", "operation has no signed transaction")
         })?;
@@ -7656,7 +7773,12 @@ impl AccountWallet {
                                 'checkpoint_hash', checkpoint_hash,
                                 'backup_acked', backup_acked)
              FROM opencsv_operations
-             WHERE state NOT IN ('cancelled') ORDER BY created_at, rowid",
+             WHERE state NOT IN ('cancelled')
+                OR EXISTS (
+                    SELECT 1 FROM opencsv_production_issuance_authorizations a
+                    WHERE a.operation_id = opencsv_operations.operation_id
+                )
+             ORDER BY created_at, rowid",
         )?;
         // Backup acknowledgement metadata cannot be part of the checkpoint it
         // acknowledges. Likewise, the receipt's copy of checkpoint_hash is a
@@ -7881,13 +8003,74 @@ impl AccountWallet {
             })
             .collect::<Result<Vec<_>, AccountError>>()?
         };
+        #[cfg(any(test, feature = "issuer-tools"))]
+        let production_issuance_authorizations = {
+            let mut statement = self.db.conn.prepare(
+                "SELECT asset_id, sequence_decimal, authorization_id_sha256,
+                        policy_commitment_sha256, supply_before_decimal,
+                        supply_after_decimal, authorization_json, operation_id,
+                        created_at
+                 FROM opencsv_production_issuance_authorizations
+                 ORDER BY asset_id, sequence_decimal",
+            )?;
+            let rows = statement.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, String>(7)?,
+                    row.get::<_, i64>(8)?,
+                ))
+            })?;
+            rows.map(|row| {
+                let (
+                    asset_id,
+                    sequence,
+                    authorization_id_sha256,
+                    policy_commitment_sha256,
+                    supply_before,
+                    supply_after,
+                    authorization_json,
+                    operation_id,
+                    created_at,
+                ) = row?;
+                Ok(BackupProductionIssuanceAuthorization {
+                    asset_id,
+                    sequence: decode_u64_decimal(&sequence, "production issuance sequence")?,
+                    authorization_id_sha256,
+                    policy_commitment_sha256,
+                    supply_before_base_units: decode_u64_decimal(
+                        &supply_before,
+                        "production issuance supply before",
+                    )?,
+                    supply_after_base_units: decode_u64_decimal(
+                        &supply_after,
+                        "production issuance supply after",
+                    )?,
+                    authorization: serde_json::from_str(&authorization_json).map_err(|error| {
+                        AccountError::new(
+                            "database_corrupt",
+                            format!("production issuance authorization: {error}"),
+                        )
+                    })?,
+                    operation_id,
+                    created_at,
+                })
+            })
+            .collect::<Result<Vec<_>, AccountError>>()?
+        };
         let owners = self
             .protocol
             .as_ref()
             .map(MemWallet::owners)
             .or_else(|| self.config.watch_owner.clone().map(|owner| vec![owner]))
             .unwrap_or_default();
-        let payload = json!({
+        #[cfg_attr(not(any(test, feature = "issuer-tools")), allow(unused_mut))]
+        let mut payload = json!({
             "version": CHECKPOINT_VERSION,
             "deployment_id": self.config.deployment_id,
             "key_derivation_id": account_key_derivation_id(&self.config.network),
@@ -7905,6 +8088,18 @@ impl AccountWallet {
             "batch_stocks": batch_stocks,
             "batch_reserve_operations": batch_reserve_operations,
         });
+        #[cfg(any(test, feature = "issuer-tools"))]
+        if !production_issuance_authorizations.is_empty() {
+            payload
+                .as_object_mut()
+                .expect("checkpoint payload is an object")
+                .insert(
+                    "production_issuance_authorizations".into(),
+                    serde_json::to_value(production_issuance_authorizations).map_err(|error| {
+                        AccountError::new("checkpoint_failed", error.to_string())
+                    })?,
+                );
+        }
         let canonical = serde_json::to_vec(&payload)
             .map_err(|error| AccountError::new("checkpoint_failed", error.to_string()))?;
         Ok(json!({
@@ -8059,7 +8254,8 @@ impl AccountWallet {
                   + (SELECT COUNT(*) FROM opencsv_send_batches)
                   + (SELECT COUNT(*) FROM opencsv_send_batch_members)
                   + (SELECT COUNT(*) FROM opencsv_batch_stocks)
-                  + (SELECT COUNT(*) FROM opencsv_batch_reserve_operations)",
+                  + (SELECT COUNT(*) FROM opencsv_batch_reserve_operations)
+                  + (SELECT COUNT(*) FROM opencsv_production_issuance_authorizations)",
             [],
             |row| row.get(0),
         )?;
@@ -8188,6 +8384,145 @@ impl AccountWallet {
             .iter()
             .map(|operation| operation.operation_id.as_str())
             .collect();
+        #[cfg(any(test, feature = "issuer-tools"))]
+        {
+            let release = self.config.production_usd_registry.as_ref();
+            let mut authorization_ids = HashSet::new();
+            let mut authorization_operations = HashSet::new();
+            let mut supply_floors: HashMap<&str, (u64, u64)> = HashMap::new();
+            for admitted in &envelope.checkpoint.production_issuance_authorizations {
+                decode_hex_32(
+                    &admitted.authorization_id_sha256,
+                    "production issuance authorization id",
+                )?;
+                decode_hex_32(
+                    &admitted.policy_commitment_sha256,
+                    "production issuance policy commitment",
+                )?;
+                if admitted.created_at < 0
+                    || admitted.operation_id != admitted.authorization_id_sha256
+                    || !authorization_ids.insert(admitted.authorization_id_sha256.as_str())
+                    || !authorization_operations.insert(admitted.operation_id.as_str())
+                {
+                    return Err(AccountError::new(
+                        "invalid_backup_checkpoint",
+                        "invalid or duplicate production issuance authorization",
+                    ));
+                }
+                let operation = envelope
+                    .checkpoint
+                    .operations
+                    .iter()
+                    .find(|operation| operation.operation_id == admitted.operation_id)
+                    .ok_or_else(|| {
+                        AccountError::new(
+                            "invalid_backup_checkpoint",
+                            "production issuance authorization has no matching operation",
+                        )
+                    })?;
+                let request: IssuanceRequest = serde_json::from_value(operation.request.clone())
+                    .map_err(|error| {
+                        AccountError::new(
+                            "invalid_backup_checkpoint",
+                            format!("production mint request: {error}"),
+                        )
+                    })?;
+                if operation.kind != "mint"
+                    || request.asset_id != admitted.asset_id
+                    || request.to_owner.as_deref()
+                        != Some(admitted.authorization.to_owner.as_str())
+                    || request.amounts != admitted.authorization.amounts
+                    || request.production_authorization.as_ref()
+                        != Some(&admitted.authorization)
+                    || admitted.asset_id != admitted.authorization.asset_id
+                    || admitted.sequence != admitted.authorization.sequence
+                    || admitted.authorization_id_sha256
+                        != admitted.authorization.authorization_id_sha256
+                    || admitted.policy_commitment_sha256
+                        != admitted
+                            .authorization
+                            .issuance_policy_commitment_sha256
+                    || admitted.supply_before_base_units
+                        != admitted.authorization.supply_before_base_units
+                    || admitted.supply_after_base_units
+                        != admitted.authorization.supply_after_base_units
+                {
+                    return Err(AccountError::new(
+                        "invalid_backup_checkpoint",
+                        "production issuance ledger disagrees with its operation or authorization",
+                    ));
+                }
+                let prior = supply_floors.entry(&admitted.asset_id).or_insert((0, 0));
+                let expected_sequence = prior.0.checked_add(1).ok_or_else(|| {
+                    AccountError::new(
+                        "invalid_backup_checkpoint",
+                        "production issuance sequence overflow",
+                    )
+                })?;
+                if admitted.sequence != expected_sequence
+                    || admitted.supply_before_base_units != prior.1
+                {
+                    return Err(AccountError::new(
+                        "invalid_backup_checkpoint",
+                        "production issuance ledger has a gap, replay, or stale supply floor",
+                    ));
+                }
+                *prior = (admitted.sequence, admitted.supply_after_base_units);
+
+                let release = release.ok_or_else(|| {
+                    AccountError::new(
+                        "invalid_backup_checkpoint",
+                        "production issuance backup requires its exact registry release",
+                    )
+                })?;
+                let reference = release
+                    .issuance_policy_commitments
+                    .iter()
+                    .find(|reference| reference.asset_id == admitted.asset_id)
+                    .ok_or_else(|| {
+                        AccountError::new(
+                            "invalid_backup_checkpoint",
+                            "production issuance backup asset is absent from the registry",
+                        )
+                    })?;
+                let policy = self
+                    .config
+                    .production_issuance_policies
+                    .iter()
+                    .find(|policy| policy.asset_id == admitted.asset_id)
+                    .ok_or_else(|| {
+                        AccountError::new(
+                            "invalid_backup_checkpoint",
+                            "production issuance backup policy is unavailable",
+                        )
+                    })?;
+                if admitted.authorization.registry_commitment_sha256
+                    != release.commitment_sha256
+                    || admitted.policy_commitment_sha256
+                        != reference.policy_commitment_sha256
+                {
+                    return Err(AccountError::new(
+                        "invalid_backup_checkpoint",
+                        "production issuance backup names another registry or policy",
+                    ));
+                }
+                verify_production_mint_authorization(
+                    policy,
+                    &admitted.authorization,
+                    release.registry_version,
+                    &reference.policy_commitment_sha256,
+                    &admitted.authorization.to_owner,
+                    &admitted.authorization.amounts,
+                    admitted.authorization.not_before_unix_seconds,
+                )
+                .map_err(|error| {
+                    AccountError::new(
+                        "invalid_backup_checkpoint",
+                        format!("production issuance authorization: {}", error.message),
+                    )
+                })?;
+            }
+        }
         let batch_ids: HashSet<&str> = envelope
             .checkpoint
             .send_batches
@@ -8521,6 +8856,33 @@ impl AccountWallet {
                     )?;
                 }
             }
+            #[cfg(any(test, feature = "issuer-tools"))]
+            for admitted in &envelope.checkpoint.production_issuance_authorizations {
+                self.db.conn.execute(
+                    "INSERT INTO opencsv_production_issuance_authorizations(
+                         asset_id, sequence_decimal, authorization_id_sha256,
+                         policy_commitment_sha256, supply_before_decimal,
+                         supply_after_decimal, authorization_json, operation_id,
+                         created_at
+                     ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                    params![
+                        admitted.asset_id,
+                        encode_u64_decimal(admitted.sequence),
+                        admitted.authorization_id_sha256,
+                        admitted.policy_commitment_sha256,
+                        encode_u64_decimal(admitted.supply_before_base_units),
+                        encode_u64_decimal(admitted.supply_after_base_units),
+                        serde_json::to_string(&admitted.authorization).map_err(|error| {
+                            AccountError::new(
+                                "invalid_backup_checkpoint",
+                                format!("production issuance authorization: {error}"),
+                            )
+                        })?,
+                        admitted.operation_id,
+                        admitted.created_at,
+                    ],
+                )?;
+            }
             for batch in &envelope.checkpoint.send_batches {
                 let proposal_wire = batch
                     .proposal_wire_base64
@@ -8755,15 +9117,247 @@ impl AccountWallet {
     }
 
     /// Issuer tooling is intentionally a separate feature and custody
-    /// boundary, but a structurally valid registry file is not an
-    /// independently authenticated authorization to expand production
-    /// supply. Until the production issuer/key ceremony defines that
-    /// authorization and its supply envelope, mainnet manifest construction
-    /// remains available for review while every fresh mint fails closed.
+    /// boundary. Mainnet issuance additionally requires a version-two
+    /// consumer registry and an exact public threshold-supply policy; the
+    /// per-mint authorization and monotonic supply floor are checked by the
+    /// prepare/sign boundaries below.
     fn require_issuance_write_enabled(&self) -> Result<(), AccountError> {
         self.require_write_enabled()?;
         if self.config.network == "mainnet" {
+            let release = self
+                .config
+                .production_usd_registry
+                .as_ref()
+                .ok_or_else(|| write_block_error("production_issuance_not_authorized"))?;
+            if release.format_version != PRODUCTION_USD_REGISTRY_FORMAT_VERSION_V2
+                || release.issuance_policy_commitments.is_empty()
+            {
+                return Err(write_block_error("production_issuance_not_authorized"));
+            }
+            #[cfg(any(test, feature = "issuer-tools"))]
+            if self.config.production_issuance_policies.is_empty() {
+                return Err(write_block_error("production_issuance_not_authorized"));
+            }
+            #[cfg(not(any(test, feature = "issuer-tools")))]
             return Err(write_block_error("production_issuance_not_authorized"));
+            #[cfg(any(test, feature = "issuer-tools"))]
+            self.require_product_write_enabled()?;
+        }
+        Ok(())
+    }
+
+    #[cfg(any(test, feature = "issuer-tools"))]
+    fn validate_current_production_mint(
+        &self,
+        request: &IssuanceRequest,
+        to_owner: &str,
+    ) -> Result<(ProductionIssuancePolicy, ProductionMintAuthorization), AccountError> {
+        let release = self
+            .config
+            .production_usd_registry
+            .as_ref()
+            .ok_or_else(|| write_block_error("production_issuance_not_authorized"))?;
+        let reference = release
+            .issuance_policy_commitments
+            .iter()
+            .find(|reference| reference.asset_id == request.asset_id)
+            .ok_or_else(|| write_block_error("production_issuance_not_authorized"))?;
+        let policy = self
+            .config
+            .production_issuance_policies
+            .iter()
+            .find(|policy| policy.asset_id == request.asset_id)
+            .cloned()
+            .ok_or_else(|| write_block_error("production_issuance_not_authorized"))?;
+        let authorization = request
+            .production_authorization
+            .clone()
+            .ok_or_else(|| write_block_error("production_issuance_not_authorized"))?;
+        if authorization.deployment_id != self.config.deployment_id
+            || authorization.registry_commitment_sha256 != release.commitment_sha256
+            || authorization.asset_id != request.asset_id
+        {
+            return Err(write_block_error("production_issuance_not_authorized"));
+        }
+        let now = u64::try_from(unix_time()?)
+            .map_err(|_| AccountError::new("clock_error", "negative timestamp"))?;
+        verify_production_mint_authorization(
+            &policy,
+            &authorization,
+            release.registry_version,
+            &reference.policy_commitment_sha256,
+            to_owner,
+            &request.amounts,
+            now,
+        )
+        .map_err(|error| AccountError::new(error.code, error.message))?;
+        Ok((policy, authorization))
+    }
+
+    #[cfg(any(test, feature = "issuer-tools"))]
+    fn validate_current_production_mint_operation(
+        &self,
+        operation: &OperationRow,
+    ) -> Result<ProductionIssuanceAuthorizationSnapshot, AccountError> {
+        let request: IssuanceRequest = serde_json::from_str(&operation.request_json).map_err(
+            |error| AccountError::new("database_corrupt", format!("mint request: {error}")),
+        )?;
+        let to_owner = request.to_owner.as_deref().ok_or_else(|| {
+            AccountError::new(
+                "database_corrupt",
+                "production mint request has no exact recipient",
+            )
+        })?;
+        let (policy, authorization) = self.validate_current_production_mint(&request, to_owner)?;
+        self.verify_production_issuance_ledger_entry(operation, &policy, &authorization)?;
+        Ok(ProductionIssuanceAuthorizationSnapshot {
+            policy,
+            authorization,
+        })
+    }
+
+    #[cfg(any(test, feature = "issuer-tools"))]
+    fn verify_signed_production_mint(
+        &self,
+        operation: &OperationRow,
+        receipt: &Value,
+    ) -> Result<(), AccountError> {
+        if operation.kind != "mint" || self.config.network != "mainnet" {
+            return Ok(());
+        }
+        let snapshot: ProductionIssuanceAuthorizationSnapshot = serde_json::from_value(
+            receipt["production_issuance_authorization"].clone(),
+        )
+        .map_err(|error| {
+            AccountError::new(
+                "database_corrupt",
+                format!("signed production issuance snapshot: {error}"),
+            )
+        })?;
+        let rollout = receipt
+            .get("production_rollout_authorization")
+            .ok_or_else(|| {
+                AccountError::new(
+                    "database_corrupt",
+                    "signed production mint has no rollout authorization",
+                )
+            })?;
+        let release: ProductionUsdRegistryRelease =
+            serde_json::from_value(rollout["release"].clone()).map_err(|error| {
+                AccountError::new(
+                    "database_corrupt",
+                    format!("signed production mint registry: {error}"),
+                )
+            })?;
+        let reference = release
+            .issuance_policy_commitments
+            .iter()
+            .find(|reference| reference.asset_id == snapshot.authorization.asset_id)
+            .ok_or_else(|| {
+                AccountError::new(
+                    "database_corrupt",
+                    "signed production mint policy is absent from its release",
+                )
+            })?;
+        if release.format_version != PRODUCTION_USD_REGISTRY_FORMAT_VERSION_V2
+            || snapshot.authorization.registry_commitment_sha256 != release.commitment_sha256
+            || snapshot.authorization.authorization_id_sha256 != operation.operation_id
+            || snapshot.policy.commitment_sha256 != reference.policy_commitment_sha256
+        {
+            return Err(AccountError::new(
+                "database_corrupt",
+                "signed production mint names another operation, registry, or policy",
+            ));
+        }
+        let request: IssuanceRequest = serde_json::from_str(&operation.request_json).map_err(
+            |error| AccountError::new("database_corrupt", format!("mint request: {error}")),
+        )?;
+        if request.production_authorization.as_ref() != Some(&snapshot.authorization)
+            || request.to_owner.as_deref() != Some(snapshot.authorization.to_owner.as_str())
+            || request.amounts != snapshot.authorization.amounts
+            || request.asset_id != snapshot.authorization.asset_id
+        {
+            return Err(AccountError::new(
+                "database_corrupt",
+                "signed production mint snapshot disagrees with its durable request",
+            ));
+        }
+        verify_production_mint_authorization(
+            &snapshot.policy,
+            &snapshot.authorization,
+            release.registry_version,
+            &reference.policy_commitment_sha256,
+            &snapshot.authorization.to_owner,
+            &snapshot.authorization.amounts,
+            snapshot.authorization.not_before_unix_seconds,
+        )
+        .map_err(|error| AccountError::new("database_corrupt", error.message))?;
+        self.verify_production_issuance_ledger_entry(
+            operation,
+            &snapshot.policy,
+            &snapshot.authorization,
+        )
+    }
+
+    #[cfg(any(test, feature = "issuer-tools"))]
+    fn verify_production_issuance_ledger_entry(
+        &self,
+        operation: &OperationRow,
+        policy: &ProductionIssuancePolicy,
+        authorization: &ProductionMintAuthorization,
+    ) -> Result<(), AccountError> {
+        let stored = self
+            .db
+            .conn
+            .query_row(
+                "SELECT asset_id, sequence_decimal, policy_commitment_sha256,
+                        supply_before_decimal, supply_after_decimal,
+                        authorization_json, operation_id
+                 FROM opencsv_production_issuance_authorizations
+                 WHERE authorization_id_sha256 = ?1",
+                [&authorization.authorization_id_sha256],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, String>(5)?,
+                        row.get::<_, String>(6)?,
+                    ))
+                },
+            )
+            .optional()?
+            .ok_or_else(|| {
+                AccountError::new(
+                    "production_issuance_replay",
+                    "production mint authorization is absent from the durable supply ledger",
+                )
+            })?;
+        let stored_authorization: ProductionMintAuthorization = serde_json::from_str(&stored.5)
+            .map_err(|error| {
+                AccountError::new(
+                    "database_corrupt",
+                    format!("production issuance authorization: {error}"),
+                )
+            })?;
+        if stored.0 != authorization.asset_id
+            || decode_u64_decimal(&stored.1, "production issuance sequence")?
+                != authorization.sequence
+            || stored.2 != policy.commitment_sha256
+            || decode_u64_decimal(&stored.3, "production issuance supply before")?
+                != authorization.supply_before_base_units
+            || decode_u64_decimal(&stored.4, "production issuance supply after")?
+                != authorization.supply_after_base_units
+            || stored_authorization != *authorization
+            || stored.6 != operation.operation_id
+            || operation.operation_id != authorization.authorization_id_sha256
+        {
+            return Err(AccountError::new(
+                "database_corrupt",
+                "production issuance ledger entry disagrees with its authorization",
+            ));
         }
         Ok(())
     }
@@ -9287,6 +9881,125 @@ impl AccountWallet {
                 now,
             ],
         )?;
+        Ok(())
+    }
+
+    #[cfg(any(test, feature = "issuer-tools"))]
+    fn insert_production_mint_operation(
+        &mut self,
+        operation_id: &str,
+        request_json: &str,
+        delivery_nonce: &str,
+        policy: &ProductionIssuancePolicy,
+        authorization: &ProductionMintAuthorization,
+    ) -> Result<(), AccountError> {
+        let _: Value = serde_json::from_str(request_json).map_err(|error| {
+            AccountError::new("invalid_request", format!("request JSON: {error}"))
+        })?;
+        if operation_id != authorization.authorization_id_sha256 {
+            return Err(AccountError::new(
+                "production_issuance_not_authorized",
+                "production mint operation id must equal its authorization id",
+            ));
+        }
+        let sequence_decimal = encode_u64_decimal(authorization.sequence);
+        let supply_before_decimal = encode_u64_decimal(authorization.supply_before_base_units);
+        let supply_after_decimal = encode_u64_decimal(authorization.supply_after_base_units);
+        let authorization_json = serde_json::to_string(authorization)
+            .map_err(|error| AccountError::new("invalid_request", error.to_string()))?;
+        let now = unix_time()?;
+        let transaction = self
+            .db
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let replayed = transaction
+            .query_row(
+                "SELECT 1 FROM opencsv_production_issuance_authorizations
+                 WHERE authorization_id_sha256 = ?1 OR operation_id = ?2 LIMIT 1",
+                params![authorization.authorization_id_sha256, operation_id],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        if replayed {
+            return Err(AccountError::new(
+                "production_issuance_replay",
+                "production mint authorization was already admitted",
+            ));
+        }
+        let prior = transaction
+            .query_row(
+                "SELECT sequence_decimal, supply_after_decimal
+                 FROM opencsv_production_issuance_authorizations
+                 WHERE asset_id = ?1 ORDER BY sequence_decimal DESC LIMIT 1",
+                [&authorization.asset_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?;
+        let (expected_sequence, expected_supply_before) = match prior {
+            Some((sequence, supply_after)) => (
+                decode_u64_decimal(&sequence, "production issuance sequence")?
+                    .checked_add(1)
+                    .ok_or_else(|| {
+                        AccountError::new(
+                            "production_issuance_limit_exceeded",
+                            "production issuance sequence overflow",
+                        )
+                    })?,
+                decode_u64_decimal(&supply_after, "production issuance supply")?,
+            ),
+            None => (1, 0),
+        };
+        if authorization.sequence != expected_sequence {
+            return Err(AccountError::new(
+                "production_issuance_sequence_mismatch",
+                format!(
+                    "expected production issuance sequence {expected_sequence}, got {}",
+                    authorization.sequence
+                ),
+            ));
+        }
+        if authorization.supply_before_base_units != expected_supply_before {
+            return Err(AccountError::new(
+                "production_issuance_supply_mismatch",
+                format!(
+                    "expected production supply floor {expected_supply_before}, got {}",
+                    authorization.supply_before_base_units
+                ),
+            ));
+        }
+        transaction.execute(
+            "INSERT INTO opencsv_operations(
+                 operation_id, kind, state, request_json, delivery_nonce,
+                 created_at, updated_at
+             ) VALUES(?1, 'mint', ?2, ?3, ?4, ?5, ?5)",
+            params![
+                operation_id,
+                OperationState::Planned.as_str(),
+                request_json,
+                delivery_nonce,
+                now,
+            ],
+        )?;
+        transaction.execute(
+            "INSERT INTO opencsv_production_issuance_authorizations(
+                 asset_id, sequence_decimal, authorization_id_sha256,
+                 policy_commitment_sha256, supply_before_decimal,
+                 supply_after_decimal, authorization_json, operation_id, created_at
+             ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                authorization.asset_id,
+                sequence_decimal,
+                authorization.authorization_id_sha256,
+                policy.commitment_sha256,
+                supply_before_decimal,
+                supply_after_decimal,
+                authorization_json,
+                operation_id,
+                now,
+            ],
+        )?;
+        transaction.commit()?;
         Ok(())
     }
 
@@ -12437,6 +13150,27 @@ fn validate_configured_production_issuance_policies(
     Ok(())
 }
 
+#[cfg(any(test, feature = "issuer-tools"))]
+fn encode_u64_decimal(value: u64) -> String {
+    format!("{value:020}")
+}
+
+#[cfg(any(test, feature = "issuer-tools"))]
+fn decode_u64_decimal(value: &str, field: &str) -> Result<u64, AccountError> {
+    if value.len() != 20 || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(AccountError::new(
+            "database_corrupt",
+            format!("{field} is not a canonical padded u64"),
+        ));
+    }
+    value.parse::<u64>().map_err(|error| {
+        AccountError::new(
+            "database_corrupt",
+            format!("{field} is outside u64: {error}"),
+        )
+    })
+}
+
 /// Build the exact canonical production-registry release used by account
 /// configuration. This pure, secret-free helper is exposed only to tests and
 /// the opt-in headless operator tools; Signal never enables that feature.
@@ -12944,6 +13678,11 @@ fn confirmed_protocol_input_spends(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::production_issuance::{
+        production_issuance_policy_commitment, production_mint_authorization_digest,
+        ProductionAuthoritySignature, PRODUCTION_ISSUANCE_POLICY_FORMAT_VERSION,
+        PRODUCTION_MINT_AUTHORIZATION_FORMAT_VERSION,
+    };
     use std::collections::VecDeque;
     use std::io::{Read as _, Write as _};
     use std::net::TcpListener;
@@ -13305,6 +14044,185 @@ mod tests {
             "test_skip_protocol_spend_preflight": true,
         }))
         .unwrap()
+    }
+
+    fn production_authority_secret(byte: u8) -> SecretKey {
+        SecretKey::from_slice(&[byte; 32]).unwrap()
+    }
+
+    fn mainnet_issuance_config() -> (String, ProductionIssuancePolicy, String) {
+        let deployment_id = "opencsv-mainnet-unit";
+        let root = [92_u8; 32];
+        let issuer_root = derive::<32>(
+            &root,
+            b"opencsv-issuer-root-mainnet-v1",
+            deployment_id.as_bytes(),
+        )
+        .unwrap();
+        let issuer_seed = derive::<32>(
+            &issuer_root,
+            b"opencsv-asset-issuer-v1",
+            &0_u32.to_be_bytes(),
+        )
+        .unwrap();
+        let terms = InstrumentTermsV1 {
+            version: 1,
+            network: "mainnet".into(),
+            display_name: "Unit-test production USD".into(),
+            unit_code: "USD".into(),
+            decimals: 6,
+            issuer_name: "Unit-test production issuer".into(),
+            terms_uri: "https://opencsv.net/unit-production-terms".into(),
+            redemption_summary: "Synthetic manifest used only by the Rust test suite.".into(),
+            test_only: false,
+        };
+        let genesis = AssetGenesis {
+            issuer_pk: PoseidonIssuerAuthorization::public_key(&issuer_seed),
+            currency_code: *b"USD",
+            terms_hash: terms.terms_hash().unwrap(),
+            nonce: 1,
+        };
+        let issuer = json!({
+            "manifest": InstrumentManifestV1 { terms, genesis },
+            "priority": 0,
+        });
+        let mut value: Value =
+            serde_json::from_str(&mainnet_config(vec![issuer])).unwrap();
+        let mut release = serde_json::from_value::<ProductionUsdRegistryRelease>(
+            value["production_usd_registry"].clone(),
+        )
+        .unwrap();
+        value["deployment_id"] = json!(deployment_id);
+        release.deployment_id = deployment_id.into();
+        let asset_id = hex_encode(release.issuers[0].manifest.genesis.asset_id().as_bytes());
+        let secp = Secp256k1::signing_only();
+        let mut authority_public_keys = [31_u8, 32, 33]
+            .into_iter()
+            .map(|byte| {
+                hex_encode(
+                    &PublicKey::from_secret_key(&secp, &production_authority_secret(byte))
+                        .serialize(),
+                )
+            })
+            .collect::<Vec<_>>();
+        authority_public_keys.sort();
+        let now = u64::try_from(unix_time().unwrap()).unwrap();
+        let mut policy = ProductionIssuancePolicy {
+            format_version: PRODUCTION_ISSUANCE_POLICY_FORMAT_VERSION,
+            policy_version: 1,
+            deployment_id: release.deployment_id.clone(),
+            registry_version: release.registry_version,
+            asset_id: asset_id.clone(),
+            authority_public_keys,
+            signature_threshold: 2,
+            max_authorization_base_units: 1_000,
+            max_cumulative_supply_base_units: 1_000_000,
+            max_authorization_lifetime_seconds: 3_600,
+            valid_from_unix_seconds: now.saturating_sub(60),
+            expires_at_unix_seconds: now + 86_400,
+            source_revision: "cd".repeat(20),
+            approval_receipts: vec![
+                "https://github.com/opencsvnet/opencsv/issues/1#production-policy-test".into(),
+            ],
+            commitment_sha256: "00".repeat(32),
+        };
+        policy.commitment_sha256 = production_issuance_policy_commitment(&policy).unwrap();
+        release.format_version = PRODUCTION_USD_REGISTRY_FORMAT_VERSION_V2;
+        release.issuance_policy_commitments = vec![ProductionIssuancePolicyRef {
+            asset_id: asset_id.clone(),
+            policy_commitment_sha256: policy.commitment_sha256.clone(),
+        }];
+        release.commitment_sha256 = production_usd_registry_commitment(&release).unwrap();
+        value["production_usd_registry"] = serde_json::to_value(release).unwrap();
+        value["production_issuance_policies"] = json!([policy]);
+        (value.to_string(), policy, asset_id)
+    }
+
+    fn production_mint_authorization(
+        policy: &ProductionIssuancePolicy,
+        registry_commitment_sha256: &str,
+        to_owner: &str,
+        amounts: Vec<u64>,
+        sequence: u64,
+        supply_before_base_units: u64,
+    ) -> ProductionMintAuthorization {
+        let total = amounts.iter().copied().sum::<u64>();
+        let now = u64::try_from(unix_time().unwrap()).unwrap();
+        let mut authorization = ProductionMintAuthorization {
+            format_version: PRODUCTION_MINT_AUTHORIZATION_FORMAT_VERSION,
+            authorization_id_sha256: "00".repeat(32),
+            deployment_id: policy.deployment_id.clone(),
+            registry_commitment_sha256: registry_commitment_sha256.into(),
+            issuance_policy_commitment_sha256: policy.commitment_sha256.clone(),
+            asset_id: policy.asset_id.clone(),
+            to_owner: to_owner.into(),
+            amounts,
+            sequence,
+            supply_before_base_units,
+            supply_after_base_units: supply_before_base_units + total,
+            not_before_unix_seconds: now.saturating_sub(10),
+            expires_at_unix_seconds: now + 600,
+            approval_receipts: vec![format!(
+                "https://github.com/opencsvnet/opencsv/issues/1#production-mint-{sequence}"
+            )],
+            signatures: Vec::new(),
+        };
+        let digest = production_mint_authorization_digest(&authorization).unwrap();
+        authorization.authorization_id_sha256 = hex_encode(&digest);
+        let secp = Secp256k1::signing_only();
+        for byte in [31_u8, 32] {
+            let authority_public_key = hex_encode(
+                &PublicKey::from_secret_key(&secp, &production_authority_secret(byte)).serialize(),
+            );
+            let signature = secp.sign_ecdsa(
+                &Message::from_digest(digest),
+                &production_authority_secret(byte),
+            );
+            authorization.signatures.push(ProductionAuthoritySignature {
+                authority_public_key,
+                signature_compact: hex_encode(&signature.serialize_compact()),
+            });
+        }
+        authorization
+            .signatures
+            .sort_by(|left, right| left.authority_public_key.cmp(&right.authority_public_key));
+        authorization
+    }
+
+    fn install_manifested_production_asset(wallet: &AccountWallet, asset_id: &str) {
+        let release = wallet.config.production_usd_registry.as_ref().unwrap();
+        let manifest = release
+            .issuers
+            .iter()
+            .find(|issuer| hex_encode(issuer.manifest.genesis.asset_id().as_bytes()) == asset_id)
+            .unwrap()
+            .manifest
+            .clone();
+        wallet
+            .db
+            .conn
+            .execute(
+                "INSERT INTO opencsv_assets(
+                     asset_index, currency, terms_hash, nonce, asset_id
+                 ) VALUES(0, ?1, ?2, ?3, ?4)",
+                params![
+                    manifest.terms.unit_code,
+                    hex_encode(manifest.genesis.terms_hash.as_bytes()),
+                    i64::try_from(manifest.genesis.nonce).unwrap(),
+                    asset_id,
+                ],
+            )
+            .unwrap();
+        wallet
+            .db
+            .conn
+            .execute(
+                "INSERT INTO opencsv_instrument_manifests(
+                     asset_id, manifest_json, created_at
+                 ) VALUES(?1, ?2, ?3)",
+                params![asset_id, serde_json::to_string(&manifest).unwrap(), unix_time().unwrap()],
+            )
+            .unwrap();
     }
 
     fn rewrite_mainnet_registry(
@@ -14153,6 +15071,253 @@ mod tests {
             .fee_bump("pre-gate-mainnet-mint", 2)
             .unwrap_err();
         assert_eq!(fee_bump_error.code, "production_issuance_not_authorized");
+    }
+
+    #[test]
+    fn production_issuance_ledger_consumes_authorizations_and_survives_restore() {
+        let (config, policy, asset_id) = mainnet_issuance_config();
+        let config_value: Value = serde_json::from_str(&config).unwrap();
+        let registry_commitment = config_value["production_usd_registry"]
+            ["commitment_sha256"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let dir = tempfile::tempdir().unwrap();
+        let mut wallet = AccountWallet::open(
+            &config,
+            &[92_u8; 32],
+            dir.path().join("wallet.sqlite").to_str().unwrap(),
+        )
+        .unwrap();
+        install_manifested_production_asset(&wallet, &asset_id);
+        let owner = wallet.protocol.as_ref().unwrap().owners()[0].clone();
+
+        let first = production_mint_authorization(
+            &policy,
+            &registry_commitment,
+            &owner,
+            vec![5],
+            1,
+            0,
+        );
+        let first_request = json!({
+            "asset_id": asset_id,
+            "to_owner": owner,
+            "amounts": [5],
+            "production_authorization": first,
+        })
+        .to_string();
+        let error = wallet.mint_prepare(&first_request).unwrap_err();
+        assert_eq!(error.code, "insufficient_fees");
+        let error = wallet.mint_prepare(&first_request).unwrap_err();
+        assert_eq!(error.code, "production_issuance_replay");
+
+        let skipped = production_mint_authorization(
+            &policy,
+            &registry_commitment,
+            &owner,
+            vec![3],
+            3,
+            5,
+        );
+        let error = wallet
+            .mint_prepare(
+                &json!({
+                    "asset_id": asset_id,
+                    "to_owner": owner,
+                    "amounts": [3],
+                    "production_authorization": skipped,
+                })
+                .to_string(),
+            )
+            .unwrap_err();
+        assert_eq!(error.code, "production_issuance_sequence_mismatch");
+
+        let stale_supply = production_mint_authorization(
+            &policy,
+            &registry_commitment,
+            &owner,
+            vec![3],
+            2,
+            0,
+        );
+        let error = wallet
+            .mint_prepare(
+                &json!({
+                    "asset_id": asset_id,
+                    "to_owner": owner,
+                    "amounts": [3],
+                    "production_authorization": stale_supply,
+                })
+                .to_string(),
+            )
+            .unwrap_err();
+        assert_eq!(error.code, "production_issuance_supply_mismatch");
+
+        let second = production_mint_authorization(
+            &policy,
+            &registry_commitment,
+            &owner,
+            vec![3],
+            2,
+            5,
+        );
+        let error = wallet
+            .mint_prepare(
+                &json!({
+                    "asset_id": asset_id,
+                    "to_owner": owner,
+                    "amounts": [3],
+                    "production_authorization": second,
+                })
+                .to_string(),
+            )
+            .unwrap_err();
+        assert_eq!(error.code, "insufficient_fees");
+
+        let checkpoint = wallet.checkpoint().unwrap();
+        assert_eq!(
+            checkpoint["checkpoint"]["production_issuance_authorizations"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+        let restored_dir = tempfile::tempdir().unwrap();
+        let mut restored = AccountWallet::open(
+            &config,
+            &[92_u8; 32],
+            restored_dir.path().join("wallet.sqlite").to_str().unwrap(),
+        )
+        .unwrap();
+        restored
+            .restore_checkpoint(&checkpoint.to_string())
+            .unwrap();
+        let restored_count: i64 = restored
+            .db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM opencsv_production_issuance_authorizations",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(restored_count, 2);
+        let third = production_mint_authorization(
+            &policy,
+            &registry_commitment,
+            &owner,
+            vec![2],
+            3,
+            8,
+        );
+        let error = restored
+            .mint_prepare(
+                &json!({
+                    "asset_id": asset_id,
+                    "to_owner": owner,
+                    "amounts": [2],
+                    "production_authorization": third,
+                })
+                .to_string(),
+            )
+            .unwrap_err();
+        assert_eq!(error.code, "insufficient_fees");
+
+        let tampered_dir = tempfile::tempdir().unwrap();
+        let mut tampered_wallet = AccountWallet::open(
+            &config,
+            &[92_u8; 32],
+            tampered_dir.path().join("wallet.sqlite").to_str().unwrap(),
+        )
+        .unwrap();
+        let mut tampered = checkpoint;
+        tampered["checkpoint"]["production_issuance_authorizations"][1]
+            ["supply_before_base_units"] = json!(4);
+        let canonical = serde_json::to_vec(&tampered["checkpoint"]).unwrap();
+        tampered["checkpoint_hash"] = json!(sha256::Hash::hash(&canonical).to_string());
+        let error = tampered_wallet
+            .restore_checkpoint(&tampered.to_string())
+            .unwrap_err();
+        assert_eq!(error.code, "invalid_backup_checkpoint");
+    }
+
+    #[test]
+    fn signed_production_mint_recovery_uses_authenticated_snapshot_after_rotation() {
+        let (config, policy, asset_id) = mainnet_issuance_config();
+        let config_value: Value = serde_json::from_str(&config).unwrap();
+        let registry_commitment = config_value["production_usd_registry"]
+            ["commitment_sha256"]
+            .as_str()
+            .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let mut wallet = AccountWallet::open(
+            &config,
+            &[92_u8; 32],
+            dir.path().join("wallet.sqlite").to_str().unwrap(),
+        )
+        .unwrap();
+        install_manifested_production_asset(&wallet, &asset_id);
+        let owner = wallet.protocol.as_ref().unwrap().owners()[0].clone();
+        let authorization = production_mint_authorization(
+            &policy,
+            registry_commitment,
+            &owner,
+            vec![7],
+            1,
+            0,
+        );
+        let operation_id = authorization.authorization_id_sha256.clone();
+        let request = serde_json::to_string(&IssuanceRequest {
+            asset_id,
+            to_owner: Some(owner),
+            amounts: vec![7],
+            production_authorization: Some(authorization.clone()),
+        })
+        .unwrap();
+        wallet
+            .insert_production_mint_operation(
+                &operation_id,
+                &request,
+                "production-mint-delivery",
+                &policy,
+                &authorization,
+            )
+            .unwrap();
+        let operation = wallet.operation(&operation_id).unwrap();
+        let snapshot = wallet
+            .validate_current_production_mint_operation(&operation)
+            .unwrap();
+        let mut receipt = json!({
+            "operation_id": operation_id,
+            "production_issuance_authorization": snapshot,
+        });
+        wallet
+            .stamp_production_rollout_authorization(&mut receipt, &operation_id)
+            .unwrap();
+        wallet.signed_fee_limit(&receipt, &operation_id).unwrap();
+        wallet
+            .verify_signed_production_mint(&operation, &receipt)
+            .unwrap();
+
+        wallet.config.production_issuance_policies.clear();
+        wallet.config.production_usd_registry = None;
+        let current_error = wallet
+            .validate_current_production_mint_operation(&operation)
+            .unwrap_err();
+        assert_eq!(current_error.code, "production_issuance_not_authorized");
+        wallet.signed_fee_limit(&receipt, &operation_id).unwrap();
+        wallet
+            .verify_signed_production_mint(&operation, &receipt)
+            .unwrap();
+
+        let mut tampered = receipt;
+        tampered["production_issuance_authorization"]["policy"]
+            ["max_cumulative_supply_base_units"] = json!(6);
+        let error = wallet
+            .verify_signed_production_mint(&operation, &tampered)
+            .unwrap_err();
+        assert_eq!(error.code, "database_corrupt");
     }
 
     #[test]

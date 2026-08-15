@@ -1,5 +1,40 @@
 # Signet/mainnet readiness decision journal
 
+## 2026-08-15 — production supply floors are atomic, backup-carried, and replay-safe
+
+The threshold envelope is now admitted at the issuer wallet boundary. Mainnet
+mint preparation first verifies the exact v2 registry, its committed policy,
+the threshold signatures, recipient, amounts, time window, and supply
+transition. The operation id is the authorization digest. One immediate SQLite
+transaction then creates both the planned mint and its authorization-ledger
+row. Per asset, the first row must be sequence one at supply zero; every later
+row must be the exact next sequence and begin at the preceding supply-after
+value.
+
+Authorization consumption at proof completion was rejected. A crash, missing
+fee cell, or proof failure after approval could otherwise reuse the same
+authorization against a second operation. The ledger therefore consumes the
+approval at durable planning and retains it even when the operation is later
+cancelled. Sequence and supply are stored as canonical zero-padded decimal u64
+strings, preserving numeric ordering without truncating to SQLite i64.
+
+Secure Backup now carries the authorization, operation link, policy
+commitment, sequence, and supply transition. Restore validates the full chain,
+matching mint request, signatures, release identity, and exact operation before
+opening one import transaction. A missing operation, duplicate id, gap, stale
+floor, mutated authorization, or locally occupied database fails before any
+write. Cancelled mint operations remain in the checkpoint when their consumed
+authorization establishes the supply floor.
+
+At pre-sign, the live release and policy are checked again. The signed receipt
+then snapshots the exact policy and authorization alongside the existing
+wallet-signed rollout release. Resume and RBF validate the historical snapshot
+and durable ledger rather than requiring the live policy to remain installed;
+unsigned work does fail closed after removal. Tests cover replay, skipped
+sequence, stale supply, backup round-trip, tampered backup, and signed recovery
+after policy rotation. The full FFI library result is 123 passed, zero failed,
+and three explicitly ignored slow release tests.
+
 ## 2026-08-15 — production issuance uses a distinct threshold authority
 
 The consumer registry and AIR issuer key answer different questions: which
@@ -28,10 +63,10 @@ failure mode.
 
 Five focused tests cover exact-envelope binding, threshold/duplicate/wrong-key
 failures, time and supply ceilings, ambiguous policies, external release
-identity, and create-versus-verify commitment behavior. The wallet still blocks
-all mainnet mint preparation, signing, rebroadcast, and RBF. Activation remains
-closed until this policy is committed by a reviewed production release and a
-crash-safe, backup-carried sequence/supply floor prevents replay across recovery.
+identity, and create-versus-verify commitment behavior. At this stage the
+wallet still blocked all mainnet mint preparation, signing, rebroadcast, and
+RBF; the later ledger entry above records the separate activation-boundary
+implementation. No real production policy or key ceremony is implied.
 
 A follow-up caught one remaining circularity: passing the expected registry and
 asset to the policy verifier did not prove that the containing release approved
