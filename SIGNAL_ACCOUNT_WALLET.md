@@ -47,6 +47,14 @@ sign/broadcast, resume, cancellation, and protocol-safe fee bump. Possession
 of this executable alone conveys no authority: mint proofs require the issuer
 seed derived by the account that created the exact asset id.
 
+That cryptographic issuer key is necessary but not sufficient to activate
+production issuance. Mainnet manifest construction remains available for
+review, while mint preparation, signing, rebroadcast, and mint fee bumps all
+return `production_issuance_not_authorized` until a separately authenticated
+issuer authorization and supply policy exist. Putting numeric limits into an
+operator-supplied registry file would not authenticate them, so the current
+mainnet boundary fails closed instead. Signet/regtest issuance is unaffected.
+
 Temporary root and derivation buffers are zeroized. The primary wallet keeps
 the derived signing state required while the account is open. A linked device
 passes no account root and opens with public descriptors and owner identity;
@@ -237,6 +245,10 @@ cross-deployment, or receipt-free release cannot arm consumer writes. The
 containing application release authenticates this immutable input through its
 normal distribution signature; the public receipts do not by themselves
 prove issuer backing, solvency, legal authority, or brand control.
+
+The application registry authorizes consumer selection and spending of exact
+issuer instruments; it does not authorize the issuer to increase supply. The
+headless issuer has a distinct mainnet issuance gate as described above.
 
 Every signed production operation also carries the complete release snapshot
 plus a Rust-wallet signature over its commitment and stable operation identity.

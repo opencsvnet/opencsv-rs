@@ -1,5 +1,28 @@
 # Signet/mainnet readiness decision journal
 
+## 2026-08-15 — consumer activation cannot authorize production issuance
+
+The production registry gate covered transfers, batches, reserve maintenance,
+observation policy, and signed recovery, but the opt-in issuer path still used
+only the generic primary-device and backup gate. A headless mainnet operator
+could therefore prepare and sign a mint without passing the product registry,
+activation, or observer boundary.
+
+Mainnet manifest construction remains available because it creates reviewable
+identity bytes without touching Bitcoin. Every fresh mint preparation and
+pre-broadcast signature now returns the stable
+`production_issuance_not_authorized` reason. Stale mint rows from an older
+binary cannot bypass the decision through resume or fee bump; read-only status,
+observation, and evidence remain available. Signet/regtest issuance is
+unchanged.
+
+Adding issuance numbers to the existing registry envelope was rejected. The
+headless operator supplies that file, so self-consistent caps and approval URLs
+would be structurally valid but would not cryptographically authenticate who
+authorized new production supply. Production minting stays disabled until the
+issuer/key ceremony defines a separate authenticated authorization and supply
+policy.
+
 ## 2026-08-15 — signed production recovery never falls back to live policy
 
 The first rollout-authorization snapshot pass verified a persisted mainnet

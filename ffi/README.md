@@ -46,6 +46,15 @@ Until a valid nonempty release is present, status returns
 transfer, batch, proof, signing, and wallet-internal reserve-split path fails
 with that stable reason before selecting Bitcoin inputs.
 
+The consumer registry does not authorize expansion of issuer supply. The
+headless issuer may construct a mainnet manifest for offline review, but every
+mainnet mint preparation, pre-broadcast signature, rebroadcast, and mint RBF
+currently fails closed with `production_issuance_not_authorized`. Enabling
+production issuance requires a separately authenticated issuer authorization
+and committed supply policy after the issuer/key ceremony; an operator-edited
+registry JSON file is deliberately not treated as that authority. Signet and
+regtest issuer flows are unchanged.
+
 The database stores the highest registry version and its exact commitment as
 one atomic floor, and production Secure Backup checkpoints carry the same
 floor. Reopening or restoring with an older valid release remains readable but

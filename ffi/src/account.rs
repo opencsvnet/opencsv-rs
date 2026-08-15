@@ -970,6 +970,10 @@ fn write_block_error(reason: &'static str) -> AccountError {
             "production_observation_policy_required",
             "mainnet Bitcoin-writing operations require two independent pinned raw-transaction observers, direct relay, and two confirmed-chain peers",
         ),
+        "production_issuance_not_authorized" => AccountError::new(
+            "production_issuance_not_authorized",
+            "mainnet issuance remains disabled until an independently authenticated issuer authorization and supply policy are implemented",
+        ),
         _ => AccountError::new("write_disabled", "wallet writes are disabled"),
     }
 }
@@ -4226,7 +4230,7 @@ impl AccountWallet {
     #[cfg(any(test, feature = "issuer-tools"))]
     pub fn mint_prepare(&mut self, request_json: &str) -> Result<Value, AccountError> {
         let total_started = Instant::now();
-        self.require_write_enabled()?;
+        self.require_issuance_write_enabled()?;
         let request: IssuanceRequest = serde_json::from_str(request_json).map_err(|error| {
             AccountError::new("invalid_request", format!("issuance request: {error}"))
         })?;
@@ -6522,6 +6526,9 @@ impl AccountWallet {
             ));
         }
         let operation = self.operation(operation_id)?;
+        if operation.kind == "mint" {
+            self.require_issuance_write_enabled()?;
+        }
         if operation.kind == "transfer" {
             self.require_product_write_enabled()?;
         }
@@ -7014,6 +7021,9 @@ impl AccountWallet {
     /// to continue with backup acknowledgement or signing.
     pub fn resume_operation(&mut self, operation_id: &str) -> Result<Value, AccountError> {
         let operation = self.operation(operation_id)?;
+        if operation.kind == "mint" {
+            self.require_issuance_write_enabled()?;
+        }
         match operation.state.as_str() {
             "signed_persisted" | "broadcast_unobserved" => {
                 let signed = operation.signed_tx_hex.as_deref().ok_or_else(|| {
@@ -7308,6 +7318,9 @@ impl AccountWallet {
             ));
         }
         let operation = self.operation(operation_id)?;
+        if operation.kind == "mint" {
+            self.require_issuance_write_enabled()?;
+        }
         if !matches!(
             operation.state.as_str(),
             "broadcast_unobserved" | "broadcast" | "mempool"
@@ -8709,6 +8722,20 @@ impl AccountWallet {
         }
         if !self.production_observation_policy_ready() {
             return Err(write_block_error("production_observation_policy_required"));
+        }
+        Ok(())
+    }
+
+    /// Issuer tooling is intentionally a separate feature and custody
+    /// boundary, but a structurally valid registry file is not an
+    /// independently authenticated authorization to expand production
+    /// supply. Until the production issuer/key ceremony defines that
+    /// authorization and its supply envelope, mainnet manifest construction
+    /// remains available for review while every fresh mint fails closed.
+    fn require_issuance_write_enabled(&self) -> Result<(), AccountError> {
+        self.require_write_enabled()?;
+        if self.config.network == "mainnet" {
+            return Err(write_block_error("production_issuance_not_authorized"));
         }
         Ok(())
     }
@@ -13795,6 +13822,90 @@ mod tests {
             )
             .unwrap();
         assert_eq!(created["backup_required"], true);
+    }
+
+    #[test]
+    fn mainnet_issuer_tool_fails_closed_without_authenticated_supply_policy() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut wallet = AccountWallet::open(
+            &mainnet_config(Vec::new()),
+            &[72_u8; 32],
+            dir.path().join("wallet.sqlite").to_str().unwrap(),
+        )
+        .unwrap();
+
+        let prepare_error = wallet
+            .mint_prepare(
+                &json!({
+                    "asset_id": hex_encode(&[3_u8; 32]),
+                    "amounts": [1],
+                })
+                .to_string(),
+            )
+            .unwrap_err();
+        assert_eq!(prepare_error.code, "production_issuance_not_authorized");
+
+        // A stale proof-ready row from an older binary must not turn the
+        // signing boundary into a bypass after this gate is introduced.
+        wallet
+            .insert_planned_operation(
+                "pre-gate-mainnet-mint",
+                "mint",
+                &json!({
+                    "asset_id": hex_encode(&[3_u8; 32]),
+                    "amounts": [1],
+                })
+                .to_string(),
+                "pre-gate-delivery-nonce",
+            )
+            .unwrap();
+        wallet
+            .db
+            .conn
+            .execute(
+                "UPDATE opencsv_operations
+                 SET state = 'proof_ready', backup_acked = 1
+                 WHERE operation_id = 'pre-gate-mainnet-mint'",
+                [],
+            )
+            .unwrap();
+        let signing_error = wallet
+            .sign_and_broadcast(
+                "pre-gate-mainnet-mint",
+                &json!({ "target_sat_per_vb": 1 }).to_string(),
+            )
+            .unwrap_err();
+        assert_eq!(signing_error.code, "production_issuance_not_authorized");
+
+        wallet
+            .db
+            .conn
+            .execute(
+                "UPDATE opencsv_operations
+                 SET state = 'signed_persisted', signed_tx_hex = '00'
+                 WHERE operation_id = 'pre-gate-mainnet-mint'",
+                [],
+            )
+            .unwrap();
+        let resume_error = wallet
+            .resume_operation("pre-gate-mainnet-mint")
+            .unwrap_err();
+        assert_eq!(resume_error.code, "production_issuance_not_authorized");
+
+        wallet
+            .db
+            .conn
+            .execute(
+                "UPDATE opencsv_operations
+                 SET state = 'broadcast_unobserved'
+                 WHERE operation_id = 'pre-gate-mainnet-mint'",
+                [],
+            )
+            .unwrap();
+        let fee_bump_error = wallet
+            .fee_bump("pre-gate-mainnet-mint", 2)
+            .unwrap_err();
+        assert_eq!(fee_bump_error.code, "production_issuance_not_authorized");
     }
 
     #[test]
