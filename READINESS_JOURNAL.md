@@ -1,5 +1,20 @@
 # Signet/mainnet readiness decision journal
 
+## 2026-08-15 — signed production recovery never falls back to live policy
+
+The first rollout-authorization snapshot pass verified a persisted mainnet
+release before fee replacement, but a receipt with the complete snapshot
+removed fell back to the current host fee limit. That made absence less strict
+than malformed bytes and could let damaged mainnet state recover under policy
+that did not authorize the original signature.
+
+Mainnet replacement now treats a missing signed rollout snapshot as
+`database_corrupt`, just like a malformed or commitment-mismatched snapshot.
+Signet receipts remain backward-compatible and may use their configured fee
+limit without production metadata. Falling back to the live mainnet release
+was rejected because later policy may neither raise the exposure of old signed
+bytes nor retroactively stand in for their missing authorization.
+
 ## 2026-08-15 — production issuer policy is an exact release input
 
 The initial mainnet gate considered any nonempty, internally valid

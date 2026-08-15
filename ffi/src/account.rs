@@ -8866,6 +8866,12 @@ impl AccountWallet {
 
     fn signed_fee_limit(&self, receipt: &Value) -> Result<Option<u64>, AccountError> {
         let Some(authorization) = receipt.get("production_rollout_authorization") else {
+            if self.config.network == "mainnet" {
+                return Err(AccountError::new(
+                    "database_corrupt",
+                    "signed production operation has no rollout authorization snapshot",
+                ));
+            }
             return Ok(self.config.max_fee_sats);
         };
         let release = serde_json::from_value::<ProductionUsdRegistryRelease>(
@@ -13209,6 +13215,15 @@ mod tests {
 
     #[test]
     fn signed_production_fee_authorization_survives_registry_changes() {
+        let signet_dir = tempfile::tempdir().unwrap();
+        let signet = AccountWallet::open(
+            &config(AccountRole::Primary, true),
+            &[90_u8; 32],
+            signet_dir.path().join("wallet.sqlite").to_str().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(signet.signed_fee_limit(&json!({})).unwrap(), None);
+
         let config = rewrite_mainnet_release(
             &mainnet_config(vec![mainnet_usd_issuer_policy(89)]),
             |release| release.rollout.max_miner_fee_sats = 5_000,
@@ -13220,6 +13235,10 @@ mod tests {
             dir.path().join("wallet.sqlite").to_str().unwrap(),
         )
         .unwrap();
+        assert_eq!(
+            wallet.signed_fee_limit(&json!({})).unwrap_err().code,
+            "database_corrupt"
+        );
         let mut receipt = json!({});
         wallet.stamp_production_rollout_authorization(&mut receipt);
         assert_eq!(
