@@ -1,5 +1,29 @@
 # Signet/mainnet readiness decision journal
 
+## 2026-08-15 — production issuer policy is an exact release input
+
+The initial mainnet gate considered any nonempty, internally valid
+`usd_issuers` list to be a configured production product. That protected exact
+asset selection but left the activation boundary as mutable host input: it did
+not identify which registry version, source revision, or approval receipts the
+application release had actually reviewed.
+
+Mainnet now refuses loose issuer lists. Its effective policies must come from
+a versioned `production_usd_registry` release bound to the exact deployment.
+Rust recomputes a domain-separated SHA-256 commitment over the format and
+registry versions, deployment, ordered exact manifests/priorities, source
+revision, and public approval receipts. Mutated manifests, cross-deployment
+releases, missing approvals, and commitment mismatches fail during account
+configuration. Status publishes the exact release identity for support and
+independent review. Signet/regtest keep their Test USD registry and reject the
+production object.
+
+This is deliberately not a claim that a URL or application signature proves
+reserves, redemption, legal authority, or brand ownership. Those remain
+external evidence gates, and no real production registry exists yet. Treating
+a nonempty caller-supplied vector as equivalent to a reviewed release was
+rejected.
+
 ## 2026-08-15 — production observation policy cannot silently downgrade
 
 The first production gate made an empty mainnet issuer registry read-only, but

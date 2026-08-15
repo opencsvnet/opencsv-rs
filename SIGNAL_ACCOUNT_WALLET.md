@@ -221,12 +221,22 @@ The action-oriented surface is:
 - `opencsv_fee_bump`
 - `opencsv_operation_mark_delivered`
 
-The account config may contain reviewed public `usd_issuers` manifests. Rust
-validates each exact genesis/terms pair, network, `USD` unit code, and unique
-asset id. Status groups those issuer-specific identities under the
-`trusted_test_usd_v2` product profile with deterministic priority, while preserving
-the issuer name and asset id for review and receipts. Unknown or legacy assets
-remain visible but are not promoted by their ticker.
+On signet/regtest the account config may contain reviewed public `usd_issuers`
+manifests. Rust validates each exact genesis/terms pair, network, `USD` unit
+code, and unique asset id. Status groups those issuer-specific identities
+under the `trusted_test_usd_v2` product profile with deterministic priority,
+while preserving the issuer name and asset id for review and receipts. Unknown
+or legacy assets remain visible but are not promoted by their ticker.
+
+Mainnet rejects that loose list. It accepts issuer policies only inside
+`production_usd_registry`, a version-one release object bound to the exact
+non-test deployment. Its SHA-256 commitment is recomputed over the registry
+version, ordered policies, source revision, and public approval receipts.
+Status exposes the release version and commitment; a missing, empty, mutated,
+cross-deployment, or receipt-free release cannot arm consumer writes. The
+containing application release authenticates this immutable input through its
+normal distribution signature; the public receipts do not by themselves
+prove issuer backing, solvency, legal authority, or brand control.
 
 Omitting `observation_checks` on signet or mainnet installs two required raw
 transaction observers plus observable direct relay and confirmed-chain SPV.

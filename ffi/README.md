@@ -19,9 +19,13 @@ the complete unsigned solo or frozen batch.
 ## Production activation boundary
 
 Opening and synchronizing a mainnet account does not activate a product. A
-mainnet account is read-only until its configuration contains at least one
-fully validated, non-test `USD` issuer manifest under a non-test deployment
-identifier. Until then status returns
+mainnet account is read-only until its configuration contains a versioned,
+deployment-bound production registry release with at least one fully
+validated, non-test `USD` issuer manifest. Loose top-level `usd_issuers` are
+rejected on mainnet. The registry commitment covers its encoding and policy
+version, deployment, exact ordered manifest set, source revision, and public
+approval receipts; status exposes that identity for independent receipts.
+Until a valid nonempty release is present, status returns
 `write_block_reason: "production_usd_not_configured"`, and every new consumer
 transfer, batch, proof, signing, and wallet-internal reserve-split path fails
 with that stable reason before selecting Bitcoin inputs.
@@ -34,6 +38,9 @@ the production namespace. Removing an issuer stops unsigned consumer work,
 but an exact transaction already signed and persisted can still resume and
 use its protocol-safe fee-bump path. Opt-in headless issuer tooling keeps its
 separate backup/device gate and remains absent from Signal's default binary.
+Test USD keeps the existing signet/regtest `usd_issuers` configuration and
+refuses a production registry release, so neither registry format can be
+silently interpreted on the other network.
 
 Fresh mainnet accounts also inherit the same fail-closed observation shape as
 Test USD: exact transaction bytes from both immutable, pinned mempool.space

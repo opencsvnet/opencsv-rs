@@ -67,6 +67,7 @@ const LEGACY_CHECKPOINT_VERSION: u32 = 1;
 const BATCH_CHECKPOINT_VERSION: u32 = 2;
 const PRE_RESET_CHECKPOINT_VERSION: u32 = 3;
 const CHECKPOINT_VERSION: u32 = 4;
+const PRODUCTION_USD_REGISTRY_FORMAT_VERSION: u32 = 1;
 /// Immutable deployment namespace for the fresh signet/regtest Test USD v2 wallet.
 pub const TEST_USD_V2_DEPLOYMENT_ID: &str = "opencsv-test-usd-v2";
 const TEST_KEY_DERIVATION_ID: &str = "opencsv-account-v2";
@@ -279,7 +280,7 @@ struct ObservationEvidenceEnvelope {
 /// One exact issuer-specific USD instrument trusted by the Signal product.
 /// Trust comes from the reviewed app configuration, never from the `USD`
 /// display code alone.
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct UsdIssuerPolicy {
     /// Full terms/genesis manifest whose asset id is admitted as USD.
@@ -287,6 +288,32 @@ pub struct UsdIssuerPolicy {
     /// Lower values are preferred when one issuer balance can cover a send.
     #[serde(default)]
     pub priority: u32,
+}
+
+/// Exact production USD registry carried by one reviewed application release.
+///
+/// The registry is not fetched at spend time. Its commitment binds the
+/// deployment, monotonically named release version, ordered issuer policies,
+/// source revision, and public approval receipts. Application distribution
+/// signing authenticates the containing release; these public fields make the
+/// exact policy independently reproducible and auditable.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ProductionUsdRegistryRelease {
+    /// Registry encoding version. Version one is the only supported format.
+    pub format_version: u32,
+    /// Monotonic policy version chosen by the production release process.
+    pub registry_version: u64,
+    /// Exact non-test account deployment this registry may activate.
+    pub deployment_id: String,
+    /// Ordered, exact issuer-specific manifests and selection priorities.
+    pub issuers: Vec<UsdIssuerPolicy>,
+    /// Immutable source revision that generated the containing client build.
+    pub source_revision: String,
+    /// Public review/approval receipts for this exact registry release.
+    pub approval_receipts: Vec<String>,
+    /// SHA-256 over the canonical version-one release payload.
+    pub commitment_sha256: String,
 }
 
 /// Account configuration supplied by Signal. It contains no secret key.
@@ -369,6 +396,11 @@ pub struct AccountConfig {
     /// product. This list contains public manifests only, never issuer keys.
     #[serde(default)]
     pub usd_issuers: Vec<UsdIssuerPolicy>,
+    /// Versioned, deployment-bound production registry. Mainnet refuses loose
+    /// top-level `usd_issuers`; its effective issuer set comes only from this
+    /// exact release input. Signet and regtest refuse this field.
+    #[serde(default)]
+    pub production_usd_registry: Option<ProductionUsdRegistryRelease>,
     /// Absolute miner-fee ceiling in satoshis for fee-bump replacements,
     /// which take no per-call fee policy. When omitted, bumps are uncapped.
     #[serde(default)]
@@ -1681,6 +1713,7 @@ impl AccountWallet {
             })?;
         }
         validate_observation_checks(&config)?;
+        prepare_production_usd_registry(&mut config)?;
         validate_usd_issuer_policy(&config)?;
 
         #[cfg(feature = "test-wallet-recovery")]
@@ -2282,6 +2315,15 @@ impl AccountWallet {
             "write_enabled": self.write_enabled()?,
             "write_block_reason": self.write_block_reason()?,
             "production_usd_configured": self.production_usd_configured(),
+            "production_usd_registry": self.config.production_usd_registry.as_ref().map(|registry| json!({
+                "format_version": registry.format_version,
+                "registry_version": registry.registry_version,
+                "deployment_id": registry.deployment_id,
+                "source_revision": registry.source_revision,
+                "approval_receipts": registry.approval_receipts,
+                "commitment_sha256": registry.commitment_sha256,
+                "issuer_count": registry.issuers.len(),
+            })),
             "production_observation_policy_ready": self.production_observation_policy_ready(),
             "issuance_enabled": false,
             "device_binding": {
@@ -8489,7 +8531,9 @@ impl AccountWallet {
     }
 
     fn production_usd_configured(&self) -> bool {
-        self.config.network != "mainnet" || !self.config.usd_issuers.is_empty()
+        self.config.network != "mainnet"
+            || (self.config.production_usd_registry.is_some()
+                && !self.config.usd_issuers.is_empty())
     }
 
     /// Production may use the immutable built-ins or independently hosted
@@ -11515,6 +11559,133 @@ fn validate_observation_checks(config: &AccountConfig) -> Result<(), AccountErro
     Ok(())
 }
 
+#[derive(Serialize)]
+struct ProductionUsdRegistryCommitmentPayload<'a> {
+    domain: &'static str,
+    format_version: u32,
+    registry_version: u64,
+    deployment_id: &'a str,
+    issuers: &'a [UsdIssuerPolicy],
+    source_revision: &'a str,
+    approval_receipts: &'a [String],
+}
+
+fn production_usd_registry_commitment(
+    release: &ProductionUsdRegistryRelease,
+) -> Result<String, AccountError> {
+    let canonical = serde_json::to_vec(&ProductionUsdRegistryCommitmentPayload {
+        domain: "OpenCSV-production-USD-registry-v1",
+        format_version: release.format_version,
+        registry_version: release.registry_version,
+        deployment_id: &release.deployment_id,
+        issuers: &release.issuers,
+        source_revision: &release.source_revision,
+        approval_receipts: &release.approval_receipts,
+    })
+    .map_err(|error| {
+        AccountError::new(
+            "invalid_config",
+            format!("encode production USD registry commitment: {error}"),
+        )
+    })?;
+    Ok(sha256::Hash::hash(&canonical).to_string())
+}
+
+fn prepare_production_usd_registry(config: &mut AccountConfig) -> Result<(), AccountError> {
+    if config.network != "mainnet" {
+        if config.production_usd_registry.is_some() {
+            return Err(AccountError::new(
+                "invalid_config",
+                "production USD registry releases are mainnet-only",
+            ));
+        }
+        return Ok(());
+    }
+
+    if !config.usd_issuers.is_empty() {
+        return Err(AccountError::new(
+            "invalid_config",
+            "mainnet USD issuers must come from a versioned production registry release",
+        ));
+    }
+    let Some(release) = config.production_usd_registry.as_ref() else {
+        return Ok(());
+    };
+    if release.format_version != PRODUCTION_USD_REGISTRY_FORMAT_VERSION {
+        return Err(AccountError::new(
+            "invalid_config",
+            format!(
+                "unsupported production USD registry format version {}",
+                release.format_version
+            ),
+        ));
+    }
+    if release.registry_version == 0 {
+        return Err(AccountError::new(
+            "invalid_config",
+            "production USD registry version must be nonzero",
+        ));
+    }
+    if release.deployment_id != config.deployment_id {
+        return Err(AccountError::new(
+            "invalid_config",
+            "production USD registry belongs to another deployment",
+        ));
+    }
+    let revision_is_supported = matches!(release.source_revision.len(), 40 | 64)
+        && release
+            .source_revision
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase());
+    if !revision_is_supported {
+        return Err(AccountError::new(
+            "invalid_config",
+            "production USD registry source revision must be a 40- or 64-character lowercase hex digest",
+        ));
+    }
+    if release.approval_receipts.is_empty() {
+        return Err(AccountError::new(
+            "invalid_config",
+            "production USD registry needs at least one public approval receipt",
+        ));
+    }
+    let mut receipt_urls = HashSet::new();
+    for receipt in &release.approval_receipts {
+        let parsed = Url::parse(receipt).map_err(|_| {
+            AccountError::new(
+                "invalid_config",
+                "production USD registry approval receipts must be valid HTTPS URLs",
+            )
+        })?;
+        if parsed.scheme() != "https" || parsed.host_str().is_none() {
+            return Err(AccountError::new(
+                "invalid_config",
+                "production USD registry approval receipts must be valid HTTPS URLs",
+            ));
+        }
+        if !receipt_urls.insert(receipt) {
+            return Err(AccountError::new(
+                "invalid_config",
+                "production USD registry contains a duplicate approval receipt",
+            ));
+        }
+    }
+    validate_hex_32_config(
+        &release.commitment_sha256,
+        "production USD registry commitment",
+    )?;
+    let expected_commitment = production_usd_registry_commitment(release)?;
+    if release.commitment_sha256 != expected_commitment {
+        return Err(AccountError::new(
+            "invalid_config",
+            "production USD registry commitment does not match its exact release payload",
+        ));
+    }
+
+    config.usd_issuers.clone_from(&release.issuers);
+    Ok(())
+}
+
 fn validate_usd_issuer_policy(config: &AccountConfig) -> Result<(), AccountError> {
     let mut asset_ids = HashSet::new();
     for issuer in &config.usd_issuers {
@@ -12035,6 +12206,27 @@ mod tests {
     }
 
     fn mainnet_config(issuers: Vec<Value>) -> String {
+        let production_usd_registry = if issuers.is_empty() {
+            Value::Null
+        } else {
+            let issuers = issuers
+                .into_iter()
+                .map(|issuer| serde_json::from_value::<UsdIssuerPolicy>(issuer).unwrap())
+                .collect::<Vec<_>>();
+            let mut release = ProductionUsdRegistryRelease {
+                format_version: PRODUCTION_USD_REGISTRY_FORMAT_VERSION,
+                registry_version: 1,
+                deployment_id: "opencsv-mainnet-v1-test".into(),
+                issuers,
+                source_revision: "ab".repeat(20),
+                approval_receipts: vec![
+                    "https://github.com/opencsvnet/opencsv/issues/1#unit-test-approval".into(),
+                ],
+                commitment_sha256: "00".repeat(32),
+            };
+            release.commitment_sha256 = production_usd_registry_commitment(&release).unwrap();
+            serde_json::to_value(release).unwrap()
+        };
         serde_json::to_string(&json!({
             "version": SCHEMA_VERSION,
             "deployment_id": "opencsv-mainnet-v1-test",
@@ -12043,10 +12235,104 @@ mod tests {
             "peers": ["127.0.0.1:8333", "127.0.0.2:8333"],
             "role": AccountRole::Primary,
             "backup_verified": true,
-            "usd_issuers": issuers,
+            "production_usd_registry": production_usd_registry,
             "test_skip_protocol_spend_preflight": true,
         }))
         .unwrap()
+    }
+
+    fn open_mainnet_config_error(config: &Value, database_name: &str) -> AccountError {
+        let dir = tempfile::tempdir().unwrap();
+        match AccountWallet::open(
+            &config.to_string(),
+            &[70_u8; 32],
+            dir.path().join(database_name).to_str().unwrap(),
+        ) {
+            Ok(_) => panic!("mainnet config unexpectedly opened"),
+            Err(error) => error,
+        }
+    }
+
+    #[test]
+    fn mainnet_refuses_loose_or_mutated_production_registry_inputs() {
+        let issuer = mainnet_usd_issuer_policy(70);
+
+        let mut loose: Value = serde_json::from_str(&mainnet_config(Vec::new())).unwrap();
+        loose["usd_issuers"] = json!([issuer.clone()]);
+        let error = open_mainnet_config_error(&loose, "loose.sqlite");
+        assert_eq!(error.code, "invalid_config");
+        assert!(error.message.contains("versioned production registry"));
+
+        let valid: Value =
+            serde_json::from_str(&mainnet_config(vec![issuer.clone()])).unwrap();
+        let mut mutated_manifest = valid.clone();
+        mutated_manifest["production_usd_registry"]["issuers"][0]["priority"] = json!(9);
+        let error = open_mainnet_config_error(&mutated_manifest, "manifest.sqlite");
+        assert_eq!(error.code, "invalid_config");
+        assert!(error.message.contains("commitment does not match"));
+
+        let mut wrong_deployment = valid.clone();
+        wrong_deployment["production_usd_registry"]["deployment_id"] =
+            json!("opencsv-mainnet-other");
+        let error = open_mainnet_config_error(&wrong_deployment, "deployment.sqlite");
+        assert_eq!(error.code, "invalid_config");
+        assert!(error.message.contains("another deployment"));
+
+        let mut no_approval = valid.clone();
+        no_approval["production_usd_registry"]["approval_receipts"] = json!([]);
+        let error = open_mainnet_config_error(&no_approval, "approval.sqlite");
+        assert_eq!(error.code, "invalid_config");
+        assert!(error.message.contains("approval receipt"));
+
+        let mut signet: Value = serde_json::from_str(&config(AccountRole::Primary, true)).unwrap();
+        signet["production_usd_registry"] = valid["production_usd_registry"].clone();
+        let error = open_mainnet_config_error(&signet, "signet.sqlite");
+        assert_eq!(error.code, "invalid_config");
+        assert!(error.message.contains("mainnet-only"));
+    }
+
+    #[test]
+    fn production_registry_status_exposes_the_exact_release_identity() {
+        let config = mainnet_config(vec![mainnet_usd_issuer_policy(70)]);
+        let config_value: Value = serde_json::from_str(&config).unwrap();
+        let configured_commitment = config_value["production_usd_registry"]
+            ["commitment_sha256"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let dir = tempfile::tempdir().unwrap();
+        let mut wallet = AccountWallet::open(
+            &config,
+            &[70_u8; 32],
+            dir.path().join("wallet.sqlite").to_str().unwrap(),
+        )
+        .unwrap();
+
+        let status = wallet.status().unwrap();
+        assert_eq!(status["production_usd_configured"], true);
+        assert_eq!(status["production_usd_registry"]["format_version"], 1);
+        assert_eq!(status["production_usd_registry"]["registry_version"], 1);
+        assert_eq!(
+            status["production_usd_registry"]["deployment_id"],
+            "opencsv-mainnet-v1-test"
+        );
+        assert_eq!(status["production_usd_registry"]["issuer_count"], 1);
+        assert_eq!(
+            status["production_usd_registry"]["commitment_sha256"],
+            configured_commitment
+        );
+
+        let release = wallet.config.production_usd_registry.as_ref().unwrap();
+        assert_eq!(
+            production_usd_registry_commitment(release).unwrap(),
+            configured_commitment
+        );
+        let mut changed = release.clone();
+        changed.registry_version += 1;
+        assert_ne!(
+            production_usd_registry_commitment(&changed).unwrap(),
+            configured_commitment
+        );
     }
 
     #[test]
