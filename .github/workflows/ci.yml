@@ -37,11 +37,12 @@ jobs:
       - name: Verify recovery and issuer symbols are feature-gated
         run: |
           cargo build --locked --release -p opencsv-ffi
-          if nm -g target/release/libopencsv_ffi.a | grep -q opencsv_account_rebind_test_device; then
+          nm -g target/release/libopencsv_ffi.a > target/release/opencsv-default-symbols.txt
+          if grep -q opencsv_account_rebind_test_device target/release/opencsv-default-symbols.txt; then
             echo "test rebind symbol leaked into the default release build" >&2
             exit 1
           fi
-          if nm -g target/release/libopencsv_ffi.a | grep -Eq 'opencsv_wallet_init_issuer|opencsv_prove_mint'; then
+          if grep -Eq 'opencsv_wallet_init_issuer|opencsv_prove_mint' target/release/opencsv-default-symbols.txt; then
             echo "issuer symbol leaked into the default Signal release build" >&2
             exit 1
           fi
@@ -56,5 +57,17 @@ jobs:
           cargo build --locked --release -p opencsv-ffi --features issuer-tools
           nm -g target/release/libopencsv_ffi.a | grep -q opencsv_wallet_init_issuer
           nm -g target/release/libopencsv_ffi.a | grep -q opencsv_prove_mint
+      - name: Check secret-free production registry tooling
+        env:
+          RUSTFLAGS: -D warnings
+          CARGO_TARGET_DIR: target/registry-tools
+        run: |
+          cargo test --locked -p opencsv-ffi --features registry-tools --bin opencsv-registry
+          cargo build --locked --release -p opencsv-ffi --features registry-tools --lib --bin opencsv-registry
+          nm -g target/registry-tools/release/libopencsv_ffi.a > target/registry-tools/release/opencsv-registry-symbols.txt
+          if grep -Eq 'opencsv_wallet_init_issuer|opencsv_prove_mint' target/registry-tools/release/opencsv-registry-symbols.txt; then
+            echo "issuer symbol leaked into the registry-only build" >&2
+            exit 1
+          fi
       - name: Verify reproducible reference binaries
         run: ./scripts/reproducible-build.sh --verify dist/reproducible

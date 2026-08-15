@@ -41,7 +41,13 @@ application deployment. The public example is deliberately
 issuer-empty, candidate-only, and pinned to a placeholder revision; it cannot
 arm writes. Copying the commitment algorithm into an operational script was
 rejected because one byte-level implementation is easier to reproduce and
-audit.
+audit. CI builds the registry feature in an isolated target directory, runs its
+golden and durability tests, and rejects any issuer C symbol in that artifact.
+Reusing the issuer-feature build directory for the symbol check was rejected
+because stale archives could produce a false result. Piping `nm` directly into
+a negative grep was also rejected: an incompatible or failed inspector can look
+the same as an absent symbol. CI now writes the symbol inventory first, making
+inspection failure fatal before testing absence.
 
 ## 2026-08-15 — production issuer policy is an exact release input
 
