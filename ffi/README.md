@@ -16,6 +16,193 @@ the exact planned/fee-reserved operation and Bitcoin lock durable. Verified
 conflicts and stale-state contradictions return `"retryable":false` and close
 the complete unsigned solo or frozen batch.
 
+## Production activation boundary
+
+Opening and synchronizing a mainnet account does not activate a product. A
+mainnet account is read-only until its configuration contains a versioned,
+deployment-bound production registry release with at least one fully
+validated, non-test `USD` issuer manifest. Loose top-level `usd_issuers` are
+rejected on mainnet. The registry commitment covers its encoding and policy
+version, deployment, exact ordered manifest set, source revision, and public
+approval receipts. It also commits a `candidate`, `limited`, or `general`
+activation phase plus the exact per-transfer, per-batch, rolling-day,
+recipient-count, reserve-allocation, and miner-fee ceilings; status exposes
+that identity and rollout envelope for independent receipts. A candidate
+release is intentionally reviewable but returns
+`production_activation_not_authorized` for every fresh Bitcoin write.
+Limited and general releases remain bounded by the committed ceilings at
+intent creation and again before proof/signing, so application configuration
+cannot raise them. Cancelled or protocol-rejected intents stop consuming the
+rolling-day allowance; live and completed intents continue to count.
+Proof-lineage v4 is deliberately not sufficient to cross this boundary. D4
+binds predecessor verification keys, but the root verifier is still rebuilt
+from proof-carried common data. Until D5 independently authenticates that
+root, every shipped mainnet build reports
+`production_root_vk_authentication_required` after the activation-phase check
+and before observation, Bitcoin selection, proving, or signing. The only test
+override is compiled under `cfg(test)` and is rejected as an unknown config
+field by normal, issuer-tools, and registry-tools builds.
+`ffi/tests/production_root_gate.rs` freezes that release-shape property so the
+override cannot silently leak into the Signal or operator surface.
+When exact transaction bytes are signed and persisted, their receipt snapshots
+the authorizing registry version, commitment, rollout, and miner-fee ceiling.
+Rust signs that snapshot with a deployment-separated wallet key over the stable
+solo, batch, or reserve operation identity. A missing snapshot, self-consistent
+substitution, or cross-operation copy is database corruption. A later registry
+change therefore cannot raise that operation's RBF exposure or strand its
+protocol-safe recovery by lowering the current ceiling.
+Solo, shared-batch, and reserve-maintenance crash resume revalidate that exact
+authorization before parsing transaction bytes, consulting chain state, or
+attempting relay. A stale signed row from a pre-gate binary cannot turn
+idempotent rebroadcast into an authorization bypass.
+The corresponding three fee-bump paths perform the same check before
+reconstructing or signing a replacement or invoking authoritative chain
+verification.
+Until a valid nonempty release is present, status returns
+`write_block_reason: "production_usd_not_configured"`, and every new consumer
+transfer, batch, proof, signing, and wallet-internal reserve-split path fails
+with that stable reason before selecting Bitcoin inputs.
+
+The consumer registry does not authorize expansion of issuer supply. The
+headless issuer admits a mainnet mint only when registry format v2 commits the
+exact public issuance policy and a threshold-signed authorization binds the
+recipient, amounts, one canonical Bitcoin funding outpoint, registry, policy,
+sequence, and supply transition. Missing
+or v1 policy material fails closed with `production_issuance_not_authorized`;
+an operator-edited registry JSON file is deliberately not treated as supply
+authority. Signet and regtest issuer flows are unchanged.
+
+The secret-free `opencsv-registry` tool now defines the reviewable form of that
+separate authority without enabling it. A version-one issuance policy commits
+one exact deployment, production-registry version, asset id, sorted set of
+distinct administrative secp256k1 public keys, a threshold of at least two,
+per-authorization and cumulative supply ceilings, authorization lifetime,
+policy validity window, source revision, and public approval receipts. These
+administrative keys are distinct from the AIR issuer key that proves protocol
+mint validity. One mint authorization binds the exact recipient, one or two
+amounts, one canonical confirmed Bitcoin funding outpoint, monotonic sequence,
+supply-before/supply-after transition, validity window, policy commitment, and
+public approval receipts; every threshold
+signature covers the canonical authorization digest and must be low-S.
+
+Policy verification requires the expected deployment, registry version, asset
+id, and policy commitment as external inputs from the containing release. Mint
+authorization verification additionally requires that release's exact registry
+commitment. A self-consistent JSON file cannot nominate its own
+trust root. The issuer wallet verifies these envelopes before fee
+selection, creates the mint operation and authorization-ledger row in one
+`BEGIN IMMEDIATE` transaction, and requires a contiguous per-asset sequence
+and exact cumulative-supply floor. An admitted authorization can never create
+a second operation. If the process stops before fee reservation or proof, the
+same durable operation resumes with the same authorization and exact outpoint;
+creating a replacement operation still requires a fresh authorization.
+Operators may review canonical bytes with:
+
+```sh
+opencsv-registry issuance-policy build --input draft.json --output policy.json
+opencsv-registry issuance-policy verify --input policy.json \
+  --expected-deployment <deployment> \
+  --expected-registry-version <version> --expected-asset-id <asset-id> \
+  --expected-policy-commitment <sha256>
+opencsv-registry mint-authorization verify --policy policy.json \
+  --authorization mint.json --expected-deployment <deployment> \
+  --expected-registry-version <version> \
+  --expected-registry-commitment <sha256> --expected-asset-id <asset-id> \
+  --expected-policy-commitment <sha256> \
+  --expected-to-owner <owner> --expected-amount <units> \
+  --at-unix-seconds <explicit-time>
+```
+
+Production registry format version one remains byte-for-byte stable and cannot
+authorize issuance. Version two extends the release commitment with a sorted,
+unique list of exact `(asset_id, issuance_policy_commitment)` references, each
+of which must name an asset already admitted by the same consumer registry.
+Unknown assets, duplicate/unsorted references, mutated commitments, and a
+version-one release carrying references fail closed. This gives the external
+`--expected-policy-commitment` input one reproducible source without treating
+the policy file as its own authority. No version-two production release or real
+policy exists yet.
+
+The policy deliberately does not commit the registry hash: registry v2 already
+commits the policy hash, so including the reverse edge would create an
+unconstructible hash fixed point. The threshold-signed mint envelope binds both
+final commitments instead.
+
+The production authorization ledger stores canonical padded-u64 sequence and
+supply values so ordering remains exact beyond SQLite's signed integer range.
+Secure Backup carries every ledger row together with its mint operation and
+rejects gaps, replays, stale floors, mismatched authorizations, or missing
+operations before importing anything. Signed mints snapshot the exact policy
+and authorization beside the wallet-signed registry release. Resume and RBF
+revalidate that historical evidence and the ledger without substituting a
+later live policy; unsigned work fails closed after policy rotation.
+
+The funding outpoint is part of the threshold-signed authorization digest and
+the wallet reserves that exact outpoint rather than falling back to another
+fee coin. This is the rollback-replay boundary: restoring an older valid backup
+cannot reuse an already-consumed authorization with fresh Bitcoin funding. A
+second transaction using the same authorization must double-spend the same
+outpoint, so at most one branch can settle. An unavailable authorized outpoint
+leaves the admitted operation durably `planned` and returns
+`insufficient_fees`; resuming it retries only that outpoint and another wallet
+UTXO is never substituted. A crash after exact reservation resumes from
+`fee_reserved` and proves the same operation. Pre-sign rechecks the durable
+operation funding columns; signed resume and RBF also require the persisted
+transaction's first input to equal the authorized outpoint before relay or
+replacement signing.
+
+The database stores the highest registry version and its exact commitment as
+one atomic floor, and production Secure Backup checkpoints carry the same
+floor. Reopening or restoring with an older valid release remains readable but
+returns `production_registry_rollback`; reusing one version with different
+committed bytes returns `production_registry_conflict`. Neither case hides
+balance/history/evidence, and neither can create a new unsigned Bitcoin write.
+An authenticated higher version advances the floor, including an empty
+emergency-freeze release.
+
+The opt-in, secret-free registry operator uses the same canonical serializer,
+manifest checks, rollout validation, and commitment verifier as account open:
+
+```sh
+cargo run -p opencsv-ffi --features registry-tools --bin opencsv-registry -- \
+  build --input ffi/examples/production_registry_candidate_draft.json \
+  --output candidate-release.json
+cargo run -p opencsv-ffi --features registry-tools --bin opencsv-registry -- \
+  verify --input candidate-release.json \
+  --expected-deployment opencsv-mainnet-candidate-v1
+```
+
+Build input must omit `commitment_sha256`; a supplied value is rejected rather
+than silently replaced. Output uses create-new semantics and is never
+overwritten. The checked-in draft has no issuers, a placeholder source
+revision, and candidate phase, so it cannot activate a production product.
+Verification requires the deployment expected by the containing application;
+a structurally valid release for another deployment fails closed. Limited and
+general releases additionally require at least one exact issuer and reject the
+all-zero placeholder source revision.
+
+Production accounts use the deployment-scoped
+`opencsv-mainnet-account-v1` key-derivation namespace. Signet/regtest retain
+the exact `opencsv-account-v2` derivation for Test USD compatibility; a
+pre-v1 mainnet database or checkpoint is archived rather than guessed into
+the production namespace. Removing an issuer stops unsigned consumer work,
+but an exact transaction already signed and persisted can still resume and
+use its protocol-safe fee-bump path. Opt-in headless issuer tooling keeps its
+separate backup/device gate and remains absent from Signal's default binary.
+Test USD keeps the existing signet/regtest `usd_issuers` configuration and
+refuses a production registry release, so neither registry format can be
+silently interpreted on the other network.
+
+Fresh mainnet accounts also inherit the same fail-closed observation shape as
+Test USD: exact transaction bytes from both immutable, pinned mempool.space
+and Blockstream endpoints, direct P2P relay evidence, and confirmed-chain SPV.
+Production may replace the built-ins with independently hosted pinned
+observers, but two distinct required raw endpoints, non-disabled direct relay,
+non-disabled SPV, and two distinct configured compact-filter peers are a
+second activation gate. A downgraded policy keeps the account readable and
+returns
+`production_observation_policy_required` before any new Bitcoin write.
+
 The older in-memory compatibility model is retained temporarily:
 `opencsv_wallet_create` returns a small secrets
 JSON the host keeps in its keystore (iOS Keychain) and passes back to

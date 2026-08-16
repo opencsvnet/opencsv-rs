@@ -1,0 +1,20 @@
+{
+  "format_version": 1,
+  "registry_version": 1,
+  "deployment_id": "opencsv-mainnet-candidate-v1",
+  "issuers": [],
+  "rollout": {
+    "phase": "candidate",
+    "max_transfer_base_units": 1000000,
+    "max_batch_total_base_units": 1000000,
+    "max_rolling_24h_outgoing_base_units": 1000000,
+    "max_rolling_24h_operations": 1,
+    "max_batch_recipients": 1,
+    "max_reserve_allocation_sats": 1000,
+    "max_miner_fee_sats": 1000
+  },
+  "source_revision": "0000000000000000000000000000000000000000",
+  "approval_receipts": [
+    "https://github.com/opencsvnet/opencsv/issues/1"
+  ]
+}
