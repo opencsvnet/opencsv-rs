@@ -22,8 +22,10 @@ independent third-party audit and not mainnet approval.
 
 ## Reviewed invariants
 
-- The production verifier rejects any verification-key tag other than the
-  frozen proof-lineage-v3 tag before decoding or verifying a proof.
+- The receiver rejects any verification-key tag other than the frozen
+  proof-lineage-v4 tag before decoding or verifying a proof. This authenticates
+  a format/profile label, not the recursive root key itself; D5 is a separate
+  mainnet blocker below.
 - Issuer authorization is enforced inside the AIR through a domain-separated
   Poseidon2 commitment; wrong issuer secrets and tampered mint statements are
   covered by the prover tests.
@@ -46,6 +48,15 @@ independent third-party audit and not mainnet approval.
 
 ## Residual risks and mainnet blockers
 
+- **D5 / root verification-key authentication is open.** D4 hard-binds each
+  predecessor key inside the circuit that consumes it, but the v4 receiver
+  still reconstructs the root native verifier from proof-carried common data.
+  The static lineage tag does not independently authenticate that circuit.
+  Shipped mainnet accounts therefore return
+  `production_root_vk_authentication_required` before any fresh consumer or
+  issuer Bitcoin write, even for a structurally valid `limited` or `general`
+  registry. Signet v4 remains test-only. Issue #32 owns the v5 design,
+  adversarial custom-root regression, and independent-review receipt.
 - This is SPV, not full block validation. Correctness requires at least one
   honest, independently operated peer and protection against total eclipse.
   Duplicate resolved addresses are rejected, but that does not prove operator
@@ -82,7 +93,7 @@ independent third-party audit and not mainnet approval.
 - A self-mint is not credited merely because its anchor confirms. The final
   Signal flow must supply the confirmed recipient-side chain snapshot through
   the same consignment verifier used for received attachments.
-- Mainnet broadcast, release publication, and iOS rollout remain blocked on an
-  independent review, reproducible release receipts, owner approval, and the
-  physical iPhone acceptance sequence. The owner has deferred the independent
-  adversarial review; it has not been recorded as passed.
+- Mainnet broadcast, release publication, and iOS rollout remain blocked on
+  D5, independent review, reproducible release receipts, owner approval, and
+  the physical iPhone acceptance sequence. No independent approval of the
+  current integration tips has been recorded.

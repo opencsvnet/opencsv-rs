@@ -47,6 +47,60 @@ sign/broadcast, resume, cancellation, and protocol-safe fee bump. Possession
 of this executable alone conveys no authority: mint proofs require the issuer
 seed derived by the account that created the exact asset id.
 
+That cryptographic issuer key is necessary but not sufficient to activate
+production issuance. Mainnet mint preparation requires registry v2 to commit a
+separately authenticated threshold policy and requires one exact signed mint
+authorization. Without both, preparation, signing, rebroadcast, and mint fee
+bumps return `production_issuance_not_authorized`. Putting numeric limits into
+an operator-supplied registry file does not authenticate them. Signet/regtest
+issuance is unaffected.
+
+The authorization boundary uses a pure, secret-free verifier and is enabled
+only in the headless issuer path, never as a Signal API. A production issuance policy commits
+the exact deployment, consumer-registry version, asset id, at least two
+distinct administrative secp256k1 keys, threshold, per-mint and cumulative
+supply ceilings, authorization lifetime, policy validity, source revision, and
+approval receipts. The administrative threshold is independent of the AIR
+issuer key. Each mint envelope additionally binds its exact recipient, amounts,
+one canonical confirmed Bitcoin funding outpoint, sequence,
+supply-before/supply-after transition, validity window, and policy commitment.
+Verification receives the expected deployment, registry version,
+asset id, and policy commitment from the containing reviewed release; the mint
+envelope separately binds the release's final registry commitment. This avoids
+a policy-hash/registry-hash cycle while preventing self-authorization. Binding
+the fee outpoint also prevents an older valid backup from replaying the same
+approval with fresh Bitcoin funding: the wallet reserves exactly the signed
+outpoint and never substitutes a different UTXO. If admission is followed by
+a crash or the outpoint is not yet available, the one durable mint operation
+remains resumable from `planned` or `fee_reserved`; it cannot become a second
+operation or select another fee coin. Pre-sign, signed resume, and RBF recheck
+the operation row and persisted transaction input against the signed outpoint.
+No authority secret enters Signal or the secret-free verifier.
+
+The headless issuer wallet admits the envelope only after the reviewed policy
+is bound into registry v2. It atomically creates the mint operation and a
+per-asset authorization-ledger row, requiring sequence one/supply zero for the
+first mint and an exact contiguous sequence and supply floor thereafter. A
+failed proof or unavailable fee input does not free the authorization for
+reuse. The ledger is included in Secure Backup; restore rejects gaps, replays,
+operation mismatches, stale floors, and authorization mutation before writing.
+A structurally valid test policy remains evidence of format behavior, not of a
+real issuer or key ceremony.
+
+The containing consumer registry gains this binding only in format version two:
+its canonical commitment includes sorted, unique asset-to-issuance-policy
+commitments, and every referenced asset must already be an exact reviewed
+issuer in that release. Version one remains byte-for-byte compatible and
+cannot carry a supply-policy reference. Signal still receives no mint action,
+authority key, or authorization parser through its default C boundary.
+
+Before signing, the issuer revalidates the live v2 release, policy, threshold
+authorization, and durable ledger row. The signed receipt then snapshots the
+exact policy and authorization beside the wallet-authenticated release.
+Crash-resume and RBF verify that historical snapshot and ledger, so later
+policy removal blocks unsigned work but cannot strand an already signed
+transaction or silently substitute new policy bytes.
+
 Temporary root and derivation buffers are zeroized. The primary wallet keeps
 the derived signing state required while the account is open. A linked device
 passes no account root and opens with public descriptors and owner identity;
@@ -221,12 +275,61 @@ The action-oriented surface is:
 - `opencsv_fee_bump`
 - `opencsv_operation_mark_delivered`
 
-The account config may contain reviewed public `usd_issuers` manifests. Rust
-validates each exact genesis/terms pair, network, `USD` unit code, and unique
-asset id. Status groups those issuer-specific identities under the
-`trusted_test_usd_v2` product profile with deterministic priority, while preserving
-the issuer name and asset id for review and receipts. Unknown or legacy assets
-remain visible but are not promoted by their ticker.
+On signet/regtest the account config may contain reviewed public `usd_issuers`
+manifests. Rust validates each exact genesis/terms pair, network, `USD` unit
+code, and unique asset id. Status groups those issuer-specific identities
+under the `trusted_test_usd_v2` product profile with deterministic priority,
+while preserving the issuer name and asset id for review and receipts. Unknown
+or legacy assets remain visible but are not promoted by their ticker.
+
+Mainnet rejects that loose list. It accepts issuer policies only inside
+`production_usd_registry`, a version-one release object bound to the exact
+non-test deployment. Its SHA-256 commitment is recomputed over the registry
+version, ordered policies, source revision, and public approval receipts.
+Status exposes the release version and commitment; a missing, empty, mutated,
+cross-deployment, or receipt-free release cannot arm consumer writes. The
+containing application release authenticates this immutable input through its
+normal distribution signature; the public receipts do not by themselves
+prove issuer backing, solvency, legal authority, or brand control.
+
+The application registry authorizes consumer selection and spending of exact
+issuer instruments; it does not authorize the issuer to increase supply. The
+headless issuer has a distinct mainnet issuance gate as described above.
+
+Every signed production operation also carries the complete release snapshot
+plus a Rust-wallet signature over its commitment and stable operation identity.
+This makes a self-consistent substituted release, a snapshot copied between
+operations, or missing authentication fail as database corruption during RBF;
+the live host policy is never substituted for the original authorization.
+The same check runs before crash rebroadcast of a solo transfer, shared batch,
+or reserve-maintenance transaction, before transaction parsing, chain lookup,
+or network I/O. Their fee-bump paths also validate it before chain verification
+or replacement signing.
+
+Production release construction is also kept out of Signal. The separately
+featured, secret-free `opencsv-registry` binary builds and verifies the exact
+canonical envelope with the same Rust rules as account open. Its checked-in
+example is an issuer-empty candidate only; it is evidence tooling, not an
+activation artifact.
+
+Rust persists the highest accepted production registry version plus commitment
+as an atomic database floor and includes it in Secure Backup checkpoints. A
+client downgrade therefore opens read-only with
+`production_registry_rollback` instead of losing wallet visibility or silently
+reactivating old policy. The same version with different bytes opens read-only
+with `production_registry_conflict`. A newer authenticated release advances
+the floor; an older checkpoint can restore state but cannot lower it, while a
+newer checkpoint raises the floor and keeps an older client read-only.
+
+Omitting `observation_checks` on signet or mainnet installs two required raw
+transaction observers plus observable direct relay and confirmed-chain SPV.
+The built-in endpoints and chain-pin profiles are immutable for each network.
+Mainnet product writes additionally require two distinct pinned raw endpoints,
+direct relay and SPV to remain enabled, and at least two distinct configured
+compact-filter peers; an explicitly weakened configuration is read-only with
+`production_observation_policy_required`. Swift performs
+normal TLS/hostname validation and pin matching, while Rust treats its raw
+bytes and TLS receipt as untrusted evidence and recomputes the transaction id.
 
 `opencsv_account_open` takes the public config, account-root bytes,
 device-binding bytes, and database path. The config may include

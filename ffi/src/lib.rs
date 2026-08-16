@@ -34,6 +34,8 @@ pub mod account;
 pub mod cbf;
 pub mod crosscheck;
 mod hex;
+#[cfg(any(test, feature = "issuer-tools", feature = "registry-tools"))]
+pub mod production_issuance;
 pub mod scan;
 pub mod snapshot;
 pub mod wallet;
