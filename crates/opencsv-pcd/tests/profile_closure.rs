@@ -1,3 +1,5 @@
+#![cfg(feature = "d5-profile-spike")]
+
 //! D5 value-free profile-closure and desktop security screen.
 //!
 //! This is deliberately ignored in the default suite because it generates
