@@ -70,9 +70,12 @@ envelope separately binds the release's final registry commitment. This avoids
 a policy-hash/registry-hash cycle while preventing self-authorization. Binding
 the fee outpoint also prevents an older valid backup from replaying the same
 approval with fresh Bitcoin funding: the wallet reserves exactly the signed
-outpoint and never substitutes a different UTXO. Pre-sign, resume, and RBF
-recheck the operation row and persisted transaction input against it. No
-authority secret enters Signal or the secret-free verifier.
+outpoint and never substitutes a different UTXO. If admission is followed by
+a crash or the outpoint is not yet available, the one durable mint operation
+remains resumable from `planned` or `fee_reserved`; it cannot become a second
+operation or select another fee coin. Pre-sign, signed resume, and RBF recheck
+the operation row and persisted transaction input against the signed outpoint.
+No authority secret enters Signal or the secret-free verifier.
 
 The headless issuer wallet admits the envelope only after the reviewed policy
 is bound into registry v2. It atomically creates the mint operation and a

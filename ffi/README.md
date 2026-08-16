@@ -82,8 +82,10 @@ commitment. A self-consistent JSON file cannot nominate its own
 trust root. The issuer wallet verifies these envelopes before fee
 selection, creates the mint operation and authorization-ledger row in one
 `BEGIN IMMEDIATE` transaction, and requires a contiguous per-asset sequence
-and exact cumulative-supply floor. An admitted authorization is consumed even
-if proving or funding later fails, so retry requires a fresh authorization.
+and exact cumulative-supply floor. An admitted authorization can never create
+a second operation. If the process stops before fee reservation or proof, the
+same durable operation resumes with the same authorization and exact outpoint;
+creating a replacement operation still requires a fresh authorization.
 Operators may review canonical bytes with:
 
 ```sh
@@ -131,10 +133,13 @@ fee coin. This is the rollback-replay boundary: restoring an older valid backup
 cannot reuse an already-consumed authorization with fresh Bitcoin funding. A
 second transaction using the same authorization must double-spend the same
 outpoint, so at most one branch can settle. An unavailable authorized outpoint
-consumes the authorization and fails with `insufficient_fees`; another wallet
-UTXO is never substituted. Pre-sign rechecks the durable operation funding
-columns; signed resume and RBF also require the persisted transaction's first
-input to equal the authorized outpoint before relay or replacement signing.
+leaves the admitted operation durably `planned` and returns
+`insufficient_fees`; resuming it retries only that outpoint and another wallet
+UTXO is never substituted. A crash after exact reservation resumes from
+`fee_reserved` and proves the same operation. Pre-sign rechecks the durable
+operation funding columns; signed resume and RBF also require the persisted
+transaction's first input to equal the authorized outpoint before relay or
+replacement signing.
 
 The database stores the highest registry version and its exact commitment as
 one atomic floor, and production Secure Backup checkpoints carry the same

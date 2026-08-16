@@ -532,3 +532,28 @@ verification `credits` describe the accepted payment and are not an accounting
 delta. Persistent hosts must deduplicate retries by the stable `payment_id`.
 The legacy in-memory verifier remains compatibility-only and is not a new-host
 integration surface.
+
+## 2026-08-15 — production mint admission is resumable, not reusable
+
+The first funding-bound issuance gate atomically consumed a threshold
+authorization before reserving its signed Bitcoin outpoint. That was safe
+against excess issuance, but a process stop in the narrow interval left a
+`planned` mint that status could display but no API could advance. Replaying
+the prepare call correctly failed as an authorization replay, permanently
+stranding the admitted sequence.
+
+Mint proof construction is now a reusable internal state transition. The
+issuer-only resume path advances `planned` by reserving exactly the
+authorization's outpoint, advances `fee_reserved` with the existing durable
+lock, and commits the original operation as `proof_ready`. If the signed
+outpoint is absent, the operation stays `planned` and retryable; an unrelated
+larger wallet UTXO remains untouched. The rejected alternative was allowing a
+second operation to reuse the authorization, because that would weaken the
+atomic sequence and supply ledger rather than repair crash availability.
+
+The release-only two-recipient success fixture also used a random proposal
+nonce and could therefore land in the intentionally rejected tagged-record
+ambiguity region. That made a required receipt depend on a lucky rerun. The
+fixture now uses one fixed compatible proposal nonce; the production rejection
+and its adversarial coverage are unchanged, and no protocol nonce-grinding
+behavior was introduced.

@@ -4372,15 +4372,36 @@ impl AccountWallet {
         let funding = match funding_result {
             Ok(funding) => funding,
             Err(error) => {
-                self.reject_prebroadcast_operation(&operation_id, error.code)?;
+                // A production authorization names one exact outpoint. It may
+                // be admitted before that funding transaction reaches this
+                // wallet's confirmed view, so keep the durable operation
+                // planned and retryable instead of consuming it as rejected.
+                if production_authorization.is_none() {
+                    self.reject_prebroadcast_operation(&operation_id, error.code)?;
+                }
                 return Err(error);
             }
         };
+        self.prove_mint_operation(&operation_id, &request, funding, total_started)
+    }
+
+    #[cfg(any(test, feature = "issuer-tools"))]
+    fn prove_mint_operation(
+        &mut self,
+        operation_id: &str,
+        request: &IssuanceRequest,
+        funding: ReservedFunding,
+        total_started: Instant,
+    ) -> Result<Value, AccountError> {
+        let asset_id = request.asset_id.as_str();
+        let to_owner = request.to_owner.as_deref().ok_or_else(|| {
+            AccountError::new("database_corrupt", "mint request has no exact recipient")
+        })?;
         let funding_verification_started = Instant::now();
         let verification = match self.verify_funding(&funding) {
             Ok(receipt) => receipt,
             Err(error) => {
-                self.reject_prebroadcast_operation(&operation_id, error.code)?;
+                self.reject_prebroadcast_operation(operation_id, error.code)?;
                 return Err(error);
             }
         };
@@ -4391,13 +4412,13 @@ impl AccountWallet {
         let proved = {
             let protocol = match self.primary_protocol_mut() {
                 Ok(protocol) => protocol,
-                Err(error) => return self.fail_prebroadcast(&operation_id, error),
+                Err(error) => return self.fail_prebroadcast(operation_id, error),
             };
-            let proved = match protocol.prove_mint(&asset_id, &to_owner, &request.amounts) {
+            let proved = match protocol.prove_mint(asset_id, to_owner, &request.amounts) {
                 Ok(proved) => proved,
                 Err(error) => {
                     return self.fail_prebroadcast(
-                        &operation_id,
+                        operation_id,
                         AccountError::new("invalid_proof_request", error),
                     );
                 }
@@ -4405,14 +4426,14 @@ impl AccountWallet {
             proved
         };
         self.pending_by_operation
-            .insert(operation_id.clone(), proved.pending_id);
+            .insert(operation_id.to_owned(), proved.pending_id);
         let record = match self.primary_protocol_mut().and_then(|protocol| {
             protocol
                 .rebind_pending(proved.pending_id, ctx)
                 .map_err(|error| AccountError::new("protocol_layout_violation", error))
         }) {
             Ok(record) => record,
-            Err(error) => return self.fail_prebroadcast(&operation_id, error),
+            Err(error) => return self.fail_prebroadcast(operation_id, error),
         };
         let pending_json = match self.primary_protocol_mut().and_then(|protocol| {
             protocol
@@ -4420,18 +4441,18 @@ impl AccountWallet {
                 .map_err(|error| AccountError::new("database_error", error))
         }) {
             Ok(pending_json) => pending_json,
-            Err(error) => return self.fail_prebroadcast(&operation_id, error),
+            Err(error) => return self.fail_prebroadcast(operation_id, error),
         };
         let local_proving_ms = elapsed_millis(local_proving_started);
-        let normalized_request: Value = serde_json::from_str(&normalized_request)
+        let normalized_request = serde_json::to_value(request)
             .map_err(|error| AccountError::new("database_corrupt", error.to_string()))?;
         if let Err(error) = self.mark_proof_ready(
-            &operation_id,
+            operation_id,
             &normalized_request,
             &pending_json,
             &hex_encode(&record),
         ) {
-            return self.fail_prebroadcast(&operation_id, error);
+            return self.fail_prebroadcast(operation_id, error);
         }
         let phase_timings_ms = json!({
             "funding_verification": funding_verification_ms,
@@ -4440,14 +4461,14 @@ impl AccountWallet {
             "proof_total": elapsed_millis(total_started),
         });
         match self.prepared_receipt(
-            &operation_id,
+            operation_id,
             funding,
             &verification,
             &record,
             &phase_timings_ms,
         ) {
             Ok(receipt) => Ok(receipt),
-            Err(error) => self.fail_prebroadcast(&operation_id, error),
+            Err(error) => self.fail_prebroadcast(operation_id, error),
         }
     }
 
@@ -7144,9 +7165,10 @@ impl AccountWallet {
         Ok(())
     }
 
-    /// Resume a crash-interrupted operation. Signed transactions are
-    /// rebroadcast idempotently; earlier states are returned for the caller
-    /// to continue with backup acknowledgement or signing.
+    /// Resume a crash-interrupted operation. Issuer-only mint states advance
+    /// from their exact durable fee reservation, signed transactions are
+    /// rebroadcast idempotently, and other earlier states are returned for the
+    /// caller to continue with proof, backup acknowledgement, or signing.
     pub fn resume_operation(&mut self, operation_id: &str) -> Result<Value, AccountError> {
         let operation = self.operation(operation_id)?;
         let signed_recovery = matches!(
@@ -7155,6 +7177,37 @@ impl AccountWallet {
         );
         if operation.kind == "mint" && !signed_recovery {
             self.require_issuance_write_enabled()?;
+        }
+        #[cfg(any(test, feature = "issuer-tools"))]
+        if operation.kind == "mint"
+            && matches!(operation.state.as_str(), "planned" | "fee_reserved")
+        {
+            let total_started = Instant::now();
+            let request: IssuanceRequest = serde_json::from_str(&operation.request_json).map_err(
+                |error| AccountError::new("database_corrupt", format!("mint request: {error}")),
+            )?;
+            let production_snapshot = if self.config.network == "mainnet" {
+                Some(self.validate_current_production_mint_admission(&operation)?)
+            } else {
+                None
+            };
+            let funding = match operation.state.as_str() {
+                "planned" => {
+                    let expected = production_snapshot
+                        .as_ref()
+                        .map(|snapshot| production_mint_funding_outpoint(&snapshot.authorization))
+                        .transpose()
+                        .map_err(|error| AccountError::new(error.code, error.message))?;
+                    self.reserve_fee_utxo_matching(operation_id, expected)?
+                }
+                "fee_reserved" => self.reserved_funding_for_operation(&operation)?,
+                _ => unreachable!("mint resume state was checked above"),
+            };
+            if production_snapshot.is_some() {
+                let reserved_operation = self.operation(operation_id)?;
+                self.validate_current_production_mint_operation(&reserved_operation)?;
+            }
+            return self.prove_mint_operation(operation_id, &request, funding, total_started);
         }
         match operation.state.as_str() {
             "signed_persisted" | "broadcast_unobserved" => {
@@ -9209,6 +9262,20 @@ impl AccountWallet {
         &self,
         operation: &OperationRow,
     ) -> Result<ProductionIssuanceAuthorizationSnapshot, AccountError> {
+        let snapshot = self.validate_current_production_mint_admission(operation)?;
+        self.verify_production_mint_funding_binding(
+            operation,
+            &snapshot.authorization,
+            false,
+        )?;
+        Ok(snapshot)
+    }
+
+    #[cfg(any(test, feature = "issuer-tools"))]
+    fn validate_current_production_mint_admission(
+        &self,
+        operation: &OperationRow,
+    ) -> Result<ProductionIssuanceAuthorizationSnapshot, AccountError> {
         let request: IssuanceRequest = serde_json::from_str(&operation.request_json).map_err(
             |error| AccountError::new("database_corrupt", format!("mint request: {error}")),
         )?;
@@ -9219,7 +9286,6 @@ impl AccountWallet {
             )
         })?;
         let (policy, authorization) = self.validate_current_production_mint(&request, to_owner)?;
-        self.verify_production_mint_funding_binding(operation, &authorization, false)?;
         self.verify_production_issuance_ledger_entry(operation, &policy, &authorization)?;
         Ok(ProductionIssuanceAuthorizationSnapshot {
             policy,
@@ -15377,10 +15443,101 @@ mod tests {
         assert_eq!(error.code, "insufficient_fees");
         assert!(error.message.contains(&already_consumed.to_string()));
         assert!(!wallet.bitcoin.is_outpoint_locked(available));
+        let operation_id = authorization.authorization_id_sha256.clone();
+        assert_eq!(
+            wallet.operation(&operation_id).unwrap().state,
+            OperationState::Planned.as_str()
+        );
+        let resume_error = wallet.resume_operation(&operation_id).unwrap_err();
+        assert_eq!(resume_error.code, "insufficient_fees");
+        assert!(resume_error
+            .message
+            .contains(&already_consumed.to_string()));
+        assert!(!wallet.bitcoin.is_outpoint_locked(available));
+        assert_eq!(
+            wallet.operation(&operation_id).unwrap().state,
+            OperationState::Planned.as_str()
+        );
         assert_eq!(
             wallet.mint_prepare(&request).unwrap_err().code,
             "production_issuance_replay"
         );
+    }
+
+    #[test]
+    fn production_mint_resumes_exact_authorized_funding_after_planned_crash() {
+        let (config, policy, asset_id) = mainnet_issuance_config();
+        let config_value: Value = serde_json::from_str(&config).unwrap();
+        let registry_commitment = config_value["production_usd_registry"]
+            ["commitment_sha256"]
+            .as_str()
+            .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let database_path = dir.path().join("wallet.sqlite");
+        let mut wallet = AccountWallet::open(
+            &config,
+            &[92_u8; 32],
+            database_path.to_str().unwrap(),
+        )
+        .unwrap();
+        allow_funding_verification(&mut wallet);
+        install_manifested_production_asset(&wallet, &asset_id);
+        wallet.restore_issuers().unwrap();
+        let authorized_funding = fund(&mut wallet, 50_000);
+        let alternate_funding = fund(&mut wallet, 60_000);
+        let owner = wallet.protocol.as_ref().unwrap().owners()[0].clone();
+        let authorization = production_mint_authorization_for_funding(
+            &policy,
+            registry_commitment,
+            &owner,
+            vec![5],
+            1,
+            0,
+            authorized_funding,
+        );
+        let operation_id = authorization.authorization_id_sha256.clone();
+        let request = serde_json::to_string(&IssuanceRequest {
+            asset_id,
+            to_owner: Some(owner),
+            amounts: vec![5],
+            production_authorization: Some(authorization.clone()),
+        })
+        .unwrap();
+
+        // Model a process crash immediately after the atomic operation and
+        // authorization-ledger admission, before fee reservation begins.
+        wallet
+            .insert_production_mint_operation(
+                &operation_id,
+                &request,
+                "planned-crash-delivery",
+                &policy,
+                &authorization,
+            )
+            .unwrap();
+        assert_eq!(
+            wallet.operation(&operation_id).unwrap().state,
+            OperationState::Planned.as_str()
+        );
+
+        drop(wallet);
+        let mut wallet = AccountWallet::open(
+            &config,
+            &[92_u8; 32],
+            database_path.to_str().unwrap(),
+        )
+        .unwrap();
+        allow_funding_verification(&mut wallet);
+        let resumed = wallet.resume_operation(&operation_id).unwrap();
+        assert_eq!(resumed["state"], OperationState::ProofReady.as_str());
+        assert_eq!(resumed["funding_outpoint"], authorized_funding.to_string());
+        assert!(wallet.bitcoin.is_outpoint_locked(authorized_funding));
+        assert!(!wallet.bitcoin.is_outpoint_locked(alternate_funding));
+        wallet
+            .validate_current_production_mint_operation(
+                &wallet.operation(&operation_id).unwrap(),
+            )
+            .unwrap();
     }
 
     #[test]
@@ -18636,10 +18793,15 @@ mod tests {
             .transfer_batch_add_recipient(&batch_id, &request(95, 40))
             .unwrap();
         wallet.freeze_send_batch(&batch_id).unwrap();
-        let job = match wallet.begin_send_batch_proof(&batch_id).unwrap() {
+        let mut job = match wallet.begin_send_batch_proof(&batch_id).unwrap() {
             BatchProofJobStart::Run(job) => job,
             _ => panic!("frozen two-member batch did not produce a proof job"),
         };
+        // This success-path fixture must not depend on the ~0.8% of random
+        // proposal contexts that intentionally fail the tagged-record
+        // ambiguity guard. In production that error asks the coordinator to
+        // reserve another stock; the separate adversarial tests cover it.
+        job.proposal_nonce = [0x5a; 32];
         let completed = job.run().unwrap();
         let proved = wallet.finish_send_batch_proof(completed).unwrap();
         assert_eq!(proved["state"], "proof_ready");
