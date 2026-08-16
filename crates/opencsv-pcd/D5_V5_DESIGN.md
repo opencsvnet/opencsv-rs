@@ -24,7 +24,8 @@ a narrow, auditable upstream change, and fails closed on mainnet until present.
 
 Two findings gate everything below:
 
-- **F1 (upstream, structural).** At the pinned revision the `Const` table's
+- **F1 (upstream, structural; resolved at the current pin).** At the earlier
+  `d6510eb` design revision the `Const` table's
   *preprocessed* columns commit only `(multiplicity, witness_index)` — **not the
   constant value**. Constant values live in the *main* (witness) trace, and
   `ConstAir` "has no constraints" (`circuit-prover/src/air/const_air.rs:17`).
@@ -39,6 +40,8 @@ Two findings gate everything below:
   outcome: if exploitable, the upstream fix is mandatory; if not, it is cheap
   hardening — and **KS soundness is conditioned on the fix either way**, because
   the in-circuit KS-hash domain tags are themselves const-table values.
+  **Current status:** the `28c9a37f` dependency pin commits constant values in
+  the `Const` preprocessed trace, closing M1 and making M2 runnable.
 
 - **F2 (root-verifier self-description, the known D5 gap).** `verify_coin_proof`
   (`crates/opencsv-pcd/src/node.rs:1558`) reconstructs the verifier from the
@@ -96,7 +99,7 @@ existing `verification_key_identity` may remain as the *cache/D1* key, but the
 
 ```
 DOMAIN         = "opencsv/pcd/root-vk-identity/v5"        (ASCII, length-prefixed)
-UPSTREAM_REV   = "opencsvnet/plonky3-recursion/d6510eb…"  (the pinned rev)
+UPSTREAM_REV   = "opencsvnet/plonky3-recursion/28c9a37f…"  (the pinned rev)
 PROFILE_ID     = COIN_PROOF_PROFILE_ID                     (security.rs:15)
 
 RootVkIdentity(proof) = SHA256(

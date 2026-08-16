@@ -192,6 +192,9 @@ fn maybe_pad_d5_profile_spike(
     let Some(profile) = d5_profile_spike() else {
         return Ok(());
     };
+    // Every profile change routes through install/clear, which reset the recursive
+    // setup caches. A stale entry therefore already has preprocessed columns padded
+    // to this installed profile; only its fresh traces still require padding here.
     if prover_data.preprocessed_stale {
         pad_traces_to_profile(traces, &profile).map_err(BatchStarkProverError::from)?;
     } else {
