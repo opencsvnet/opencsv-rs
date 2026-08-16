@@ -1,5 +1,24 @@
 # Signet/mainnet readiness decision journal
 
+## 2026-08-15 — signed funding makes backup rollback non-repeatable
+
+The authorization ledger detects replay inside one current checkpoint, but an
+older authentic Secure Backup can legitimately predate a later consumed row.
+Restoring that backup would recreate the earlier local supply floor. Because
+the first threshold envelope did not name the Bitcoin funding input, the same
+already-signed next authorization could then be paired with another fee UTXO
+and produce a second mint. Hashing more ledger data into the backup was
+rejected: it detects mutation, not rollback to older valid bytes.
+
+Every production mint authorization now binds one canonical confirmed funding
+outpoint in its threshold-signed digest. Planning reserves exactly that outpoint
+and never falls back to another wallet coin. After an old-backup restore, replay
+of an already-used authorization must therefore double-spend the same Bitcoin
+outpoint; at most one branch can settle. If the authorized outpoint is absent,
+spent, locked, unconfirmed, or too small, the authorization remains consumed
+and the operation fails. A regression keeps another eligible UTXO in the wallet
+and proves it is not selected when the signed outpoint is unavailable.
+
 ## 2026-08-15 — threshold keys have one canonical text identity
 
 An adversarial exact-tip pass found that the threshold policy parsed compressed
@@ -49,8 +68,9 @@ unsigned work does fail closed after removal. Tests cover replay, skipped
 sequence, stale supply, backup round-trip, tampered backup, and signed recovery
 after policy rotation. The full FFI library result is 123 passed, zero failed,
 and three explicitly ignored slow release tests. The subsequent canonical-key
-regression raises that exact-head result to 124 passed, zero failed, and three
-ignored; all three pass explicitly in release mode.
+regression raised that result to 124 passes. The funding-bound rollback
+regression makes the current exact-head result 125 passed, zero failed, and
+three ignored; all three pass explicitly in release mode.
 
 ## 2026-08-15 — production issuance uses a distinct threshold authority
 

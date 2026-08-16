@@ -62,11 +62,15 @@ distinct administrative secp256k1 keys, threshold, per-mint and cumulative
 supply ceilings, authorization lifetime, policy validity, source revision, and
 approval receipts. The administrative threshold is independent of the AIR
 issuer key. Each mint envelope additionally binds its exact recipient, amounts,
-sequence, supply-before/supply-after transition, validity window, and policy
-commitment. Verification receives the expected deployment, registry version,
+one canonical confirmed Bitcoin funding outpoint, sequence,
+supply-before/supply-after transition, validity window, and policy commitment.
+Verification receives the expected deployment, registry version,
 asset id, and policy commitment from the containing reviewed release; the mint
 envelope separately binds the release's final registry commitment. This avoids
-a policy-hash/registry-hash cycle while preventing self-authorization. No
+a policy-hash/registry-hash cycle while preventing self-authorization. Binding
+the fee outpoint also prevents an older valid backup from replaying the same
+approval with fresh Bitcoin funding: the wallet reserves exactly the signed
+outpoint and never substitutes a different UTXO. No
 authority secret enters Signal or the secret-free verifier.
 
 The headless issuer wallet admits the envelope only after the reviewed policy

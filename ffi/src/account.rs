@@ -60,8 +60,9 @@ use zeroize::Zeroizing;
 
 #[cfg(any(test, feature = "issuer-tools"))]
 use crate::production_issuance::{
-    validate_production_issuance_policy, verify_production_mint_authorization,
-    ProductionIssuancePolicy, ProductionMintAuthorization,
+    production_mint_funding_outpoint, validate_production_issuance_policy,
+    verify_production_mint_authorization, ProductionIssuancePolicy,
+    ProductionMintAuthorization,
 };
 use crate::wallet::MemWallet;
 use crate::{
@@ -359,7 +360,7 @@ pub struct ProductionIssuancePolicyRef {
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ProductionUsdRegistryRelease {
-    /// Registry encoding version. Version one is the only supported format.
+    /// Registry encoding version. Versions one and two have distinct canonical payloads.
     pub format_version: u32,
     /// Monotonic policy version chosen by the production release process.
     pub registry_version: u64,
@@ -4340,6 +4341,11 @@ impl AccountWallet {
             .as_ref()
             .map(|(_, authorization)| authorization.authorization_id_sha256.clone())
             .unwrap_or_else(|| random_id(16));
+        let authorized_funding = production_authorization
+            .as_ref()
+            .map(|(_, authorization)| production_mint_funding_outpoint(authorization))
+            .transpose()
+            .map_err(|error| AccountError::new(error.code, error.message))?;
         let delivery_nonce = random_id(16);
         let normalized_request = serde_json::to_string(&request)
             .map_err(|error| AccountError::new("invalid_request", error.to_string()))?;
@@ -4359,7 +4365,11 @@ impl AccountWallet {
                 &delivery_nonce,
             )?;
         }
-        let funding = match self.reserve_fee_utxo(&operation_id) {
+        let funding_result = match authorized_funding {
+            Some(outpoint) => self.reserve_fee_utxo_matching(&operation_id, Some(outpoint)),
+            None => self.reserve_fee_utxo(&operation_id),
+        };
+        let funding = match funding_result {
             Ok(funding) => funding,
             Err(error) => {
                 self.reject_prebroadcast_operation(&operation_id, error.code)?;
@@ -10004,9 +10014,18 @@ impl AccountWallet {
     }
 
     fn reserve_fee_utxo(&mut self, operation_id: &str) -> Result<ReservedFunding, AccountError> {
+        self.reserve_fee_utxo_matching(operation_id, None)
+    }
+
+    fn reserve_fee_utxo_matching(
+        &mut self,
+        operation_id: &str,
+        expected_outpoint: Option<OutPoint>,
+    ) -> Result<ReservedFunding, AccountError> {
         let mut candidates = Vec::new();
         for output in self.bitcoin.list_unspent() {
-            if self.bitcoin.is_outpoint_locked(output.outpoint)
+            if expected_outpoint.is_some_and(|expected| output.outpoint != expected)
+                || self.bitcoin.is_outpoint_locked(output.outpoint)
                 || output.txout.value.to_sat() < MIN_FEE_RESERVE_SATS
             {
                 continue;
@@ -10019,8 +10038,17 @@ impl AccountWallet {
         if candidates.is_empty() {
             return Err(AccountError::new(
                 "insufficient_fees",
-                format!(
-                    "no confirmed, unreserved fee UTXO of at least {MIN_FEE_RESERVE_SATS} sats"
+                expected_outpoint.map_or_else(
+                    || {
+                        format!(
+                            "no confirmed, unreserved fee UTXO of at least {MIN_FEE_RESERVE_SATS} sats"
+                        )
+                    },
+                    |outpoint| {
+                        format!(
+                            "authorized production funding outpoint {outpoint} is unavailable or below {MIN_FEE_RESERVE_SATS} sats"
+                        )
+                    },
                 ),
             ));
         }
@@ -14146,6 +14174,27 @@ mod tests {
         sequence: u64,
         supply_before_base_units: u64,
     ) -> ProductionMintAuthorization {
+        let funding_outpoint = OutPoint::new(Txid::from_byte_array([44_u8; 32]), 0);
+        production_mint_authorization_for_funding(
+            policy,
+            registry_commitment_sha256,
+            to_owner,
+            amounts,
+            sequence,
+            supply_before_base_units,
+            funding_outpoint,
+        )
+    }
+
+    fn production_mint_authorization_for_funding(
+        policy: &ProductionIssuancePolicy,
+        registry_commitment_sha256: &str,
+        to_owner: &str,
+        amounts: Vec<u64>,
+        sequence: u64,
+        supply_before_base_units: u64,
+        funding_outpoint: OutPoint,
+    ) -> ProductionMintAuthorization {
         let total = amounts.iter().copied().sum::<u64>();
         let now = u64::try_from(unix_time().unwrap()).unwrap();
         let mut authorization = ProductionMintAuthorization {
@@ -14157,6 +14206,7 @@ mod tests {
             asset_id: policy.asset_id.clone(),
             to_owner: to_owner.into(),
             amounts,
+            funding_outpoint: funding_outpoint.to_string(),
             sequence,
             supply_before_base_units,
             supply_after_base_units: supply_before_base_units + total,
@@ -15240,6 +15290,52 @@ mod tests {
             .restore_checkpoint(&tampered.to_string())
             .unwrap_err();
         assert_eq!(error.code, "invalid_backup_checkpoint");
+    }
+
+    #[test]
+    fn production_authorization_cannot_retarget_funding_after_backup_rollback() {
+        let (config, policy, asset_id) = mainnet_issuance_config();
+        let config_value: Value = serde_json::from_str(&config).unwrap();
+        let registry_commitment = config_value["production_usd_registry"]
+            ["commitment_sha256"]
+            .as_str()
+            .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let mut wallet = AccountWallet::open(
+            &config,
+            &[93_u8; 32],
+            dir.path().join("wallet.sqlite").to_str().unwrap(),
+        )
+        .unwrap();
+        install_manifested_production_asset(&wallet, &asset_id);
+        let available = fund(&mut wallet, 50_000);
+        let already_consumed = OutPoint::new(Txid::from_byte_array([99_u8; 32]), 7);
+        let owner = wallet.protocol.as_ref().unwrap().owners()[0].clone();
+        let authorization = production_mint_authorization_for_funding(
+            &policy,
+            registry_commitment,
+            &owner,
+            vec![5],
+            1,
+            0,
+            already_consumed,
+        );
+        let request = json!({
+            "asset_id": asset_id,
+            "to_owner": owner,
+            "amounts": [5],
+            "production_authorization": authorization,
+        })
+        .to_string();
+
+        let error = wallet.mint_prepare(&request).unwrap_err();
+        assert_eq!(error.code, "insufficient_fees");
+        assert!(error.message.contains(&already_consumed.to_string()));
+        assert!(!wallet.bitcoin.is_outpoint_locked(available));
+        assert_eq!(
+            wallet.mint_prepare(&request).unwrap_err().code,
+            "production_issuance_replay"
+        );
     }
 
     #[test]

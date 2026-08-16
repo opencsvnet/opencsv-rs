@@ -6,7 +6,9 @@
 //! no wallet or network write.
 
 use std::collections::HashSet;
+use std::str::FromStr;
 
+use bdk_wallet::bitcoin::OutPoint;
 use bdk_wallet::bitcoin::secp256k1::{ecdsa::Signature, Message, PublicKey, Secp256k1};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -76,6 +78,7 @@ pub(crate) struct ProductionMintAuthorization {
     pub(crate) asset_id: String,
     pub(crate) to_owner: String,
     pub(crate) amounts: Vec<u64>,
+    pub(crate) funding_outpoint: String,
     pub(crate) sequence: u64,
     pub(crate) supply_before_base_units: u64,
     pub(crate) supply_after_base_units: u64,
@@ -114,6 +117,7 @@ struct AuthorizationPayload<'a> {
     asset_id: &'a str,
     to_owner: &'a str,
     amounts: &'a [u64],
+    funding_outpoint: &'a str,
     sequence: u64,
     supply_before_base_units: u64,
     supply_after_base_units: u64,
@@ -163,6 +167,7 @@ pub(crate) fn production_mint_authorization_digest(
         asset_id: &authorization.asset_id,
         to_owner: &authorization.to_owner,
         amounts: &authorization.amounts,
+        funding_outpoint: &authorization.funding_outpoint,
         sequence: authorization.sequence,
         supply_before_base_units: authorization.supply_before_base_units,
         supply_after_base_units: authorization.supply_after_base_units,
@@ -359,6 +364,7 @@ pub(crate) fn verify_production_mint_authorization(
             "production mint authorization requires one or two positive outputs",
         ));
     }
+    production_mint_funding_outpoint(authorization)?;
     let total = authorization
         .amounts
         .iter()
@@ -510,6 +516,24 @@ pub(crate) fn verify_production_mint_authorization(
     Ok(digest)
 }
 
+pub(crate) fn production_mint_funding_outpoint(
+    authorization: &ProductionMintAuthorization,
+) -> Result<OutPoint, ValidationError> {
+    let outpoint = OutPoint::from_str(&authorization.funding_outpoint).map_err(|_| {
+        ValidationError::new(
+            "production_issuance_not_authorized",
+            "production mint funding outpoint is malformed",
+        )
+    })?;
+    if outpoint.to_string() != authorization.funding_outpoint {
+        return Err(ValidationError::new(
+            "production_issuance_not_authorized",
+            "production mint funding outpoint is not canonical",
+        ));
+    }
+    Ok(outpoint)
+}
+
 /// Build the canonical commitment for a draft production issuance policy.
 ///
 /// The draft must omit `commitment_sha256`; accepting a caller-supplied value
@@ -657,6 +681,7 @@ pub fn verify_production_mint_authorization_json(
         "authorization_id_sha256": to_hex(&digest),
         "policy_commitment_sha256": policy.commitment_sha256,
         "asset_id": authorization.asset_id,
+        "funding_outpoint": authorization.funding_outpoint,
         "sequence": authorization.sequence,
         "supply_before_base_units": authorization.supply_before_base_units,
         "supply_after_base_units": authorization.supply_after_base_units,
@@ -791,6 +816,7 @@ mod tests {
             asset_id: policy.asset_id.clone(),
             to_owner: "33".repeat(32),
             amounts: vec![400, 500],
+            funding_outpoint: format!("{}:0", "44".repeat(32)),
             sequence: 7,
             supply_before_base_units: 100,
             supply_after_base_units: 1_000,
@@ -866,6 +892,23 @@ mod tests {
                 &policy.commitment_sha256,
                 &changed_supply.to_owner,
                 &changed_supply.amounts,
+                2_500,
+            )
+            .unwrap_err()
+            .code,
+            "production_issuance_not_authorized"
+        );
+
+        let mut changed_funding = authorization.clone();
+        changed_funding.funding_outpoint = format!("{}:1", "44".repeat(32));
+        assert_eq!(
+            verify_production_mint_authorization(
+                &policy,
+                &changed_funding,
+                policy.registry_version,
+                &policy.commitment_sha256,
+                &changed_funding.to_owner,
+                &changed_funding.amounts,
                 2_500,
             )
             .unwrap_err()

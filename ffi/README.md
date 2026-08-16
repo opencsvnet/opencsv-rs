@@ -56,7 +56,8 @@ with that stable reason before selecting Bitcoin inputs.
 The consumer registry does not authorize expansion of issuer supply. The
 headless issuer admits a mainnet mint only when registry format v2 commits the
 exact public issuance policy and a threshold-signed authorization binds the
-recipient, amounts, registry, policy, sequence, and supply transition. Missing
+recipient, amounts, one canonical Bitcoin funding outpoint, registry, policy,
+sequence, and supply transition. Missing
 or v1 policy material fails closed with `production_issuance_not_authorized`;
 an operator-edited registry JSON file is deliberately not treated as supply
 authority. Signet and regtest issuer flows are unchanged.
@@ -69,8 +70,9 @@ per-authorization and cumulative supply ceilings, authorization lifetime,
 policy validity window, source revision, and public approval receipts. These
 administrative keys are distinct from the AIR issuer key that proves protocol
 mint validity. One mint authorization binds the exact recipient, one or two
-amounts, monotonic sequence, supply-before/supply-after transition, validity
-window, policy commitment, and public approval receipts; every threshold
+amounts, one canonical confirmed Bitcoin funding outpoint, monotonic sequence,
+supply-before/supply-after transition, validity window, policy commitment, and
+public approval receipts; every threshold
 signature covers the canonical authorization digest and must be low-S.
 
 Policy verification requires the expected deployment, registry version, asset
@@ -122,6 +124,15 @@ operations before importing anything. Signed mints snapshot the exact policy
 and authorization beside the wallet-signed registry release. Resume and RBF
 revalidate that historical evidence and the ledger without substituting a
 later live policy; unsigned work fails closed after policy rotation.
+
+The funding outpoint is part of the threshold-signed authorization digest and
+the wallet reserves that exact outpoint rather than falling back to another
+fee coin. This is the rollback-replay boundary: restoring an older valid backup
+cannot reuse an already-consumed authorization with fresh Bitcoin funding. A
+second transaction using the same authorization must double-spend the same
+outpoint, so at most one branch can settle. An unavailable authorized outpoint
+consumes the authorization and fails with `insufficient_fees`; another wallet
+UTXO is never substituted.
 
 The database stores the highest registry version and its exact commitment as
 one atomic floor, and production Secure Backup checkpoints carry the same
