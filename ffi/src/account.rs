@@ -9219,6 +9219,7 @@ impl AccountWallet {
             )
         })?;
         let (policy, authorization) = self.validate_current_production_mint(&request, to_owner)?;
+        self.verify_production_mint_funding_binding(operation, &authorization, false)?;
         self.verify_production_issuance_ledger_entry(operation, &policy, &authorization)?;
         Ok(ProductionIssuanceAuthorizationSnapshot {
             policy,
@@ -9302,11 +9303,55 @@ impl AccountWallet {
             snapshot.authorization.not_before_unix_seconds,
         )
         .map_err(|error| AccountError::new("database_corrupt", error.message))?;
+        self.verify_production_mint_funding_binding(operation, &snapshot.authorization, true)?;
         self.verify_production_issuance_ledger_entry(
             operation,
             &snapshot.policy,
             &snapshot.authorization,
         )
+    }
+
+    #[cfg(any(test, feature = "issuer-tools"))]
+    fn verify_production_mint_funding_binding(
+        &self,
+        operation: &OperationRow,
+        authorization: &ProductionMintAuthorization,
+        signed_transaction_required: bool,
+    ) -> Result<(), AccountError> {
+        let expected = production_mint_funding_outpoint(authorization)
+            .map_err(|error| AccountError::new("database_corrupt", error.message))?;
+        if operation_outpoint(operation)? != expected {
+            return Err(AccountError::new(
+                "database_corrupt",
+                "production mint operation funding disagrees with its signed authorization",
+            ));
+        }
+        let Some(signed) = operation.signed_tx_hex.as_deref() else {
+            if signed_transaction_required {
+                return Err(AccountError::new(
+                    "database_corrupt",
+                    "signed production mint has no persisted transaction",
+                ));
+            }
+            return Ok(());
+        };
+        let transaction: Transaction = deserialize(&hex_decode(
+            signed,
+            "signed production mint transaction",
+        )?)
+        .map_err(|error| {
+            AccountError::new(
+                "database_corrupt",
+                format!("signed production mint transaction: {error}"),
+            )
+        })?;
+        if transaction.input.first().map(|input| input.previous_output) != Some(expected) {
+            return Err(AccountError::new(
+                "database_corrupt",
+                "signed production mint first input disagrees with its authorization",
+            ));
+        }
+        Ok(())
     }
 
     #[cfg(any(test, feature = "issuer-tools"))]
@@ -15380,7 +15425,34 @@ mod tests {
                 &authorization,
             )
             .unwrap();
-        let operation = wallet.operation(&operation_id).unwrap();
+        let funding_outpoint = production_mint_funding_outpoint(&authorization).unwrap();
+        let signed_transaction = Transaction {
+            version: transaction::Version::TWO,
+            lock_time: absolute::LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: funding_outpoint,
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                witness: Witness::new(),
+            }],
+            output: Vec::new(),
+        };
+        wallet
+            .db
+            .conn
+            .execute(
+                "UPDATE opencsv_operations
+                 SET funding_txid = ?2, funding_vout = ?3, signed_tx_hex = ?4
+                 WHERE operation_id = ?1",
+                params![
+                    operation_id,
+                    funding_outpoint.txid.to_string(),
+                    funding_outpoint.vout,
+                    hex_encode(&serialize(&signed_transaction)),
+                ],
+            )
+            .unwrap();
+        let mut operation = wallet.operation(&operation_id).unwrap();
         let snapshot = wallet
             .validate_current_production_mint_operation(&operation)
             .unwrap();
@@ -15395,6 +15467,28 @@ mod tests {
         wallet
             .verify_signed_production_mint(&operation, &receipt)
             .unwrap();
+
+        operation.funding_vout = Some(funding_outpoint.vout + 1);
+        assert_eq!(
+            wallet
+                .validate_current_production_mint_operation(&operation)
+                .unwrap_err()
+                .code,
+            "database_corrupt"
+        );
+        operation.funding_vout = Some(funding_outpoint.vout);
+        let mut wrong_transaction = signed_transaction.clone();
+        wrong_transaction.input[0].previous_output =
+            OutPoint::new(Txid::from_byte_array([98_u8; 32]), 0);
+        operation.signed_tx_hex = Some(hex_encode(&serialize(&wrong_transaction)));
+        assert_eq!(
+            wallet
+                .verify_signed_production_mint(&operation, &receipt)
+                .unwrap_err()
+                .code,
+            "database_corrupt"
+        );
+        operation.signed_tx_hex = Some(hex_encode(&serialize(&signed_transaction)));
 
         wallet.config.production_issuance_policies.clear();
         wallet.config.production_usd_registry = None;

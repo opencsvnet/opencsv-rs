@@ -19,6 +19,13 @@ spent, locked, unconfirmed, or too small, the authorization remains consumed
 and the operation fails. A regression keeps another eligible UTXO in the wallet
 and proves it is not selected when the signed outpoint is unavailable.
 
+The first implementation enforced this only while planning. That was
+insufficient for a tampered database or a row written by an older binary.
+Pre-sign now rechecks the operation funding columns against the authorization;
+signed resume and RBF additionally deserialize the persisted transaction and
+require its first input to be that same outpoint. Tests mutate each boundary
+independently and require `database_corrupt` before signing or relay.
+
 ## 2026-08-15 — threshold keys have one canonical text identity
 
 An adversarial exact-tip pass found that the threshold policy parsed compressed

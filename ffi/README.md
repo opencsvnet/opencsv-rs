@@ -132,7 +132,9 @@ cannot reuse an already-consumed authorization with fresh Bitcoin funding. A
 second transaction using the same authorization must double-spend the same
 outpoint, so at most one branch can settle. An unavailable authorized outpoint
 consumes the authorization and fails with `insufficient_fees`; another wallet
-UTXO is never substituted.
+UTXO is never substituted. Pre-sign rechecks the durable operation funding
+columns; signed resume and RBF also require the persisted transaction's first
+input to equal the authorized outpoint before relay or replacement signing.
 
 The database stores the highest registry version and its exact commitment as
 one atomic floor, and production Secure Backup checkpoints carry the same

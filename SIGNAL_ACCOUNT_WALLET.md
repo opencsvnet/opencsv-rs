@@ -70,7 +70,8 @@ envelope separately binds the release's final registry commitment. This avoids
 a policy-hash/registry-hash cycle while preventing self-authorization. Binding
 the fee outpoint also prevents an older valid backup from replaying the same
 approval with fresh Bitcoin funding: the wallet reserves exactly the signed
-outpoint and never substitutes a different UTXO. No
+outpoint and never substitutes a different UTXO. Pre-sign, resume, and RBF
+recheck the operation row and persisted transaction input against it. No
 authority secret enters Signal or the secret-free verifier.
 
 The headless issuer wallet admits the envelope only after the reviewed policy
