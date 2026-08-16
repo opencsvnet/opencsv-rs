@@ -259,6 +259,127 @@ pub(crate) fn registered_nullifier_occurrence(
     Ok((tip, occurrence))
 }
 
+/// Confirmation evidence for one exact transaction in the registered,
+/// PoW-verified compact-filter index.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct RegisteredTxidConfirmation {
+    pub location: opencsv_core::chain::AnchorLocation,
+    pub confirmations: u64,
+    pub required_confirmations: u64,
+    pub tip_height: u64,
+}
+
+impl RegisteredTxidConfirmation {
+    /// Require both the account's crediting depth and the policy registered
+    /// with the canonical scan before treating this transaction as final.
+    pub(crate) fn satisfies_depth(self, account_required_confirmations: u32) -> bool {
+        self.confirmations
+            >= u64::from(account_required_confirmations).max(self.required_confirmations)
+    }
+}
+
+fn canonical_confirmations(tip_height: u64, occurrence_height: u64) -> u64 {
+    tip_height
+        .checked_sub(occurrence_height)
+        .and_then(|depth| depth.checked_add(1))
+        .unwrap_or(0)
+}
+
+/// Look up an exact transaction in the registered canonical scan view. This
+/// is deliberately local-only: accelerator status can decide when a caller
+/// should consult the index, but cannot manufacture this evidence.
+pub(crate) fn registered_txid_confirmation(
+    txid: &[u8; 32],
+) -> Result<Option<RegisteredTxidConfirmation>, String> {
+    let index = registered_index()?;
+    let tip_height = index.synced_tip();
+    let Some(location) = index
+        .occurrences()
+        .iter()
+        .filter(|entry| &entry.txid == txid)
+        .map(|entry| entry.location)
+        .min()
+    else {
+        return Ok(None);
+    };
+    Ok(Some(RegisteredTxidConfirmation {
+        location,
+        confirmations: canonical_confirmations(tip_height, location.height),
+        required_confirmations: registered_required_confirmations(),
+        tip_height,
+    }))
+}
+
+#[cfg(test)]
+pub(crate) fn install_test_scan(
+    cache_dir: &std::path::Path,
+    tip_height: u64,
+    required_confirmations: u64,
+    occurrences: &[opencsv_cbf::ScannedAnchor],
+) -> Result<(), String> {
+    use sha2::Digest as _;
+
+    let from_height = occurrences
+        .iter()
+        .map(|entry| entry.location.height)
+        .min()
+        .unwrap_or(1)
+        .min(tip_height.max(1));
+    let mut body = format!(
+        "opencsv-cbf-scan-index-v3\nnetwork signet\nfrom {from_height}\ntip {tip_height}\n"
+    );
+    for height in from_height..=tip_height {
+        let mut hash = sha2::Sha256::digest(height.to_le_bytes()).to_vec();
+        hash.reverse();
+        body.push_str(&format!("block {height} {}\n", to_hex(&hash)));
+    }
+    let mut occurrences = occurrences.to_vec();
+    occurrences.sort_by_key(|entry| entry.location);
+    for entry in occurrences {
+        let mut txid = entry.txid;
+        txid.reverse();
+        body.push_str(&format!(
+            "occurrence {} {} {} {} {}",
+            entry.location.height,
+            entry.location.position,
+            to_hex(&txid),
+            to_hex(&entry.ctx),
+            to_hex(&entry.record.to_bytes()),
+        ));
+        if let Some(batch) = entry.batch {
+            let kind = match batch.version {
+                opencsv_core::BatchVersion::V1 => "batch1",
+                opencsv_core::BatchVersion::V2 => "batch2",
+            };
+            let envelope = batch
+                .envelope
+                .iter()
+                .flat_map(|payload| *payload.as_bytes())
+                .collect::<Vec<_>>();
+            body.push_str(&format!(" {kind} {} {}", batch.index, to_hex(&envelope)));
+        }
+        body.push('\n');
+    }
+    let checksum = sha2::Sha256::digest(body.as_bytes());
+    let scan_dir = cache_dir.join("scan");
+    std::fs::create_dir_all(&scan_dir).map_err(|error| error.to_string())?;
+    std::fs::write(
+        scan_dir.join("scan-index.log"),
+        format!("{body}checksum {}\n", to_hex(&checksum)),
+    )
+    .map_err(|error| error.to_string())?;
+    let mut registration = match LAST_SCAN.lock() {
+        Ok(registration) => registration,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    *registration = Some(ScanRegistration {
+        network: Network::Signet,
+        cache_dir: cache_dir.display().to_string(),
+        required_confirmations,
+    });
+    Ok(())
+}
+
 fn registered_required_confirmations() -> u64 {
     let registry = match LAST_SCAN.lock() {
         Ok(registry) => registry,
@@ -456,6 +577,35 @@ mod tests {
     use opencsv_cbf::ScannedAnchor;
     use opencsv_core::chain::AnchorLocation;
     use opencsv_core::{binding, AnchorRecord, BatchVersion, Digest};
+
+    #[test]
+    fn registered_txid_depth_requires_the_stricter_policy() {
+        let shallow = RegisteredTxidConfirmation {
+            location: AnchorLocation {
+                height: 100,
+                position: 2,
+            },
+            confirmations: canonical_confirmations(100, 100),
+            required_confirmations: 6,
+            tip_height: 100,
+        };
+        assert_eq!(shallow.confirmations, 1);
+        assert!(!shallow.satisfies_depth(1));
+
+        let deep = RegisteredTxidConfirmation {
+            confirmations: canonical_confirmations(105, 100),
+            tip_height: 105,
+            ..shallow
+        };
+        assert_eq!(deep.confirmations, 6);
+        assert!(deep.satisfies_depth(1));
+
+        let account_stricter = RegisteredTxidConfirmation {
+            required_confirmations: 1,
+            ..deep
+        };
+        assert!(!account_stricter.satisfies_depth(7));
+    }
 
     #[test]
     fn exported_scan_snapshot_retains_one_exact_batch_envelope() {
