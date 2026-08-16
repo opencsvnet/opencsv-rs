@@ -1775,13 +1775,7 @@ impl AccountWallet {
         let database_path = Path::new(database_path);
         let database_preexisted = database_path.exists();
         let mut db = SqlitePersister::open(database_path)?;
-        let reset_error = |message: String| {
-            if matches!(config.network.as_str(), "signet" | "regtest") {
-                AccountError::new("testnet_reset_required", message)
-            } else {
-                AccountError::new("deployment_mismatch", message)
-            }
-        };
+        let reset_error = |message: String| deployment_reset_error(&config.network, message);
         match db.meta("deployment_id")? {
             Some(existing) if existing != config.deployment_id => {
                 return Err(reset_error(format!(
@@ -7602,9 +7596,9 @@ impl AccountWallet {
             envelope.checkpoint.version,
             LEGACY_CHECKPOINT_VERSION | BATCH_CHECKPOINT_VERSION | PRE_RESET_CHECKPOINT_VERSION
         ) {
-            return Err(AccountError::new(
-                "testnet_reset_required",
-                "pre-v2 Secure Backup checkpoints are archived and cannot restore into Test USD v2",
+            return Err(deployment_reset_error(
+                &self.config.network,
+                "legacy Secure Backup checkpoints are archived and cannot restore into this deployment",
             ));
         }
         if envelope.checkpoint.version != CHECKPOINT_VERSION {
@@ -7615,8 +7609,8 @@ impl AccountWallet {
         }
         if envelope.checkpoint.deployment_id.as_deref() != Some(self.config.deployment_id.as_str())
         {
-            return Err(AccountError::new(
-                "testnet_reset_required",
+            return Err(deployment_reset_error(
+                &self.config.network,
                 "Secure Backup checkpoint belongs to another OpenCSV deployment",
             ));
         }
@@ -11304,6 +11298,14 @@ fn validate_usd_issuer_policy(config: &AccountConfig) -> Result<(), AccountError
     Ok(())
 }
 
+fn deployment_reset_error(network: &str, message: impl Into<String>) -> AccountError {
+    if matches!(network, "signet" | "regtest") {
+        AccountError::new("testnet_reset_required", message)
+    } else {
+        AccountError::new("deployment_mismatch", message)
+    }
+}
+
 fn unix_time() -> Result<i64, AccountError> {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -11693,6 +11695,22 @@ mod tests {
         assert_eq!(
             fresh.db.meta("deployment_id").unwrap().as_deref(),
             Some(TEST_USD_V2_DEPLOYMENT_ID),
+        );
+    }
+
+    #[test]
+    fn checkpoint_reset_reason_is_network_accurate() {
+        assert_eq!(
+            deployment_reset_error("signet", "archived checkpoint").code,
+            "testnet_reset_required"
+        );
+        assert_eq!(
+            deployment_reset_error("regtest", "archived checkpoint").code,
+            "testnet_reset_required"
+        );
+        assert_eq!(
+            deployment_reset_error("mainnet", "archived checkpoint").code,
+            "deployment_mismatch"
         );
     }
 

@@ -20,7 +20,7 @@
 
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
-use std::sync::mpsc;
+use std::sync::{mpsc, OnceLock};
 use std::time::{Duration, Instant};
 
 use opencsv_core::chain::{AnchorChain, AnchorLocation, AnchorRef};
@@ -58,27 +58,89 @@ fn remaining(deadline: Instant, phase: &str) -> std::io::Result<Duration> {
         .ok_or_else(|| timed_out(phase))
 }
 
+struct ResolveRequest {
+    authority: String,
+    deadline: Instant,
+    response: mpsc::SyncSender<std::io::Result<Vec<SocketAddr>>>,
+}
+
+/// One bounded resolver worker for the complete process. A platform resolver
+/// call cannot be cancelled portably, so spawning one thread per request
+/// would let repeated stalled lookups leak an unbounded number of threads.
+/// This worker permits one active lookup and one queued request; further
+/// callers fail closed instead of consuming more process resources.
+struct ResolverService {
+    requests: mpsc::SyncSender<ResolveRequest>,
+}
+
+impl ResolverService {
+    fn spawn(
+        lookup: impl Fn(&str) -> std::io::Result<Vec<SocketAddr>> + Send + 'static,
+    ) -> std::io::Result<Self> {
+        let (requests, receiver) = mpsc::sync_channel::<ResolveRequest>(1);
+        std::thread::Builder::new()
+            .name("opencsv-dns-resolver".to_owned())
+            .spawn(move || {
+                while let Ok(request) = receiver.recv() {
+                    if Instant::now() >= request.deadline {
+                        let _ = request.response.send(Err(timed_out("DNS resolution")));
+                        continue;
+                    }
+                    let result = lookup(&request.authority);
+                    let _ = request.response.send(result);
+                }
+            })?;
+        Ok(Self { requests })
+    }
+
+    fn system() -> std::io::Result<Self> {
+        Self::spawn(|authority| {
+            authority
+                .to_socket_addrs()
+                .map(|addresses| addresses.collect::<Vec<_>>())
+        })
+    }
+
+    fn resolve(&self, authority: &str, deadline: Instant) -> std::io::Result<Vec<SocketAddr>> {
+        let (sender, receiver) = mpsc::sync_channel(1);
+        self.requests
+            .try_send(ResolveRequest {
+                authority: authority.to_owned(),
+                deadline,
+                response: sender,
+            })
+            .map_err(|error| match error {
+                mpsc::TrySendError::Full(_) => std::io::Error::new(
+                    std::io::ErrorKind::WouldBlock,
+                    "DNS resolver is at its bounded capacity",
+                ),
+                mpsc::TrySendError::Disconnected(_) => {
+                    std::io::Error::other("DNS resolver worker stopped")
+                }
+            })?;
+        receiver
+            .recv_timeout(remaining(deadline, "DNS resolution")?)
+            .map_err(|error| match error {
+                mpsc::RecvTimeoutError::Timeout => timed_out("DNS resolution"),
+                mpsc::RecvTimeoutError::Disconnected => {
+                    std::io::Error::other("DNS resolver stopped without a result")
+                }
+            })?
+    }
+}
+
+static SYSTEM_RESOLVER: OnceLock<Result<ResolverService, String>> = OnceLock::new();
+
 /// Resolve without allowing a blocking system resolver to hold the CLI past
-/// the request deadline. The resolver thread owns no wallet or socket state;
-/// if the platform resolver outlives the deadline, its eventual result is
-/// simply dropped.
+/// the request deadline or create an unbounded number of stranded threads.
 fn resolve(authority: &str, deadline: Instant) -> std::io::Result<Vec<SocketAddr>> {
-    let authority = authority.to_owned();
-    let (sender, receiver) = mpsc::sync_channel(1);
-    std::thread::spawn(move || {
-        let result = authority
-            .to_socket_addrs()
-            .map(|addresses| addresses.collect::<Vec<_>>());
-        let _ = sender.send(result);
-    });
-    receiver
-        .recv_timeout(remaining(deadline, "DNS resolution")?)
-        .map_err(|error| match error {
-            mpsc::RecvTimeoutError::Timeout => timed_out("DNS resolution"),
-            mpsc::RecvTimeoutError::Disconnected => {
-                std::io::Error::other("DNS resolver stopped without a result")
-            }
-        })?
+    match SYSTEM_RESOLVER.get_or_init(|| ResolverService::system().map_err(|error| error.to_string()))
+    {
+        Ok(resolver) => resolver.resolve(authority, deadline),
+        Err(error) => Err(std::io::Error::other(format!(
+            "DNS resolver could not start: {error}"
+        ))),
+    }
 }
 
 /// Connect to one of the resolved addresses while spending from the same
@@ -363,6 +425,62 @@ impl HttpAnchorChain {
 mod tests {
     use super::*;
     use std::net::TcpListener;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    #[test]
+    fn stalled_dns_is_bounded_to_one_worker_and_one_queued_request() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let lookup_calls = Arc::clone(&calls);
+        let (started_sender, started_receiver) = mpsc::sync_channel(1);
+        let (release_sender, release_receiver) = mpsc::sync_channel(1);
+        let resolver = Arc::new(
+            ResolverService::spawn(move |_| {
+                let call = lookup_calls.fetch_add(1, Ordering::SeqCst);
+                if call == 0 {
+                    let _ = started_sender.send(());
+                    let _ = release_receiver.recv();
+                }
+                Ok(Vec::new())
+            })
+            .unwrap(),
+        );
+
+        let active_resolver = Arc::clone(&resolver);
+        let active = std::thread::spawn(move || {
+            active_resolver.resolve("active.invalid:80", Instant::now() + Duration::from_secs(2))
+        });
+        started_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+
+        let (queued_sender, queued_receiver) = mpsc::sync_channel(1);
+        resolver
+            .requests
+            .try_send(ResolveRequest {
+                authority: "queued.invalid:80".to_owned(),
+                deadline: Instant::now() + Duration::from_secs(2),
+                response: queued_sender,
+            })
+            .unwrap();
+        let overflow = resolver
+            .resolve(
+                "overflow.invalid:80",
+                Instant::now() + Duration::from_secs(1),
+            )
+            .unwrap_err();
+        assert_eq!(overflow.kind(), std::io::ErrorKind::WouldBlock);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        release_sender.send(()).unwrap();
+        assert!(active.join().unwrap().unwrap().is_empty());
+        assert!(queued_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap()
+            .unwrap()
+            .is_empty());
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
 
     #[test]
     fn one_deadline_bounds_a_slow_drip_response() {

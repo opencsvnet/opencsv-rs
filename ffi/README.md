@@ -39,6 +39,14 @@ across the broadcast→finalize window, closing the crash-loses-consignment gap.
 Its anchor-server examples are compatibility documentation, not the target
 Signal send architecture.
 
+Verification `credits` are descriptive accepted-payment totals, not an
+accounting delta: replaying a consignment can return the same totals even
+though Rust stores its coins idempotently. Persistent-account hosts must key
+durable presentation and accounting by the returned stable `payment_id` and
+must never sum `credits` across verification retries. The legacy in-memory
+entry point does not expose a stable logical-payment identity and should not
+be used for new host integrations.
+
 Beyond the wallet core, three host-facing verification surfaces:
 
 - `opencsv_cbf_sync` / `opencsv_cbf_verify_anchor` — trustless anchor

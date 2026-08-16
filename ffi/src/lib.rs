@@ -1566,7 +1566,10 @@ pub unsafe extern "C" fn opencsv_consignment_finalize(
 
 /// Verify a received consignment blob against an anchor snapshot (see
 /// [`snapshot`] for the JSON format). On success, credited coins are stored
-/// in the wallet. Returns
+/// idempotently in the wallet. `credits` describes the accepted consignment,
+/// not a newly-added delta, so callers must not sum repeated responses. New
+/// hosts should use the persistent account API, which returns a stable
+/// `payment_id` for durable UI/accounting deduplication. Returns
 /// `{"status":"verified","credits":[{"asset_id","currency","amount"}],
 ///   "coins":[...],"anchor":{"height":N,"position":M}}`
 /// or `{"status":"rejected","reason":"..."}`.
