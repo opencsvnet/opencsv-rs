@@ -20,6 +20,10 @@ jobs:
         env:
           RUSTFLAGS: -D warnings
         run: cargo test --workspace --locked --all-targets
+      - name: Check D5 profile spike feature
+        env:
+          RUSTFLAGS: -D warnings
+        run: cargo test --locked -p opencsv-pcd --features d5-profile-spike --all-targets --no-run
       - name: Test Signal-free CLI configuration
         env:
           RUSTFLAGS: -D warnings
