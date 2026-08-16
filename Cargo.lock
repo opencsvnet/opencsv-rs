@@ -2742,7 +2742,7 @@ dependencies = [
 [[package]]
 name = "p3-circuit"
 version = "0.1.0"
-source = "git+https://github.com/opencsvnet/Plonky3-recursion.git?rev=d6510eb629097d733d631e8e833fc962025f25f5#d6510eb629097d733d631e8e833fc962025f25f5"
+source = "git+https://github.com/opencsvnet/Plonky3-recursion.git?rev=26e1ce54840781848c1b69f39302e2de3d40f0b9#26e1ce54840781848c1b69f39302e2de3d40f0b9"
 dependencies = [
  "hashbrown 0.17.1",
  "itertools 0.15.0",
@@ -2770,7 +2770,7 @@ dependencies = [
 [[package]]
 name = "p3-circuit-prover"
 version = "0.1.0"
-source = "git+https://github.com/opencsvnet/Plonky3-recursion.git?rev=d6510eb629097d733d631e8e833fc962025f25f5#d6510eb629097d733d631e8e833fc962025f25f5"
+source = "git+https://github.com/opencsvnet/Plonky3-recursion.git?rev=26e1ce54840781848c1b69f39302e2de3d40f0b9#26e1ce54840781848c1b69f39302e2de3d40f0b9"
 dependencies = [
  "hashbrown 0.17.1",
  "p3-air",
@@ -3038,7 +3038,7 @@ dependencies = [
 [[package]]
 name = "p3-poseidon-circuit-cols"
 version = "0.1.0"
-source = "git+https://github.com/opencsvnet/Plonky3-recursion.git?rev=d6510eb629097d733d631e8e833fc962025f25f5#d6510eb629097d733d631e8e833fc962025f25f5"
+source = "git+https://github.com/opencsvnet/Plonky3-recursion.git?rev=26e1ce54840781848c1b69f39302e2de3d40f0b9#26e1ce54840781848c1b69f39302e2de3d40f0b9"
 
 [[package]]
 name = "p3-poseidon1"
@@ -3071,7 +3071,7 @@ dependencies = [
 [[package]]
 name = "p3-poseidon1-circuit-air"
 version = "0.1.0"
-source = "git+https://github.com/opencsvnet/Plonky3-recursion.git?rev=d6510eb629097d733d631e8e833fc962025f25f5#d6510eb629097d733d631e8e833fc962025f25f5"
+source = "git+https://github.com/opencsvnet/Plonky3-recursion.git?rev=26e1ce54840781848c1b69f39302e2de3d40f0b9#26e1ce54840781848c1b69f39302e2de3d40f0b9"
 dependencies = [
  "itertools 0.15.0",
  "p3-air",
@@ -3124,7 +3124,7 @@ dependencies = [
 [[package]]
 name = "p3-poseidon2-circuit-air"
 version = "0.1.0"
-source = "git+https://github.com/opencsvnet/Plonky3-recursion.git?rev=d6510eb629097d733d631e8e833fc962025f25f5#d6510eb629097d733d631e8e833fc962025f25f5"
+source = "git+https://github.com/opencsvnet/Plonky3-recursion.git?rev=26e1ce54840781848c1b69f39302e2de3d40f0b9#26e1ce54840781848c1b69f39302e2de3d40f0b9"
 dependencies = [
  "itertools 0.15.0",
  "p3-air",
@@ -3149,7 +3149,7 @@ dependencies = [
 [[package]]
 name = "p3-recursion"
 version = "0.1.0"
-source = "git+https://github.com/opencsvnet/Plonky3-recursion.git?rev=d6510eb629097d733d631e8e833fc962025f25f5#d6510eb629097d733d631e8e833fc962025f25f5"
+source = "git+https://github.com/opencsvnet/Plonky3-recursion.git?rev=26e1ce54840781848c1b69f39302e2de3d40f0b9#26e1ce54840781848c1b69f39302e2de3d40f0b9"
 dependencies = [
  "hashbrown 0.17.1",
  "itertools 0.15.0",
@@ -4777,7 +4777,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix 1.1.4",
  "windows-sys 0.61.2",

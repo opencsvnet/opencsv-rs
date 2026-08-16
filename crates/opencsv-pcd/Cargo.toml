@@ -26,11 +26,12 @@ p3-symmetric = "0.6.3"
 p3-uni-stark = "0.6.3"
 p3-util = "0.6.3"
 # Recursion/circuit stack: OpenCSV's minimal fork of the official
-# Plonky3-recursion repo, pinned to the predecessor-vk accessor patch.
+# Plonky3-recursion repo, pinned to the merged predecessor-vk accessor and
+# F1 const-value-binding patches.
 # The crates.io `p3-recursion 0.1.0` is a stub — do not use it.
-# Pin: d6510eb629097d733d631e8e833fc962025f25f5 (one accessor commit over
-# official b36339709a7a67ee9760fb578b3d4339fd983709; tracks p3 0.6).
-p3-circuit = { git = "https://github.com/opencsvnet/Plonky3-recursion.git", rev = "d6510eb629097d733d631e8e833fc962025f25f5" }
-p3-circuit-prover = { git = "https://github.com/opencsvnet/Plonky3-recursion.git", rev = "d6510eb629097d733d631e8e833fc962025f25f5" }
-p3-poseidon2-circuit-air = { git = "https://github.com/opencsvnet/Plonky3-recursion.git", rev = "d6510eb629097d733d631e8e833fc962025f25f5" }
-p3-recursion = { git = "https://github.com/opencsvnet/Plonky3-recursion.git", rev = "d6510eb629097d733d631e8e833fc962025f25f5" }
+# Pin: 26e1ce54840781848c1b69f39302e2de3d40f0b9 (merge of reviewed F1 head
+# abe628c057377c7a3aa87ae842687999b1f0c702 into the D4 accessor branch).
+p3-circuit = { git = "https://github.com/opencsvnet/Plonky3-recursion.git", rev = "26e1ce54840781848c1b69f39302e2de3d40f0b9" }
+p3-circuit-prover = { git = "https://github.com/opencsvnet/Plonky3-recursion.git", rev = "26e1ce54840781848c1b69f39302e2de3d40f0b9" }
+p3-poseidon2-circuit-air = { git = "https://github.com/opencsvnet/Plonky3-recursion.git", rev = "26e1ce54840781848c1b69f39302e2de3d40f0b9" }
+p3-recursion = { git = "https://github.com/opencsvnet/Plonky3-recursion.git", rev = "26e1ce54840781848c1b69f39302e2de3d40f0b9" }

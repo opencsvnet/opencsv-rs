@@ -16,7 +16,7 @@ use sha2::{Digest as _, Sha256};
 use crate::EF;
 
 const IDENTITY_DOMAIN: &[u8] = b"opencsv-pcd/setup-identity/v1";
-const UPSTREAM_REVISION: &[u8] = b"opencsvnet/plonky3-recursion/d6510eb629097d733d631e8e833fc962025f25f5";
+const UPSTREAM_REVISION: &[u8] = b"opencsvnet/plonky3-recursion/26e1ce54840781848c1b69f39302e2de3d40f0b9";
 
 /// Digest of every input that determines setup or verifier data.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
