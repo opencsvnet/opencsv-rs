@@ -1,5 +1,9 @@
 # opencsv-pcd
 
+> Mainnet note: predecessor verification-key binding is complete, but root
+> verification-key authentication is still the D5 production gate. See
+> [D5 root verification-key authentication](D5_ROOT_VK_AUTHENTICATION.md).
+
 Proof-carrying data (PCD) circuits for **OpenCSV** (client-side verified
 RWAs on Bitcoin, see `paper/opencsv.md` §4), built on the Plonky3
 circuit/recursion stack.
@@ -261,11 +265,14 @@ work):
 - Circuit/recursion crates: the
   [`opencsvnet/Plonky3-recursion`](https://github.com/opencsvnet/Plonky3-recursion)
   fork, pinned to
-  **`d6510eb629097d733d631e8e833fc962025f25f5`**. It is exactly one narrow
-  read-only accessor commit over official Plonky3-recursion
-  `b36339709a7a67ee9760fb578b3d4339fd983709` (main @ 2026-07-06, tracks p3
-  0.6); the accessor exposes only the allocated preprocessed-commitment
-  target and keeps its metadata private. Used crates: `p3-circuit`,
+  **`28c9a37f31a7f69877a62cb372ddffce1f3f8189`**, the main-branch merge of
+  the reviewed D5 value-free profile and exact padding work. Its F1 base
+  `26e1ce54840781848c1b69f39302e2de3d40f0b9` contains the
+  narrow read-only preprocessed-commitment accessor plus the reviewed F1
+  repair that commits `Op::Const` values into the preprocessed trace and
+  reads those committed values on the witness-check bus. It is based on
+  official Plonky3-recursion `b36339709a7a67ee9760fb578b3d4339fd983709`
+  (main @ 2026-07-06, tracks p3 0.6). Used crates: `p3-circuit`,
   `p3-circuit-prover`, `p3-poseidon2-circuit-air`, and `p3-recursion` (all
   version 0.1.0, unaudited upstream PoC — expect API churn; do not bump the
   pin blindly).
@@ -519,7 +526,7 @@ recursion repo at the pinned commit — the same sources Cargo fetches):
 
 ```
 git clone https://github.com/opencsvnet/Plonky3-recursion.git
-cd Plonky3-recursion && git checkout d6510eb629097d733d631e8e833fc962025f25f5
+cd Plonky3-recursion && git checkout 28c9a37f31a7f69877a62cb372ddffce1f3f8189
 cargo run --release --example poseidon2_perm_chain -p p3-circuit-prover 3
 ```
 

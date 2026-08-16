@@ -309,6 +309,13 @@ fn recursive_setup_cache() -> &'static SetupCache<RecCircuitProverData> {
     CACHE.get_or_init(|| SetupCache::new(RECURSIVE_SETUP_CACHE_CAPACITY))
 }
 
+/// Drop spike-mutated setup data before measuring or installing a different
+/// profile. Production builds have no measured-profile state or cache reset.
+#[cfg(feature = "d5-profile-spike")]
+pub(crate) fn reset_recursive_setup_cache_for_d5_profile_spike() {
+    recursive_setup_cache().reset();
+}
+
 /// Prover-side data for a built recursive node circuit (statement size `N`).
 pub(crate) struct RecSetup {
     /// The built circuit.

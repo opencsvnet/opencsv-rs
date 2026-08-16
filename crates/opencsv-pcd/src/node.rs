@@ -88,10 +88,13 @@ use opencsv_core::{
     PoseidonIssuerAuthorization,
 };
 use p3_baby_bear::BabyBear;
-use p3_circuit::{Circuit, CircuitBuilder, CircuitBuilderError, CircuitError, ExprId, NpoTypeId};
-use p3_circuit_prover::batch_stark_prover::{
-    BatchStarkProof, BatchStarkProverError, NUM_PRIMITIVE_TABLES,
+use p3_circuit::{
+    Circuit, CircuitBuilder, CircuitBuilderError, CircuitError, ExprId, NpoTypeId, Traces,
 };
+use p3_circuit_prover::batch_stark_prover::{
+    BatchStarkProof, BatchStarkProverError, CircuitProverData, NUM_PRIMITIVE_TABLES,
+};
+use p3_circuit_prover::shape::{pad_traces_to_profile, BatchStarkShape};
 use p3_field::PrimeCharacteristicRing;
 use p3_lookup::logup::LogUpGadget;
 use p3_recursion::public_inputs::BatchStarkVerifierInputsBuilder;
@@ -104,6 +107,8 @@ use crate::issuer::{
     enforce_authorization, witness_layout as issuer_witness_layout, witness_values, IssuerWitness,
     ISSUER_AUTH_ELEMS,
 };
+#[cfg(feature = "d5-profile-spike")]
+use crate::recursion_config::reset_recursive_setup_cache_for_d5_profile_spike;
 use crate::recursion_config::{
     new_prover, node_table_provers, setup_circuit, setup_circuit_with_verification_keys,
     CoinFriParams, CoinRecursionConfig, RecSetup,
@@ -112,6 +117,90 @@ use crate::setup_cache::{lock_setup, SetupIdentity};
 use crate::statement::{statement_op_type, StatementCircuitPlugin};
 use crate::value::{enforce_sum_eq, range_check_value, u64_to_felts, VALUE_LIMBS};
 use crate::{DIGEST_ELEMS, EF};
+
+#[cfg(feature = "d5-profile-spike")]
+static D5_PROFILE_SPIKE: std::sync::OnceLock<std::sync::Mutex<Option<BatchStarkShape<BabyBear>>>> =
+    std::sync::OnceLock::new();
+#[cfg(feature = "d5-profile-spike")]
+static D5_MINT_NORMALIZATION_SPIKE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Enable the v5-only mint manifest normalization for the isolated D5 screen.
+/// This must be called before generating the raw class representatives.
+#[cfg(feature = "d5-profile-spike")]
+pub fn begin_d5_profile_spike() {
+    D5_MINT_NORMALIZATION_SPIKE.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Install or advance the unlocked, value-free profile used by the ignored D5 desktop
+/// screen. This API exists only with the `d5-profile-spike` feature; shipped
+/// builds never derive a verifier profile from transaction proofs.
+#[cfg(feature = "d5-profile-spike")]
+pub fn install_d5_profile_spike(profile: BatchStarkShape<BabyBear>) -> Result<(), &'static str> {
+    if profile.fri.is_some() {
+        return Err("D5 bootstrap profile must be unlocked (fri = None)");
+    }
+    let installed = D5_PROFILE_SPIKE.get_or_init(|| std::sync::Mutex::new(None));
+    *installed
+        .lock()
+        .map_err(|_| "D5 bootstrap profile lock is poisoned")? = Some(profile);
+    reset_recursive_setup_cache_for_d5_profile_spike();
+    Ok(())
+}
+
+/// Disable padding while the ignored D5 harness measures the next raw class
+/// family. Setup data is discarded because prior entries may have committed
+/// columns padded to a different measured profile.
+#[cfg(feature = "d5-profile-spike")]
+pub fn clear_d5_profile_spike() -> Result<(), &'static str> {
+    let installed = D5_PROFILE_SPIKE.get_or_init(|| std::sync::Mutex::new(None));
+    *installed
+        .lock()
+        .map_err(|_| "D5 bootstrap profile lock is poisoned")? = None;
+    reset_recursive_setup_cache_for_d5_profile_spike();
+    Ok(())
+}
+
+fn d5_profile_spike() -> Option<BatchStarkShape<BabyBear>> {
+    #[cfg(feature = "d5-profile-spike")]
+    {
+        D5_PROFILE_SPIKE
+            .get()
+            .and_then(|profile| profile.lock().expect("D5 bootstrap profile lock").clone())
+    }
+    #[cfg(not(feature = "d5-profile-spike"))]
+    {
+        None
+    }
+}
+
+fn d5_mint_normalization_spike() -> bool {
+    #[cfg(feature = "d5-profile-spike")]
+    {
+        D5_MINT_NORMALIZATION_SPIKE.load(std::sync::atomic::Ordering::SeqCst)
+    }
+    #[cfg(not(feature = "d5-profile-spike"))]
+    {
+        false
+    }
+}
+
+fn maybe_pad_d5_profile_spike(
+    traces: &mut Traces<EF>,
+    prover_data: &mut CircuitProverData<CoinRecursionConfig>,
+) -> Result<(), NodeError> {
+    let Some(profile) = d5_profile_spike() else {
+        return Ok(());
+    };
+    if prover_data.preprocessed_stale {
+        pad_traces_to_profile(traces, &profile).map_err(BatchStarkProverError::from)?;
+    } else {
+        prover_data
+            .pad_to_profile(traces, &profile)
+            .map_err(BatchStarkProverError::from)?;
+    }
+    Ok(())
+}
 
 /// Number of node inputs (consumed coins).
 pub const NODE_INPUTS: usize = 2;
@@ -574,6 +663,19 @@ fn build_mint_circuit(version: u8) -> Result<Circuit<EF>, NodeError> {
     builder.register_npo(StatementCircuitPlugin::<STATEMENT_ELEMS>::new());
 
     let private = builder.alloc_private_inputs(MINT_PRIVATE_ELEMS, "mint_witness");
+    if d5_mint_normalization_spike() {
+        // The isolated D5 screen needs the same ordered NPO manifest as the
+        // recursive classes. A real identity relay creates the otherwise
+        // absent recompose/coeff row; zero-row plugins are omitted upstream.
+        let relayed = builder.recompose_base_coeffs_to_ext_with_coeff_lookups::<BabyBear>(&[
+            private[0],
+            ExprId::ZERO,
+            ExprId::ZERO,
+            ExprId::ZERO,
+        ])?;
+        let difference = builder.sub(relayed, private[0]);
+        builder.assert_zero(difference);
+    }
     let witness = mint_witness_layout(&private);
 
     // Issuer seed -> issuer key -> genesis -> statement asset id.
@@ -1288,10 +1390,18 @@ fn prove_genesis_mint_raw_for_version(
     let mut runner = s.circuit.runner();
     runner.set_public_inputs(&[])?;
     runner.set_private_inputs(&private_values)?;
-    let traces = runner.run()?;
+    let mut traces = runner.run()?;
 
-    let prover = new_prover::<STATEMENT_ELEMS>(&s.config, s.table_packing.clone(), false);
-    let circuit_prover_data = lock_setup(&s.circuit_prover_data);
+    // V3/v4 mint issuance retains its historical three-table manifest. The
+    // extra recompose/coeff identity row needed by the D5 normalization spike
+    // belongs in an isolated spike/v5 builder, not this shipped path.
+    let prover = new_prover::<STATEMENT_ELEMS>(
+        &s.config,
+        s.table_packing.clone(),
+        d5_mint_normalization_spike(),
+    );
+    let mut circuit_prover_data = lock_setup(&s.circuit_prover_data);
+    maybe_pad_d5_profile_spike(&mut traces, &mut circuit_prover_data)?;
     let proof = prover.prove_all_tables(&traces, &circuit_prover_data)?;
 
     let coin = CoinProof {
@@ -1415,10 +1525,11 @@ pub fn prove_transfer(
         )
         .map_err(NodeError::FriPrivateData)?;
     }
-    let traces = runner.run()?;
+    let mut traces = runner.run()?;
 
     let prover = new_prover::<STATEMENT_ELEMS>(&s.config, s.table_packing.clone(), true);
-    let circuit_prover_data = lock_setup(&s.circuit_prover_data);
+    let mut circuit_prover_data = lock_setup(&s.circuit_prover_data);
+    maybe_pad_d5_profile_spike(&mut traces, &mut circuit_prover_data)?;
     let proof = prover.prove_all_tables(&traces, &circuit_prover_data)?;
 
     let coin = CoinProof {
@@ -1530,10 +1641,11 @@ pub fn prove_one_input_transfer(
         &predecessor.proof.proof.opening_proof,
     )
     .map_err(NodeError::FriPrivateData)?;
-    let traces = runner.run()?;
+    let mut traces = runner.run()?;
 
     let prover = new_prover::<STATEMENT_ELEMS>(&setup.config, setup.table_packing.clone(), true);
-    let circuit_prover_data = lock_setup(&setup.circuit_prover_data);
+    let mut circuit_prover_data = lock_setup(&setup.circuit_prover_data);
+    maybe_pad_d5_profile_spike(&mut traces, &mut circuit_prover_data)?;
     let proof = prover.prove_all_tables(&traces, &circuit_prover_data)?;
     let result = CoinProof {
         version: COIN_PROOF_VERSION,
@@ -1654,10 +1766,11 @@ pub fn prove_redeem(
         &predecessor.proof.proof.opening_proof,
     )
     .map_err(NodeError::FriPrivateData)?;
-    let traces = runner.run()?;
+    let mut traces = runner.run()?;
 
     let prover = new_prover::<STATEMENT_ELEMS>(&s.config, s.table_packing.clone(), true);
-    let circuit_prover_data = lock_setup(&s.circuit_prover_data);
+    let mut circuit_prover_data = lock_setup(&s.circuit_prover_data);
+    maybe_pad_d5_profile_spike(&mut traces, &mut circuit_prover_data)?;
     let proof = prover.prove_all_tables(&traces, &circuit_prover_data)?;
 
     let coin = CoinProof {
@@ -1681,6 +1794,44 @@ mod verification_key_binding_tests {
     use super::*;
     use opencsv_core::PoseidonIssuerAuthorization;
     use p3_field::BasedVectorSpace;
+
+    /// Construct a proof whose statement table has the production v4 shape
+    /// and security parameters, but whose circuit enforces none of OpenCSV's
+    /// mint, ownership, or conservation rules. This is deliberately kept in
+    /// the crate that owns the private setup helpers: it is an executable D5
+    /// regression fixture, never a public proving API.
+    fn foreign_statement_only_root(statement: NodeStatement) -> Result<CoinProof, NodeError> {
+        let fri_params = CoinFriParams::production();
+        let config = CoinRecursionConfig::new(&fri_params);
+        let mut builder = CircuitBuilder::<EF>::new();
+        config.prepare_circuit_for_verification(&mut builder)?;
+        builder.register_npo(StatementCircuitPlugin::<STATEMENT_ELEMS>::new());
+
+        let statement_elements = statement
+            .to_public_values_for_version(COIN_PROOF_VERSION, NodeMode::Mint)
+            .chunks_exact(4)
+            .map(|coefficients| const_expr(&mut builder, coefficients[0]))
+            .collect();
+        push_statement_op(&mut builder, statement_elements)?;
+
+        let setup = setup_circuit::<STATEMENT_ELEMS>(builder.build()?, &fri_params)?;
+        let mut runner = setup.circuit.runner();
+        runner.set_public_inputs(&[])?;
+        let traces = runner.run()?;
+        let prover =
+            new_prover::<STATEMENT_ELEMS>(&setup.config, setup.table_packing.clone(), false);
+        let proof = {
+            let circuit_prover_data = lock_setup(&setup.circuit_prover_data);
+            prover.prove_all_tables(&traces, &circuit_prover_data)?
+        };
+
+        Ok(CoinProof {
+            version: COIN_PROOF_VERSION,
+            mode: NodeMode::Mint,
+            statement,
+            proof,
+        })
+    }
 
     fn run_key_binding(actual: EF, expected: EF) -> Result<(), NodeError> {
         let mut builder = CircuitBuilder::<EF>::new();
@@ -1845,6 +1996,29 @@ mod verification_key_binding_tests {
         let error = verify_coin_proof(&legacy.statement, &legacy)
             .expect_err("outer-version relabel must not rewrite the bound statement version");
         assert!(matches!(error, NodeError::StatementMismatch));
+    }
+
+    #[test]
+    #[ignore = "slow D5 receipt: proves that v4 native root verification is self-described"]
+    fn foreign_statement_only_root_demonstrates_the_d5_boundary() {
+        let statement = NodeStatement {
+            asset_id: AssetId::from_bytes([0x51; 32]),
+            value: u64::MAX,
+            mint_commit: Digest::from_bytes([0x52; 32]),
+            nullifiers: [Digest::from_bytes([0u8; 32]); NODE_INPUTS],
+            output_commitments: [Digest::from_bytes([0x53; 32]); NODE_OUTPUTS],
+        };
+        let foreign = foreign_statement_only_root(statement.clone())
+            .expect("foreign production-profile root proving must reproduce the D5 threat");
+
+        // This acceptance is the vulnerability receipt, not desired product
+        // behavior: the native v4 verifier reconstructs its root verifier
+        // from proof-carried metadata. The account layer therefore rejects
+        // all mainnet writes until a fixed/authenticated v5 root exists.
+        verify_coin_proof(&statement, &foreign)
+            .expect("self-described v4 root verifies despite omitting OpenCSV constraints");
+        let report = crate::security::proof_security_report(&foreign);
+        assert!(report.union_adjusted_bits >= crate::PRODUCTION_SECURITY_TARGET_BITS);
     }
 
     #[test]

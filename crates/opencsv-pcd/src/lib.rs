@@ -108,6 +108,8 @@ pub use mint::{
     MINT_PRIVATE_ELEMS, MINT_PUBLIC_ELEMS,
 };
 pub use node::prove_transfer as prove_coin_transfer;
+#[cfg(feature = "d5-profile-spike")]
+pub use node::{begin_d5_profile_spike, clear_d5_profile_spike, install_d5_profile_spike};
 pub use node::{
     coin_fri_params, prove_genesis_mint, prove_genesis_mint_raw, prove_one_input_transfer,
     prove_redeem, verify_coin_proof, verify_redeem, CoinProof, NodeError, NodeMode, NodeStatement,
