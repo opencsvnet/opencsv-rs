@@ -1682,6 +1682,44 @@ mod verification_key_binding_tests {
     use opencsv_core::PoseidonIssuerAuthorization;
     use p3_field::BasedVectorSpace;
 
+    /// Construct a proof whose statement table has the production v4 shape
+    /// and security parameters, but whose circuit enforces none of OpenCSV's
+    /// mint, ownership, or conservation rules. This is deliberately kept in
+    /// the crate that owns the private setup helpers: it is an executable D5
+    /// regression fixture, never a public proving API.
+    fn foreign_statement_only_root(statement: NodeStatement) -> Result<CoinProof, NodeError> {
+        let fri_params = CoinFriParams::production();
+        let config = CoinRecursionConfig::new(&fri_params);
+        let mut builder = CircuitBuilder::<EF>::new();
+        config.prepare_circuit_for_verification(&mut builder)?;
+        builder.register_npo(StatementCircuitPlugin::<STATEMENT_ELEMS>::new());
+
+        let statement_elements = statement
+            .to_public_values_for_version(COIN_PROOF_VERSION, NodeMode::Mint)
+            .chunks_exact(4)
+            .map(|coefficients| const_expr(&mut builder, coefficients[0]))
+            .collect();
+        push_statement_op(&mut builder, statement_elements)?;
+
+        let setup = setup_circuit::<STATEMENT_ELEMS>(builder.build()?, &fri_params)?;
+        let mut runner = setup.circuit.runner();
+        runner.set_public_inputs(&[])?;
+        let traces = runner.run()?;
+        let prover =
+            new_prover::<STATEMENT_ELEMS>(&setup.config, setup.table_packing.clone(), false);
+        let proof = {
+            let circuit_prover_data = lock_setup(&setup.circuit_prover_data);
+            prover.prove_all_tables(&traces, &circuit_prover_data)?
+        };
+
+        Ok(CoinProof {
+            version: COIN_PROOF_VERSION,
+            mode: NodeMode::Mint,
+            statement,
+            proof,
+        })
+    }
+
     fn run_key_binding(actual: EF, expected: EF) -> Result<(), NodeError> {
         let mut builder = CircuitBuilder::<EF>::new();
         let target = builder.public_input();
@@ -1845,6 +1883,29 @@ mod verification_key_binding_tests {
         let error = verify_coin_proof(&legacy.statement, &legacy)
             .expect_err("outer-version relabel must not rewrite the bound statement version");
         assert!(matches!(error, NodeError::StatementMismatch));
+    }
+
+    #[test]
+    #[ignore = "slow D5 receipt: proves that v4 native root verification is self-described"]
+    fn foreign_statement_only_root_demonstrates_the_d5_boundary() {
+        let statement = NodeStatement {
+            asset_id: AssetId::from_bytes([0x51; 32]),
+            value: u64::MAX,
+            mint_commit: Digest::from_bytes([0x52; 32]),
+            nullifiers: [Digest::from_bytes([0u8; 32]); NODE_INPUTS],
+            output_commitments: [Digest::from_bytes([0x53; 32]); NODE_OUTPUTS],
+        };
+        let foreign = foreign_statement_only_root(statement.clone())
+            .expect("foreign production-profile root proving must reproduce the D5 threat");
+
+        // This acceptance is the vulnerability receipt, not desired product
+        // behavior: the native v4 verifier reconstructs its root verifier
+        // from proof-carried metadata. The account layer therefore rejects
+        // all mainnet writes until a fixed/authenticated v5 root exists.
+        verify_coin_proof(&statement, &foreign)
+            .expect("self-described v4 root verifies despite omitting OpenCSV constraints");
+        let report = crate::security::proof_security_report(&foreign);
+        assert!(report.union_adjusted_bits >= crate::PRODUCTION_SECURITY_TARGET_BITS);
     }
 
     #[test]

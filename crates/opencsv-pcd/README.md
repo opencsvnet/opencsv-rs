@@ -1,5 +1,9 @@
 # opencsv-pcd
 
+> Mainnet note: predecessor verification-key binding is complete, but root
+> verification-key authentication is still the D5 production gate. See
+> [D5 root verification-key authentication](D5_ROOT_VK_AUTHENTICATION.md).
+
 Proof-carrying data (PCD) circuits for **OpenCSV** (client-side verified
 RWAs on Bitcoin, see `paper/opencsv.md` §4), built on the Plonky3
 circuit/recursion stack.
