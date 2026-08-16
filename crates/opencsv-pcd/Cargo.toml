@@ -5,6 +5,11 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+# Isolated, ignored desktop harness for deriving the value-free v5 profile.
+# Production/default builds never install or consult a measured profile.
+d5-profile-spike = []
+
 [dependencies]
 opencsv-core = { path = "../opencsv-core" }
 hashbrown = "0.17.1"
@@ -29,9 +34,9 @@ p3-util = "0.6.3"
 # Plonky3-recursion repo, pinned to the merged predecessor-vk accessor and
 # F1 const-value-binding patches.
 # The crates.io `p3-recursion 0.1.0` is a stub — do not use it.
-# Pin: 26e1ce54840781848c1b69f39302e2de3d40f0b9 (merge of reviewed F1 head
-# abe628c057377c7a3aa87ae842687999b1f0c702 into the D4 accessor branch).
-p3-circuit = { git = "https://github.com/opencsvnet/Plonky3-recursion.git", rev = "26e1ce54840781848c1b69f39302e2de3d40f0b9" }
-p3-circuit-prover = { git = "https://github.com/opencsvnet/Plonky3-recursion.git", rev = "26e1ce54840781848c1b69f39302e2de3d40f0b9" }
-p3-poseidon2-circuit-air = { git = "https://github.com/opencsvnet/Plonky3-recursion.git", rev = "26e1ce54840781848c1b69f39302e2de3d40f0b9" }
-p3-recursion = { git = "https://github.com/opencsvnet/Plonky3-recursion.git", rev = "26e1ce54840781848c1b69f39302e2de3d40f0b9" }
+# Reviewed merge of the D5 value-free shape, monotone profile closure, NPO
+# padding, and empty-preprocessed dummy synthesis work (PRs #2 and #3).
+p3-circuit = { git = "https://github.com/opencsvnet/Plonky3-recursion.git", rev = "28c9a37f31a7f69877a62cb372ddffce1f3f8189" }
+p3-circuit-prover = { git = "https://github.com/opencsvnet/Plonky3-recursion.git", rev = "28c9a37f31a7f69877a62cb372ddffce1f3f8189" }
+p3-poseidon2-circuit-air = { git = "https://github.com/opencsvnet/Plonky3-recursion.git", rev = "28c9a37f31a7f69877a62cb372ddffce1f3f8189" }
+p3-recursion = { git = "https://github.com/opencsvnet/Plonky3-recursion.git", rev = "28c9a37f31a7f69877a62cb372ddffce1f3f8189" }

@@ -2742,7 +2742,7 @@ dependencies = [
 [[package]]
 name = "p3-circuit"
 version = "0.1.0"
-source = "git+https://github.com/opencsvnet/Plonky3-recursion.git?rev=26e1ce54840781848c1b69f39302e2de3d40f0b9#26e1ce54840781848c1b69f39302e2de3d40f0b9"
+source = "git+https://github.com/opencsvnet/Plonky3-recursion.git?rev=28c9a37f31a7f69877a62cb372ddffce1f3f8189#28c9a37f31a7f69877a62cb372ddffce1f3f8189"
 dependencies = [
  "hashbrown 0.17.1",
  "itertools 0.15.0",
@@ -2770,7 +2770,7 @@ dependencies = [
 [[package]]
 name = "p3-circuit-prover"
 version = "0.1.0"
-source = "git+https://github.com/opencsvnet/Plonky3-recursion.git?rev=26e1ce54840781848c1b69f39302e2de3d40f0b9#26e1ce54840781848c1b69f39302e2de3d40f0b9"
+source = "git+https://github.com/opencsvnet/Plonky3-recursion.git?rev=28c9a37f31a7f69877a62cb372ddffce1f3f8189#28c9a37f31a7f69877a62cb372ddffce1f3f8189"
 dependencies = [
  "hashbrown 0.17.1",
  "p3-air",
@@ -3038,7 +3038,7 @@ dependencies = [
 [[package]]
 name = "p3-poseidon-circuit-cols"
 version = "0.1.0"
-source = "git+https://github.com/opencsvnet/Plonky3-recursion.git?rev=26e1ce54840781848c1b69f39302e2de3d40f0b9#26e1ce54840781848c1b69f39302e2de3d40f0b9"
+source = "git+https://github.com/opencsvnet/Plonky3-recursion.git?rev=28c9a37f31a7f69877a62cb372ddffce1f3f8189#28c9a37f31a7f69877a62cb372ddffce1f3f8189"
 
 [[package]]
 name = "p3-poseidon1"
@@ -3071,7 +3071,7 @@ dependencies = [
 [[package]]
 name = "p3-poseidon1-circuit-air"
 version = "0.1.0"
-source = "git+https://github.com/opencsvnet/Plonky3-recursion.git?rev=26e1ce54840781848c1b69f39302e2de3d40f0b9#26e1ce54840781848c1b69f39302e2de3d40f0b9"
+source = "git+https://github.com/opencsvnet/Plonky3-recursion.git?rev=28c9a37f31a7f69877a62cb372ddffce1f3f8189#28c9a37f31a7f69877a62cb372ddffce1f3f8189"
 dependencies = [
  "itertools 0.15.0",
  "p3-air",
@@ -3124,7 +3124,7 @@ dependencies = [
 [[package]]
 name = "p3-poseidon2-circuit-air"
 version = "0.1.0"
-source = "git+https://github.com/opencsvnet/Plonky3-recursion.git?rev=26e1ce54840781848c1b69f39302e2de3d40f0b9#26e1ce54840781848c1b69f39302e2de3d40f0b9"
+source = "git+https://github.com/opencsvnet/Plonky3-recursion.git?rev=28c9a37f31a7f69877a62cb372ddffce1f3f8189#28c9a37f31a7f69877a62cb372ddffce1f3f8189"
 dependencies = [
  "itertools 0.15.0",
  "p3-air",
@@ -3149,7 +3149,7 @@ dependencies = [
 [[package]]
 name = "p3-recursion"
 version = "0.1.0"
-source = "git+https://github.com/opencsvnet/Plonky3-recursion.git?rev=26e1ce54840781848c1b69f39302e2de3d40f0b9#26e1ce54840781848c1b69f39302e2de3d40f0b9"
+source = "git+https://github.com/opencsvnet/Plonky3-recursion.git?rev=28c9a37f31a7f69877a62cb372ddffce1f3f8189#28c9a37f31a7f69877a62cb372ddffce1f3f8189"
 dependencies = [
  "hashbrown 0.17.1",
  "itertools 0.15.0",

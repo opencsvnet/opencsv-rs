@@ -16,7 +16,8 @@ use sha2::{Digest as _, Sha256};
 use crate::EF;
 
 const IDENTITY_DOMAIN: &[u8] = b"opencsv-pcd/setup-identity/v1";
-const UPSTREAM_REVISION: &[u8] = b"opencsvnet/plonky3-recursion/26e1ce54840781848c1b69f39302e2de3d40f0b9";
+const UPSTREAM_REVISION: &[u8] =
+    b"opencsvnet/plonky3-recursion/28c9a37f31a7f69877a62cb372ddffce1f3f8189";
 
 /// Digest of every input that determines setup or verifier data.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -180,13 +181,16 @@ impl<T> SetupCache<T> {
         Ok(setup)
     }
 
-    #[cfg(test)]
-    fn reset(&self) {
+    #[cfg(any(test, feature = "d5-profile-spike"))]
+    pub(crate) fn reset(&self) {
         let mut state = lock_unpoisoned(&self.state);
         state.entries.clear();
         state.oldest_first.clear();
-        state.hits = 0;
-        state.builds = 0;
+        #[cfg(test)]
+        {
+            state.hits = 0;
+            state.builds = 0;
+        }
     }
 
     #[cfg(test)]
