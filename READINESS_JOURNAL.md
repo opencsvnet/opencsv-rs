@@ -1,5 +1,39 @@
 # Signet/mainnet readiness decision journal
 
+## 2026-08-15 — D4 does not authenticate the recursive root key
+
+Re-reading the original security audit against the current v4 receiver found
+that the roadmap's phrase "prover production readiness" was too broad. D4
+correctly constrains every predecessor verification key inside the successor
+circuit, but `verify_coin_proof` still reconstructs the root native verifier
+from common data carried by the proof. `COIN_VK_TAG` authenticates only a
+format/profile label. A malicious custom root circuit can therefore nominate
+its own native verifier while exposing the expected statement shape.
+
+This is D5, tracked in `opencsv-rs#32`, and it blocks mainnet activation. The
+immediate repair is fail-closed, not a claim that the cryptographic design is
+finished: shipped mainnet accounts return
+`production_root_vk_authentication_required` before any fresh consumer or
+issuer Bitcoin write. V4 remains available for signet. Downstream rollout and
+issuance-policy unit tests may opt into an explicit `cfg(test)`-only modeled
+root; no such field exists in a shipped configuration.
+
+The exact warning-denied workspace completed without an executed failure. The
+account/FFI unit suite is 127 passed, 0 failed, and 3 intentional slow ignores;
+the separate release-shape integration test proves a normal build rejects the
+test-only override as an unknown field. Default, issuer-tools, and
+registry-tools warning-denied compile checks are green. The ordinary workspace
+also completed the expensive PCD node suite at 7/0/3 and redeem suite at
+2/0/1. Hosted CI and independent review of the resulting exact head remain
+required.
+
+Rejected shortcuts: the existing static tag, self-attestation carried beside
+the proof, a mutable per-transaction allowlist, issuer/server cosigning of
+ordinary transfers, and presenting a finite recursion-depth allowlist as the
+general protocol. The v5 design must independently derive or authenticate the
+root key from a canonical lineage and ship an adversarial custom-root
+regression plus independent review before this gate can open.
+
 ## 2026-08-15 — signed funding makes backup rollback non-repeatable
 
 The authorization ledger detects replay inside one current checkpoint, but an

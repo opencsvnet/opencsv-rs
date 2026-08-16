@@ -518,6 +518,12 @@ pub struct AccountConfig {
     #[cfg(test)]
     #[serde(default)]
     pub test_skip_protocol_spend_preflight: bool,
+    /// Unit tests for gates below D5 may model an authenticated proof root.
+    /// This field is absent from every shipped build: the production binary
+    /// remains fail-closed until proof-lineage v5 implements D5.
+    #[cfg(test)]
+    #[serde(default)]
+    pub test_assume_authenticated_proof_root: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1022,6 +1028,10 @@ fn write_block_error(reason: &'static str) -> AccountError {
         "production_activation_not_authorized" => AccountError::new(
             "production_activation_not_authorized",
             "this production registry is a candidate and does not authorize consumer Bitcoin writes",
+        ),
+        "production_root_vk_authentication_required" => AccountError::new(
+            "production_root_vk_authentication_required",
+            "mainnet Bitcoin-writing operations require an independently authenticated recursive root verification key; proof-lineage v4 remains testnet-only",
         ),
         "production_observation_policy_required" => AccountError::new(
             "production_observation_policy_required",
@@ -2500,6 +2510,8 @@ impl AccountWallet {
                 "rollout": registry.rollout,
             })),
             "production_activation_write_ready": self.production_activation_write_ready(),
+            "production_root_vk_authentication_ready":
+                self.production_root_vk_authentication_ready(),
             "production_observation_policy_ready": self.production_observation_policy_ready(),
             "issuance_enabled": false,
             "device_binding": {
@@ -9173,6 +9185,11 @@ impl AccountWallet {
         if !self.production_activation_write_ready() {
             return Err(write_block_error("production_activation_not_authorized"));
         }
+        if !self.production_root_vk_authentication_ready() {
+            return Err(write_block_error(
+                "production_root_vk_authentication_required",
+            ));
+        }
         if !self.production_observation_policy_ready() {
             return Err(write_block_error("production_observation_policy_required"));
         }
@@ -9517,6 +9534,22 @@ impl AccountWallet {
                 })
     }
 
+    /// D4 binds predecessor verification keys inside each recursive circuit,
+    /// but proof-lineage v4 still reconstructs the root native verifier from
+    /// proof-carried common data. A static lineage tag does not authenticate
+    /// that root. Until D5 supplies an independently derived root-key policy,
+    /// every shipped mainnet build must remain read-only.
+    fn production_root_vk_authentication_ready(&self) -> bool {
+        if self.config.network != "mainnet" {
+            return true;
+        }
+        #[cfg(test)]
+        if self.config.test_assume_authenticated_proof_root {
+            return true;
+        }
+        false
+    }
+
     /// Production may use the immutable built-ins or independently hosted
     /// replacements, but it must not turn a configurable observation policy
     /// into a silent safety downgrade. Two distinct pinned raw endpoints must
@@ -9571,6 +9604,9 @@ impl AccountWallet {
         }
         if !self.production_activation_write_ready() {
             return Ok(Some("production_activation_not_authorized"));
+        }
+        if !self.production_root_vk_authentication_ready() {
+            return Ok(Some("production_root_vk_authentication_required"));
         }
         if !self.production_observation_policy_ready() {
             return Ok(Some("production_observation_policy_required"));
@@ -14181,6 +14217,7 @@ mod tests {
             "backup_verified": true,
             "production_usd_registry": production_usd_registry,
             "test_skip_protocol_spend_preflight": true,
+            "test_assume_authenticated_proof_root": true,
         }))
         .unwrap()
     }
@@ -14678,6 +14715,45 @@ mod tests {
             )
             .unwrap_err();
         assert_eq!(error.code, "production_activation_not_authorized");
+    }
+
+    #[test]
+    fn proof_lineage_v4_cannot_activate_mainnet_writes() {
+        let mut config: Value = serde_json::from_str(&mainnet_config(vec![
+            mainnet_usd_issuer_policy(90),
+        ]))
+        .unwrap();
+        config["test_assume_authenticated_proof_root"] = json!(false);
+        let dir = tempfile::tempdir().unwrap();
+        let mut wallet = AccountWallet::open(
+            &config.to_string(),
+            &[90_u8; 32],
+            dir.path().join("wallet.sqlite").to_str().unwrap(),
+        )
+        .unwrap();
+
+        let status = wallet.status().unwrap();
+        assert_eq!(status["production_activation_write_ready"], true);
+        assert_eq!(status["production_root_vk_authentication_ready"], false);
+        assert_eq!(status["write_enabled"], false);
+        assert_eq!(
+            status["write_block_reason"],
+            "production_root_vk_authentication_required"
+        );
+        let error = wallet
+            .transfer_plan(
+                &json!({
+                    "asset_id": hex_encode(&[0_u8; 32]),
+                    "to_owner": hex_encode(&[1_u8; 32]),
+                    "amount": 1,
+                })
+                .to_string(),
+            )
+            .unwrap_err();
+        assert_eq!(
+            error.code,
+            "production_root_vk_authentication_required"
+        );
     }
 
     #[test]

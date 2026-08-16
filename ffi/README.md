@@ -34,6 +34,16 @@ Limited and general releases remain bounded by the committed ceilings at
 intent creation and again before proof/signing, so application configuration
 cannot raise them. Cancelled or protocol-rejected intents stop consuming the
 rolling-day allowance; live and completed intents continue to count.
+Proof-lineage v4 is deliberately not sufficient to cross this boundary. D4
+binds predecessor verification keys, but the root verifier is still rebuilt
+from proof-carried common data. Until D5 independently authenticates that
+root, every shipped mainnet build reports
+`production_root_vk_authentication_required` after the activation-phase check
+and before observation, Bitcoin selection, proving, or signing. The only test
+override is compiled under `cfg(test)` and is rejected as an unknown config
+field by normal, issuer-tools, and registry-tools builds.
+`ffi/tests/production_root_gate.rs` freezes that release-shape property so the
+override cannot silently leak into the Signal or operator surface.
 When exact transaction bytes are signed and persisted, their receipt snapshots
 the authorizing registry version, commitment, rollout, and miner-fee ceiling.
 Rust signs that snapshot with a deployment-separated wallet key over the stable
