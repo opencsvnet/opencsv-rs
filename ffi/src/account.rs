@@ -5317,6 +5317,25 @@ impl AccountWallet {
         if !spv_confirmation.satisfies_depth(self.config.required_confirmations) {
             return Ok(None);
         }
+        let Some(original_manifest) = batch_receipt
+            .get("pre_replacement_manifest_wire_base64")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+        else {
+            let object = batch_receipt.as_object_mut().ok_or_else(|| {
+                AccountError::new("database_corrupt", "batch receipt is not an object")
+            })?;
+            object.insert(
+                "legacy_replacement_reconcile_unavailable".into(),
+                json!(true),
+            );
+            self.db.conn.execute(
+                "UPDATE opencsv_send_batches
+                 SET receipt_json = ?2, updated_at = ?3 WHERE batch_local_id = ?1",
+                params![batch_local_id, batch_receipt.to_string(), unix_time()?],
+            )?;
+            return Ok(None);
+        };
         let original = match self.bitcoin.get_tx(replaced) {
             Some(transaction) => transaction.tx_node.tx.as_ref().clone(),
             None => client
@@ -5336,17 +5355,8 @@ impl AccountWallet {
             ));
         }
         let original_hex = hex_encode(&serialize(&original));
-        let original_manifest = batch_receipt
-            .get("pre_replacement_manifest_wire_base64")
-            .and_then(Value::as_str)
-            .ok_or_else(|| {
-                AccountError::new(
-                    "database_corrupt",
-                    "replacement batch has no pre-replacement manifest",
-                )
-            })?;
         let original_manifest = base64::engine::general_purpose::STANDARD
-            .decode(original_manifest)
+            .decode(&original_manifest)
             .map_err(|error| AccountError::new("database_corrupt", error.to_string()))?;
 
         let members = self.send_batch_members(batch_local_id)?;
@@ -5538,7 +5548,8 @@ impl AccountWallet {
         let (p2p_submissions, relay_peers) = self.submit_direct_p2p(&transaction)?;
         let client = self.esplora_client();
         let fallback = relay_via_esplora_if_unobserved(&client, &transaction);
-        let mut receipt: Value = batch
+        let mut receipt: Value = self
+            .send_batch(batch_local_id)?
             .receipt_json
             .as_deref()
             .and_then(|encoded| serde_json::from_str(encoded).ok())
@@ -15289,6 +15300,191 @@ mod tests {
             assert_eq!(operation["txid"], original_txid);
             assert_eq!(operation["receipt"]["delivery_ready"], true);
             assert_eq!(operation["receipt"]["consignment_delivered"], true);
+        }
+    }
+
+    #[test]
+    #[ignore = "slow recursive receipt and mock listener; run explicitly with --release --ignored"]
+    fn legacy_batch_replacement_without_manifest_rebroadcasts_current_transaction() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wallet.sqlite");
+        let key = [106u8; 32];
+        let mut config_value: Value = serde_json::from_str(&config_with_url(
+            AccountRole::Primary,
+            true,
+            "http://127.0.0.1:1",
+        ))
+        .unwrap();
+        config_value["required_confirmations"] = json!(6);
+        let mut wallet =
+            AccountWallet::open(&config_value.to_string(), &key, path.to_str().unwrap()).unwrap();
+        allow_funding_verification(&mut wallet);
+        fund(&mut wallet, 60_000);
+        let minted = prepare_test_issuance(&mut wallet, "USD", &[60, 40]).unwrap();
+        let asset_id = minted["asset_id"].as_str().unwrap().to_owned();
+        let mint_operation = minted["operation_id"].as_str().unwrap().to_owned();
+        let mint_pending = wallet.pending_by_operation.remove(&mint_operation).unwrap();
+        wallet
+            .primary_protocol_mut()
+            .unwrap()
+            .finalize(
+                mint_pending,
+                AnchorRef {
+                    txid: [107u8; 32],
+                    location: opencsv_core::chain::AnchorLocation {
+                        height: 1,
+                        position: 0,
+                    },
+                },
+            )
+            .unwrap();
+        wallet.release_fee_reservation(&mint_operation).unwrap();
+        wallet
+            .db
+            .conn
+            .execute(
+                "UPDATE opencsv_operations SET state = 'cancelled'
+                 WHERE operation_id = ?1",
+                [&mint_operation],
+            )
+            .unwrap();
+        fund(&mut wallet, 20_000);
+        fund(&mut wallet, 19_000);
+        let stock_outpoint = OutPoint::new(Txid::from_byte_array([108u8; 32]), 0);
+        wallet
+            .db
+            .conn
+            .execute(
+                "INSERT INTO opencsv_batch_stocks(
+                     participant_count, txid, vout, value_sats, birth_height,
+                     state, reserved_by_batch, created_at
+                 ) VALUES(2, ?1, 0, ?2, 1, 'available', NULL, 1)",
+                params![
+                    stock_outpoint.txid.to_string(),
+                    i64::try_from(opencsv_bitcoin::batch_v2::MIN_OUTPUT_SATS).unwrap(),
+                ],
+            )
+            .unwrap();
+        let request = |owner: u8, amount: u64| {
+            json!({
+                "asset_id": asset_id,
+                "to_owner": hex_encode(&[owner; 32]),
+                "amount": amount,
+            })
+            .to_string()
+        };
+        let first = wallet.transfer_batch_plan(&request(109, 60)).unwrap();
+        let batch_id = first["batch"]["batch_local_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        wallet
+            .transfer_batch_add_recipient(&batch_id, &request(110, 40))
+            .unwrap();
+        wallet.freeze_send_batch(&batch_id).unwrap();
+        let job = match wallet.begin_send_batch_proof(&batch_id).unwrap() {
+            BatchProofJobStart::Run(job) => job,
+            _ => panic!("frozen two-member batch did not produce a proof job"),
+        };
+        let proved = wallet.finish_send_batch_proof(job.run().unwrap()).unwrap();
+        wallet
+            .acknowledge_send_batch_backup(&batch_id, proved["checkpoint_hash"].as_str().unwrap())
+            .unwrap();
+        let original = wallet.sign_and_broadcast_send_batch(&batch_id).unwrap();
+        let original_txid = original["txid"].as_str().unwrap().to_owned();
+        let original_raw = hex_decode(
+            original["signed_tx_hex"].as_str().unwrap(),
+            "test batch transaction",
+        )
+        .unwrap();
+        let now = unix_time_millis().unwrap();
+        let evidence = json!({
+            "observations": [{
+                "check_id": "test_accelerator",
+                "endpoint": "http://127.0.0.1:1",
+                "result": "observed",
+                "started_at_ms": now - 2,
+                "completed_at_ms": now - 1,
+                "cached_at_ms": now - 1,
+                "certificate_chain_fingerprints_sha256": [],
+                "raw_transaction_hex": hex_encode(&original_raw),
+            }]
+        });
+        wallet
+            .observe_send_batch_unconfirmed(&batch_id, &original_raw, &evidence.to_string())
+            .unwrap();
+        let bumped = wallet.fee_bump_send_batch(&batch_id, 3).unwrap();
+        let replacement_txid = bumped["txid"].as_str().unwrap().to_owned();
+        let replacement_hex = bumped["signed_tx_hex"].as_str().unwrap().to_owned();
+        let replacement_manifest = bumped["manifest_wire_base64"].as_str().unwrap().to_owned();
+        assert_ne!(replacement_txid, original_txid);
+        assert_eq!(bumped["receipt"]["replaces"], original_txid);
+        let expected_members = wallet
+            .send_batch_members(&batch_id)
+            .unwrap()
+            .into_iter()
+            .map(|member| {
+                let operation = wallet.operation(&member.operation_id).unwrap();
+                (
+                    member.operation_id,
+                    operation.state,
+                    operation.signed_tx_hex,
+                    operation.txid,
+                    operation.receipt_json,
+                    operation.delivery_nonce,
+                )
+            })
+            .collect::<Vec<_>>();
+
+        let mut legacy_receipt = bumped["receipt"].clone();
+        assert!(legacy_receipt
+            .as_object_mut()
+            .unwrap()
+            .remove("pre_replacement_manifest_wire_base64")
+            .is_some());
+        wallet
+            .db
+            .conn
+            .execute(
+                "UPDATE opencsv_send_batches SET receipt_json = ?2 WHERE batch_local_id = ?1",
+                params![batch_id, legacy_receipt.to_string()],
+            )
+            .unwrap();
+        let original_txid_parsed = original_txid.parse::<Txid>().unwrap();
+        scan::install_test_scan(
+            dir.path(),
+            305,
+            u64::from(wallet.config.required_confirmations),
+            &[txid_only_scan_occurrence(original_txid_parsed, 300, 3)],
+        )
+        .unwrap();
+        let (esplora_url, server) = confirmed_status_server(300);
+        wallet.config.esplora_url = esplora_url;
+
+        let resumed = wallet.resume_send_batch(&batch_id).unwrap();
+        server.join().unwrap();
+
+        assert_eq!(resumed["state"], "broadcast_unobserved");
+        assert_eq!(resumed["txid"], replacement_txid);
+        assert_eq!(resumed["signed_tx_hex"], replacement_hex);
+        assert_eq!(resumed["manifest_wire_base64"], replacement_manifest);
+        assert_eq!(resumed["receipt"]["replaces"], original_txid);
+        assert_eq!(
+            resumed["receipt"]["legacy_replacement_reconcile_unavailable"],
+            true
+        );
+        assert!(resumed["receipt"]
+            .get("pre_replacement_manifest_wire_base64")
+            .is_none());
+        for (operation_id, state, signed_tx_hex, txid, receipt_json, delivery_nonce) in
+            expected_members
+        {
+            let operation = wallet.operation(&operation_id).unwrap();
+            assert_eq!(operation.state, state);
+            assert_eq!(operation.signed_tx_hex, signed_tx_hex);
+            assert_eq!(operation.txid, txid);
+            assert_eq!(operation.receipt_json, receipt_json);
+            assert_eq!(operation.delivery_nonce, delivery_nonce);
         }
     }
 
