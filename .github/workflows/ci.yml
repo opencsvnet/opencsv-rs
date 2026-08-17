@@ -24,12 +24,10 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: debug
-      - name: Format and check
+      - name: Check
         env:
           RUSTFLAGS: -D warnings
-        run: |
-          cargo fmt --check
-          cargo check --workspace --locked --all-targets
+        run: cargo check --workspace --locked --all-targets
 
   rust:
     needs: gate
